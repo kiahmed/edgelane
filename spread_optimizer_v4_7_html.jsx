@@ -234,7 +234,7 @@ async function _atlasCall(tool, body, { maxRetries = 3 } = {}) {
 
 const _num = (v) => (v == null || v === '' ? null : Number(v));
 
-function _normalizeContract(c, sideHint) {
+function _normalizeContract(c, sideHint, expiration) {
   const sideSrc = String(c.side || c.type || c.option_type || c.contract_type || sideHint || '').toLowerCase();
   const side = sideSrc.includes('p') ? 'put' : 'call';
   const bid = _num(c.bid ?? c.bidPrice);
@@ -244,6 +244,7 @@ function _normalizeContract(c, sideHint) {
   return {
     strike: _num(c.strike ?? c.strike_price ?? c.strikePrice),
     side,
+    expiration: expiration ?? c.expiration ?? c.expiry ?? c.exp_date ?? null,
     bid: bid ?? 0,
     ask: ask ?? 0,
     mid: mid ?? 0,
@@ -261,22 +262,22 @@ function _normalizeContract(c, sideHint) {
 function _flattenChain(chainData, targetExpiration) {
   const out = [];
   const target = targetExpiration ? String(targetExpiration) : null;
-  const walk = (node, sideHint) => {
+  const walk = (node, sideHint, currentExp) => {
     if (node == null) return;
-    if (Array.isArray(node)) { node.forEach(n => walk(n, sideHint)); return; }
+    if (Array.isArray(node)) { node.forEach(n => walk(n, sideHint, currentExp)); return; }
     if (typeof node !== 'object') return;
-    const exp = node.expiration || node.expiry || node.exp_date;
+    const exp = node.expiration || node.expiry || node.exp_date || currentExp;
     if (target && exp && String(exp) !== target) return;
-    if (Array.isArray(node.calls)) node.calls.forEach(c => out.push(_normalizeContract(c, 'call')));
-    if (Array.isArray(node.puts))  node.puts.forEach(c => out.push(_normalizeContract(c, 'put')));
-    if (Array.isArray(node.contracts)) node.contracts.forEach(c => out.push(_normalizeContract(c, sideHint)));
-    if (node.strike != null && (node.side || node.type || node.option_type)) out.push(_normalizeContract(node, sideHint));
+    if (Array.isArray(node.calls)) node.calls.forEach(c => out.push(_normalizeContract(c, 'call', exp)));
+    if (Array.isArray(node.puts))  node.puts.forEach(c => out.push(_normalizeContract(c, 'put', exp)));
+    if (Array.isArray(node.contracts)) node.contracts.forEach(c => out.push(_normalizeContract(c, sideHint, exp)));
+    if (node.strike != null && (node.side || node.type || node.option_type)) out.push(_normalizeContract(node, sideHint, exp));
     for (const k of Object.keys(node)) {
       if (['calls','puts','contracts'].includes(k)) continue;
-      if (Array.isArray(node[k]) || (typeof node[k] === 'object' && node[k])) walk(node[k], sideHint);
+      if (Array.isArray(node[k]) || (typeof node[k] === 'object' && node[k])) walk(node[k], sideHint, exp);
     }
   };
-  walk(chainData);
+  walk(chainData, undefined, target);
   return out;
 }
 
@@ -327,7 +328,276 @@ const atlas = {
       contracts,
     };
   },
+  // v4.7.25 interface aliases — keep snake_case existing methods AND expose
+  // provider-agnostic camelCase. dataProvider downstream uses the camelCase.
+  async optionsChain(symbol, expiration, opts) { return atlas.getOptionsChain(symbol, expiration, opts); },
+  async subscriptionStatus() { return atlas.getSubscriptionStatus(); },
+  async greekExposures(symbol, num_expirations = 3) { return _getGreekExposures(symbol, num_expirations); },
 };
+
+// ==============================================
+// DEALER GEX (LOCAL COMPUTATION, v4.7.25)
+// ==============================================
+// JS mirror of data_providers/gex_local.py. Aggregates per-contract gamma/delta
+// × open_interest into the same {exposures_by_date, portfolio_totals,
+// key_levels} shape Atlas\'s analyze_greek_exposures returns.
+//
+// Convention (matches SpotGamma / SqueezeMetrics):
+//   dealer_gamma_at_strike(K) = put_gamma(K) × put_OI(K) − call_gamma(K) × call_OI(K)
+//   dealer_GEX_dollars(K)     = dealer_gamma × 100 × spot²
+//   call_wall = strike above spot with most-NEGATIVE dealer GEX (forced-buy)
+//   put_wall  = strike below spot with most-POSITIVE dealer GEX (forced-sell)
+
+const _DEALER_CONTRACT_MULT = 100;
+
+function _emptyDealerExposures() {
+  return {
+    exposures_by_date: {},
+    portfolio_totals: { net_gex: 0, net_dex: 0 },
+    key_levels: { call_wall: null, put_wall: null },
+  };
+}
+
+function _computeDealerExposures(contracts, spot) {
+  if (!Array.isArray(contracts) || contracts.length === 0 || !spot || spot <= 0) {
+    return _emptyDealerExposures();
+  }
+  const buckets = new Map();   // exp -> (strike -> {call?, put?})
+  for (const c of contracts) {
+    const exp = c.expiration;
+    const strike = c.strike;
+    const side = (c.side || '').toLowerCase();
+    if (exp == null || strike == null || (side !== 'call' && side !== 'put')) continue;
+    if (!buckets.has(exp)) buckets.set(exp, new Map());
+    const sm = buckets.get(exp);
+    if (!sm.has(strike)) sm.set(strike, {});
+    sm.get(strike)[side] = c;
+  }
+  if (buckets.size === 0) return _emptyDealerExposures();
+
+  const spotSq = spot * spot;
+  const exposures_by_date = {};
+  let portNetGex = 0, portNetDex = 0;
+  const allStrikesGex = new Map();
+
+  for (const [exp, sm] of buckets) {
+    const sortedStrikes = [...sm.keys()].sort((a, b) => a - b);
+    const by_strike = [];
+    let expNetGex = 0, expNetDex = 0;
+    for (const strike of sortedStrikes) {
+      const sides = sm.get(strike);
+      const call = sides.call || {};
+      const put = sides.put || {};
+      const cG = Number(call.gamma) || 0;
+      const pG = Number(put.gamma) || 0;
+      const cD = Number(call.delta) || 0;
+      const pD = Number(put.delta) || 0;
+      const cOi = Number(call.open_interest) || 0;
+      const pOi = Number(put.open_interest) || 0;
+      const callGex = cG * cOi * _DEALER_CONTRACT_MULT * spotSq;
+      const putGex  = pG * pOi * _DEALER_CONTRACT_MULT * spotSq;
+      const netGex  = putGex - callGex;
+      const callDex = cD * cOi * _DEALER_CONTRACT_MULT * spot;
+      const putDex  = pD * pOi * _DEALER_CONTRACT_MULT * spot;
+      const netDex  = callDex - putDex;
+      by_strike.push({
+        strike, call_gex: callGex, put_gex: putGex, net_gex: netGex,
+        call_dex: callDex, put_dex: putDex, net_dex: netDex,
+        call_oi: cOi, put_oi: pOi,
+      });
+      expNetGex += netGex;
+      expNetDex += netDex;
+      allStrikesGex.set(strike, (allStrikesGex.get(strike) || 0) + netGex);
+    }
+    exposures_by_date[exp] = { by_strike, totals: { net_gex: expNetGex, net_dex: expNetDex } };
+    portNetGex += expNetGex;
+    portNetDex += expNetDex;
+  }
+
+  let callWall = null, putWall = null;
+  let bestCallGex = 0, bestPutGex = 0;
+  for (const [strike, gex] of allStrikesGex) {
+    if (strike > spot && gex < bestCallGex) { bestCallGex = gex; callWall = { strike, gex }; }
+    if (strike < spot && gex > bestPutGex)  { bestPutGex  = gex; putWall  = { strike, gex }; }
+  }
+
+  return {
+    exposures_by_date,
+    portfolio_totals: { net_gex: portNetGex, net_dex: portNetDex },
+    key_levels: { call_wall: callWall, put_wall: putWall },
+  };
+}
+
+
+// ==============================================
+// TRADIER REST CLIENT (v4.7.25)
+// ==============================================
+// Brokerage REST: Bearer auth, hyphenated PascalCase paths via REST gateway,
+// decimal IV (we convert to percent in _normalizeTradierContract to match
+// Atlas downstream convention).
+
+const _tradierRateLimit = {};
+
+async function _tradierGet(path, params) {
+  const token = (typeof window !== 'undefined' && window.TRADIER_TOKEN) || '';
+  if (!token) throw new Error(`Provider ${path}: TRADIER_TOKEN missing.`);
+  const base = (typeof window !== 'undefined' && window.TRADIER_BASE_URL) || 'https://sandbox.tradier.com';
+  const qs = new URLSearchParams(params || {}).toString();
+  const url = `${base.replace(/\/$/, '')}/v1/${path.replace(/^\//, '')}${qs ? '?' + qs : ''}`;
+
+  const abort = new AbortController();
+  const tid = setTimeout(() => abort.abort(), 30000);
+  let r;
+  try {
+    r = await fetch(url, {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
+      signal: abort.signal,
+    });
+    clearTimeout(tid);
+  } catch (e) {
+    clearTimeout(tid);
+    const isTimeout = e?.name === 'AbortError';
+    throw new Error(`Provider ${path}: ${isTimeout ? 'timed out after 30s' : 'network ' + (e?.message || e)}`);
+  }
+  for (const h of ['X-Ratelimit-Allowed','X-Ratelimit-Used','X-Ratelimit-Available','X-Ratelimit-Expiry']) {
+    const v = r.headers.get(h);
+    if (v != null) _tradierRateLimit[h] = v;
+  }
+  if (!r.ok) {
+    const text = await r.text().catch(() => '');
+    throw new Error(`Provider ${path}: HTTP ${r.status}: ${text.slice(0, 200)}`);
+  }
+  return r.json();
+}
+
+function _normalizeTradierContract(c, expiration) {
+  const sideRaw = String(c.option_type || '').toLowerCase();
+  const side = sideRaw.includes('call') ? 'call' : (sideRaw.includes('put') ? 'put' : null);
+  if (!side) return null;
+  const g = c.greeks || {};
+  const bid = _num(c.bid) ?? 0;
+  const ask = _num(c.ask) ?? 0;
+  const ivDecimal = _num(g.mid_iv);
+  return {
+    strike: _num(c.strike),
+    side,
+    expiration,
+    bid, ask,
+    last: _num(c.last) ?? 0,
+    mid: (bid + ask) / 2,
+    delta: _num(g.delta),
+    gamma: _num(g.gamma),
+    theta: _num(g.theta),
+    vega:  _num(g.vega),
+    iv: ivDecimal != null ? ivDecimal * 100 : null,    // decimal → percent (Atlas convention)
+    open_interest: _num(c.open_interest) ?? 0,
+    volume:        _num(c.volume) ?? 0,
+  };
+}
+
+const tradier = {
+  async stockQuote(symbol) {
+    const d = await _tradierGet('markets/quotes', { symbols: symbol, greeks: 'false' });
+    const q = d.quotes?.quote;
+    const quote = Array.isArray(q) ? q[0] : q;
+    if (!quote) throw new Error(`Provider markets/quotes: empty response for ${symbol}`);
+    return {
+      symbol: quote.symbol || symbol,
+      price: _num(quote.last),
+      bid: _num(quote.bid),
+      ask: _num(quote.ask),
+      volume: _num(quote.volume),
+      timestamp: quote.trade_date,
+      raw: quote,
+    };
+  },
+
+  async optionExpirations(symbol) {
+    const d = await _tradierGet('markets/options/expirations', { symbol, includeAllRoots: 'true' });
+    const dates = d.expirations?.date || [];
+    return Array.isArray(dates) ? dates.map(String) : [String(dates)];
+  },
+
+  async optionsChain(symbol, expiration, { strikeBandPct = 30 } = {}) {
+    const [quote, chainResp] = await Promise.all([
+      tradier.stockQuote(symbol).catch(() => null),
+      _tradierGet('markets/options/chains', { symbol, expiration, greeks: 'true' }),
+    ]);
+    const spot = quote?.price;
+    if (!spot) throw new Error(`Provider: could not determine spot price for ${symbol}.`);
+
+    const raw = chainResp.options?.option || [];
+    const list = Array.isArray(raw) ? raw : [raw];
+    let contracts = list.map(c => _normalizeTradierContract(c, expiration)).filter(Boolean);
+
+    const lo = spot * (1 - strikeBandPct / 100);
+    const hi = spot * (1 + strikeBandPct / 100);
+    contracts = contracts.filter(c => c.strike != null && c.strike >= lo && c.strike <= hi);
+
+    let atmStrike = null;
+    for (const c of contracts) if (atmStrike == null || Math.abs(c.strike - spot) < Math.abs(atmStrike - spot)) atmStrike = c.strike;
+    const atmCall = contracts.find(c => c.strike === atmStrike && c.side === 'call');
+    const atmPut  = contracts.find(c => c.strike === atmStrike && c.side === 'put');
+    const expectedMove = ((atmCall?.mid) || 0) + ((atmPut?.mid) || 0);
+    const atmIvPct = (((atmCall?.iv) || 0) + ((atmPut?.iv) || 0)) / 2;
+
+    const dte = Math.max(0, Math.round((new Date(`${expiration}T21:00:00Z`) - new Date()) / 86400000));
+    return {
+      spot, dte,
+      atm_iv_pct: atmIvPct, atmIV: atmIvPct,
+      expected_move: expectedMove, expectedMove,
+      expected_move_pct: spot ? (expectedMove / spot) * 100 : 0,
+      expectedMovePct:    spot ? (expectedMove / spot) * 100 : 0,
+      contracts,
+    };
+  },
+
+  async greekExposures(symbol, num_expirations = 3) {
+    const sym = String(symbol || '').toUpperCase();
+    const cached = _gexCacheGet(sym, num_expirations);
+    if (cached) { console.info(`[Tradier GEX] cache hit for ${sym}`); return cached; }
+    const expDates = (await tradier.optionExpirations(sym)).slice(0, num_expirations);
+    if (!expDates.length) throw new Error(`Provider: no expirations for ${sym}`);
+    const chains = await Promise.all(expDates.map(exp =>
+      tradier.optionsChain(sym, exp).catch(e => {
+        console.warn(`[Tradier GEX] chain ${sym} ${exp} failed:`, e?.message || e);
+        return null;
+      })
+    ));
+    const ok = chains.filter(c => c && c.contracts?.length);
+    if (!ok.length) throw new Error(`Provider: all ${expDates.length} chain pulls failed for ${sym}`);
+    const data = _computeDealerExposures(ok.flatMap(c => c.contracts), ok[0].spot);
+    data._provider = 'tradier';
+    _gexCacheSet(sym, num_expirations, data);
+    return data;
+  },
+
+  async subscriptionStatus() {
+    const rl = _tradierRateLimit;
+    const used = _num(rl['X-Ratelimit-Used']);
+    const allowed = _num(rl['X-Ratelimit-Allowed']);
+    return {
+      plan: 'brokerage',
+      status: used != null ? 'active' : 'no calls yet this session',
+      used, limit: allowed,
+      period: 'minute',
+      resetsAt: rl['X-Ratelimit-Expiry'],
+    };
+  },
+};
+
+
+// ==============================================
+// PROVIDER SELECTOR (v4.7.25)
+// ==============================================
+const dataProvider = (typeof window !== 'undefined' && String(window.DATA_PROVIDER).toLowerCase() === 'tradier')
+  ? tradier
+  : atlas;
+if (typeof window !== 'undefined') {
+  console.info(`[EdgeLane] data provider: ${dataProvider === tradier ? 'tradier' : 'atlas'}`);
+}
+
 
 // ==============================================
 // DETERMINISTIC BIAS ENGINE (v4.7 hybrid)
@@ -2006,8 +2276,11 @@ export default function SpreadOptimizer() {
   const refreshQuota = useCallback(async () => {
     setQuotaLoading(true);
     try {
-      const resp = await atlas.getSubscriptionStatus();
-      setQuota({ parsed: _parseAtlasQuota(resp), fetchedAt: new Date() });
+      const resp = await dataProvider.subscriptionStatus();
+      // tradier returns a pre-parsed shape (has scalar .limit/.used); atlas
+      // returns a raw envelope. Skip the recursive walker when already parsed.
+      const parsed = resp && resp.limit != null ? resp : _parseAtlasQuota(resp);
+      setQuota({ parsed, fetchedAt: new Date() });
     } catch (e) {
       setQuota({ parsed: null, error: e.message, fetchedAt: new Date() });
     } finally {
@@ -2068,8 +2341,8 @@ export default function SpreadOptimizer() {
       // STEP 1: REST fetch — quote in parallel with adaptive greek-exposures
       // (fast path for liquid symbols, chunked+cached for heavy chains).
       const [quote, greeksRaw] = await Promise.all([
-        atlas.stockQuote(sym),
-        _getGreekExposures(sym, 3),
+        dataProvider.stockQuote(sym),
+        dataProvider.greekExposures(sym, 3),
       ]);
       const spot = Number(quote.price);
       if (!spot) throw new Error('Could not determine spot price.');
@@ -2160,7 +2433,7 @@ OUTPUT JSON only:
     setLogSteps(s => [...s, 'Pulling chain via provider REST (one call, ±30% strike band)...']);
 
     try {
-      const data = await atlas.getOptionsChain(symbol.toUpperCase(), expiration, { strikeBandPct: 30, maxExpirations: 12 });
+      const data = await dataProvider.optionsChain(symbol.toUpperCase(), expiration, { strikeBandPct: 30, maxExpirations: 12 });
       // Refresh the live spot from the chain's parallel quote — guarantees the
       // displayed spot tracks every chain refresh, independent of bias.
       if (data?.spot) setSpotPrice(Number(data.spot));

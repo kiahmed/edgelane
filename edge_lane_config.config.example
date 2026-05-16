@@ -34,6 +34,18 @@ ANTHROPIC_KEY="sk-ant-REPLACE_ME"
 # Bump to "4.8" → next build is v4.8.1.
 EDGE_LANE_VERSION="4.7"
 
+# ─── Data provider selection (v4.7.25) ─────────────────────────────────────
+# Which backend supplies quotes + options chains + greek exposures.
+# 'atlas'   - mind-vest.io (current default, pre-computed dealer GEX rollups)
+# 'tradier' - brokerage.tradier.com (REST + chain raw, GEX computed locally)
+DATA_PROVIDER=atlas
+
+# Tradier (https://web.tradier.com/user/api for tokens) — needed when DATA_PROVIDER=tradier
+TRADIER_ACCESS_TOKEN="your-sandbox-or-production-token"
+TRADIER_BASE_URL="https://sandbox.tradier.com"   # production: https://api.tradier.com
+
+
+
 # Bias narrative + 4 Greek signal panels — default collapsed (=0). Set =1 to
 # have them open on page load. Toggle button always available in the UI.
 BIAS_NARRATIVE_OPEN_DEFAULT=0

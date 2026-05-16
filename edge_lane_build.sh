@@ -89,6 +89,10 @@ source "$CONFIG"
 : "${ATLAS_KEY:?ATLAS_KEY not set in $CONFIG}"
 : "${ANTHROPIC_KEY:?ANTHROPIC_KEY not set in $CONFIG}"
 : "${GEMINI_API_KEY:?GEMINI_API_KEY not set in $CONFIG}"
+# Provider selection (v4.7.25). Defaults preserve existing behavior.
+DATA_PROVIDER="${DATA_PROVIDER:-atlas}"
+TRADIER_ACCESS_TOKEN="${TRADIER_ACCESS_TOKEN:-}"
+TRADIER_BASE_URL="${TRADIER_BASE_URL:-https://sandbox.tradier.com}"
 GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-flash}"  # default if not in config
 ATLAS_BASE_URL="${ATLAS_BASE_URL:-}"     # empty = direct (will CORS-fail from browser)
 GEMINI_BASE_URL="${GEMINI_BASE_URL:-}"   # empty = direct
@@ -150,6 +154,9 @@ OUTPUT="${OUTPUT//__ATLAS_BASE_URL__/$ATLAS_BASE_URL}"
 OUTPUT="${OUTPUT//__GEMINI_BASE_URL__/$GEMINI_BASE_URL}"
 OUTPUT="${OUTPUT//__EDGE_LANE_VERSION__/$EDGE_LANE_VERSION}"
 OUTPUT="${OUTPUT//__BIAS_NARRATIVE_OPEN_DEFAULT__/$BIAS_NARRATIVE_OPEN_DEFAULT}"
+OUTPUT="${OUTPUT//__DATA_PROVIDER__/$DATA_PROVIDER}"
+OUTPUT="${OUTPUT//__TRADIER_TOKEN__/$TRADIER_ACCESS_TOKEN}"
+OUTPUT="${OUTPUT//__TRADIER_BASE_URL__/$TRADIER_BASE_URL}"
 
 # ---- 5. Dry-run: report and exit ------------------------------------------
 if [[ $DRY_RUN -eq 1 ]]; then
