@@ -44,6 +44,22 @@ def require_keys(cfg: dict, *keys: str) -> None:
         raise SystemExit(f"missing required keys in config: {', '.join(missing)}")
 
 
+def resolve_tradier_creds(cfg: dict) -> tuple[str, str, str]:
+    """Pick Tradier (token, base_url, env_label) based on cfg[DEVMODE].
+    Returns ('', '', 'unset') if no token configured for the active env.
+
+    DEVMODE=true (or 1 / yes) -> sandbox (default)
+    DEVMODE=false (or 0 / no) -> production
+    """
+    devmode = str(cfg.get("DEVMODE", "true")).strip().lower()
+    if devmode in ("true", "1", "yes"):
+        token = cfg.get("TRADIER_SANDBOX_TOKEN") or cfg.get("TRADIER_ACCESS_TOKEN") or ""
+        return token, "https://sandbox.tradier.com", "sandbox"
+    else:
+        token = cfg.get("TRADIER_PROD_TOKEN") or ""
+        return token, "https://api.tradier.com", "production"
+
+
 
 
 # ---- retry policy ------------------------------------------------------------

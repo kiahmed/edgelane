@@ -91,8 +91,25 @@ source "$CONFIG"
 : "${GEMINI_API_KEY:?GEMINI_API_KEY not set in $CONFIG}"
 # Provider selection (v4.7.25). Defaults preserve existing behavior.
 DATA_PROVIDER="${DATA_PROVIDER:-atlas}"
-TRADIER_ACCESS_TOKEN="${TRADIER_ACCESS_TOKEN:-}"
-TRADIER_BASE_URL="${TRADIER_BASE_URL:-https://sandbox.tradier.com}"
+# DEVMODE selects between sandbox and production Tradier creds. Defaults to
+# true (sandbox) so you cannot accidentally hit live markets without flipping
+# the flag explicitly. Override per-build by exporting DEVMODE=false.
+DEVMODE="${DEVMODE:-true}"
+TRADIER_SANDBOX_TOKEN="${TRADIER_SANDBOX_TOKEN:-}"
+TRADIER_PROD_TOKEN="${TRADIER_PROD_TOKEN:-}"
+# Back-compat: if a config still uses the old TRADIER_ACCESS_TOKEN/_BASE_URL,
+# treat it as the sandbox token (since sandbox was the v4.7.25 default).
+[[ -n "${TRADIER_ACCESS_TOKEN:-}" && -z "$TRADIER_SANDBOX_TOKEN" ]] && TRADIER_SANDBOX_TOKEN="$TRADIER_ACCESS_TOKEN"
+
+if [[ "$DEVMODE" == "true" || "$DEVMODE" == "1" || "$DEVMODE" == "yes" ]]; then
+  TRADIER_ACCESS_TOKEN="$TRADIER_SANDBOX_TOKEN"
+  TRADIER_BASE_URL="https://sandbox.tradier.com"
+  TRADIER_ENV_LABEL="sandbox"
+else
+  TRADIER_ACCESS_TOKEN="$TRADIER_PROD_TOKEN"
+  TRADIER_BASE_URL="https://api.tradier.com"
+  TRADIER_ENV_LABEL="production"
+fi
 GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-flash}"  # default if not in config
 ATLAS_BASE_URL="${ATLAS_BASE_URL:-}"     # empty = direct (will CORS-fail from browser)
 GEMINI_BASE_URL="${GEMINI_BASE_URL:-}"   # empty = direct
@@ -171,6 +188,11 @@ if [[ $DRY_RUN -eq 1 ]]; then
   printf "  %-20s = %s\n" "ANTHROPIC_KEY"  "$(mask "$ANTHROPIC_KEY")"
   printf "  %-20s = %s\n" "GEMINI_API_KEY" "$(mask "$GEMINI_API_KEY")"
   printf "  %-20s = %s\n" "GEMINI_MODEL"   "$GEMINI_MODEL"
+  printf "  %-20s = %s\n" "DATA_PROVIDER"  "$DATA_PROVIDER"
+  if [[ "$DATA_PROVIDER" == "tradier" ]]; then
+    printf "  %-20s = %s\n" "TRADIER_ENV"    "$TRADIER_ENV_LABEL ($TRADIER_BASE_URL)"
+    printf "  %-20s = %s\n" "TRADIER_TOKEN"  "$(mask "$TRADIER_ACCESS_TOKEN")"
+  fi
   printf "  %-20s = %s\n" "VERSION"        "v$EDGE_LANE_VERSION ($PATCH_REASON)"
   echo
   echo "── output preview ─────────────────────────────────────────────────"
@@ -211,5 +233,8 @@ LINES=$(wc -l < "$OUT" | tr -d ' ')
 BYTES=$(wc -c < "$OUT" | tr -d ' ')
 echo "✓ wrote $OUT  ($LINES lines, $BYTES bytes)"
 echo "  version: v$EDGE_LANE_VERSION  ($PATCH_REASON)"
+if [[ "$DATA_PROVIDER" == "tradier" ]]; then
+  echo "  provider: tradier ($TRADIER_ENV_LABEL - $TRADIER_BASE_URL)"
+fi
 echo "  open it directly in a browser, or serve via:  python3 -m http.server 8080"
 echo "  then visit http://localhost:8080/$OUT"

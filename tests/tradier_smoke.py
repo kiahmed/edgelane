@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from utils import load_config
+from utils import load_config, resolve_tradier_creds
 from data_providers import tradier
 
 # ANSI
@@ -31,13 +31,13 @@ G, R, Y, B, D, N, BOLD = "\033[32m", "\033[31m", "\033[33m", "\033[34m", "\033[2
 def main():
     symbol = (sys.argv[1] if len(sys.argv) > 1 else "SPY").upper()
     cfg = load_config()
-    token = cfg.get("TRADIER_ACCESS_TOKEN")
-    base = cfg.get("TRADIER_BASE_URL") or "https://sandbox.tradier.com"
+    token, base, env_label = resolve_tradier_creds(cfg)
     if not token:
-        sys.exit(f"{R}TRADIER_ACCESS_TOKEN missing from config{N}")
+        sys.exit(f"{R}No Tradier {env_label} token configured (DEVMODE={cfg.get('DEVMODE', 'true')}); "
+                 f"set TRADIER_{env_label.upper()}_TOKEN in your config{N}")
 
     print(f"{BOLD}Tradier smoke — {symbol}{N}")
-    print(f"{D}base: {base}{N}\n")
+    print(f"{D}env:  {env_label}  ({base}){N}\n")
     fails = []
 
     # 1. user/profile — token sanity

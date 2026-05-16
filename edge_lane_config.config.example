@@ -40,9 +40,12 @@ EDGE_LANE_VERSION="4.7"
 # 'tradier' - brokerage.tradier.com (REST + chain raw, GEX computed locally)
 DATA_PROVIDER=atlas
 
-# Tradier (https://web.tradier.com/user/api for tokens) — needed when DATA_PROVIDER=tradier
-TRADIER_ACCESS_TOKEN="your-sandbox-or-production-token"
-TRADIER_BASE_URL="https://sandbox.tradier.com"   # production: https://api.tradier.com
+# Tradier (https://web.tradier.com/user/api for tokens). Two tokens — one
+# per environment — so flipping DEVMODE switches both the credential and the
+# base URL together without losing either.
+DEVMODE=true                                    # true -> sandbox, false -> production
+TRADIER_SANDBOX_TOKEN="your-sandbox-token"      # for paper trading / development
+TRADIER_PROD_TOKEN="your-production-token"      # for real trading; only used when DEVMODE=false
 
 
 
