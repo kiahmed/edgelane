@@ -1,0 +1,3 @@
+ next:
+ keep using and fine tuning
+ slowly start integrating with Webull or tradier

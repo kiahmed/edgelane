@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EdgeLane — Spread Optimizer</title>
+
+  <!-- Tailwind via CDN, with the custom font tokens this JSX uses -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            num:     ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'monospace'],
+            display: ['Georgia', '"Times New Roman"', 'serif'],
+          },
+        },
+      },
+    };
+  </script>
+
+  <!-- React + Babel-standalone for in-browser JSX compile -->
+  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+
+  <style>
+    body {
+      margin: 0;
+      background: #f4ecd8;  /* parchment cream — matches the user palette (olive/tan/pale yellow) */
+      color: #4a3f33;       /* warm dark brown for default text */
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    }
+    .glow-emerald { box-shadow: 0 0 60px -10px rgba(16, 185, 129, 0.30); }
+    .glow-rose    { box-shadow: 0 0 60px -10px rgba(244,  63,  94, 0.30); }
+    .glow-amber   { box-shadow: 0 0 60px -10px rgba(245, 158,  11, 0.30); }
+    .skeleton {
+      background: linear-gradient(90deg, #1a1a24 0%, #252535 50%, #1a1a24 100%);
+      background-size: 200% 100%;
+      animation: shimmer 1.5s infinite;
+    }
+    @keyframes shimmer {
+      0%   { background-position: -200% 0; }
+      100% { background-position:  200% 0; }
+    }
+    /* Loading splash — hidden once Babel mounts the app */
+    #boot-splash {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      color: #57534e; font-family: ui-monospace, monospace; font-size: 0.875rem;
+      letter-spacing: 0.1em; text-transform: uppercase;
+    }
+    #root:not(:empty) ~ #boot-splash { display: none; }
+
+t; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <div id="boot-splash">◌ Compiling JSX in browser...</div>
+
+  <script>
+    // ------------------------------------------------------------
+    // Keys injected at build time by edge_lane_build.sh from
+    // edge_lane_config.config. These live in the bundle — fine for
+    // personal/local use, NOT for any public deploy. For public deploy,
+    // put a thin proxy in front and read keys server-side.
+    // ------------------------------------------------------------
+    window.ATLAS_KEY     = '__ATLAS_KEY__';
+    window.ANTHROPIC_KEY = '__ANTHROPIC_KEY__';
+    window.GEMINI_API_KEY = '__GEMINI_API_KEY__';
+    window.GEMINI_MODEL   = '__GEMINI_MODEL__';
+    // Optional: route through a CORS-enabled proxy. Empty string = direct.
+    window.ATLAS_BASE_URL  = '__ATLAS_BASE_URL__' || undefined;
+    window.GEMINI_BASE_URL = '__GEMINI_BASE_URL__' || undefined;
+    window.BIAS_NARRATIVE_OPEN_DEFAULT = '__BIAS_NARRATIVE_OPEN_DEFAULT__' === '1';
+  </script>
+
+  <script type="text/babel" data-presets="env,react">
+    // React hooks pulled from the global UMD bundle (CDN)
+    const { useState, useEffect, useMemo, useCallback } = React;
+
+__JSX_BODY__
+
+    // Mount
+    ReactDOM.createRoot(document.getElementById('root')).render(<SpreadOptimizer />);
+  </script>
+
+  <!-- ============================================================== -->
+  <!-- Palette overrides — placed at end of <body> so they parse AFTER -->
+  <!-- Tailwind CDN's runtime-injected styles, winning the cascade.   -->
+  <!-- !important still set as belt-and-suspenders.                   -->
+  <!-- ============================================================== -->
+  <style id="brand-palette">
+    /* Warm-brown tier, all AA-readable (≥4.5:1) on the parchment #f4ecd8 bg.
+       Original UX spec values were designed for a dark theme — flipping them
+       wholesale to dark stops on light bg keeps the earth-tone feel readable. */
+    .text-stone-50  { --tw-text-opacity: 1 !important; color: #2d2419 !important; }  /* primary headlines/values  ~13:1 */
+    .text-stone-100 { --tw-text-opacity: 1 !important; color: #2d2419 !important; }  /* primary tier (spot, score) */
+    .text-stone-200 { --tw-text-opacity: 1 !important; color: rgb(82 82 74) !important; }  /* body prose       ~7:1 */
+    .text-stone-300 { --tw-text-opacity: 1 !important; color: #6e5537 !important; }  /* secondary labels         ~5.4:1 */
+    .text-stone-400 { --tw-text-opacity: 1 !important; color: #6e5537 !important; }  /* tertiary labels/hints     ~5.4:1 */
+    .text-stone-500 { --tw-text-opacity: 1 !important; color: #8b7050 !important; }  /* dim labels (was Tailwind default) */
+    .text-stone-600 { --tw-text-opacity: 1 !important; color: #a89880 !important; }  /* very dim / disabled */
+    .font-bold      { font-weight: 500 !important; }
+    .bg-black\/30      { background-color: rgb(134 130 130 / 30%) !important; }
+    .bg-rose-950\/40   { background-color: rgb(203 185 190 / 40%) !important; }
+    /* Colored card backgrounds — light pastel versions for parchment theme.   */
+    /* Emerald (healthy / good wall): light mint                                 */
+    .bg-emerald-950\/40 { background-color: rgb(220 245 220 / 70%) !important; }
+    .bg-emerald-950\/60 { background-color: rgb(210 240 215 / 85%) !important; }
+    .bg-emerald-950     { background-color: rgb(210 240 215) !important; }
+    .border-emerald-800\/50 { border-color: rgb(120 180 140 / 70%) !important; }
+    .border-emerald-700,
+    .border-emerald-700\/60 { border-color: rgb(100 160 120 / 80%) !important; }
+    /* Amber (warn / thin / directional / mid liq): light butter                 */
+    .bg-amber-950\/40   { background-color: rgb(248 235 195 / 70%) !important; }
+    .bg-amber-950\/60   { background-color: rgb(245 225 175 / 85%) !important; }
+    .border-amber-800\/50 { border-color: rgb(190 150  80 / 70%) !important; }
+    /* Rose (broken / capital trap / bad wall / low liq): /60 variant           */
+    .bg-rose-950\/60    { background-color: rgb(218 195 200 / 80%) !important; }
+    .border-rose-800\/50 { border-color: rgb(180 130 140 / 70%) !important; }
+    /* Text on colored cards — flip from Tailwind's bright -400/-300 stops      */
+    /* (designed for near-black bgs) to dark -800/-700 stops (readable on light  */
+    /* pastels). Same semantic ramp, different end of the scale.                 */
+    /* Emerald (healthy / good wall / recommended)                              */
+    .text-emerald-400 { --tw-text-opacity: 1 !important; color: #166534 !important; }
+    .text-emerald-300 { --tw-text-opacity: 1 !important; color: #15803d !important; }
+    .text-emerald-200 { --tw-text-opacity: 1 !important; color: #166534 !important; }
+    /* Amber (thin / directional / warn)                                         */
+    .text-amber-400   { --tw-text-opacity: 1 !important; color: #854d0e !important; }
+    .text-amber-300   { --tw-text-opacity: 1 !important; color: #a16207 !important; }
+    /* Rose (broken / capital trap / bad wall)                                   */
+    .text-rose-400    { --tw-text-opacity: 1 !important; color: #9f1239 !important; }
+    .text-rose-300    { --tw-text-opacity: 1 !important; color: #be123c !important; }
+    /* The JSX wraps everything in <div className="bg-[#0a0a0f] ..."> — flip
+       it to match the body parchment so the page reads as one surface. */
+    .bg-\[\#0a0a0f\]  { background-color: #f4ecd8 !important; }
+    /* Cards inside the app use bg-[#13131c] — give them a subtle warm white. */
+    .bg-\[\#13131c\]  { background-color: #faf3e0 !important; border-color: #d8cdb1 !important; }
+    /* Stone-900-ish backgrounds → warm light surfaces */
+    .bg-stone-900       { background-color: #ebe3c9 !important; }
+    .bg-stone-900\/40  { background-color: rgb(235 227 201 / 40%) !important; }
+    .bg-stone-900\/60  { background-color: rgb(235 227 201 / 60%) !important; }
+    .bg-stone-800\/40  { background-color: rgb(216 205 177 / 40%) !important; }
+    .bg-stone-800\/60  { background-color: rgb(216 205 177 / 60%) !important; }
+    .border-stone-800\/40,
+    .border-stone-800\/60 { border-color: #d8cdb1 !important; }
+    .border-stone-700,
+    .border-stone-700\/60 { border-color: #c4b88f !important; }
+  </style>
+</body>
+</html>

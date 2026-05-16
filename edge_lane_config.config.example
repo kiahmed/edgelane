@@ -1,0 +1,39 @@
+# edge_lane_config.config.example
+# -----------------------------------------------------------------------------
+# Copy this file to edge_lane_config.config (no .example suffix) and fill in
+# your real keys, then run ./edge_lane_build.sh.
+#
+#   cp edge_lane_config.config.example edge_lane_config.config
+#   # edit edge_lane_config.config — paste real keys
+#   ./edge_lane_build.sh
+#
+# This file is sourced by bash, so:
+#   - no spaces around =
+#   - quote values that contain anything weird
+#   - lines starting with # are comments
+#
+# DO NOT commit your real edge_lane_config.config to git — add it to .gitignore.
+# -----------------------------------------------------------------------------
+
+# Atlas (mind-vest.io) — get one at https://mind-vest.io/dashboard
+ATLAS_KEY="sk_atlas_REPLACE_ME"
+
+# Anthropic — get one at https://console.anthropic.com/settings/keys
+# Used by detectBias to call the Messages API + atlas-mcp via mcp_servers.
+ANTHROPIC_KEY="sk-ant-REPLACE_ME"
+
+# ----- Optional: route through dev CORS proxy ---------------------------------
+# Run: python3 tools/cors_proxy.py
+# Then uncomment these so the browser hits the proxy instead of Atlas/Gemini direct.
+# ATLAS_BASE_URL="http://localhost:8787/atlas"
+# GEMINI_BASE_URL="http://localhost:8787/gemini"
+
+# Brand version base (major.minor) — the build script auto-appends a patch
+# number that bumps when JSX/template content changes. Reset patch to 1 by
+# editing this base. Examples: "4.7" → builds produce v4.7.1, v4.7.2, ...
+# Bump to "4.8" → next build is v4.8.1.
+EDGE_LANE_VERSION="4.7"
+
+# Bias narrative + 4 Greek signal panels — default collapsed (=0). Set =1 to
+# have them open on page load. Toggle button always available in the UI.
+BIAS_NARRATIVE_OPEN_DEFAULT=0
