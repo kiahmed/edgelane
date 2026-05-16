@@ -32,17 +32,22 @@ score = 50  (center)
 
 Then clamped to [0, 100]. EV is already wall-adjusted via `ev_adjusted`, so the wall verdict is implicitly counted through EV without double-billing.
 
-### Button semantics (v4.7.3+)
+### Button semantics (v4.7.3+, v4.7.15)
 
-| Button | Refreshes | When to click | Atlas cost |
+| Button | Refreshes | When to click | Provider cost |
 |---|---|---|---|
 | **Detect bias from Greeks** | Bias only (Stock-Quote + Greek-Exposures) | First analysis of a ticker, or after major market move | 2 calls |
+| **↻ Re-detect bias from Greeks** *(label flips once bias is cached, v4.7.15)* | Bias only — **force-refetches** past the cache | When the tape clearly moved and you want a fresh GEX read on the same symbol/expiration. Prior to v4.7.15 the second click was a silent no-op. | 2 calls |
 | **↻ Refresh chain & re-rank** *(formerly "Optimize")* | Chain only — fresh quotes/IV | Every few minutes while watching a setup; before placing a limit order | 1 call |
 | **↻ Reload all data** *(in the status row)* | Both bias + chain | Ticker change, or "start fresh" | 3 calls |
 
 Bias data is slow-moving (GEX walls stable for 30–60 min). Chain prices are tick-by-tick. Use the chain-only refresh frequently; bias refresh only when warranted.
 
 The status row also shows the **last-fetched timestamp** for each cache so you can see at a glance how stale the data is.
+
+**Live spot price (v4.7.13).** The Spot value at the top of the page refreshes immediately on every chain fetch, decoupled from the bias-analysis pipeline. Even if the narrative or strategies fail to update, the visible price reflects the fresh quote that was just pulled. The center cell of every Lookup grid (see below) is also anchored to this live mid.
+
+**Heavy single-name chains.** For a handful of very active single-name tickers (popular semiconductors and leveraged momentum names), the first bias detection of a session can take 20–30 seconds while the full options chain is pulled in pieces. Any subsequent bias detection on the same symbol within a few minutes is effectively instant — the result is held in memory for re-use. Index ETFs and most mega-caps remain on the fast path and respond in a second or two. See **Provider notes & troubleshooting** at the bottom for details.
 
 ### How card glow color is determined
 
@@ -204,49 +209,62 @@ Expected-move base scales by DTE: 0.4× at DTE 0, 1.0× at DTE 1–7, 1.5× at D
 
 ---
 
-## Limit-Order Target Premium
+## Limit-Order Target Premium — width-scaled tiers (v4.7.16 / v4.7.17)
 
-When the market doesn't currently price a spread at positive EV, the optimizer shows you **the exact premium it would take** to make it tradeable. Set a GTC limit order at that price; if the market ever drifts there, you fill on your terms.
+When the market isn't currently pricing a spread the way you'd want, the optimizer shows you **what premium it would take** to make it tradeable — at three different edge tiers — and tells you which ones are already satisfied at market vs which would need a patient GTC limit.
 
-Each card with a feasible target shows:
+The earlier single-target version (constant +$5 EV) didn't scale: $5 on a $50-wide spread is 10% mispricing (fantasy), while $5 on a $500-wide spread is 1% (reasonable). Each tier is now expressed as a **fraction of spread width**, which is how institutional desks frame edge.
 
-```
-◎ LIMIT ORDER TARGET
-Sell limit @ $1.95 ≥ for EV ≥ +$5     (breakeven $1.65)
-Currently quoted at $1.23; needs $0.72 more credit for +$5 EV.
-```
+### The three tiers
+
+| Tier | Edge target | Hint | Typical scenario |
+|---|---|---|---|
+| **modest** | 0.75% of width | "often fills" | Patient limit, frequently catchable on normal intraday noise. |
+| **balanced** | 1.50% of width | "patient" | The everyday achievable target on minor dislocations. |
+| **strong** | 3.00% of width | "on dislocations" | Only fills on real liquidity events, IV crush, or earnings unwinds. |
+
+Each tier resolves to a **limit price** (sell-at-or-above for credit; buy-at-or-below for debit), and is tagged with one of three statuses:
+
+- **✓ met** *(emerald)* — current live mid already gives you at least this edge. No waiting required; market beats the tier.
+- **○ reachable** *(stone)* — feasible but not currently satisfied. Set a GTC limit at the target price to lock this edge in if the market comes to you.
+- **infeasible** — the tier's premium is mathematically impossible on this spread (e.g., target credit > width, or target debit < $0.05). Hidden from the card.
+
+### Scenario-aware headline (v4.7.17)
+
+The single bold line at the top of the tier card adapts to where the live mid sits relative to the tiers, so you can read the situation in one glance without parsing every row:
+
+| Live edge vs tiers | Headline color | Headline text |
+|---|---|---|
+| Beats **strong** (all three met) | emerald | `◎ Already at +$X edge — market beats every tier. Take at market.` |
+| Beats **modest** or **balanced**, but not strong | dim emerald | `◎ Already at +$X edge — beats MODEST/BALANCED. Patient limit can unlock the next tier.` |
+| Slight positive edge, below modest threshold | amber | `◎ Slight +$X edge — under the modest threshold. Limit at one of these locks meaningful edge.` |
+| Live mid is sub-fair (negative edge) | stone | `◎ Sub-fair by $X — limit-only setup. Need the market to come to you.` |
+
+The card also shows the **breakeven** (EV = 0) and the **live** premium below the headline, plus — if at least one tier is already met — an arrow pointing to the next reachable tier's target price.
 
 ### Math (under the hood)
 
 **Credit spreads** (sell premium — bull_put, bear_call, condors, iron_butterfly):
 
 ```
-breakeven_credit = (1 − POP) × width                # premium where EV = 0
-target_credit    = breakeven + targetEV / wall_factor
+breakeven_credit       = (1 − POP) × width                  # premium where EV = 0
+target_credit(tier)    = breakeven + (tier_pct × width) / wall_factor
 ```
 
-Place a **limit SELL** at `target_credit` or higher. Higher fills only.
+Place a **limit SELL** at `target_credit` or higher.
 
 **Debit spreads** (pay premium — bull_call, bear_put, call/put butterflies):
 
 ```
-breakeven_debit = POP × width
-target_debit    = breakeven − targetEV / wall_factor
+breakeven_debit        = POP × width
+target_debit(tier)     = breakeven − (tier_pct × width) / wall_factor
 ```
 
-Place a **limit BUY** at `target_debit` or lower. Lower fills only.
+Place a **limit BUY** at `target_debit` or lower.
 
-Default target EV is **$5**. Wall factor is included so the target accounts for any wall penalty/boost already applied.
+Wall factor is included so the target accounts for any wall penalty/boost already applied.
 
-### Feasibility
-
-The card only shows the target if it's mathematically achievable:
-- Credit: target < width (can't collect more than the full width as credit)
-- Debit: target > 0 (can't pay negative premium)
-
-When infeasible (rare — usually means the structure is fundamentally unrewardable for your target EV), no panel shows. Adjust width pref or try a different strategy.
-
-The panel highlights **green** when the target is realistic (close to current price); **grey** when the target is far from current — you'd need a substantial price move to fill, more "patient limit" than "tradeable now".
+The **modest** tier is also used as the back-compat reference for composite scoring and the trade-ticket fallback price (so a "patience-limit ticket" snapped from the card reflects the realistic, often-fills tier — not the aggressive strong-tier number).
 
 ### Card actions (v4.7.7+)
 
@@ -263,8 +281,8 @@ Hover the composite hero number on any card to see the per-component breakdown �
 
 ### Workflow
 
-1. Run Detect Bias → Optimize. All candidates score, most are likely negative EV.
-2. Pick the structure whose target is *closest* to current premium AND has good liquidity (high or mid).
+1. Run Detect Bias → Refresh Chain. All candidates score, most will be sub-fair.
+2. Pick the structure whose target tier is *closest* to current premium AND has good liquidity (high or mid).
 3. Note the strikes, side, and the target limit price from the card.
 4. In your broker, set up the same spread. Enter price = the card's target. Make it GTC.
 5. If the market ever moves your way, you fill at your terms. If not, you didn't trade — which is also the right answer.
@@ -273,34 +291,82 @@ This is the rare disciplined options play: instead of taking what the market giv
 
 ---
 
-## Engine Pick / Selected / Recommended / Fits Bias / Off-Bias
+## Tickets tab vs Lookup tab (v4.7.20)
 
-| State | Visual | Meaning |
+Above the three candidate cards there's a tab switcher with two views:
+
+| Tab | What it shows |
+|---|---|
+| **Tickets (3)** | The standard candidate cards — composite score, badges, wall verdict, limit-order tiers, copy/push actions. This is the default and matches everything described above. Unchanged by the Lookup work. |
+| **Lookup** | A what-if projection grid for each candidate showing projected premium and close-now P&L across nearby spot prices and the next three hours of clock time. Useful for sanity-checking how the spread behaves if price drifts a dollar either way or if you hold another hour. |
+
+Switching tabs is free — no provider calls — and doesn't change the candidates themselves. You can flip back and forth at will.
+
+### Reading the Lookup grid
+
+Each candidate gets its own 9-row heatmap with up to 12 columns:
+
+- **Rows (vertical axis)** — hypothetical spot prices in steps around the current spot, spanning roughly ±2 expected moves (auto-clamped between 6% and 30%). The middle row is "spot is exactly where it is now"; rows above are higher prices, rows below are lower. The center row is bolded and tagged with a small emerald dot.
+- **Columns (horizontal axis)** — time slices of **15 minutes each**, walking forward from now. The axis is capped at **3 hours** OR at expiration, whichever is sooner. Column labels are `now`, `+15m`, `+30m`, ..., `+1h`, `+1h15`, ..., up to `+2h45` or `exp`. (Pre-v4.7.21 this was a multi-day axis; the intraday rework matches how the grid is actually used — "what's my premium worth in 30 minutes if spot ticks to $X" — not multi-day theta planning.)
+- **Cells** — the projected spread premium at that (spot, time) pair, shown as a signed dollar amount with `+` for credit-side and `−` for debit-side display, and color-coded by **close-now P&L** (see heatmap below). The center cell at (current spot, now) is anchored to the live mid exactly, with Black-Scholes sensitivity radiating outward from there.
+
+### Lookup heatmap colors (v4.7.21)
+
+Each cell's color encodes the **close-now P&L** of the spread at that spot/time pair, normalized to the spread's own max profit (for gains) or max loss (for losses). Seven discrete levels:
+
+| Level | Normalized P&L range | Color |
 |---|---|---|
-| **★ Engine Pick** | emerald glow + ★ badge | Optimizer's #1 recommendation given current bias. |
-| **Selected** | white pill | The strategy you've explicitly clicked. |
-| **Recommended** | emerald | In `recommended_strategies` top 3 but not the #1. |
-| **Fits bias** | white border | `.fits` array contains current bias label, but not in top 3. |
-| **Off-bias** | dimmed | Doesn't fit current bias. Clicking still works. |
+| **+3** *(deep emerald, bold)* | ≥ +55% of max profit | `bg-emerald-700` |
+| **+2** *(medium emerald)* | +25% to +55% of max profit | `bg-emerald-800` |
+| **+1** *(faint emerald)* | +8% to +25% of max profit | `bg-emerald-900` |
+| **0** *(stone)* | within ±8% of breakeven | `bg-stone-800` |
+| **−1** *(faint rose)* | −8% to −25% of max loss | `bg-rose-900` |
+| **−2** *(medium rose)* | −25% to −55% of max loss | `bg-rose-800` |
+| **−3** *(deep rose, bold)* | ≥ −55% of max loss | `bg-rose-700` |
+
+**Hover any cell** to see the exact P&L number per contract, e.g.
+`Spot $182.50 · +30m → premium +$1.42 · close-now P&L +$58/contract`.
+
+The "current spot" row is tagged with a green dot in the left margin, and the "now × current spot" cell is ringed in emerald — that's the anchor point where projection = live mid by construction.
+
+### Assumptions baked into the projection
+
+- European exercise (good for index, minor error for early-exercisable American single-name puts near dividends).
+- Sticky-strike IV — each leg's IV stays attached to its strike as spot moves. Realistic for short-DTE intraday projections; less so for multi-day projections through a vol-changing event.
+- Constant risk-free rate r = 5%.
+- No dividends.
+- Center cell is forced to match the live mid (`candidate.net_premium`); all other cells are BS-derived offsets from that anchor.
+
+If a leg is missing IV data, the cell falls back to intrinsic value and the card shows `(some legs missing IV — intrinsic fallback)` in amber italics next to the live-premium line.
+
+### EDGELANE wordmark (v4.7.19)
+
+The header now leads with an embossed `EDGELANE` wordmark in emerald above the "Spread Optimizer" title. Cosmetic — it doesn't change any behavior. The version pill (`· OPTIONS OPTIMIZATION LAB · v4.7.x`) sits next to it.
 
 ---
 
-## When candidates show "no candidates"
+## Provider notes & troubleshooting
 
-In likelihood order:
-1. All strikes filtered out for `bid > 0` rule (untradeable as short legs).
-2. Width-prefs too tight — flip to *Generous* and re-run.
-3. Strategy doesn't fit bias (e.g. bull_call on bearish bias = no scoreable setups). Click ★ Engine Pick.
-4. Chain didn't load — check Network tab; Atlas error or proxy down means contract list is empty.
+Most users shouldn't have to think about provider mechanics. This section exists so that if you ever notice **MU taking ~25 seconds to load**, or a re-detect on a heavy symbol returning instantly, you know it's expected behavior, not a bug.
 
----
+### Adaptive Greek-exposure fetch (v4.7.22 – v4.7.24)
 
-## When EV is negative across ALL candidates
+The provider's aggregated `analyze_greek_exposures` endpoint is fast (5–15s) for liquid index and mega-cap symbols, but slow-to-failing on heavy single-name option chains. EdgeLane now adapts automatically:
 
-This means there's no edge in the current setup. Diagnose in this order:
+- **Known-heavy symbols** (`MU`, `AMD`, `SMCI`, `COIN`, `PLTR`, `ARM`, `AVGO`, `MARA`, `MSTR`) skip the aggregated call entirely and fan out **parallel per-expiration requests**, then aggregate the result client-side. First fetch is 20–30s; cached afterwards.
+- **All other symbols** try the aggregated call first. On timeout, HTTP 5xx, "Internal server error", "gateway", or "service unavailable", they fall back to the same chunked path transparently.
+- Results are held in a **5-minute in-memory cache** keyed by `(symbol, num_expirations)`. Re-detecting bias on the same ticker within five minutes is effectively instant.
+- The provider request timeout on the JSX side is **75 seconds** (with `AbortController` cancellation), up from the older default — heavy aggregated calls regularly take 40–60s server-side and need the headroom.
 
-1. **Strategy mismatch** — confirm ★ Engine Pick. Forcing the wrong-direction structure produces uniformly bad EV.
-2. **Wall fighting** — if all wall verdicts are `bad`/`warn`, the GEX wall is positioned against this strategy regardless of strikes. Try the opposite-direction strategy.
-3. **Width/EM misaligned** — toggle width pref Tight ↔ Generous. If neither helps, this expiration is genuinely untradeable.
+You'll see this in the browser console as `[Greek exposures] MU on denylist → chunked path immediately` or `[Greek exposures] cache hit for SPY (num_exp=3)`. Operationally invisible from the UI — the symbol just works, or it doesn't.
 
-If after those three nothing turns positive, **don't trade**. Try the next expiration, a different ticker, or wait. Sitting out negative-EV setups is what separates traders who survive.
+### Symptom → cause cheat sheet
+
+| What you see | What's happening |
+|---|---|
+| MU/AMD/etc. takes 20–30s on first bias detect | Chunked per-expiration fetch is in flight. Normal. |
+| Second bias detect on same symbol returns instantly | 5-minute cache hit. |
+| "↻ Re-detect bias from Greeks" button label | Bias is cached. Clicking force-refetches past the cache (v4.7.15). |
+| Spot price updates but bias narrative is stale | Spot decoupled from bias pipeline (v4.7.13). Click re-detect to refresh narrative. |
+| Lookup cell says "intrinsic fallback" | At least one leg has no IV from provider; BS surface degrades to intrinsic for that cell. |
+| Symbol fails after ~75s with timeout error | Even chunked fallback timed out. Try again in a minute; if persistent, the symbol may need to be added to the heavy-chain list. |

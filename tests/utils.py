@@ -52,8 +52,9 @@ _RETRY_HTTP_CODES = (429, 500, 502, 503, 504)
 
 
 def _is_retryable(err_msg: str) -> bool:
-    """True for transient errors worth retrying (rate-limit, 5xx, network)."""
-    if "network error" in err_msg.lower():
+    """True for transient errors worth retrying (rate-limit, 5xx, network, timeout)."""
+    msg = err_msg.lower()
+    if "network error" in msg or "timed out" in msg:
         return True
     return any(f"HTTP {code}" in err_msg for code in _RETRY_HTTP_CODES)
 
@@ -71,10 +72,14 @@ class AtlasError(RuntimeError):
     pass
 
 
-def atlas_call(tool: str, body: dict | None, atlas_key: str, timeout: int = 30,
+def atlas_call(tool: str, body: dict | None, atlas_key: str, timeout: int = 75,
                max_retries: int = 3) -> dict:
     """POST to /api/v1/tools/{tool}. Atlas wraps quota errors in 200 + {error,message}.
-    Retries on 429 / 5xx / network with exponential backoff + jitter."""
+    Retries on 429 / 5xx / network / mid-read timeout with exponential backoff + jitter.
+
+    Default timeout bumped from 30s → 75s because analyze_greek_exposures on
+    heavy-chain symbols (MU, AMD, SMCI) routinely takes 40-60s server-side.
+    """
     last_err = None
     for attempt in range(max_retries + 1):
         req = urllib.request.Request(
@@ -98,6 +103,11 @@ def atlas_call(tool: str, body: dict | None, atlas_key: str, timeout: int = 30,
             last_err = AtlasError(f"Atlas {tool}: HTTP {e.code} — {body_text}")
         except urllib.error.URLError as e:
             last_err = AtlasError(f"Atlas {tool}: network error — {e.reason}")
+        except TimeoutError as e:
+            # Mid-read socket timeout. Raw TimeoutError escapes URLError on
+            # Python 3.10+ when the timeout fires AFTER connect — must catch
+            # explicitly or the retry loop is bypassed.
+            last_err = AtlasError(f"Atlas {tool}: read timed out after {timeout}s (server-side compute too slow)")
         except AtlasError:
             raise  # quota envelope — don't retry
 
