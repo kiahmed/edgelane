@@ -2288,10 +2288,13 @@ export default function SpreadOptimizer() {
     }
   }, []);
 
-  // Fetch on mount (so user sees current quota before doing anything)
+  // Fetch on mount (so user sees current quota before doing anything).
+  // Skipped entirely when DATA_PROVIDER=tradier — Tradier exposes per-minute
+  // rate limits via X-Ratelimit-* response headers, not a monthly quota, so
+  // the quota pill concept doesn't apply. UI hides the pill in that case too.
   useEffect(() => {
-    // Only if an ATLAS_KEY appears to be configured (avoid throwing on first load
-    // when user hasn't set up yet)
+    const isTradier = typeof window !== 'undefined' && String(window.DATA_PROVIDER).toLowerCase() === 'tradier';
+    if (isTradier) return;
     const hasKey = (typeof window !== 'undefined' && window.ATLAS_KEY) ||
                    (typeof localStorage !== 'undefined' && localStorage.getItem('ATLAS_KEY'));
     if (hasKey) refreshQuota();
@@ -2536,8 +2539,10 @@ OUTPUT JSON only:
                 ● Chain {chainData ? `cached (${chainData.contracts?.length || 0} contracts)` : 'pending'}
                 {lastChainFetch && <span className="normal-case text-stone-400 ml-1" title={lastChainFetch.toLocaleString()}>· {lastChainFetch.toLocaleTimeString()}</span>}
               </span>
-              {/* Atlas quota pill (v4.7+) */}
-              {quota && quota.parsed && quota.parsed.limit > 0 && (() => {
+              {/* Atlas quota pill (v4.7+) — hidden when provider is tradier
+                  since Tradier uses per-minute rate-limit headers, not a
+                  monthly quota. */}
+              {(typeof window === 'undefined' || String(window.DATA_PROVIDER).toLowerCase() !== 'tradier') && quota && quota.parsed && quota.parsed.limit > 0 && (() => {
                 const q = quota.parsed;
                 const pct = (q.used / q.limit) * 100;
                 const color = pct < 75 ? 'emerald' : pct < 95 ? 'amber' : 'rose';
@@ -2554,7 +2559,7 @@ OUTPUT JSON only:
                   </Tooltip>
                 );
               })()}
-              {quota && (!quota.parsed || !(quota.parsed.limit > 0)) && (
+              {(typeof window === 'undefined' || String(window.DATA_PROVIDER).toLowerCase() !== 'tradier') && quota && (!quota.parsed || !(quota.parsed.limit > 0)) && (
                 <Tooltip content={
                   quota.error
                     ? `Quota fetch failed: ${quota.error}`
@@ -2932,6 +2937,7 @@ OUTPUT JSON only:
               )}
             </div>
           )}
+
 
           {!biasLoading && !biasResult && !error && (
             <div className="text-center py-16 text-stone-500">
