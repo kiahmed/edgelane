@@ -1177,98 +1177,6 @@ function _strikeFromRow(row) {
   return Number(row?.strike ?? row?.strike_price ?? row?.K);
 }
 
-// v4.7.67: EdgelaneProvider-style bilateral wall finder. Returns the dominant PUT
-// wall (highest positive net_gex — puts dominate) and dominant CALL wall
-// (most negative net_gex — calls dominate) SEPARATELY rather than collapsing
-// them into a single "GEX wall" by absolute magnitude.
-//
-// Why: per EdgelaneProvider empirical model and consistent with the user's own
-// observations of their 0DTE GEX tool, call walls and put walls behave
-// asymmetrically:
-//   • PUT walls   → MAGNET (price drifts toward)         — dealers short gamma
-//   • CALL walls  → RESISTANCE (price gets blocked at)   — dealers long gamma
-// Treating both as magnets (v4.7.63-65) misreads call-wall setups.
-function _findGexWallsBilateral(greeksRaw, exposuresForChosen) {
-  const rows = _strikeRowsFrom(exposuresForChosen);
-  const enriched = rows.map(r => ({
-    strike: _strikeFromRow(r),
-    netGex: _gexFromRow(r),
-    callGex: Number((r && (r.call_gex !== undefined ? r.call_gex : r.callGex)) || 0),
-    putGex:  Number((r && (r.put_gex  !== undefined ? r.put_gex  : r.putGex))  || 0),
-  })).filter(o => o.strike != null && !isNaN(o.strike));
-
-  if (enriched.length === 0) return { putWall: null, callWall: null };
-
-  let totalAbs = 0;
-  for (const o of enriched) totalAbs += Math.abs(o.netGex);
-
-  const classify = (gexAbs) => {
-    if (!gexAbs || !totalAbs) return 'low';
-    const share = gexAbs / totalAbs;
-    return share > 0.20 ? 'high' : share > 0.10 ? 'medium' : 'low';
-  };
-
-  let putWall = null;
-  for (const o of enriched) {
-    if (o.netGex > 0 && (!putWall || o.netGex > putWall.netGex)) putWall = Object.assign({}, o);
-  }
-  if (putWall) putWall.strength = classify(Math.abs(putWall.netGex));
-
-  let callWall = null;
-  for (const o of enriched) {
-    if (o.netGex < 0 && (!callWall || o.netGex < callWall.netGex)) callWall = Object.assign({}, o);
-  }
-  if (callWall) callWall.strength = classify(Math.abs(callWall.netGex));
-
-  return { putWall, callWall };
-}
-
-// v4.7.67: EdgelaneProvider-style asymmetric directional score for 0DTE / 1DTE.
-//
-//   • Put wall is the MAGNET (sets direction). Price drifts toward it.
-//   • Call wall is RESISTANCE (modulates magnitude). If it sits between
-//     spot and the put wall on the same side, the magnet pull is reduced.
-//   • Score sign comes from put-wall position vs spot:
-//        put wall ABOVE spot → bullish drift
-//        put wall BELOW spot → bearish drift
-//   • Magnitude scales with put-wall strength and proximity.
-function _computeEdgelaneProviderScore(spot, putWall, callWall) {
-  if (!spot || !putWall || !putWall.strike) {
-    if (callWall && callWall.strike) {
-      const callDist = (callWall.strike - spot) / spot;
-      const sm = callWall.strength === 'high' ? 1.5 : callWall.strength === 'medium' ? 1.0 : 0.5;
-      return Math.max(-30, Math.min(30, Math.round(-Math.sign(callDist) * 20 * sm * 10) / 10));
-    }
-    return 0;
-  }
-  const putDistPct = (putWall.strike - spot) / spot;
-  const putDir = Math.sign(putDistPct);
-  const distAbs = Math.abs(putDistPct);
-
-  const reach = distAbs < 0.005 ? 1.0
-              : distAbs < 0.01  ? 0.80
-              : distAbs < 0.02  ? 0.55
-              : distAbs < 0.03  ? 0.35
-              : 0.15;
-
-  const sm = putWall.strength === 'high' ? 1.5 : putWall.strength === 'medium' ? 1.0 : 0.5;
-  let magnetScore = putDir * 90 * sm * reach;
-
-  if (callWall && callWall.strike) {
-    const callDistPct = (callWall.strike - spot) / spot;
-    const sameSide = Math.sign(callDistPct) === putDir;
-    const closer   = Math.abs(callDistPct) < distAbs;
-    if (sameSide && closer) {
-      const callMag = Math.abs(callWall.netGex);
-      const putMag  = Math.abs(putWall.netGex);
-      const blockRatio = callMag / Math.max(callMag + putMag, 1e-9);
-      magnetScore *= (1 - blockRatio * 0.75);
-    }
-  }
-  return Math.max(-100, Math.min(100, Math.round(magnetScore * 10) / 10));
-}
-
-
 // Find the dominant gamma wall + classify its strength relative to others.
 // Atlas often pre-computes call_wall / put_wall in key_levels — prefer those.
 function _findGexWall(greeksRaw, exposuresForChosen) {
@@ -1508,8 +1416,6 @@ function _extractGreekWall(greeksRaw, exposuresForChosen, keyName, fallbackRowFi
 
 function _computeBiasSignals(symbol, expiration, spot, greeksRaw, exposuresForChosen, regimeOverride = null, chosenDte = null) {
   const wall = _findGexWall(greeksRaw, exposuresForChosen);
-  // v4.7.67: also extract dominant put + call walls separately.
-  const { putWall, callWall } = _findGexWallsBilateral(greeksRaw, exposuresForChosen);
   // v4.7.58: regime (netGex/netDex) can be supplied externally — used by
   // detectBias to smooth across 0/1/2/3 DTE for short-dated plays.
   // v4.7.59: smoothed regime is IGNORED for intraday plays (DTE < 1.5) because
@@ -1520,13 +1426,7 @@ function _computeBiasSignals(symbol, expiration, spot, greeksRaw, exposuresForCh
   const intraday = chosenDte != null && chosenDte < 1.5;
   const netGex = (!intraday && regimeOverride && regimeOverride.netGex != null) ? regimeOverride.netGex : fallback.netGex;
   const netDex = (!intraday && regimeOverride && regimeOverride.netDex != null) ? regimeOverride.netDex : fallback.netDex;
-  // v4.7.67: for intraday (DTE < 1.5), use EdgelaneProvider-style asymmetric
-  // scoring (put = magnet, call = resistance). For multi-day, keep the
-  // legacy barrier model.
-  const intradayForScore = chosenDte != null && chosenDte < 1.5;
-  const score = intradayForScore
-    ? _computeEdgelaneProviderScore(spot, putWall, callWall)
-    : _computeDirectionalScore(spot, wall, netGex, netDex, chosenDte);
+  const score = _computeDirectionalScore(spot, wall, netGex, netDex, chosenDte);
   const biasLabel = _scoreToBiasLabel(score);
   const confidence = _computeConfidence(score, wall, netDex, spot, chosenDte);
   const recommended = _recommendStrategies(biasLabel);
@@ -1551,18 +1451,12 @@ function _computeBiasSignals(symbol, expiration, spot, greeksRaw, exposuresForCh
     // scorer + wall-penalty math can regime-gate. Sign convention matches the
     // bias engine: positive = long-gamma (stabilizing), negative = short-gamma.
     net_gex: netGex,
+    // v4.7.59: chosen DTE flows through to candidate generation so wall
+    // penalty math can do the same intraday-vs-multi-day gating.
     dte: chosenDte,
     gex_wall_strike: wall.strike,
     gex_wall_strength: wall.strength,
-    gex_wall_type: wall.type,
-    // v4.7.67: bilateral walls — separate put and call. Used by the
-    // EdgelaneProvider-style intraday scorer and surfaced in the UI.
-    put_wall_strike:   putWall  ? putWall.strike   : null,
-    put_wall_strength: putWall  ? putWall.strength : null,
-    put_wall_net_gex:  putWall  ? putWall.netGex   : null,
-    call_wall_strike:   callWall ? callWall.strike   : null,
-    call_wall_strength: callWall ? callWall.strength : null,
-    call_wall_net_gex:  callWall ? callWall.netGex   : null,
+    gex_wall_type: wall.type,  // v4.7.65: 'put' | 'call' | 'mixed' | null
 
     vex_wall_strike: vexWall?.strike ?? null,
     vex_wall_value:  vexWall?.value  ?? null,
@@ -4855,12 +4749,6 @@ OUTPUT JSON only:
         gex_wall_strike: computed.gex_wall_strike,
         gex_wall_strength: computed.gex_wall_strength,
         gex_wall_type: computed.gex_wall_type,
-        put_wall_strike:    computed.put_wall_strike,
-        put_wall_strength:  computed.put_wall_strength,
-        put_wall_net_gex:   computed.put_wall_net_gex,
-        call_wall_strike:   computed.call_wall_strike,
-        call_wall_strength: computed.call_wall_strength,
-        call_wall_net_gex:  computed.call_wall_net_gex,
         // v4.7.29: VEX/TEX walls drive the optional 3-lens divergence strip on
         // candidate cards. Only render when all three are present AND they
         // disagree by more than 5 strikes (handled in CandidateCard).
@@ -5294,18 +5182,22 @@ OUTPUT JSON only:
                 <Stat label="ATM IV" value={`${chainData.atmIV?.toFixed(0)}%`} />
                 <Stat label="DTE" value={_formatDteForDisplay(chainData.dte)} />
                 <Stat label="Width Pref" value={WIDTH_PREFS[widthPref].name} />
-                {/* v4.7.67: split into Put Wall (magnet) + Call Wall (resistance)
-                    stat tiles. Mirrors EdgelaneProvider-style display where both walls
-                    are surfaced separately rather than collapsed into one. */}
                 <Stat
-                  label="Put Wall (magnet)"
-                  value={biasResult?.put_wall_strike != null ? `$${Number(biasResult.put_wall_strike).toFixed(2)}` : '—'}
-                  sub={biasResult?.put_wall_strike != null ? `${biasResult.put_wall_strength || 'low'} strength` : 'no put-side wall'}
-                />
-                <Stat
-                  label="Call Wall (resistance)"
-                  value={biasResult?.call_wall_strike != null ? `$${Number(biasResult.call_wall_strike).toFixed(2)}` : '—'}
-                  sub={biasResult?.call_wall_strike != null ? `${biasResult.call_wall_strength || 'low'} strength` : 'no call-side wall'}
+                  label={(() => {
+                    // v4.7.66: label explicit by type — "Put Wall", "Call Wall",
+                    // "Mixed Wall" — so the user can tell what kind of OI is
+                    // dominating at the dominant GEX strike. Cross-checks with
+                    // other dealer-positioning tools that label walls by side.
+                    const t = biasResult?.gex_wall_type;
+                    if (t === 'put') return 'Put Wall';
+                    if (t === 'call') return 'Call Wall';
+                    if (t === 'mixed') return 'Mixed Wall';
+                    return 'GEX Wall';
+                  })()}
+                  value={biasResult?.gex_wall_strike != null ? `$${Number(biasResult.gex_wall_strike).toFixed(2)}` : '—'}
+                  sub={biasResult?.gex_wall_strike != null
+                    ? `${biasResult.gex_wall_strength || 'medium'} strength${biasResult?.gex_wall_type ? ` · ${biasResult.gex_wall_type}-dominated` : ''}`
+                    : 'no wall data'}
                 />
               </div>
 

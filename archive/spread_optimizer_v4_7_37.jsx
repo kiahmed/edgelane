@@ -726,220 +726,11 @@ function _rootFromOcc(occ) {
   return occ.slice(0, occ.length - 15).trim() || null;
 }
 
-// v4.7.46: index-style underlyings have multiple root variants depending on
-// settlement style (AM vs PM, weekly vs monthly). Tradier's chain endpoint
-// happily returns contracts using whichever root it indexed, but the order
-// endpoint requires the CANONICAL root for that specific contract. If the
-// chain root is wrong for the order, Tradier rejects with "Undefined symbol".
-// We probe alternate roots via markets/quotes before submitting.
-const _OPTION_ROOT_VARIANTS = {
-  NDX:  ['NDX', 'NDXP', 'NDXPM', 'NDXW', 'NDXX'],
-  SPX:  ['SPX', 'SPXW', 'SPXPM'],
-  RUT:  ['RUT', 'RUTW'],
-  XSP:  ['XSP', 'XSPW'],
-};
-
-function _rootVariants(root) {
-  const r = String(root || '').toUpperCase();
-  if (_OPTION_ROOT_VARIANTS[r]) return _OPTION_ROOT_VARIANTS[r];
-  for (const variants of Object.values(_OPTION_ROOT_VARIANTS)) {
-    if (variants.includes(r)) return variants;
-  }
-  return [r];
-}
-
-function _rewriteOccRoot(occ, newRoot) {
-  if (typeof occ !== 'string' || occ.length < 16) return occ;
-  const tail = occ.slice(occ.length - 15); // YYMMDD(6) + C|P(1) + strike(8)
-  return newRoot + tail;
-}
-
-// Try each known root variant by hitting markets/quotes. The variant whose
-// symbols all return a usable quote (bid OR ask OR last present) is the
-// canonical root for these contracts. Falls back to the original if nothing
-// resolves — Tradier's own error then surfaces.
-// v4.7.52: cache (underlying, expiration) → { root, legMap }. legMap is a
-// { 'strike|side': occSymbol } dict pulled straight from Tradier's chain
-// for the canonical root. Module-level so resolution survives re-renders.
-// v4.7.56: bump the cache namespace so any wrong entries from prior versions
-// don't get reused. Manifestly, we no longer skip ghost listings — the chain
-// canonical symbols are kept as-is and the parent symbol is forced for
-// index underlyings.
-const _canonicalRootCache = new Map();
-const _CANONICAL_CACHE_NAMESPACE = 'v4.7.56';
-
-// Mirrors Python's lookup_canonical_symbols (tests/tradier_execute_ticket.py).
-// For each candidate root variant: query the expirations endpoint to confirm
-// the expiration date exists on that root, then pull the chain and accept the
-// variant whose chain contains canonical OCC symbols for ALL of our legs.
-// Crucial: we take symbols from Tradier's chain response — NOT by rewriting
-// the root on a chain symbol we already had, because Tradier may format the
-// strike/padding differently between roots and a string-rewrite produces an
-// unrecognized symbol that the order endpoint rejects with "Undefined symbol".
-async function _findCanonicalRootForLegs(underlying, expiration, legs, connection) {
-  const variants = _rootVariants(underlying);
-  const ordered = [underlying, ...variants.filter(v => v !== underlying)];
-  const wantedKeys = legs.map(l => `${Number(l.strike)}|${String(l.side).toLowerCase()}`);
-  console.info(`[Tradier root probe] underlying=${underlying}  expiration=${expiration}  wanted legs=`, wantedKeys);
-  for (const root of ordered) {
-    let dates;
-    try {
-      const expResp = connection
-        ? await _tradierConnectionGet(connection, 'markets/options/expirations', { symbol: root, includeAllRoots: 'true' })
-        : await _tradierGet('markets/options/expirations', { symbol: root, includeAllRoots: 'true' });
-      dates = expResp?.expirations?.date;
-    } catch (e) {
-      console.warn(`[Tradier root probe] ${root}: expirations call threw:`, e?.message || e);
-      continue;
-    }
-    if (!dates) { console.info(`[Tradier root probe] ${root}: no expirations returned`); continue; }
-    if (!Array.isArray(dates)) dates = [dates];
-    const hasExp = dates.map(String).includes(expiration);
-    console.info(`[Tradier root probe] ${root}: ${dates.length} expirations, contains ${expiration}? ${hasExp}`);
-    if (!hasExp) continue;
-    let opts;
-    try {
-      const chainResp = connection
-        ? await _tradierConnectionGet(connection, 'markets/options/chains', { symbol: root, expiration, greeks: 'false' })
-        : await _tradierGet('markets/options/chains', { symbol: root, expiration, greeks: 'false' });
-      opts = chainResp?.options?.option;
-    } catch (e) {
-      console.warn(`[Tradier root probe] ${root}: chain call threw:`, e?.message || e);
-      continue;
-    }
-    if (!opts) { console.info(`[Tradier root probe] ${root}: empty chain for ${expiration}`); continue; }
-    if (!Array.isArray(opts)) opts = [opts];
-    const legMap = {};
-    for (const opt of opts) {
-      const k = parseFloat(opt.strike);
-      const s = String(opt.option_type || '').toLowerCase();
-      const sym = opt.symbol;
-      if (!isNaN(k) && (s === 'call' || s === 'put') && sym) {
-        legMap[`${k}|${s}`] = sym;
-      }
-    }
-    const missing = wantedKeys.filter(k => !legMap[k]);
-    if (missing.length === 0) {
-      const sampleSym = legMap[wantedKeys[0]];
-      // v4.7.56: NOT ghost listings — Tradier indexes index options under a
-      // parent symbol (NDX) while individual contracts can have settlement-
-      // variant roots in their OCC (NDXP for PM-settled weeklies). It's
-      // expected. Take the chain's canonical symbol verbatim. The order body
-      // uses the parent symbol for the `symbol` field (see _buildTradierOrderBody).
-      console.info(`[Tradier root probe] ${root}: ALL legs resolved · sample symbol=${sampleSym} · selecting this root`);
-      return { root, legMap };
-    } else {
-      const haveStrikes = Object.keys(legMap).filter(k => k.endsWith('|put') || k.endsWith('|call'))
-        .map(k => k.split('|')[0]).sort((a,b)=>+a-+b);
-      console.info(`[Tradier root probe] ${root}: chain has ${opts.length} contracts but missing legs ${missing.join(', ')}.`
-        + ` strikes in chain (sample): ${haveStrikes.slice(0,5).join(', ')} … ${haveStrikes.slice(-5).join(', ')}`);
-    }
-  }
-  console.warn(`[Tradier root probe] NO root resolved all legs for ${underlying} ${expiration}.`);
-  return null;
-}
-
-// Return a candidate whose legs all carry canonical-root OCC symbols. For
-// non-index tickers (NVDA, AAPL, SPY, etc.) this is a no-op (single root,
-// no probe). For NDX/SPX/RUT/XSP it queries Tradier directly to find the
-// settlement-variant root that actually carries the expiration we need,
-// then stamps the chain-canonical OCC onto each leg.
-async function _resolveCanonicalLegSymbols(candidate, symbol, expiration, connection) {
-  if (!candidate?.legs?.length) return candidate;
-  const upper = String(symbol || '').toUpperCase();
-  const variants = _rootVariants(upper);
-  console.info(`[Tradier resolve] entering for ${upper} ${expiration} · variants:`, variants);
-  // Non-index ticker — no resolution needed, just normalize any missing leg symbols.
-  if (variants.length <= 1) {
-    console.info(`[Tradier resolve] ${upper} is non-index — no probe needed`);
-    return {
-      ...candidate,
-      legs: candidate.legs.map(l => ({
-        ...l,
-        symbol: (typeof l.symbol === 'string' && l.symbol)
-          ? l.symbol
-          : _buildOccSymbol(upper, expiration, l.side, l.strike),
-      })),
-    };
-  }
-  // Index ticker — probe (cached). Key includes the env so a sandbox lookup
-  // doesn't poison a production lookup or vice versa.
-  const env = connection?.config?.env || 'operator';
-  const cacheKey = `${_CANONICAL_CACHE_NAMESPACE}|${env}|${upper}|${expiration}`;
-  console.info(`[Tradier resolve] using ${env} env for canonical probe`);
-  let resolved = _canonicalRootCache.get(cacheKey);
-  if (!resolved) {
-    resolved = await _findCanonicalRootForLegs(upper, expiration, candidate.legs, connection);
-    if (resolved) _canonicalRootCache.set(cacheKey, resolved);
-  }
-  if (!resolved) {
-    console.warn(`[Tradier] canonical root probe failed for ${upper} ${expiration} — keeping original symbols.`);
-    return {
-      ...candidate,
-      legs: candidate.legs.map(l => ({
-        ...l,
-        symbol: (typeof l.symbol === 'string' && l.symbol)
-          ? l.symbol
-          : _buildOccSymbol(upper, expiration, l.side, l.strike),
-      })),
-    };
-  }
-  // Stamp chain-canonical OCC symbols onto every leg.
-  return {
-    ...candidate,
-    legs: candidate.legs.map(l => {
-      const key = `${Number(l.strike)}|${String(l.side).toLowerCase()}`;
-      const canonical = resolved.legMap[key];
-      return {
-        ...l,
-        symbol: canonical || _buildOccSymbol(resolved.root, expiration, l.side, l.strike),
-      };
-    }),
-  };
-}
-
-async function _resolveTradierSymbols(connection, legSymbols) {
-  const initialRoot = _rootFromOcc(legSymbols[0]);
-  if (!initialRoot) return { root: null, legSymbols, ok: false };
-  const variants = _rootVariants(initialRoot);
-  // Ensure original goes first so we don't pay a probe cost on the common path.
-  const ordered = [initialRoot, ...variants.filter(v => v !== initialRoot)];
-  for (const root of ordered) {
-    const candidates = legSymbols.map(s => _rewriteOccRoot(s, root));
-    try {
-      const qResp = await _tradierConnectionGet(connection, 'markets/quotes',
-        { symbols: candidates.join(','), greeks: 'false' });
-      let qs = qResp?.quotes?.quote;
-      if (!qs) continue;
-      if (!Array.isArray(qs)) qs = [qs];
-      const allFound = candidates.every(sym => {
-        const q = qs.find(x => x && x.symbol === sym);
-        if (!q) return false;
-        // Tradier surfaces unknown symbols inside quotes.unmatched_symbols;
-        // even when listed in quote[], they have bid/ask/last all null.
-        return (q.bid != null) || (q.ask != null) || (q.last != null);
-      });
-      if (allFound) {
-        if (root !== initialRoot) {
-          console.info(`[Tradier] canonical root resolved: ${initialRoot} → ${root}`);
-        }
-        return { root, legSymbols: candidates, ok: true };
-      }
-    } catch (e) {
-      console.debug(`[Tradier] root ${root} probe failed:`, e?.message || e);
-    }
-  }
-  return { root: initialRoot, legSymbols, ok: false };
-}
-
 function _buildTradierOrderBody(candidate, symbol, expiration, priceMode, limitPrice, opts) {
   if (!candidate?.legs?.length) throw new Error('Order build: candidate has no legs.');
   const isCredit = candidate.type === 'credit';
   const orderType = priceMode === 'market' ? 'market' : (isCredit ? 'credit' : 'debit');
   const duration = (opts && opts.duration) || 'day';
-  // v4.7.45: contract quantity multiplier — applied to every leg's qty. The
-  // butterfly's doubled-middle leg still gets ×2 within a single "contract".
-  const orderQty = Math.max(1, Math.floor((opts && opts.quantity) || 1));
   // v4.7.31a: Tradier `tag` is strictly alphanumeric — strip everything but
   // a-z A-Z 0-9 and cap at 30. (HTTP 400 'invalid characters' otherwise.)
   const rawTag = (opts && opts.tag) || `edgelane${candidate.label || 'candidate'}`;
@@ -953,19 +744,7 @@ function _buildTradierOrderBody(candidate, symbol, expiration, priceMode, limitP
   const legSymbols = candidate.legs.map(l =>
     (typeof l.symbol === 'string' && l.symbol) ? l.symbol : _buildOccSymbol(symbol, expiration, l.side, l.strike)
   );
-  // v4.7.56: Tradier's order endpoint indexes orders under a PARENT symbol.
-  // For index options (NDX/SPX/RUT/XSP), the OCC contracts use settlement-
-  // variant roots (NDXP, SPXW, etc.) but the parent symbol stays NDX/SPX/etc.
-  // Sending `symbol=NDXP` fails with "Undefined symbol: NDXP" because NDXP
-  // isn't a tradeable parent — it's only a valid OCC prefix. So: for known
-  // index parents, force the parent symbol regardless of OCC root.
-  const occRoot = _rootFromOcc(legSymbols[0]);
-  const userTyped = String(symbol).toUpperCase();
-  const isIndexParent = Object.prototype.hasOwnProperty.call(_OPTION_ROOT_VARIANTS, userTyped);
-  const occIsVariantOfUserTyped = occRoot && _rootVariants(userTyped).includes(occRoot);
-  const resolvedRoot = (isIndexParent && occIsVariantOfUserTyped)
-    ? userTyped
-    : (occRoot || userTyped);
+  const resolvedRoot = _rootFromOcc(legSymbols[0]) || String(symbol).toUpperCase();
 
   const params = new URLSearchParams();
   params.set('class', 'multileg');
@@ -980,9 +759,8 @@ function _buildTradierOrderBody(candidate, symbol, expiration, priceMode, limitP
   if (opts && opts.preview) params.set('preview', 'true');
 
   candidate.legs.forEach((leg, idx) => {
-    // qtyFactor: standard legs are 1×, the doubled middle leg of a butterfly is 2×.
-    // Multiplied by orderQty (user-selected total contracts).
-    const qtyFactor = (Math.abs(leg.longShort) === 2 ? 2 : 1) * orderQty;
+    // qtyFactor: standard legs are 1×, the doubled middle leg of a butterfly is 2×
+    const qtyFactor = Math.abs(leg.longShort) === 2 ? 2 : 1;
     params.set(`option_symbol[${idx}]`, legSymbols[idx]);
     params.set(`side[${idx}]`, _tradierLegSide(leg.longShort, leg.side));
     params.set(`quantity[${idx}]`, String(qtyFactor));
@@ -1080,7 +858,7 @@ async function _testBrokerConnection(connection) {
 
 // Submit an order via the active connection. priceMode: 'market'|'limit'.
 // On success returns { id, status, raw, previewed }. Throws otherwise.
-async function _submitOrderToActiveBroker(connection, candidate, symbol, expiration, priceMode, limitPrice, quantity) {
+async function _submitOrderToActiveBroker(connection, candidate, symbol, expiration, priceMode, limitPrice) {
   if (!connection) throw new Error('No active broker connection — set one in Settings.');
   if (connection.provider === 'webull') {
     throw new Error('WeBull integration not yet implemented. Use Tradier or contact support.');
@@ -1088,35 +866,21 @@ async function _submitOrderToActiveBroker(connection, candidate, symbol, expirat
   if (connection.provider !== 'tradier') {
     throw new Error(`Unknown provider: ${connection.provider}`);
   }
-  const orderQty = Math.max(1, Math.floor(Number(quantity) || 1));
   // 1. Resolve account
   const accountId = await _resolveTradierAccountId(connection);
-  // v4.7.51: canonical root resolution is now done UPSTREAM, at the moment
-  // the user clicks Copy or Push (see CardActions). By the time we reach
-  // this submit path, candidate.legs[i].symbol is already order-ready.
-  // No probe round-trip needed here — exactly the original design intent.
-  console.info('[Tradier submit] candidate leg symbols at submit time:', candidate.legs.map(l => l.symbol));
   // 2. Preview first
-  const previewBody = _buildTradierOrderBody(candidate, symbol, expiration, priceMode, limitPrice, { preview: true, quantity: orderQty });
-  console.info('[Tradier submit] preview body:', previewBody);
+  const previewBody = _buildTradierOrderBody(candidate, symbol, expiration, priceMode, limitPrice, { preview: true });
   const previewResp = await _tradierConnectionPost(connection, `accounts/${accountId}/orders`, previewBody);
-  console.info('[Tradier submit] preview response:', JSON.stringify(previewResp));
   const previewOrder = previewResp?.order;
-  // v4.7.55: also surface bare {"errors":{"error":"..."}} responses that have
-  // no `order` field — these silently passed before, and the live POST got
-  // the same error.
-  if (previewResp && previewResp.errors) {
-    const e = previewResp.errors.error;
-    throw new Error(`Tradier preview rejected: ${Array.isArray(e) ? e.join('; ') : e}`);
-  }
+  // Tradier returns result:"ok" on accepted preview (and may also surface
+  // estimated cost/margin etc). A real rejection surfaces with errors above
+  // (handled in _tradierConnectionPost via HTTP status).
   if (previewOrder && previewOrder.status && String(previewOrder.status).toLowerCase() !== 'ok') {
     throw new Error(`Tradier preview rejected: ${previewOrder.status} — ${previewOrder.reason_description || JSON.stringify(previewOrder).slice(0, 200)}`);
   }
   // 3. Submit live
-  const liveBody = _buildTradierOrderBody(candidate, symbol, expiration, priceMode, limitPrice, { preview: false, quantity: orderQty });
-  console.info('[Tradier submit] live body:', liveBody);
+  const liveBody = _buildTradierOrderBody(candidate, symbol, expiration, priceMode, limitPrice, { preview: false });
   const liveResp = await _tradierConnectionPost(connection, `accounts/${accountId}/orders`, liveBody);
-  console.info('[Tradier submit] live response:', JSON.stringify(liveResp));
   const order = liveResp?.order;
   if (!order || !order.id) {
     throw new Error(`Tradier accepted POST but returned no order id. Body: ${JSON.stringify(liveResp).slice(0, 200)}`);
@@ -1177,98 +941,6 @@ function _strikeFromRow(row) {
   return Number(row?.strike ?? row?.strike_price ?? row?.K);
 }
 
-// v4.7.67: EdgelaneProvider-style bilateral wall finder. Returns the dominant PUT
-// wall (highest positive net_gex — puts dominate) and dominant CALL wall
-// (most negative net_gex — calls dominate) SEPARATELY rather than collapsing
-// them into a single "GEX wall" by absolute magnitude.
-//
-// Why: per EdgelaneProvider empirical model and consistent with the user's own
-// observations of their 0DTE GEX tool, call walls and put walls behave
-// asymmetrically:
-//   • PUT walls   → MAGNET (price drifts toward)         — dealers short gamma
-//   • CALL walls  → RESISTANCE (price gets blocked at)   — dealers long gamma
-// Treating both as magnets (v4.7.63-65) misreads call-wall setups.
-function _findGexWallsBilateral(greeksRaw, exposuresForChosen) {
-  const rows = _strikeRowsFrom(exposuresForChosen);
-  const enriched = rows.map(r => ({
-    strike: _strikeFromRow(r),
-    netGex: _gexFromRow(r),
-    callGex: Number((r && (r.call_gex !== undefined ? r.call_gex : r.callGex)) || 0),
-    putGex:  Number((r && (r.put_gex  !== undefined ? r.put_gex  : r.putGex))  || 0),
-  })).filter(o => o.strike != null && !isNaN(o.strike));
-
-  if (enriched.length === 0) return { putWall: null, callWall: null };
-
-  let totalAbs = 0;
-  for (const o of enriched) totalAbs += Math.abs(o.netGex);
-
-  const classify = (gexAbs) => {
-    if (!gexAbs || !totalAbs) return 'low';
-    const share = gexAbs / totalAbs;
-    return share > 0.20 ? 'high' : share > 0.10 ? 'medium' : 'low';
-  };
-
-  let putWall = null;
-  for (const o of enriched) {
-    if (o.netGex > 0 && (!putWall || o.netGex > putWall.netGex)) putWall = Object.assign({}, o);
-  }
-  if (putWall) putWall.strength = classify(Math.abs(putWall.netGex));
-
-  let callWall = null;
-  for (const o of enriched) {
-    if (o.netGex < 0 && (!callWall || o.netGex < callWall.netGex)) callWall = Object.assign({}, o);
-  }
-  if (callWall) callWall.strength = classify(Math.abs(callWall.netGex));
-
-  return { putWall, callWall };
-}
-
-// v4.7.67: EdgelaneProvider-style asymmetric directional score for 0DTE / 1DTE.
-//
-//   • Put wall is the MAGNET (sets direction). Price drifts toward it.
-//   • Call wall is RESISTANCE (modulates magnitude). If it sits between
-//     spot and the put wall on the same side, the magnet pull is reduced.
-//   • Score sign comes from put-wall position vs spot:
-//        put wall ABOVE spot → bullish drift
-//        put wall BELOW spot → bearish drift
-//   • Magnitude scales with put-wall strength and proximity.
-function _computeEdgelaneProviderScore(spot, putWall, callWall) {
-  if (!spot || !putWall || !putWall.strike) {
-    if (callWall && callWall.strike) {
-      const callDist = (callWall.strike - spot) / spot;
-      const sm = callWall.strength === 'high' ? 1.5 : callWall.strength === 'medium' ? 1.0 : 0.5;
-      return Math.max(-30, Math.min(30, Math.round(-Math.sign(callDist) * 20 * sm * 10) / 10));
-    }
-    return 0;
-  }
-  const putDistPct = (putWall.strike - spot) / spot;
-  const putDir = Math.sign(putDistPct);
-  const distAbs = Math.abs(putDistPct);
-
-  const reach = distAbs < 0.005 ? 1.0
-              : distAbs < 0.01  ? 0.80
-              : distAbs < 0.02  ? 0.55
-              : distAbs < 0.03  ? 0.35
-              : 0.15;
-
-  const sm = putWall.strength === 'high' ? 1.5 : putWall.strength === 'medium' ? 1.0 : 0.5;
-  let magnetScore = putDir * 90 * sm * reach;
-
-  if (callWall && callWall.strike) {
-    const callDistPct = (callWall.strike - spot) / spot;
-    const sameSide = Math.sign(callDistPct) === putDir;
-    const closer   = Math.abs(callDistPct) < distAbs;
-    if (sameSide && closer) {
-      const callMag = Math.abs(callWall.netGex);
-      const putMag  = Math.abs(putWall.netGex);
-      const blockRatio = callMag / Math.max(callMag + putMag, 1e-9);
-      magnetScore *= (1 - blockRatio * 0.75);
-    }
-  }
-  return Math.max(-100, Math.min(100, Math.round(magnetScore * 10) / 10));
-}
-
-
 // Find the dominant gamma wall + classify its strength relative to others.
 // Atlas often pre-computes call_wall / put_wall in key_levels — prefer those.
 function _findGexWall(greeksRaw, exposuresForChosen) {
@@ -1277,15 +949,10 @@ function _findGexWall(greeksRaw, exposuresForChosen) {
   const atlasCallWall = Number(kl.call_wall ?? kl.callWall ?? kl.gex_call_wall ?? 0) || null;
   const atlasPutWall  = Number(kl.put_wall  ?? kl.putWall  ?? kl.gex_put_wall  ?? 0) || null;
 
-  // 2. Compute from per-strike GEX (signed: + = puts dominate, - = calls dominate)
+  // 2. Compute from per-strike GEX
   const rows = _strikeRowsFrom(exposuresForChosen);
   const gexByStrike = rows
-    .map(r => ({
-      strike: _strikeFromRow(r),
-      gex: _gexFromRow(r),
-      callGex: Number(r?.call_gex ?? r?.callGex ?? 0) || 0,
-      putGex:  Number(r?.put_gex  ?? r?.putGex  ?? 0) || 0,
-    }))
+    .map(r => ({ strike: _strikeFromRow(r), gex: _gexFromRow(r) }))
     .filter(o => o.strike != null && !isNaN(o.strike));
 
   let best = null;
@@ -1303,39 +970,11 @@ function _findGexWall(greeksRaw, exposuresForChosen) {
     strength = 'high';
   }
 
-  // v4.7.65: classify the wall as PUT, CALL, or MIXED based on which side
-  // dominates GEX at the dominant strike.
-  //   net_gex = putGex - callGex
-  //     positive → puts dominate → "put wall"
-  //     negative → calls dominate → "call wall"
-  //     near zero (within 30% diff) → "mixed wall"
-  // This is intel the engine had all along (per-leg call_gex / put_gex are
-  // already computed in _computeDealerExposures) but was being thrown away
-  // when picking the max-|gex| strike. Now we surface it.
-  let wallType = null;
-  if (best) {
-    const cgex = Math.abs(best.callGex);
-    const pgex = Math.abs(best.putGex);
-    if (cgex + pgex > 0) {
-      const dominanceRatio = Math.max(cgex, pgex) / Math.max(1e-9, Math.min(cgex, pgex));
-      if (dominanceRatio < 1.3) {
-        wallType = 'mixed';
-      } else if (pgex > cgex) {
-        wallType = 'put';
-      } else {
-        wallType = 'call';
-      }
-    }
-  }
-
-  // Final wall: prefer computed best; fall back to atlas pre-computed levels
+  // Final wall: prefer the larger of (computed, atlas call_wall, atlas put_wall)
+  // by |GEX|, but if computed is null, take whichever atlas value exists.
   const wallStrike = best?.strike ?? atlasCallWall ?? atlasPutWall ?? null;
-  // If we fell back to an atlas wall, type comes from that:
-  if (best == null && wallStrike != null) {
-    wallType = (wallStrike === atlasCallWall) ? 'call' : (wallStrike === atlasPutWall) ? 'put' : null;
-  }
 
-  return { strike: wallStrike, strength, type: wallType, atlasCallWall, atlasPutWall, computedTopGex: best?.gex || 0 };
+  return { strike: wallStrike, strength, atlasCallWall, atlasPutWall, computedTopGex: best?.gex || 0 };
 }
 
 // Aggregate signed exposures for the chosen expiration.
@@ -1352,24 +991,11 @@ function _aggregateExposures(exposuresForChosen, portfolioTotals) {
 }
 
 // Score directional bias on [-100, 100] from spot vs wall + DEX + gamma regime.
-//
-// Base intuition: wall BELOW spot = support = bullish; wall ABOVE = resistance =
-// bearish. That's the SHORT-GAMMA "wall as magnet/repeller" interpretation.
-//
-// v4.7.57: gamma regime now actively reshapes the score (not just dampens it).
-//   • LONG-GAMMA  (netGex > 0): wall is a STABILIZER, not a magnet. Indices in
-//     normal regimes sit here. Heavy dampen (×0.3) so wall geometry produces at
-//     most a mild bias. DEX sign flips: in long-gamma, dealer-long-delta is
-//     bullish flow (dealers want price up so their book decays favorably),
-//     opposite of the short-vol mental model that the old code assumed.
-//   • SHORT-GAMMA (netGex < 0): wall acts as magnet/repeller. Amplify slightly
-//     (×1.2). Original DEX convention applies (dealer-short-delta hedges into
-//     rallies = bearish flow contribution).
-//
-// Pre-v4.7.57, the engine used short-gamma sign conventions unconditionally —
-// which is why index tickers in long-gamma kept reading as mild_bearish on
-// otherwise benign setups, sandbagging bull_put and steering toward bear_call.
-function _computeDirectionalScore(spot, wall, netGex, netDex, dte) {
+// Wall ABOVE spot → resistance → bearish. Wall BELOW spot → support → bullish.
+// Strength multiplies the effect. Positive net gamma (pinning) dampens, negative
+// (amplifying) leaves it. Net DEX adds a small skew (positive dealer delta =
+// dealers sell rallies = bearish flow contribution).
+function _computeDirectionalScore(spot, wall, netGex, netDex) {
   if (!spot || wall.strike == null) return 0;
   const pctFromWall = (spot - wall.strike) / wall.strike;
   let score = pctFromWall * 200;  // 5% above = +10; 25% above = +50
@@ -1377,50 +1003,12 @@ function _computeDirectionalScore(spot, wall, netGex, netDex, dte) {
   const strengthMult = wall.strength === 'high' ? 1.5 : wall.strength === 'medium' ? 1.0 : 0.5;
   score *= strengthMult;
 
-  // v4.7.63: TWO mental models for the wall, depending on horizon:
-  //   • MULTI-DAY (DTE ≥ 1.5): wall = barrier/resistance. Wall above spot
-  //     pushes price down (resistance) → bearish. Wall below = support →
-  //     bullish. This matches the geometric `pctFromWall * 200` baseline.
-  //   • INTRADAY (DTE < 1.5): wall = magnet/pin. Gamma concentration at
-  //     near-expiration pulls price TOWARD high-OI strikes. Wall above spot
-  //     means price drifts UP to it (bullish drift). Wall below = bearish
-  //     drift. This is the empirical 0DTE pinning effect; the baseline
-  //     barrier sign must be FLIPPED to get it right.
-  //
-  // Pre-v4.7.63 the engine used barrier convention regardless of DTE, which
-  // systematically inverted 0DTE direction reads — recommending bear_call
-  // on bullish-drift days (wall above) and bull_put on bearish-drift days
-  // (wall below). This was the root cause of the user's losses on intraday
-  // index plays. The flip + amplification below corrects it.
-  const intraday = dte != null && dte < 1.5;
-  if (!intraday && netGex > 0) {
-    // Multi-day long-gamma: wall = stabilizer, not magnet. Heavy dampen.
-    score *= 0.3;
-    if (netDex !== 0) score += 10 * Math.sign(netDex);   // positive DEX = bullish flow
-  } else if (intraday) {
-    // 0DTE/1DTE: wall = magnet. Flip sign + amplify based on REACH.
-    //
-    // Pin probability is high when wall is close (small pctFromWall) AND
-    // gamma is intensifying. We boost more for closer walls and less for
-    // far walls (unreachable in the remaining trade horizon).
-    //   < 0.5%  pin → 6× boost (very tight, near-certain magnet)
-    //   < 1%    pin → 4× boost
-    //   < 2%    pin → 2× boost
-    //   < 3%    pin → 1× boost
-    //   ≥ 3%    pin → 0.3× boost (likely unreachable in remaining time)
-    const distPct = Math.abs(pctFromWall);
-    const reach = distPct < 0.005 ? 6 : distPct < 0.01 ? 4 : distPct < 0.02 ? 2 : distPct < 0.03 ? 1 : 0.3;
-    score = -score * 8 * reach;
-    // 0DTE DEX: positive net dealer delta typically means dealers are long
-    // delta from short-put exposure. They want price to STAY UP / RISE so
-    // those puts expire OTM — bullish flow contribution.
-    if (netDex !== 0) score += 15 * Math.sign(netDex);
-  } else if (netGex < 0) {
-    // Multi-day short-gamma: wall = barrier (original convention).
-    score *= 1.2;
-    if (netDex !== 0) score += -10 * Math.sign(netDex);  // positive DEX = bearish flow
-  }
-  // netGex == 0 multi-day → no regime contribution (geometric only).
+  // Gamma regime modulator
+  if (netGex > 0) score *= 0.7;       // positive gamma = pinning, dampen
+  else if (netGex < 0) score *= 1.2;  // negative = amplifying
+
+  // DEX skew (small contribution, max ±10)
+  if (netDex !== 0) score += -10 * Math.sign(netDex);
 
   return Math.max(-100, Math.min(100, Math.round(score * 10) / 10));
 }
@@ -1435,15 +1023,7 @@ function _scoreToBiasLabel(score) {
 
 // Confidence: high when wall is strong AND |score| > 30 AND DEX direction
 // agrees with wall-position direction. Low when wall is weak or score tiny.
-// v4.7.59: intraday "wall reachability" — for DTE < 1.5, a wall the underlying
-// can't realistically reach in the trade horizon shouldn't drive a high-
-// confidence directional read. Rough heuristic: if |spot - wall| > 1.5% AND
-// it's intraday, knock confidence down a notch. (1.5% ≈ a typical full-day
-// move for SPX/NDX; if the trader holds for 1-2 hours, expected reach is much
-// less.) This naturally suppresses composite scores on "magnet too far away"
-// setups without adding a new UI element — confidence already flows into
-// the health-badge / composite pipeline.
-function _computeConfidence(score, wall, netDex, spot, dte) {
+function _computeConfidence(score, wall, netDex, spot) {
   const absScore = Math.abs(score);
   if (wall.strength === 'low' || wall.strike == null) return 'low';
   if (absScore < 15) return 'low';
@@ -1452,22 +1032,9 @@ function _computeConfidence(score, wall, netDex, spot, dte) {
   const dexDir = -Math.sign(netDex);  // positive DEX = bearish flow → -1
   const aligned = wallDir !== 0 && dexDir !== 0 && wallDir === dexDir;
 
-  // Intraday reachability gate
-  const intraday = dte != null && dte < 1.5;
-  const wallDistPct = (wall.strike != null && spot) ? Math.abs(spot - wall.strike) / spot : 0;
-  const unreachableIntraday = intraday && wallDistPct > 0.015;
-
-  let base;
-  if (wall.strength === 'high' && absScore > 30 && aligned) base = 'high';
-  else if (absScore < 25) base = 'low';
-  else base = 'medium';
-
-  if (unreachableIntraday) {
-    if (base === 'high') return 'medium';
-    if (base === 'medium') return 'low';
-    return 'low';
-  }
-  return base;
+  if (wall.strength === 'high' && absScore > 30 && aligned) return 'high';
+  if (absScore < 25) return 'low';
+  return 'medium';
 }
 
 // Pick recommended strategies: primary from BIAS_TO_STRATEGY, then any other
@@ -1506,29 +1073,12 @@ function _extractGreekWall(greeksRaw, exposuresForChosen, keyName, fallbackRowFi
   return (best && best.value !== 0) ? best : null;
 }
 
-function _computeBiasSignals(symbol, expiration, spot, greeksRaw, exposuresForChosen, regimeOverride = null, chosenDte = null) {
+function _computeBiasSignals(symbol, expiration, spot, greeksRaw, exposuresForChosen) {
   const wall = _findGexWall(greeksRaw, exposuresForChosen);
-  // v4.7.67: also extract dominant put + call walls separately.
-  const { putWall, callWall } = _findGexWallsBilateral(greeksRaw, exposuresForChosen);
-  // v4.7.58: regime (netGex/netDex) can be supplied externally — used by
-  // detectBias to smooth across 0/1/2/3 DTE for short-dated plays.
-  // v4.7.59: smoothed regime is IGNORED for intraday plays (DTE < 1.5) because
-  // multi-day regime sign is meaningless at near-expiration anyway — gamma
-  // concentration at the trading expiration dominates. Wall detection still
-  // stays per-chosen-expiration (correct in both regimes).
-  const fallback = _aggregateExposures(exposuresForChosen, greeksRaw?.portfolio_totals);
-  const intraday = chosenDte != null && chosenDte < 1.5;
-  const netGex = (!intraday && regimeOverride && regimeOverride.netGex != null) ? regimeOverride.netGex : fallback.netGex;
-  const netDex = (!intraday && regimeOverride && regimeOverride.netDex != null) ? regimeOverride.netDex : fallback.netDex;
-  // v4.7.67: for intraday (DTE < 1.5), use EdgelaneProvider-style asymmetric
-  // scoring (put = magnet, call = resistance). For multi-day, keep the
-  // legacy barrier model.
-  const intradayForScore = chosenDte != null && chosenDte < 1.5;
-  const score = intradayForScore
-    ? _computeEdgelaneProviderScore(spot, putWall, callWall)
-    : _computeDirectionalScore(spot, wall, netGex, netDex, chosenDte);
+  const { netGex, netDex } = _aggregateExposures(exposuresForChosen, greeksRaw?.portfolio_totals);
+  const score = _computeDirectionalScore(spot, wall, netGex, netDex);
   const biasLabel = _scoreToBiasLabel(score);
-  const confidence = _computeConfidence(score, wall, netDex, spot, chosenDte);
+  const confidence = _computeConfidence(score, wall, netDex, spot);
   const recommended = _recommendStrategies(biasLabel);
 
   // v4.7.29: VEX/TEX walls for the optional 3-lens divergence strip (Tickets tab).
@@ -1547,23 +1097,8 @@ function _computeBiasSignals(symbol, expiration, spot, greeksRaw, exposuresForCh
     directional_score: score,
     bias_label: biasLabel,
     confidence,
-    // v4.7.57: net dealer gamma is now part of the bias result so the candidate
-    // scorer + wall-penalty math can regime-gate. Sign convention matches the
-    // bias engine: positive = long-gamma (stabilizing), negative = short-gamma.
-    net_gex: netGex,
-    dte: chosenDte,
     gex_wall_strike: wall.strike,
     gex_wall_strength: wall.strength,
-    gex_wall_type: wall.type,
-    // v4.7.67: bilateral walls — separate put and call. Used by the
-    // EdgelaneProvider-style intraday scorer and surfaced in the UI.
-    put_wall_strike:   putWall  ? putWall.strike   : null,
-    put_wall_strength: putWall  ? putWall.strength : null,
-    put_wall_net_gex:  putWall  ? putWall.netGex   : null,
-    call_wall_strike:   callWall ? callWall.strike   : null,
-    call_wall_strength: callWall ? callWall.strength : null,
-    call_wall_net_gex:  callWall ? callWall.netGex   : null,
-
     vex_wall_strike: vexWall?.strike ?? null,
     vex_wall_value:  vexWall?.value  ?? null,
     tex_wall_strike: texWall?.strike ?? null,
@@ -2068,35 +1603,27 @@ function _nextSessionOpenET(afterMs) {
 // premiums. Anchored so the center cell at (currentSpot, now) equals
 // candidate.net_premium exactly; BS sensitivity provides the surface.
 function _buildProjectionGrid(candidate, currentSpot, expectedMove, opts) {
+  const ROWS = (opts && opts.rows) || 9;
+  const COLS = (opts && opts.cols) || 5;
   if (!candidate || !candidate.legs || !candidate.legs.length) return null;
   if (currentSpot == null || candidate.dte == null) return null;
 
   const isCredit = candidate.type === 'credit';
-  // v4.7.46: anchor uses CURRENT-TIME DTE, not candidate.dte (snapshotted at
-  // chain fetch). Otherwise the (currentSpot, NOW) cell drifts away from
-  // candidate.net_premium as time passes between fetch and viewing.
-  const expStr = candidate.expiration || (opts && opts.expiration);
-  const expirationMs = expStr ? _msAtETClock(String(expStr), 16, 0)
-                              : (Date.now() + Math.max(0, candidate.dte) * 86_400_000);
-  const dteNow = Math.max(0, (expirationMs - Date.now()) / 86_400_000);
-  const T0 = Math.max(0, dteNow / 365);
+  const T0 = Math.max(0, candidate.dte / 365);
 
   const anchorBs = _priceSpreadAtSpot(candidate.legs, currentSpot, T0, 0.05);
   if (!anchorBs) return null;
   const liveSigned = isCredit ? -candidate.net_premium : candidate.net_premium;
   const offset = liveSigned - anchorBs.total;
 
-  // v4.7.46: $0.50 step y-axis (or $1 for spot>$1000) with 41 rows centered
-  // on the snapped spot. Vertical scroll handles the column height.
-  const STEP = currentSpot > 1000 ? 1 : 0.5;
-  const HALF_ROWS = 20;
-  const centerSnap = Math.round(currentSpot / STEP) * STEP;
+  const rangePct = expectedMove > 0 && currentSpot > 0
+    ? Math.min(0.30, Math.max(0.06, (2 * expectedMove) / currentSpot))
+    : 0.10;
   const spotAxis = [];
-  for (let i = -HALF_ROWS; i <= HALF_ROWS; i++) {
-    spotAxis.push(centerSnap + i * STEP);
+  for (let i = 0; i < ROWS; i++) {
+    const frac = (i - (ROWS - 1) / 2) / ((ROWS - 1) / 2);
+    spotAxis.push(currentSpot * (1 + frac * rangePct));
   }
-  const ROWS = spotAxis.length;
-  const COLS = (opts && opts.cols) || 5;
 
   // v4.7.33: wall-clock ET time axis. Walks trading minutes from "now" to
   // expiration close (4:00pm ET, PM-settled assumption), 15-min stride. For
@@ -2106,7 +1633,14 @@ function _buildProjectionGrid(candidate, currentSpot, expectedMove, opts) {
   const MIN_STEP_MIN = 15;
   const MAX_COLS = 12;
   const nowMs = Date.now();
-  // v4.7.46: expirationMs is already computed above for the T0 anchor; reuse.
+  // Expiration close: assume 4:00pm ET (PM-settled). AM-settled monthlies
+  // would settle at the morning auction; we accept that small inaccuracy
+  // until a settlement-type field appears on chain data.
+  const expirationMs = (() => {
+    const expStr = candidate.expiration || (opts && opts.expiration);
+    if (!expStr) return nowMs + Math.max(0, candidate.dte) * 86_400_000;
+    return _msAtETClock(String(expStr), 16, 0);
+  })();
   const todayP = _etParts(nowMs);
   const firstCellDay = todayP.weekday;
   // v4.7.34: capture the local (browser) date for the first cell, used to
@@ -2174,18 +1708,12 @@ function _buildProjectionGrid(candidate, currentSpot, expectedMove, opts) {
     })
   );
 
-  // v4.7.46: pick centerRow as the spotAxis entry closest to currentSpot
-  let centerRow = 0, bestDist = Infinity;
-  for (let i = 0; i < spotAxis.length; i++) {
-    const d = Math.abs(spotAxis[i] - currentSpot);
-    if (d < bestDist) { bestDist = d; centerRow = i; }
-  }
   return {
     spotAxis, timeAxis, grid,
     currentSpot,
     currentPremium: candidate.net_premium,
     isCredit,
-    centerRow,
+    centerRow: Math.floor((ROWS - 1) / 2),
     missingIv: anchorBs.missingIv,
   };
 }
@@ -2374,23 +1902,11 @@ function _computeLimitPremiums(candidate) {
   };
 }
 
-// v4.7.57: signature gained `netGex` so we can regime-gate. The "wall as
-// magnet" geometry (penalize bull_put when wall is below short put, penalize
-// bear_call when wall is above short call) is ONLY correct in short-gamma
-// regimes (netGex < 0). In long-gamma regimes the wall is a stabilizing
-// support/resistance level and those geometries are actually GOOD for the
-// spread, not bad. Defaulting netGex to 0 keeps callers that don't pass it
-// in the original behavior path (treated as short-gamma magnet).
-function computeWallPenalty(strategy, strikes, breakevens, wallStrike, wallStrength, netGex = 0, dte = null) {
+function computeWallPenalty(strategy, strikes, breakevens, wallStrike, wallStrength) {
   if (!wallStrike || !strikes) return { factor: 1.0, reason: null, verdict: 'neutral' };
   const w = wallStrike;
   const s = WALL_STRENGTH_MULT[wallStrength] ?? 0.5;
   const fmt = (v) => Number(v).toFixed(2);
-  // v4.7.59: at intraday DTE (<1.5), gamma concentration overwhelms multi-day
-  // regime sign — force the "wall as magnet" interpretation. Only apply the
-  // long-gamma "stabilizing floor" reading for multi-day holds.
-  const intraday = dte != null && dte < 1.5;
-  const longGamma = !intraday && netGex > 0;
 
   switch (strategy) {
     case 'bull_put': {
@@ -2398,19 +1914,11 @@ function computeWallPenalty(strategy, strikes, breakevens, wallStrike, wallStren
       if (sp == null) return { factor: 1.0, reason: null, verdict: 'neutral' };
       if (w > sp) return { factor: 1.0, reason: `Wall ${fmt(w)} above short put — acts as upward support.`, verdict: 'good' };
       if (Math.abs(w - sp) < 0.01) return { factor: 1 - 0.4 * s, reason: `Wall AT short put ${fmt(sp)} — high pin risk on the short strike.`, verdict: 'bad' };
-      // Wall is BELOW the short put. Regime decides whether that's bad or good.
-      if (longGamma) {
-        return {
-          factor: 1.0,
-          reason: `Wall ${fmt(w)} below short put ${fmt(sp)} in long-gamma regime — put wall acts as support floor below the spread, stabilizing.`,
-          verdict: 'good',
-        };
-      }
       const distPct = (sp - w) / sp;
       const proximity = Math.max(0, 1 - distPct * 10);
       return {
         factor: 1 - 0.4 * proximity * s,
-        reason: `Wall ${fmt(w)} below short put ${fmt(sp)} (short-gamma) — no upward pull; price can drift through.`,
+        reason: `Wall ${fmt(w)} below short put ${fmt(sp)} — no upward pull; price can drift through.`,
         verdict: proximity > 0.5 ? 'bad' : 'warn',
       };
     }
@@ -2420,19 +1928,11 @@ function computeWallPenalty(strategy, strikes, breakevens, wallStrike, wallStren
       if (sc == null) return { factor: 1.0, reason: null, verdict: 'neutral' };
       if (w < sc) return { factor: 1.0, reason: `Wall ${fmt(w)} below short call — caps upside as resistance.`, verdict: 'good' };
       if (Math.abs(w - sc) < 0.01) return { factor: 1 - 0.4 * s, reason: `Wall AT short call ${fmt(sc)} — high pin risk on the short strike.`, verdict: 'bad' };
-      // Wall is ABOVE the short call. Regime decides whether that's bad or good.
-      if (longGamma) {
-        return {
-          factor: 1.0,
-          reason: `Wall ${fmt(w)} above short call ${fmt(sc)} in long-gamma regime — call wall acts as resistance ceiling above the spread, stabilizing.`,
-          verdict: 'good',
-        };
-      }
       const distPct = (w - sc) / sc;
       const proximity = Math.max(0, 1 - distPct * 10);
       return {
         factor: 1 - 0.4 * proximity * s,
-        reason: `Wall ${fmt(w)} above short call ${fmt(sc)} (short-gamma) — no downward push; price can drift through.`,
+        reason: `Wall ${fmt(w)} above short call ${fmt(sc)} — no downward push; price can drift through.`,
         verdict: proximity > 0.5 ? 'bad' : 'warn',
       };
     }
@@ -2446,22 +1946,20 @@ function computeWallPenalty(strategy, strikes, breakevens, wallStrike, wallStren
         const offCenter = Math.abs(w - mid) / half;
         const centered = 1 - offCenter;
         if (centered > 0.7) return { factor: 1.0, reason: `Wall ${fmt(w)} centered between shorts ${fmt(sp)}/${fmt(sc)} — ideal pin.`, verdict: 'good' };
-        const skewReason = longGamma
-          ? `Wall ${fmt(w)} inside body ${fmt(sp)}/${fmt(sc)} but skewed (long-gamma) — anchors price toward nearer short.`
-          : `Wall ${fmt(w)} inside body ${fmt(sp)}/${fmt(sc)} but skewed — pinning will pull price toward nearer short.`;
-        return { factor: 1 - 0.3 * (1 - centered) * s, reason: skewReason, verdict: 'warn' };
+        return {
+          factor: 1 - 0.3 * (1 - centered) * s,
+          reason: `Wall ${fmt(w)} inside body ${fmt(sp)}/${fmt(sc)} but skewed — pinning will pull price toward nearer short.`,
+          verdict: 'warn',
+        };
       }
       const dist = w < sp ? sp - w : w - sc;
       const distPct = dist / ((sp + sc) / 2);
       const proximity = Math.max(0, 1 - distPct * 10);
-      const sideDesc = w < sp ? 'below body' : 'above body';
-      // v4.7.58: wall-outside-body is bad for IC in BOTH regimes (anchor in
-      // long-gamma, magnet in short-gamma — different mechanism, same result).
-      // Text differs so the user sees the right mental model.
-      const reason = longGamma
-        ? `Wall ${fmt(w)} ${sideDesc} ${fmt(sp)}/${fmt(sc)} in long-gamma regime — anchors price ${(distPct*100).toFixed(1)}% from the profit zone.`
-        : `Wall ${fmt(w)} OUTSIDE shorts ${fmt(sp)}/${fmt(sc)} (short-gamma) — pinning drags price out of profit zone.`;
-      return { factor: 1 - 0.5 * proximity * s, reason, verdict: 'bad' };
+      return {
+        factor: 1 - 0.5 * proximity * s,
+        reason: `Wall ${fmt(w)} OUTSIDE shorts ${fmt(sp)}/${fmt(sc)} — pinning drags price out of profit zone.`,
+        verdict: 'bad',
+      };
     }
 
     case 'iron_butterfly':
@@ -2833,11 +2331,7 @@ function generateCandidates(strategy, contracts, dte, expectedMove, targetDelta,
     const c = builder(cfg.delta, cfg.width);
     if (!c) continue;
     // Strategy-aware GEX wall penalty. Adjusts EV used for ranking; keeps raw EV for display.
-    // v4.7.57: regime-aware via walls.netGex (long-gamma multi-day = wall is floor).
-    // v4.7.59: also DTE-gated — for intraday plays (DTE < 1.5), wall acts as
-    // magnet regardless of regime sign because gamma concentration at near-
-    // expiration overwhelms multi-day positioning.
-    const wallPen = computeWallPenalty(strategy, c.strikes, c.breakevens, walls?.strike, walls?.strength, walls?.netGex || 0, walls?.dte);
+    const wallPen = computeWallPenalty(strategy, c.strikes, c.breakevens, walls?.strike, walls?.strength);
     const evAdjusted = c.ev * wallPen.factor;
     let rationale = `${cfg.label} variant — short Δ target ${cfg.delta.toFixed(2)}, width factor ${cfg.width.toFixed(1)}×.`;
     if (wallPen.reason) rationale += ` ${wallPen.reason}`;
@@ -3126,49 +2620,15 @@ function Row({ label, value, positive, negative }) {
   );
 }
 
-function CardActions({ candidate, symbol, expiration, onPushBroker, hasActiveBroker, connection }) {
+function CardActions({ candidate, symbol, expiration, onPushBroker, hasActiveBroker }) {
   const [copied, setCopied] = useState(false);
-  const [resolving, setResolving] = useState(false);
-  // v4.7.51: BOTH copy + push run the canonical-root probe BEFORE doing
-  // their work. For index-style underlyings (NDX/SPX/RUT/XSP) this swaps
-  // the chain-stamped OCC root with the order-ready settlement variant
-  // (NDXP/NDXW/etc) — even if the user only clicks Copy and never submits.
-  // The result is cached at module level keyed by (initialRoot, expiration),
-  // so the round-trip happens at most once per ticker/expiration in a session.
   const handleCopy = async () => {
     try {
-      setResolving(true);
-      // v4.7.54: pass the active broker connection so the canonical-root
-      // probe uses the SAME env+token the order POST will use. Without
-      // this the probe runs via operator-level token (which may be a
-      // different env from the user's broker connection) → finds symbols
-      // that don't exist on the POST endpoint → "Undefined symbol".
-      const resolved = await _resolveCanonicalLegSymbols(candidate, symbol, expiration, connection);
-      const ticket = _buildTradeTicket(resolved, symbol, expiration);
+      const ticket = _buildTradeTicket(candidate, symbol, expiration);
       await navigator.clipboard.writeText(ticket);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    } catch (e) {
-      console.error('Copy failed:', e);
-    } finally {
-      setResolving(false);
-    }
-  };
-  const handlePush = async () => {
-    if (!onPushBroker) return;
-    try {
-      setResolving(true);
-      const resolved = await _resolveCanonicalLegSymbols(candidate, symbol, expiration, connection);
-      console.info('[Tradier push] resolved candidate leg symbols:', resolved.legs.map(l => l.symbol));
-      onPushBroker(resolved);
-    } catch (e) {
-      console.error('Push prep failed:', e);
-      // Best-effort — hand the original candidate to the dialog and let
-      // the submit-time retry handle root rewrite if it comes to it.
-      onPushBroker(candidate);
-    } finally {
-      setResolving(false);
-    }
+    } catch (e) { console.error('Copy failed:', e); }
   };
   const pushTooltip = hasActiveBroker
     ? 'Push order to active broker connection'
@@ -3184,16 +2644,16 @@ function CardActions({ candidate, symbol, expiration, onPushBroker, hasActiveBro
           <span className="text-base leading-none">{copied ? '✓' : '⎘'}</span>
         </button>
       </Tooltip>
-      <Tooltip content={resolving ? 'Resolving order-ready symbol…' : pushTooltip}>
-        <button onClick={handlePush}
-          disabled={!onPushBroker || resolving}
+      <Tooltip content={pushTooltip}>
+        <button onClick={() => onPushBroker && onPushBroker(candidate)}
+          disabled={!onPushBroker}
           aria-label="Push to broker"
           className={`w-8 h-8 rounded-md border flex items-center justify-center transition-colors ${
             hasActiveBroker
-              ? 'bg-emerald-200 border-emerald-700 text-emerald-900 hover:bg-emerald-100 disabled:opacity-60'
+              ? 'bg-emerald-200 border-emerald-700 text-emerald-900 hover:bg-emerald-100'
               : 'bg-stone-200/70 border-stone-500 text-stone-600 hover:bg-stone-100'
           }`}>
-          <span className={`text-base leading-none ${resolving ? 'spin inline-block' : ''}`}>{resolving ? '⟳' : '↗'}</span>
+          <span className="text-base leading-none">↗</span>
         </button>
       </Tooltip>
     </div>
@@ -3223,24 +2683,13 @@ async function _hashPassword(plain) {
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
 }
 
-// Brand SVG marks from Simple Icons v11. Each path is single-color
-// (fill=currentColor) and renders inside a 24x24 viewBox. Provider buttons
-// use brand backgrounds with white/dark icons for proper contrast.
 const SIMULATED_OAUTH_PROVIDERS = [
-  { id: 'google',    name: 'Google',    color: '#fff',    text: '#3c4043', border: 'border-stone-400',
-    path: 'M12.48 10.92v3.28h7.84c-.24 1.84-.853 3.187-1.787 4.133-1.147 1.147-2.933 2.4-6.053 2.4-4.827 0-8.6-3.893-8.6-8.72s3.773-8.72 8.6-8.72c2.6 0 4.507 1.027 5.907 2.347l2.307-2.307C18.747 1.44 16.133 0 12.48 0 5.867 0 .307 5.387.307 12s5.56 12 12.173 12c3.573 0 6.267-1.173 8.373-3.36 2.16-2.16 2.84-5.213 2.84-7.667 0-.76-.053-1.467-.173-2.053H12.48z' },
-  { id: 'microsoft', name: 'Microsoft', color: '#fff',    text: '#5e5e5e', border: 'border-stone-400',
-    path: 'M11.4 24H0V12.6h11.4V24zM24 24H12.6V12.6H24V24zM11.4 11.4H0V0h11.4v11.4zM24 11.4H12.6V0H24v11.4z' },
-  { id: 'x',         name: 'X',         color: '#000',    text: '#fff',    border: 'border-stone-700',
-    path: 'M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z' },
-  { id: 'facebook',  name: 'Facebook',  color: '#1877f2', text: '#fff',    border: 'border-blue-700',
-    path: 'M9.101 23.691v-7.98H6.627v-3.667h2.474v-1.58c0-4.085 1.848-5.978 5.858-5.978.401 0 .955.042 1.468.103a8.68 8.68 0 0 1 1.141.195v3.325a8.623 8.623 0 0 0-.653-.036 26.805 26.805 0 0 0-.733-.009c-.707 0-1.259.096-1.675.309a1.686 1.686 0 0 0-.679.622c-.258.42-.374.995-.374 1.752v1.297h3.919l-.386 2.103-.287 1.564h-3.246v8.245C19.396 23.238 24 18.179 24 12.044c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.628 3.874 10.35 9.101 11.647Z' },
-  { id: 'instagram', name: 'Instagram', color: '#e1306c', text: '#fff',    border: 'border-pink-700',
-    path: 'M12 0C8.74 0 8.333.015 7.053.072 5.775.132 4.905.333 4.14.63c-.789.306-1.459.717-2.126 1.384S.935 3.35.63 4.14C.333 4.905.131 5.775.072 7.053.012 8.333 0 8.74 0 12s.015 3.667.072 4.947c.06 1.277.261 2.148.558 2.913.306.788.717 1.459 1.384 2.126.667.666 1.336 1.079 2.126 1.384.766.296 1.636.499 2.913.558C8.333 23.988 8.74 24 12 24s3.667-.015 4.947-.072c1.277-.06 2.148-.262 2.913-.558.788-.306 1.459-.718 2.126-1.384.666-.667 1.079-1.335 1.384-2.126.296-.765.499-1.636.558-2.913.06-1.28.072-1.687.072-4.947s-.015-3.667-.072-4.947c-.06-1.277-.262-2.149-.558-2.913-.306-.789-.718-1.459-1.384-2.126C21.319 1.347 20.651.935 19.86.63c-.765-.297-1.636-.499-2.913-.558C15.667.012 15.26 0 12 0zm0 2.16c3.203 0 3.585.016 4.85.071 1.17.055 1.805.249 2.227.415.562.217.96.477 1.382.896.419.42.679.819.896 1.381.164.422.36 1.057.413 2.227.057 1.266.07 1.646.07 4.85s-.015 3.585-.074 4.85c-.061 1.17-.256 1.805-.421 2.227-.224.562-.479.96-.899 1.382-.419.419-.824.679-1.38.896-.42.164-1.065.36-2.235.413-1.274.057-1.649.07-4.859.07-3.211 0-3.586-.015-4.859-.074-1.171-.061-1.816-.256-2.236-.421-.569-.224-.96-.479-1.379-.899-.421-.419-.69-.824-.9-1.38-.165-.42-.359-1.065-.42-2.235-.045-1.26-.061-1.649-.061-4.844 0-3.196.016-3.586.061-4.861.061-1.17.255-1.814.42-2.234.21-.57.479-.96.9-1.381.419-.419.81-.689 1.379-.898.42-.166 1.051-.361 2.221-.421 1.275-.045 1.65-.06 4.859-.06zm0 3.678c-3.405 0-6.162 2.76-6.162 6.162 0 3.405 2.76 6.162 6.162 6.162 3.405 0 6.162-2.76 6.162-6.162 0-3.405-2.76-6.162-6.162-6.162zM12 16c-2.21 0-4-1.79-4-4s1.79-4 4-4 4 1.79 4 4-1.79 4-4 4zm7.846-10.405c0 .795-.646 1.44-1.44 1.44-.795 0-1.44-.646-1.44-1.44 0-.794.646-1.439 1.44-1.439.793-.001 1.44.645 1.44 1.439z' },
-  { id: 'linkedin',  name: 'LinkedIn',  color: '#0a66c2', text: '#fff',    border: 'border-blue-800',
-    path: 'M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433a2.062 2.062 0 0 1-2.063-2.065 2.063 2.063 0 1 1 2.063 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z' },
-  { id: 'reddit',    name: 'Reddit',    color: '#ff4500', text: '#fff',    border: 'border-orange-700',
-    path: 'M12 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0zm5.01 4.744c.688 0 1.25.561 1.25 1.249a1.25 1.25 0 0 1-2.498.056l-2.597-.547-.8 3.747c1.824.07 3.48.632 4.674 1.488.308-.309.73-.491 1.207-.491.968 0 1.754.786 1.754 1.754 0 .716-.435 1.333-1.01 1.614a3.111 3.111 0 0 1 .042.52c0 2.694-3.13 4.87-7.004 4.87-3.874 0-7.004-2.176-7.004-4.87 0-.183.015-.366.043-.534A1.748 1.748 0 0 1 4.028 12c0-.968.786-1.754 1.754-1.754.464 0 .898.196 1.207.49 1.207-.883 2.878-1.43 4.744-1.487l.885-4.182a.342.342 0 0 1 .14-.197.35.35 0 0 1 .238-.042l2.906.617a1.214 1.214 0 0 1 1.108-.701zM9.25 12C8.561 12 8 12.562 8 13.25c0 .687.561 1.248 1.25 1.248.687 0 1.248-.561 1.248-1.249 0-.688-.561-1.249-1.249-1.249zm5.5 0c-.687 0-1.248.561-1.248 1.25 0 .687.561 1.248 1.249 1.248.687 0 1.249-.561 1.249-1.249 0-.687-.562-1.249-1.25-1.249zm-5.466 3.99a.327.327 0 0 0-.231.094.33.33 0 0 0 0 .463c.842.842 2.484.913 2.961.913.477 0 2.105-.056 2.961-.913a.361.361 0 0 0 .029-.463.33.33 0 0 0-.464 0c-.547.533-1.684.73-2.512.73-.828 0-1.979-.196-2.512-.73a.326.326 0 0 0-.232-.095z' },
+  { id: 'google',    name: 'Google',    color: '#fff', text: '#3c4043', glyph: 'G', border: 'border-stone-400' },
+  { id: 'microsoft', name: 'Microsoft', color: '#fff', text: '#5e5e5e', glyph: '⊞', border: 'border-stone-400' },
+  { id: 'x',         name: 'X',         color: '#000', text: '#fff',    glyph: '𝕏', border: 'border-stone-700' },
+  { id: 'facebook',  name: 'Facebook',  color: '#1877f2', text: '#fff', glyph: 'f', border: 'border-blue-700' },
+  { id: 'instagram', name: 'Instagram', color: '#e1306c', text: '#fff', glyph: '◷', border: 'border-pink-700' },
+  { id: 'linkedin',  name: 'LinkedIn',  color: '#0a66c2', text: '#fff', glyph: 'in', border: 'border-blue-800' },
 ];
 
 function _readSession() {
@@ -3361,63 +2810,19 @@ async function _emailPasswordReset(email, newPassword) {
   return true;
 }
 
-
-// v4.7.38: returning-user breadcrumb. ONLY stores email + displayName so the
-// next session can personalize the greeting and pre-fill the email field.
-// Lives in localStorage (not sessionStorage) so it survives tab close. No
-// password, no token, no session data — those still live in sessionStorage.
-const _LAST_USER_KEY = 'edgelane_last_user_v1';
-function _readLastUser() {
-  try { const raw = localStorage.getItem(_LAST_USER_KEY); return raw ? JSON.parse(raw) : null; } catch { return null; }
-}
-function _writeLastUser(user) {
-  try {
-    if (user && user.email) {
-      localStorage.setItem(_LAST_USER_KEY, JSON.stringify({
-        email: user.email,
-        displayName: user.displayName || (user.email.split('@')[0]),
-      }));
-    }
-  } catch {}
-}
-
-// v4.7.38: Local time of day → friendly greeting
-function _greetingForLocalTime(date) {
-  const h = (date || new Date()).getHours();
-  if (h < 5)  return 'Welcome back';      // late-night / red-eye
-  if (h < 12) return 'Good morning';
-  if (h < 17) return 'Good afternoon';
-  if (h < 22) return 'Good evening';
-  return 'Good night';
-}
-
 function AuthDialog({ onSignedIn }) {
   const [mode, setMode] = useState('signin'); // signin | signup | forgot
-  // v4.7.38: pre-fill email from the returning-user breadcrumb
-  const [lastUser] = useState(() => _readLastUser());
-  const [email, setEmail] = useState(() => lastUser?.email || '');
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [forgotStage, setForgotStage] = useState('email'); // email | newpwd | done
 
-  // v4.7.38: subtitle changes by mode. For sign-in, personalize with the
-  // returning user's first name when known.
-  const subtitle = (() => {
-    if (mode === 'signup') return 'Create your account';
-    if (mode === 'forgot') return 'Reset password';
-    const greet = _greetingForLocalTime();
-    const firstname = (lastUser?.displayName || '').split(/[\s@]/)[0];
-    if (firstname) return `${greet}, ${firstname}`;
-    return greet;
-  })();
-
   const handleOAuth = async (pid) => {
     setBusy(true); setError(null);
     try {
       const session = await _simulatedOAuthSignIn(pid);
-      _writeLastUser(session.user);
       onSignedIn(session);
     } catch (e) { setError(e.message); } finally { setBusy(false); }
   };
@@ -3427,7 +2832,6 @@ function AuthDialog({ onSignedIn }) {
     setBusy(true); setError(null);
     try {
       const session = await _emailPasswordSignIn(email, password);
-      _writeLastUser(session.user);
       onSignedIn(session);
     } catch (err) { setError(err.message); } finally { setBusy(false); }
   };
@@ -3438,7 +2842,6 @@ function AuthDialog({ onSignedIn }) {
     setBusy(true); setError(null);
     try {
       const session = await _emailPasswordSignUp(email, password);
-      _writeLastUser(session.user);
       onSignedIn(session);
     } catch (err) { setError(err.message); } finally { setBusy(false); }
   };
@@ -3468,27 +2871,22 @@ function AuthDialog({ onSignedIn }) {
                style={{ textShadow: '0 1px 0 rgba(167,243,208,0.35), 0 2px 2px rgba(0,0,0,0.6)' }}>
             EDGELANE
           </div>
-          <div className="text-[11px] text-stone-300 font-num tracking-widest uppercase mt-2">
-            {subtitle}
+          <div className="text-[10px] text-stone-500 font-num tracking-widest uppercase mt-1">
+            {mode === 'signup' ? 'Create your account' : mode === 'forgot' ? 'Reset password' : 'Welcome back'}
           </div>
-          {mode === 'signin' && lastUser?.email && (
-            <div className="text-[10px] text-stone-500 mt-1">welcome back</div>
-          )}
         </div>
 
         {mode !== 'forgot' && (
           <>
-            <div className="flex flex-wrap justify-center gap-2 mb-4">
+            <div className="grid grid-cols-3 gap-2 mb-4">
               {SIMULATED_OAUTH_PROVIDERS.map(p => (
                 <Tooltip key={p.id} content={`Sign in with ${p.name} (simulated)`}>
                   <button
                     onClick={() => handleOAuth(p.id)} disabled={busy}
-                    className={`w-12 h-12 rounded-md border ${p.border} flex items-center justify-center transition-opacity hover:opacity-80 disabled:opacity-50 disabled:cursor-wait`}
+                    className={`h-11 rounded-md border ${p.border} flex items-center justify-center text-base font-bold transition-opacity hover:opacity-80 disabled:opacity-50 disabled:cursor-wait`}
                     style={{ background: p.color, color: p.text }}
                     aria-label={`Sign in with ${p.name}`}>
-                    <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                      <path d={p.path} />
-                    </svg>
+                    {p.glyph}
                   </button>
                 </Tooltip>
               ))}
@@ -3944,35 +3342,15 @@ function OrderDialog({ candidate, symbol, expiration, connection, onClose }) {
   const liveEdge = lp ? (isCredit ? (lp.current - lp.breakeven) : (lp.breakeven - lp.current)) : 0;
   const beatsMarket = liveEdge >= 0;
   const initialMode = beatsMarket ? 'market' : 'limit';
-  // v4.7.60: default limit picks the BEST achievable price in the trade's
-  // direction, comparing the algorithm's modest tier target against the live
-  // market mid. Previously we always seeded with the modest tier — which
-  // sandbagged credit spreads when the live market was offering a better
-  // credit than the algorithm's conservative target (e.g. modest=$2.96 but
-  // market mid=$4.30 → user undersold by $1.34 if they accepted the default).
-  //   credit (sell): higher price = more credit, pick MAX
-  //   debit  (buy):  lower  price = less cost,   pick MIN
-  // Falls back to candidate.net_premium if nothing else is available.
-  const tierTarget   = lp?.tiers?.find(t => t.feasible)?.target;
-  const marketCur    = lp?.current;
-  const breakeven    = lp?.breakeven;
-  const limitOptions = [tierTarget, marketCur, breakeven]
-    .filter(v => v != null && !isNaN(Number(v)))
-    .map(Number);
-  let initialLimit;
-  if (limitOptions.length === 0) {
-    initialLimit = Number(candidate.net_premium) || 0;
-  } else if (isCredit) {
-    initialLimit = Math.max(...limitOptions);
-  } else {
-    initialLimit = Math.min(...limitOptions);
-  }
+  // Default limit price = the most achievable tier price (modest) if reachable,
+  // else breakeven price.
+  const initialLimit = lp
+    ? (lp.tiers?.find(t => t.feasible)?.target ?? lp.breakeven ?? lp.current ?? candidate.net_premium)
+    : candidate.net_premium;
 
   const [mode, setMode] = useState(initialMode);
   const [limitPrice, setLimitPrice] = useState(Number(initialLimit).toFixed(2));
   const [duration, setDuration] = useState('day');
-  // v4.7.45: contract quantity input (defaults to 1)
-  const [quantity, setQuantity] = useState(1);
   const [health, setHealth] = useState({ checking: true, ok: null, message: 'Checking connection…' });
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState(null);
@@ -3996,7 +3374,7 @@ function OrderDialog({ candidate, symbol, expiration, connection, onClose }) {
     if (!connection || !health.ok) return;
     setSubmitting(true); setError(null);
     try {
-      const r = await _submitOrderToActiveBroker(connection, candidate, symbol, expiration, mode, mode === 'market' ? null : Number(limitPrice), quantity);
+      const r = await _submitOrderToActiveBroker(connection, candidate, symbol, expiration, mode, mode === 'market' ? null : Number(limitPrice));
       setResult(r);
     } catch (e) {
       setError(e.message);
@@ -4080,19 +3458,6 @@ function OrderDialog({ candidate, symbol, expiration, connection, onClose }) {
                 </div>
               )}
               <div>
-                <label className="block text-[10px] font-num uppercase tracking-widest text-stone-500 mb-1.5">Contracts</label>
-                <input type="number" min="1" step="1" value={quantity}
-                  onChange={e => setQuantity(Math.max(1, Math.floor(Number(e.target.value) || 1)))}
-                  className="w-full bg-stone-900 border border-stone-700 rounded-md px-3 py-2 text-sm text-stone-100 font-num" />
-                {candidate?.max_profit != null && candidate?.max_loss != null && (
-                  <div className="mt-1.5 text-[10px] text-stone-500 font-num leading-snug">
-                    Total max profit: <span className="text-emerald-300">+${(candidate.max_profit * quantity * 100).toFixed(0)}</span>
-                    <span className="mx-2">·</span>
-                    Total max loss: <span className="text-rose-300">−${(candidate.max_loss * quantity * 100).toFixed(0)}</span>
-                  </div>
-                )}
-              </div>
-              <div>
                 <label className="block text-[10px] font-num uppercase tracking-widest text-stone-500 mb-1.5">Time-in-force</label>
                 <select value={duration} onChange={e => setDuration(e.target.value)}
                   className="w-full bg-stone-900 border border-stone-700 rounded-md px-3 py-2 text-sm text-stone-100">
@@ -4115,7 +3480,7 @@ function OrderDialog({ candidate, symbol, expiration, connection, onClose }) {
               </button>
               <button onClick={handleExecute} disabled={submitting || !health.ok}
                 className="px-4 py-2 text-xs font-num uppercase tracking-widest text-emerald-50 bg-emerald-600 hover:bg-emerald-500 rounded disabled:opacity-40 disabled:cursor-not-allowed">
-                {submitting ? 'Submitting…' : `Execute ${mode} · ${quantity} contract${quantity > 1 ? 's' : ''}`}
+                {submitting ? 'Submitting…' : `Execute ${mode}`}
               </button>
             </div>
           </>
@@ -4144,59 +3509,21 @@ function OrderDialog({ candidate, symbol, expiration, connection, onClose }) {
   );
 }
 
-// v4.7.61: direction-aware 3-lens positioning strip.
-//
-// Pre-v4.7.61: the strip always shouted "⚠ lenses diverge" whenever the
-// strike span between GEX/VEX/TEX exceeded 5 chain steps — even when all
-// three walls were on the SAME side of spot and PULLING IN THE SAME
-// DIRECTION. That's confirmation, not divergence. A bear-call setup with
-// all walls below spot was getting flagged as cautionary when the lenses
-// were actually supporting the trade.
-//
-// New logic:
-//   1. Compare wall strikes to spot (above / below / at).
-//   2. If walls split across spot → real divergence → amber warning.
-//   3. If all on same side, compare pull direction to the candidate's
-//      strategy thesis (bear_call/bear_put = down; bull_call/bull_put = up;
-//      IC/butterfly = neutral).
-//        - Match  → green "✓ lenses confirm"
-//        - Oppose → amber "⚠ pull against thesis"
-//        - Neutral thesis + aligned-elsewhere → amber informational
-//   4. Tight aligned cluster matching neutral thesis: hidden (no signal).
-//
-// Strike granularity (stepGuess) is still computed from candidate legs to
-// stay chain-aware for the span gate on info-only states.
-function _thesisDirection(candidate) {
-  // 'up' = profits when price rises / stays above; 'down' = inverse;
-  // 'neutral' = profits when price pins; null = unknown shape.
-  if (!candidate?.strikes) return null;
-  const s = candidate.strikes;
-  if (s.center != null) return 'neutral';   // butterfly / iron butterfly
-  const hasShortCall = s.short_call != null;
-  const hasShortPut  = s.short_put  != null;
-  const hasLongCall  = s.long_call  != null;
-  const hasLongPut   = s.long_put   != null;
-  const isCredit = candidate.type === 'credit';
-  if (isCredit) {
-    if (hasShortCall && hasShortPut) return 'neutral'; // iron condor
-    if (hasShortCall) return 'down';                    // bear_call
-    if (hasShortPut)  return 'up';                      // bull_put
-  } else {
-    if (hasLongCall && hasLongPut) return 'neutral';
-    if (hasLongCall) return 'up';                       // bull_call (debit)
-    if (hasLongPut)  return 'down';                     // bear_put (debit)
-  }
-  return null;
-}
-
+// v4.7.29: helper for the optional 3-lens positioning strip. Returns either
+// null (lenses agree → don't render) or a render-ready spec. Threshold is
+// "walls disagree by more than 5 strikes" — i.e. the span between the min and
+// max wall strike must exceed 5 of the same chain's strike granularity.
+//   For SPY/QQQ on liquid expirations that's $5 actual.
+//   For high-strike names ($300+) it's effectively $5 too.
+// We compute strike granularity from the candidate's own legs to stay
+// chain-aware (a $50-stock chain steps in $0.50 or $1; a $500-stock chain
+// usually steps in $5).
 function _buildLensesStrip(biasResult, candidate) {
   if (!biasResult) return null;
   const gex = biasResult.gex_wall_strike;
   const vex = biasResult.vex_wall_strike;
   const tex = biasResult.tex_wall_strike;
-  const spot = Number(biasResult.spot) || 0;
-  if (gex == null || vex == null || tex == null || !spot) return null;
-
+  if (gex == null || vex == null || tex == null) return null;
   // Strike granularity from candidate legs (median consecutive diff)
   const legs = (candidate?.legs || []).map(l => Number(l.strike)).filter(s => !isNaN(s));
   const sortedLegs = [...new Set(legs)].sort((a,b)=>a-b);
@@ -4208,73 +3535,21 @@ function _buildLensesStrip(biasResult, candidate) {
   }
   const strikes = [gex, vex, tex];
   const span = Math.max(...strikes) - Math.min(...strikes);
-
-  // Side of spot per wall
-  const sides = strikes.map(s => s < spot ? 'below' : s > spot ? 'above' : 'at');
-  const allBelow = sides.every(s => s === 'below');
-  const allAbove = sides.every(s => s === 'above');
-  const split    = !allBelow && !allAbove && sides.some(s => s === 'below') && sides.some(s => s === 'above');
-  const pullDir  = allBelow ? 'down' : allAbove ? 'up' : null;
-  const thesis   = _thesisDirection(candidate);
-
-  // Tag each wall relative to spot (clearer than relative to GEX)
-  const tagRelSpot = (val) => {
-    if (val == null) return '';
-    if (val < spot) return ' (pull below)';
-    if (val > spot) return ' (pull above)';
-    return ' (at spot)';
+  // Threshold: divergence > 5 strike steps. Below this, hide the strip.
+  if (span <= 5 * stepGuess) return null;
+  // Label each lens with its position relative to the GEX anchor.
+  const tag = (val) => {
+    if (val == null || val === gex) return '';
+    return val < gex ? ' (pull below)' : ' (pull above)';
   };
-
-  let status, label, tooltipHeader, tooltipBody;
-  if (split) {
-    status = 'diverge';
-    label  = '⚠ lenses diverge';
-    tooltipHeader = 'Lenses split across spot';
-    tooltipBody = 'GEX (structural magnet), VEX (vol magnet), and TEX (decay-burn zone) are on different sides of current price — competing gravity wells. Price has no clean direction. Consider tightening strikes, cutting size, or waiting for the lenses to re-converge.';
-  } else if (thesis === 'down' && pullDir === 'down') {
-    status = 'confirm';
-    label  = '✓ lenses confirm';
-    tooltipHeader = 'Lenses agree with thesis (pull down)';
-    tooltipBody = 'All three walls — GEX, VEX, TEX — pull below spot. This bearish spread profits when price stays down or drifts lower. Triple-lens agreement is higher conviction than the GEX wall alone.';
-  } else if (thesis === 'up' && pullDir === 'up') {
-    status = 'confirm';
-    label  = '✓ lenses confirm';
-    tooltipHeader = 'Lenses agree with thesis (pull up)';
-    tooltipBody = 'All three walls — GEX, VEX, TEX — pull above spot. This bullish spread profits when price stays up or drifts higher. Triple-lens agreement is higher conviction than the GEX wall alone.';
-  } else if ((thesis === 'down' && pullDir === 'up') || (thesis === 'up' && pullDir === 'down')) {
-    status = 'against';
-    label  = `⚠ pull against thesis`;
-    tooltipHeader = `Walls pull ${pullDir}, opposite of trade direction`;
-    tooltipBody = `All three walls pull ${pullDir}, but this spread profits when price moves the OTHER way. Even with a healthy composite, dealer-positioning is signaling drift toward the wrong side. Consider passing or re-sizing.`;
-  } else if (thesis === 'neutral' && pullDir) {
-    // IC / fly: walls clustering off-spot is bad (price drifts away from center).
-    if (span <= 5 * stepGuess) return null;
-    status = 'against';
-    label  = `⚠ lenses pull ${pullDir}`;
-    tooltipHeader = `Walls cluster ${pullDir} of spot`;
-    tooltipBody = `All three lenses pull ${pullDir} of current price. For a range-bound (neutral) strategy, this is bad — price is likely to drift away from your profit zone rather than pin between your shorts.`;
-  } else {
-    // Unknown thesis, aligned — informational only, gated by span threshold.
-    if (span <= 5 * stepGuess) return null;
-    status = 'info';
-    label  = `lenses aligned ${pullDir}`;
-    tooltipHeader = `Walls cluster ${pullDir} of spot`;
-    tooltipBody = `All three lenses pull ${pullDir}. No strategy-specific recommendation for this candidate shape.`;
-  }
-
   return {
     gex, vex, tex,
-    gexTag: tagRelSpot(gex),
-    vexTag: tagRelSpot(vex),
-    texTag: tagRelSpot(tex),
-    status,
-    label,
-    tooltipHeader,
-    tooltipBody,
+    vexTag: tag(vex),
+    texTag: tag(tex),
   };
 }
 
-function CandidateCard({ candidate, isBest, symbol, expiration, biasResult, contracts, onPushBroker, hasActiveBroker, connection }) {
+function CandidateCard({ candidate, isBest, symbol, expiration, biasResult, contracts, onPushBroker, hasActiveBroker }) {
   const c = candidate;
   const isCredit = c.type === 'credit';
   const labelColor = c.label === 'Conservative' ? 'emerald' : c.label === 'Balanced' ? 'amber' : 'rose';
@@ -4396,7 +3671,7 @@ function CandidateCard({ candidate, isBest, symbol, expiration, biasResult, cont
       </div>
 
       {/* Trade-action buttons (v4.7.7) */}
-      <CardActions candidate={c} symbol={symbol} expiration={expiration} onPushBroker={onPushBroker} hasActiveBroker={hasActiveBroker} connection={connection} />
+      <CardActions candidate={c} symbol={symbol} expiration={expiration} onPushBroker={onPushBroker} hasActiveBroker={hasActiveBroker} />
 
       {/* GEX wall verdict — only render when bias data provided a numeric wall */}
       {c.wall_penalty?.reason && (() => {
@@ -4414,45 +3689,27 @@ function CandidateCard({ candidate, isBest, symbol, expiration, biasResult, cont
         );
       })()}
 
-      {/* v4.7.61: 3-lens positioning strip — direction-aware.
-          Renders green when lenses CONFIRM the candidate's thesis, amber when
-          they oppose it or split across spot. The strip's helper function
-          decides which case applies; this just maps `status` to color+label. */}
-      {lenses && (() => {
-        const isConfirm = lenses.status === 'confirm';
-        const isInfo    = lenses.status === 'info';
-        // confirm → emerald; everything else (diverge / against / info-warn) → amber
-        const bgClass     = isConfirm ? 'border-emerald-800/70 bg-emerald-950/15 text-emerald-200'
-                                      : isInfo ? 'border-stone-700 bg-stone-900/30 text-stone-300'
-                                               : 'border-amber-800/70 bg-amber-950/15 text-amber-200';
-        const labelClass  = isConfirm ? 'text-emerald-400 font-bold'
-                                      : isInfo ? 'text-stone-200 font-bold'
-                                               : 'text-amber-400 font-bold';
-        const tagClass    = isConfirm ? 'text-emerald-700'
-                                      : isInfo ? 'text-stone-500'
-                                               : 'text-amber-700';
-        const numClass    = isConfirm ? 'text-emerald-200'
-                                      : isInfo ? 'text-stone-300'
-                                               : 'text-amber-200';
-        return (
-          <Tooltip content={
-            <div className="text-left text-[12px] leading-relaxed max-w-xs">
-              <div className="font-bold uppercase tracking-wider mb-1">{lenses.tooltipHeader}</div>
-              <div className="mb-1">{lenses.tooltipBody}</div>
-            </div>
-          }>
-            <div className={`mt-3 px-3 py-2 border border-dashed rounded-lg text-[11px] font-num cursor-help leading-snug ${bgClass}`}>
-              <span className={labelClass}>{lenses.label}</span>
-              <span className="text-stone-500 mx-2">·</span>
-              <span className="text-stone-300">GEX <span className="font-bold text-stone-100">${lenses.gex.toFixed(2)}</span><span className={tagClass}>{lenses.gexTag}</span></span>
-              <span className="text-stone-500 mx-2">·</span>
-              <span className={numClass}>VEX <span className="font-bold">${lenses.vex.toFixed(2)}</span><span className={tagClass}>{lenses.vexTag}</span></span>
-              <span className="text-stone-500 mx-2">·</span>
-              <span className={numClass}>TEX <span className="font-bold">${lenses.tex.toFixed(2)}</span><span className={tagClass}>{lenses.texTag}</span></span>
-            </div>
-          </Tooltip>
-        );
-      })()}
+      {/* v4.7.29: 3-lens positioning strip — only when GEX/VEX/TEX walls
+          diverge by more than 5 strikes. Hidden by default to avoid clutter. */}
+      {lenses && (
+        <Tooltip content={
+          <div className="text-left text-[12px] leading-relaxed max-w-xs">
+            <div className="font-bold uppercase tracking-wider mb-1">Lenses diverge</div>
+            <div className="mb-1">GEX (structural magnet), VEX (vol-magnet), and TEX (decay-burn zone) wall strikes don\'t line up. Price has more than one gravity well — your spread is structured around the GEX wall only.</div>
+            <div className="text-stone-300 mt-1">Either tighten the short strike toward the VEX/TEX side, cut size, or skip and wait for the lenses to re-converge.</div>
+          </div>
+        }>
+          <div className="mt-3 px-3 py-2 border border-dashed border-amber-800/70 rounded-lg bg-amber-950/15 text-[11px] font-num text-amber-200 cursor-help leading-snug">
+            <span className="text-amber-400 font-bold">⚠ lenses diverge</span>
+            <span className="text-stone-500 mx-2">·</span>
+            <span className="text-stone-300">GEX <span className="font-bold text-stone-100">${lenses.gex.toFixed(2)}</span></span>
+            <span className="text-stone-500 mx-2">·</span>
+            <span className="text-amber-200">VEX <span className="font-bold">${lenses.vex.toFixed(2)}</span><span className="text-amber-700">{lenses.vexTag}</span></span>
+            <span className="text-stone-500 mx-2">·</span>
+            <span className="text-amber-200">TEX <span className="font-bold">${lenses.tex.toFixed(2)}</span><span className="text-amber-700">{lenses.texTag}</span></span>
+          </div>
+        </Tooltip>
+      )}
 
       {/* Limit-order targets — scenario-aware tier table (v4.7.17) */}
       {c.limit_premiums && (() => {
@@ -4563,14 +3820,6 @@ export default function SpreadOptimizer() {
   const [symbol, setSymbol] = useState('SPY');
   const [strategy, setStrategy] = useState(null);
   const [expiration, setExpiration] = useState('');
-  // v4.7.44: per-symbol available-expirations list. Drives:
-  //   - native <input type="date"> min/max clamp (calendar range)
-  //   - auto-correct when user picks an unlisted date (equities have no dailies)
-  //   - inline notice telling user what we substituted
-  // Refreshes 300ms after the user stops typing a new symbol; clears on every
-  // symbol change so a stale list from a prior ticker can never mislead.
-  const [validExpirations, setValidExpirations] = useState([]);
-  const [expirationNotice, setExpirationNotice] = useState('');
   const [targetDelta, setTargetDelta] = useState(20);
   const [widthPref, setWidthPref] = useState('balanced');
 
@@ -4606,16 +3855,6 @@ export default function SpreadOptimizer() {
   // or 'lookup' (BS projection grid across hypothetical spot × time). Phase 2
   // will let a Lookup selection rewire the ticket math; for now it's read-only.
   const [resultsTab, setResultsTab] = useState('tickets');
-  // v4.7.47: tick counter that bumps when the user switches to the Tickets
-  // tab. Included in the candidates useMemo deps so generateCandidates
-  // re-runs with the CURRENT-TIME DTE, refreshing POP / EV / composite /
-  // limit-tier targets to reflect time decay since the chain was fetched.
-  // Lookup tab is already live (its grid uses Date.now() per render); this
-  // closes the loop so flipping Tickets ↔ Lookup keeps the two consistent.
-  const [tickerTick, setTickerTick] = useState(0);
-  useEffect(() => {
-    if (resultsTab === 'tickets') setTickerTick(t => t + 1);
-  }, [resultsTab]);
   // Bias narrative + signal panels collapse — initial state from config flag
   const [biasNarrativeOpen, setBiasNarrativeOpen] = useState(
     (typeof window !== 'undefined' && window.BIAS_NARRATIVE_OPEN_DEFAULT === true)
@@ -4663,41 +3902,6 @@ export default function SpreadOptimizer() {
   const chainStale = !!(chainData && lastBiasFetch && lastChainFetch
     && lastBiasFetch.getTime() > lastChainFetch.getTime());
 
-  // v4.7.44: fetch the symbol's expirations 300ms after the user stops typing.
-  // Debounced so partial entries like "N", "NV", "NVD", "NVDA" don't fire 4 calls.
-  // Clears the list immediately on symbol change to avoid stale-list confusion.
-  useEffect(() => {
-    setValidExpirations([]);
-    setExpirationNotice('');
-    if (!symbol || symbol.length < 1) return;
-    const t = setTimeout(async () => {
-      try {
-        if (typeof dataProvider.optionExpirations !== 'function') return;
-        const list = await dataProvider.optionExpirations(symbol.toUpperCase());
-        setValidExpirations(Array.isArray(list) ? list.slice().sort() : []);
-      } catch { /* swallow — leaves list empty, calendar unconstrained */ }
-    }, 300);
-    return () => clearTimeout(t);
-  }, [symbol]);
-
-  // v4.7.44: when the validExpirations list arrives or the user picks a date,
-  // auto-correct unlisted picks to the next available expiration. Surfaces a
-  // small inline notice so the user knows the date was redirected. Cleared
-  // when the chosen date IS in the list.
-  useEffect(() => {
-    if (!expiration || validExpirations.length === 0) { setExpirationNotice(''); return; }
-    if (validExpirations.includes(expiration)) { setExpirationNotice(''); return; }
-    const todayLocal = new Date().toLocaleDateString('en-CA');
-    const next = validExpirations.find(d => d >= expiration)
-              || validExpirations.find(d => d >= todayLocal)
-              || validExpirations[0];
-    if (next && next !== expiration) {
-      setExpiration(next);
-      setBiasCache(null); setChainCache(null);
-      setExpirationNotice(`${symbol.toUpperCase()} has no options for ${expiration} — switched to next available ${next}.`);
-    }
-  }, [expiration, validExpirations, symbol]);
-
   // Set wait cursor on body when loading
   useEffect(() => {
     document.body.style.cursor = (biasLoading || chainLoading) ? 'wait' : 'auto';
@@ -4709,27 +3913,14 @@ export default function SpreadOptimizer() {
     if (!chainData || !strategy) return [];
     const td = targetDelta / 100;
     const wf = WIDTH_PREFS[widthPref].factor;
+    // Pull dominant gamma wall from cached bias data. If the LLM didn't return
+    // numeric wall data (older responses or low-confidence reads), wall penalty
+    // is a no-op (factor 1.0) and behavior matches pre-feature ranking.
     const walls = biasResult?.gex_wall_strike != null
-      ? {
-          strike: biasResult.gex_wall_strike,
-          strength: biasResult.gex_wall_strength || 'medium',
-          type: biasResult.gex_wall_type || null,    // v4.7.65: 'put' | 'call' | 'mixed'
-          netGex: Number(biasResult.net_gex) || 0,
-          dte: Number(biasResult.dte) || null,
-        }
+      ? { strike: biasResult.gex_wall_strike, strength: biasResult.gex_wall_strength || 'medium' }
       : null;
-    // v4.7.47: derive live DTE from current time instead of using the static
-    // chain-fetch-time snapshot. This makes the Tickets card numbers (POP /
-    // EV / composite / limit tiers) tick down as time passes — same approach
-    // the Lookup grid uses for its NOW-cell anchor. Falls back to the cached
-    // value if expiration isn't known.
-    const liveDte = (() => {
-      if (!expiration) return chainData.dte;
-      const expMs = _msAtETClock(expiration, 16, 0);
-      return Math.max(0, (expMs - Date.now()) / 86_400_000);
-    })();
-    return generateCandidates(strategy, chainData.contracts, liveDte, chainData.expectedMove, td, wf, walls);
-  }, [chainData, strategy, targetDelta, widthPref, biasResult, tickerTick, expiration]);
+    return generateCandidates(strategy, chainData.contracts, chainData.dte, chainData.expectedMove, td, wf, walls);
+  }, [chainData, strategy, targetDelta, widthPref, biasResult]);
 
   const bestPick = useMemo(() => pickBestCandidate(candidates), [candidates]);
 
@@ -4773,44 +3964,8 @@ export default function SpreadOptimizer() {
       const exposuresForChosen = ebd[chosen] || null;
       setLogSteps(s => [...s, `Spot ${spot.toFixed(2)}, exposures for ${chosen}. Running JS bias engine...`]);
 
-      // v4.7.58: for short-DTE plays (chosen expiration within ~2 days), the
-      // chosen chain alone reflects intraday flow rather than the durable
-      // dealer book. Smooth the REGIME signal (netGex/netDex) across the
-      // nearest 3 expirations weighted 0.5/0.3/0.2. The wall geometry stays
-      // per-chosen-expiration because the wall IS specific to the trade exit.
-      let regimeOverride = null;
-      const chosenDte = (() => {
-        if (!chosen) return null;
-        const t = new Date(chosen + 'T21:00:00Z');
-        return (t - new Date()) / 86400000;
-      })();
-      if (chosenDte != null && chosenDte < 2) {
-        const sortedDates = Object.keys(ebd).sort((a, b) => +new Date(a) - +new Date(b));
-        const idx = sortedDates.indexOf(chosen);
-        if (idx >= 0) {
-          const window = sortedDates.slice(idx, idx + 3);
-          const weights = [0.5, 0.3, 0.2];
-          let gxW = 0, dxW = 0, wSum = 0;
-          window.forEach((d, i) => {
-            const t = ebd[d] && ebd[d].totals;
-            const w = weights[i] != null ? weights[i] : 0.1;
-            if (t) { gxW += (t.net_gex || 0) * w; dxW += (t.net_dex || 0) * w; wSum += w; }
-          });
-          if (wSum > 0 && window.length >= 2) {
-            regimeOverride = { netGex: gxW / wSum, netDex: dxW / wSum };
-            console.info(`[bias regime] short-DTE (${chosenDte.toFixed(2)}d) smoothed across ${window.length} expirations [${window.join(', ')}]:`, regimeOverride);
-          }
-        }
-      }
-
       // STEP 2: deterministic JS bias engine
-      // v4.7.59: pass chosenDte so the engine can DTE-gate the regime
-      // interpretation (intraday → wall as magnet always; multi-day → regime-aware).
-      const computed = _computeBiasSignals(sym, expiration, spot, greeksRaw, exposuresForChosen, regimeOverride, chosenDte);
-      const dteRegimeNote = (chosenDte != null && chosenDte < 1.5)
-        ? ' (intraday — multi-day regime sign IGNORED; wall = magnet)'
-        : '';
-      console.info(`[bias engine] sym=${sym} exp=${chosen} dte=${chosenDte != null ? chosenDte.toFixed(2) : 'n/a'} netGex=${(regimeOverride?.netGex ?? _aggregateExposures(exposuresForChosen, greeksRaw?.portfolio_totals).netGex).toFixed(0)}${dteRegimeNote} → score=${computed.directional_score} → ${computed.bias_label}`);
+      const computed = _computeBiasSignals(sym, expiration, spot, greeksRaw, exposuresForChosen);
       setLogSteps(s => [...s, `Bias: ${computed.bias_label} (score ${computed.directional_score}, ${computed.confidence} conf). Asking Gemini for narrative...`]);
 
       // STEP 3: Gemini prose-only call. Pass JS-computed values as facts; the
@@ -4821,8 +3976,8 @@ export default function SpreadOptimizer() {
 FACTS:
 - Spot price: ${spot}
 - Directional bias: ${computed.bias_label.replace('_',' ')} (score ${computed.directional_score} on -100..100 scale, confidence ${computed.confidence})
-- Dominant gamma wall: ${computed.gex_wall_type ? (computed.gex_wall_type === 'mixed' ? 'mixed put/call wall' : `${computed.gex_wall_type} wall`) : 'wall'} at strike ${computed.gex_wall_strike} (${computed.gex_wall_strength} strength)
-- Spot is ${f.wallSide} this ${computed.gex_wall_type === 'mixed' ? 'mixed wall' : (computed.gex_wall_type || 'wall')} by ${computed.gex_wall_strike != null ? Math.abs(spot - computed.gex_wall_strike).toFixed(2) : 'N/A'}
+- Dominant gamma wall strike: ${computed.gex_wall_strike} (${computed.gex_wall_strength} strength)
+- Spot is ${f.wallSide} the wall by ${computed.gex_wall_strike != null ? Math.abs(spot - computed.gex_wall_strike).toFixed(2) : 'N/A'}
 - Net dealer gamma (chosen expiration): ${f.gammaRegime} (raw: ${f.netGex.toFixed(0)})
 - Net dealer delta exposure: ${f.dexSkewSide} (raw: ${f.netDex.toFixed(0)})
 - Recommended strategies (in order): ${computed.recommended_strategies.join(', ')}
@@ -4851,16 +4006,8 @@ OUTPUT JSON only:
         directional_score: computed.directional_score,
         bias_label: computed.bias_label,
         confidence: computed.confidence,
-        net_gex: computed.net_gex,  // v4.7.57: carried through for wall-penalty regime gating
         gex_wall_strike: computed.gex_wall_strike,
         gex_wall_strength: computed.gex_wall_strength,
-        gex_wall_type: computed.gex_wall_type,
-        put_wall_strike:    computed.put_wall_strike,
-        put_wall_strength:  computed.put_wall_strength,
-        put_wall_net_gex:   computed.put_wall_net_gex,
-        call_wall_strike:   computed.call_wall_strike,
-        call_wall_strength: computed.call_wall_strength,
-        call_wall_net_gex:  computed.call_wall_net_gex,
         // v4.7.29: VEX/TEX walls drive the optional 3-lens divergence strip on
         // candidate cards. Only render when all three are present AND they
         // disagree by more than 5 strikes (handled in CandidateCard).
@@ -4894,39 +4041,10 @@ OUTPUT JSON only:
     setLogSteps(s => [...s, 'Pulling chain via provider REST (one call, ±30% strike band)...']);
 
     try {
-      // v4.7.43: pre-flight validate the picked expiration. Equity tickers
-      // (e.g. NVDA) don't have dailies — only Friday weeklies plus monthlies.
-      // Hitting an unlisted date returns an empty chain silently, which made
-      // the bottom panel flicker and hide with no clear error. Now we fetch
-      // the symbol's actual expirations list first and surface a clean
-      // selection error with valid dates the user can pick from.
-      let validExpirations = [];
-      if (typeof dataProvider.optionExpirations === 'function') {
-        try {
-          validExpirations = await dataProvider.optionExpirations(symbol.toUpperCase());
-        } catch { /* swallow — fall through to letting the chain call run */ }
-      }
-      if (validExpirations.length > 0 && !validExpirations.includes(expiration)) {
-        const nearby = validExpirations.slice(0, 6).join(', ');
-        throw new Error(
-          `${symbol.toUpperCase()} has no options listed for ${expiration}. ` +
-          `Equity tickers typically only have Friday weeklies + monthly third-Fridays. ` +
-          `Available dates start: ${nearby}${validExpirations.length > 6 ? '\u2026' : ''}.`
-        );
-      }
       const data = await dataProvider.optionsChain(symbol.toUpperCase(), expiration, { strikeBandPct: 30, maxExpirations: 12 });
       // Refresh the live spot from the chain's parallel quote — guarantees the
       // displayed spot tracks every chain refresh, independent of bias.
       if (data?.spot) updateSpot(data.spot, 'fetchChain');
-      // v4.7.43: empty-chain backstop. If pre-flight didn't catch it (e.g. the
-      // provider doesn't expose optionExpirations or returned a stale list),
-      // an empty contracts array still means the date is unusable.
-      if (!data?.contracts || data.contracts.length === 0) {
-        throw new Error(
-          `${symbol.toUpperCase()} has no options for ${expiration}. ` +
-          `Pick a Friday weekly or monthly expiration listed by your broker.`
-        );
-      }
       setChainCache({ key: cacheKey, data }); setLastChainFetch(new Date());
       // v4.7.37: chainStale is now derived from lastBiasFetch > lastChainFetch,
       // so advancing lastChainFetch above is all that's needed to re-expand.
@@ -4941,7 +4059,7 @@ OUTPUT JSON only:
   const optimize = async () => {
     // v4.7.3: always force-refetch the chain. Bias is left alone (it changes
     // on a slower timescale than option premiums). v4.7.35: for a fresh bias
-    // read, click "Re-detect bias" — the chain auto-collapses
+    // read, click "Re-detect" — the chain auto-collapses
     // after a 2nd+ detect so you naturally come back to this button.
     await fetchChain(true);
   };
@@ -5070,21 +4188,8 @@ OUTPUT JSON only:
               </div>
               <div>
                 <label className="block text-[10px] font-num uppercase tracking-widest text-stone-500 mb-2">Expiration</label>
-                <input
-                  type="date"
-                  value={expiration}
-                  min={validExpirations[0] || undefined}
-                  max={validExpirations[validExpirations.length - 1] || undefined}
-                  onChange={(e) => { setExpiration(e.target.value); setBiasCache(null); setChainCache(null); }}
+                <input type="date" value={expiration} onChange={(e) => { setExpiration(e.target.value); setBiasCache(null); setChainCache(null); }}
                   className="w-full bg-black/40 border border-stone-700/60 rounded-lg px-4 py-3 text-base font-num text-stone-100 focus:outline-none focus:border-emerald-500/60 transition-colors" />
-                {expirationNotice && (
-                  <div className="mt-1.5 text-[10px] font-num text-amber-400 leading-snug">{expirationNotice}</div>
-                )}
-                {validExpirations.length > 0 && !expirationNotice && expiration && (
-                  <div className="mt-1.5 text-[10px] font-num text-stone-500">
-                    {validExpirations.length} expirations available · range {validExpirations[0]} → {validExpirations[validExpirations.length - 1]}
-                  </div>
-                )}
               </div>
               <div>
                 <label className="block text-[10px] font-num uppercase tracking-widest text-stone-500 mb-2">
@@ -5121,7 +4226,7 @@ OUTPUT JSON only:
                 ? '◌ Reading tape...'
                 : (
                   <>
-                    {biasResult ? '↻ Re-detect bias' : '⟶ Detect bias'}
+                    {biasResult ? '↻ Re-detect' : '⟶ Detect'}
                     {isSandbox && <span className="ml-2 text-rose-700">(SANDBOX)</span>}
                   </>
                 )}
@@ -5294,18 +4399,10 @@ OUTPUT JSON only:
                 <Stat label="ATM IV" value={`${chainData.atmIV?.toFixed(0)}%`} />
                 <Stat label="DTE" value={_formatDteForDisplay(chainData.dte)} />
                 <Stat label="Width Pref" value={WIDTH_PREFS[widthPref].name} />
-                {/* v4.7.67: split into Put Wall (magnet) + Call Wall (resistance)
-                    stat tiles. Mirrors EdgelaneProvider-style display where both walls
-                    are surfaced separately rather than collapsed into one. */}
                 <Stat
-                  label="Put Wall (magnet)"
-                  value={biasResult?.put_wall_strike != null ? `$${Number(biasResult.put_wall_strike).toFixed(2)}` : '—'}
-                  sub={biasResult?.put_wall_strike != null ? `${biasResult.put_wall_strength || 'low'} strength` : 'no put-side wall'}
-                />
-                <Stat
-                  label="Call Wall (resistance)"
-                  value={biasResult?.call_wall_strike != null ? `$${Number(biasResult.call_wall_strike).toFixed(2)}` : '—'}
-                  sub={biasResult?.call_wall_strike != null ? `${biasResult.call_wall_strength || 'low'} strength` : 'no call-side wall'}
+                  label="GEX Wall"
+                  value={biasResult?.gex_wall_strike != null ? `$${Number(biasResult.gex_wall_strike).toFixed(2)}` : '—'}
+                  sub={biasResult?.gex_wall_strike != null ? `${biasResult.gex_wall_strength || 'medium'} strength` : 'no wall data'}
                 />
               </div>
 
@@ -5372,7 +4469,6 @@ OUTPUT JSON only:
                         contracts={chainData?.contracts}
                         onPushBroker={(cand) => setOrderDialog({ candidate: cand })}
                         hasActiveBroker={!!broker.active}
-                        connection={broker.active}
                       />
                     ))}
                   </div>
@@ -5382,50 +4478,15 @@ OUTPUT JSON only:
               {/* LOOKUP TAB — projection grids (v4.7.20 phase 1; v4.7.29 adds
                   VEX/TEX cluster annotations + tooltip P&L decomposition) */}
               {resultsTab === 'lookup' && (
-                <div className="space-y-5 xl:-mx-24 2xl:-mx-48">
-                  {/* v4.7.42: lifted to slate card surface + per-legend tooltips */}
-                  <div className="bg-[#13131c] border border-stone-800/60 rounded-lg p-3 text-[12px] text-stone-300 leading-relaxed">
-                    <span className="font-num font-bold uppercase tracking-widest text-stone-300 mr-2">Lookup:</span>
+                <div className="space-y-5">
+                  <div className="bg-stone-900/40 border border-stone-800/40 rounded-lg p-3 text-[12px] text-stone-300 leading-relaxed">
+                    <span className="font-num font-bold uppercase tracking-widest text-stone-400 mr-2">Lookup:</span>
                     Premium over the next 3 hours at 15-minute steps, assuming today\'s implied volatility. Rows = hypothetical spot. <span className="text-emerald-300">Green</span> = profitable to close at that price; <span className="text-rose-300">red</span> = at a loss.
-                    <span className="text-stone-300"> Hover any cell to see the theta / delta / vega breakdown.</span>
-
-                    {/* Marker legend with tooltips */}
-                    <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-stone-400">
-                      <Tooltip content="Marks the row where current spot sits. The cell at (current spot, now) is anchored to this candidate's live mid premium.">
-                        <span className="cursor-help"><span className="text-emerald-400">▸</span> current spot</span>
-                      </Tooltip>
-                      <Tooltip content="Strikes near here are in the top quartile of vega × open interest. Premium re-prices faster than the linear model predicts when IV ticks — bump your mental error bars on these rows by ~1.3×.">
-                        <span className="cursor-help"><span className="text-amber-400">●</span> VEX cluster — vol re-prices fastest here</span>
-                      </Tooltip>
-                      <Tooltip content="Time columns where theta decay accelerates. Only flagged for ≤1 DTE because longer-DTE spreads have roughly constant theta per day. Plan exits in these columns to harvest faster.">
-                        <span className="cursor-help"><span className="text-amber-400">⌛</span> TEX cluster — theta-burn window (≤1 DTE only)</span>
-                      </Tooltip>
-                    </div>
-
-                    {/* Cell color legend — same 7 levels the heatmap renders, with per-tier tooltip guidance */}
-                    <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-stone-300">
-                      <span className="text-stone-400 uppercase tracking-widest font-num font-bold mr-1">Cell color:</span>
-                      <Tooltip content="Deep emerald — close here and you take essentially the full credit (credit spreads) or full payoff (debit spreads). Almost always worth closing if you see this early.">
-                        <span className="inline-flex items-center gap-1.5 cursor-help"><span className="inline-block w-4 h-3 rounded-sm bg-emerald-700/70 border border-emerald-600/50"></span>≥55% max profit</span>
-                      </Tooltip>
-                      <Tooltip content="Medium emerald — healthy partial gain. Typical early-close sweet spot for credit spreads (the 'take 50%' rule lives in this band).">
-                        <span className="inline-flex items-center gap-1.5 cursor-help"><span className="inline-block w-4 h-3 rounded-sm bg-emerald-800/55"></span>25–55%</span>
-                      </Tooltip>
-                      <Tooltip content="Faint emerald — small win. Usually not worth closing early unless you need the capital for a better setup or want to harvest a small theta tick.">
-                        <span className="inline-flex items-center gap-1.5 cursor-help"><span className="inline-block w-4 h-3 rounded-sm bg-emerald-900/40"></span>8–25%</span>
-                      </Tooltip>
-                      <Tooltip content="Neutral — you're roughly where you opened. The cell is informational; nothing to act on except waiting for the position to walk into either green or red bands.">
-                        <span className="inline-flex items-center gap-1.5 cursor-help"><span className="inline-block w-4 h-3 rounded-sm bg-stone-800/40 border border-stone-700/50"></span>±8% (near breakeven)</span>
-                      </Tooltip>
-                      <Tooltip content="Faint rose — small loss. Depending on time-to-expiration this can still recover; watch the column drift before reacting.">
-                        <span className="inline-flex items-center gap-1.5 cursor-help"><span className="inline-block w-4 h-3 rounded-sm bg-rose-900/40"></span>−8 to −25%</span>
-                      </Tooltip>
-                      <Tooltip content="Medium rose — meaningful loss. Consider rolling the threatened side, cutting size, or closing rather than holding to expiration.">
-                        <span className="inline-flex items-center gap-1.5 cursor-help"><span className="inline-block w-4 h-3 rounded-sm bg-rose-800/55"></span>−25 to −55%</span>
-                      </Tooltip>
-                      <Tooltip content="Deep rose — you're approaching max loss. Close decisively unless you have a specific catalyst-bet thesis that justifies riding it to expiry.">
-                        <span className="inline-flex items-center gap-1.5 cursor-help"><span className="inline-block w-4 h-3 rounded-sm bg-rose-700/70 border border-rose-600/50"></span>≥55% max loss</span>
-                      </Tooltip>
+                    <span className="text-stone-400"> Hover any cell to see the theta / delta / vega breakdown.</span>
+                    <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-stone-500">
+                      <span><span className="text-emerald-400">▸</span> current spot</span>
+                      <span><span className="text-amber-400">●</span> VEX cluster — vol re-prices fastest here</span>
+                      <span><span className="text-amber-400">⌛</span> TEX cluster — theta-burn window (≤1 DTE only)</span>
                     </div>
                   </div>
                   {candidates.map((c, idx) => {
@@ -5455,16 +4516,15 @@ OUTPUT JSON only:
                             {grid.missingIv && <span className="ml-2 text-amber-400 italic">(some legs missing IV — intrinsic fallback)</span>}
                           </div>
                         </div>
-                        {/* v4.7.46: vertical scroll only — fits horizontally */}
-                        <div className="overflow-y-auto overflow-x-hidden" style={{ maxHeight: '520px' }}>
-                          <table className="w-full font-num text-[11px] border-separate" style={{borderSpacing: '2px', tableLayout: 'fixed'}}>
+                        <div className="overflow-x-auto">
+                          <table className="w-full font-num text-[12px] border-separate" style={{borderSpacing: '2px'}}>
                             <thead>
                               <tr>
-                                <th className="text-left text-[10px] font-num uppercase tracking-widest text-stone-500 px-1 py-1" style={{width: '80px'}}>Spot ↓ / Time →</th>
+                                <th className="text-left text-[10px] font-num uppercase tracking-widest text-stone-500 px-2 py-1">Spot ↓ / Time →</th>
                                 {grid.timeAxis.map((t, j) => {
                                   const isTexCol = annot.texClusterCols.has(j);
                                   return (
-                                    <th key={j} className={`text-center text-[10px] font-num uppercase tracking-widest px-1 py-1 ${
+                                    <th key={j} className={`text-center text-[10px] font-num uppercase tracking-widest px-2 py-1 ${
                                       isTexCol ? 'bg-amber-900/30 text-amber-200 rounded' : 'text-stone-500'
                                     }`}>
                                       {t.label} {isTexCol && <span className="text-amber-400 ml-0.5">⌛</span>}
@@ -5479,13 +4539,13 @@ OUTPUT JSON only:
                                 const isVexRow = annot.vexClusterRows.has(i);
                                 return (
                                   <tr key={i}>
-                                    <td className={`px-1 py-1 text-right ${isCenter ? 'text-stone-100 font-bold' : 'text-stone-400'}`}>
+                                    <td className={`px-2 py-1 text-right ${isCenter ? 'text-stone-100 font-bold' : 'text-stone-400'}`}>
                                       {isVexRow && <span className="text-amber-400 mr-1">●</span>}
                                       ${grid.spotAxis[i].toFixed(2)}
                                       {isCenter && <span className="ml-1 text-[9px] text-emerald-400">▸</span>}
                                     </td>
                                     {row.map((px, j) => {
-                                      if (px == null) return <td key={j} className="px-1 py-1 text-stone-600">—</td>;
+                                      if (px == null) return <td key={j} className="px-2 py-1 text-stone-600">—</td>;
                                       const pnl = isCredit ? (live - px) : (px - live);
                                       const denom = pnl > 0 ? Math.max(0.05, c.max_profit) : Math.max(0.05, c.max_loss);
                                       const norm = Math.max(-1, Math.min(1, pnl / denom));
@@ -5529,7 +4589,7 @@ OUTPUT JSON only:
                                         </div>
                                       );
                                       return (
-                                        <td key={j} className={`px-1 py-1 text-center rounded ${cls} ${ringCls}`}>
+                                        <td key={j} className={`px-2 py-1 text-center rounded ${cls} ${ringCls}`}>
                                           <Tooltip content={tipContent}>
                                             <div className="cursor-help">{isCredit ? '+' : '−'}${Math.abs(px).toFixed(2)}</div>
                                           </Tooltip>
@@ -5562,4 +4622,30 @@ OUTPUT JSON only:
           )}
 
           <footer className="mt-12 pt-6 border-t border-stone-800/60 text-xs text-stone-600 font-num text-center">
-      
+            Not financial advice. Refresh to get the latest data.
+            <span className="mx-2 text-stone-700">·</span>
+            © {new Date().getFullYear()} EdgeLane. All rights reserved.
+          </footer>
+        </div>
+      </div>
+
+      {/* v4.7.30: settings + push-to-broker modals */}
+      {settingsOpen && (
+        <SettingsModal
+          session={auth.session}
+          broker={broker}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
+      {orderDialog && (
+        <OrderDialog
+          candidate={orderDialog.candidate}
+          symbol={symbol}
+          expiration={expiration}
+          connection={broker.active}
+          onClose={() => setOrderDialog(null)}
+        />
+      )}
+    </>
+  );
+}

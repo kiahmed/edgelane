@@ -4,100 +4,11 @@ What every badge, label, and number on the page means, and how to use the tool e
 
 ---
 
-## Sign in & user session
-
-EdgeLane gates on a sign-in before showing the optimizer. The dialog appears the first time you load the app in a tab; once signed in, the session lives in your browser's tab memory and is restored automatically on reload (until you close the tab).
-
-### Sign-in options
-
-The dialog offers two paths:
-
-- **Social sign-in** — single-click buttons for Google, Microsoft, X, Facebook, Instagram, LinkedIn. **In this build the OAuth flows are simulated** — buttons synthesize a believable user object client-side; no real identity provider is contacted. A future release will swap them for real OAuth once the backend exists.
-- **Email + password** — full sign-up flow with confirm-password, plus a "Forgot password?" link that prompts for your email and then lets you set a new password locally.
-
-Accounts created via email/password are stored in your browser's session memory, hashed with SHA-256. They clear when you close the tab. Not a substitute for a real backend — adequate for prototyping.
-
-### Profile menu (top-right)
-
-Once signed in, an emerald avatar circle appears in the header's top-right corner showing your initial. Clicking it opens a dropdown with:
-
-- **Settings** — opens the broker-connections page (see below).
-- **Sign out** — clears your session and returns to the sign-in dialog.
-
----
-
-## Broker connections (Settings page)
-
-EdgeLane separates two flows: the **market-data** plumbing the app itself uses to fetch quotes/chains/greeks (configured once at deploy time by the operator) and **your own broker connection** used to push trades to your account. The settings page is where you configure the second.
-
-### Providers
-
-| Provider | Status | Required fields | Notes |
-|---|---|---|---|
-| **Tradier** | Live | Access token, Environment (sandbox / production) | Full multi-leg option order support. Sandbox accepts paper-trading fills against simulated quotes. Get a token at https://dash.tradier.com/settings/api (production) or https://developer.tradier.com (sandbox). |
-| **WeBull** | Stub | App key, App secret | UI shell only. WeBull's official OpenAPI requires HMAC request signing which leaks the secret if done in-browser. Lights up once a signing proxy server is in place. |
-
-### Connection lifecycle
-
-Each connection has a label (free-form, e.g. *"Tradier sandbox · personal"*), a provider, and the provider-specific credentials. Multiple connections can coexist; **only one is active at a time**. The active one is the one your push-to-broker dialog uses for order routing.
-
-From any connection card you can:
-
-- **Test connection** — runs `GET /user/profile` against the provider and reports latency, account number, and option-trading level (Tradier needs level ≥ 3 for credit spreads, level 4+ for iron condors).
-- **Set active** — promote this connection to the active one. Marked with an emerald "Active" pill.
-- **Edit** — change label or credentials.
-- **Remove** — drop the connection. If it was active, the next remaining connection becomes active automatically.
-
-A green ✓ next to a connection means the most recent test succeeded; a red ✗ means it failed (with the provider's error message). Test results timestamp themselves so you can see how stale the health read is.
-
-### Storage & warning
-
-All credentials are stored in `sessionStorage`. **They clear when you close the tab.** That's deliberate — there's no encrypted backend yet, so persisting tokens permanently would be reckless. Expect to re-enter your token at the start of each session for now. A small amber line at the bottom of the Settings page reminds you of this.
-
----
-
-## Pushing trades to your broker
-
-The **↗** button on each candidate card opens the push-to-broker dialog. It's no longer a placeholder — when an active broker connection exists, the button is enabled.
-
-### What the dialog shows
-
-- **Title row** — `{symbol} · {Conservative|Balanced|Aggressive} · {structure}` with the leg summary below (e.g. `BUY put 535 · SELL put 540 · SELL call 555 · BUY call 560`).
-- **Connection-status banner** — checks your active broker connection on open:
-  - **✓ Healthy** *(emerald)* — green light. The Execute button is enabled.
-  - **✗ Unhealthy** *(rose)* — the connection's `/user/profile` call failed, or there is no active connection. Execute stays disabled. Open Settings to fix it.
-- **Order type toggle** — Market or Limit:
-  - **Market** is pre-selected when the live mid already meets fair value (live edge ≥ 0). The price field is hidden because there's nothing to set.
-  - **Limit** is pre-selected when the live mid is sub-fair. The price field is pre-filled with the candidate's "modest tier" target — the same one the Tickets card shows as the easiest reachable edge.
-  - You can always switch and override.
-- **Limit price** — fully editable when in Limit mode. Suggested price, breakeven, and live mid are shown directly under the field so you can compare without leaving the dialog.
-- **Time-in-force** — Day or GTC.
-
-### What "Execute" does
-
-For Tradier, the dialog does a **preview then live** flow:
-
-1. Resolves your account number (cached after the first successful test).
-2. POSTs the order with `preview=true` — Tradier validates it (margin, option level, strike spacing) without filling. If preview fails, you see the rejection reason inline and nothing is submitted.
-3. If preview passes, POSTs the same payload live. Returns the order ID and initial status.
-
-You'll see a confirmation card with the order ID and status. Track the fill in your broker terminal — the dialog doesn't poll. For WeBull, Execute throws `WeBull integration not yet implemented` until the signing-proxy backend ships.
-
-### When Execute is grayed out
-
-Three reasons:
-
-- **No active broker connection** — Settings is empty or you haven't promoted one to active.
-- **Connection healthcheck failed** — token expired, sandbox/production mismatch, network issue. The banner shows the provider's exact error.
-- **Submitting** — pressed once, request in flight. Resolves to either a success card or an error inline.
-
----
-
 ## Page layout at a glance
 
 The screen flows roughly from setup at the top to analysis below:
 
-1. **Header row** — title, status pills (bias cached / chain cached / last fetched), a **Reload all data** button, and your **profile avatar** in the top-right.
+1. **Header row** — title, status pills (bias cached / chain cached / last fetched), and a **Reload all data** button.
 2. **Inputs panel** — symbol, expiration, strategy buttons, target delta, wing width preference, and the green **Detect bias from Greeks** button.
 3. **Bias card** (appears after detect) — the dealer-positioning read: bias label, directional score, recommended strategies, and an expandable narrative.
 4. **Stats strip** — Spot price, expected move, ATM IV, DTE, current width preference, and the GEX wall location.
@@ -436,19 +347,11 @@ Two small icon buttons at the bottom right of each card:
 | Icon | What | Behavior |
 |---|---|---|
 | **⎘** | Copy trade ticket | Copies a single-line trade ticket to clipboard. If EV ≥ 0 → MARKET ticket; if EV negative but limit-feasible → LIMIT @ target GTC; otherwise → LIMIT @ breakeven with a `[WARN]` flag appended. Shows `✓` for 1.5s on success. |
-| **↗** | Push to broker | Opens the [push-to-broker dialog](#pushing-trades-to-your-broker) pre-filled with this candidate. Enabled when you have an active broker connection under Settings; otherwise tooltip says *"No active broker connection — add one under Settings to enable"*. |
+| **↗** | Push to broker | Disabled placeholder for a future broker-integration hook. No-op currently. |
 
 ### Rationale line
 
 A short italic sentence at the bottom of each card explaining why the optimizer picked these specific strikes — typically references target delta, width factor, and any wall positioning.
-
-### 3-lens positioning strip (when present)
-
-Most days you'll never see this strip. When you do, it sits just below the GEX wall verdict on a card and reads something like:
-
-`⚠ lenses diverge · GEX $235 · VEX $232 (pull below) · TEX $228 (pull below)`
-
-It only appears when the three dealer-hedging lenses point at meaningfully different strikes — see [VEX / TEX lenses](#vex--tex-lenses--going-beyond-gex) for what to do when it shows up.
 
 ---
 
@@ -491,34 +394,11 @@ Each cell's color encodes **close-now P&L** of the spread at that spot/time pair
 
 ### Hover tooltip
 
-Hover any cell to see the exact P&L number per contract plus a decomposition:
+Hover any cell to see the exact P&L number per contract, e.g.
 
-```
-Spot $182.50 · +30m
-premium +$1.42 · close-now P&L +$58/contract
-composed: +$28 theta · +$5 delta · +$3 γ/vega
-```
+`Spot $182.50 · +30m → premium +$1.42 · close-now P&L +$58/contract`
 
-The "composed" line tells you *why* the cell is green or red — whether you're being paid for time, direction, or curvature/vol. When delta dominates a profit cell, the trade is direction-dependent; if a reversal comes, you'll give it back fast. When theta dominates, the trade is time-dependent; sitting on it longer is the play. That distinction matters for how you exit.
-
-The "current spot" row is tagged with a small emerald **▸** in the left margin, and the "now × current spot" cell is ringed in emerald.
-
-### VEX / TEX cluster annotations
-
-Extra markers in the margins flag where the chain's vol and theta hedging concentrates:
-
-| Marker | Where | Meaning |
-|---|---|---|
-| **●** *(amber, left margin)* | A spot-row label | The strike nearest this row sits in the top quartile of vega × open-interest across the chain. If price drifts into this row and IV moves, premium will re-price faster than the linear model suggests. |
-| **⌛** *(amber, column header)* | A time-column header | The column falls inside the theta-burn window. Only shown for spreads with **DTE ≤ 1** — for longer DTEs theta is roughly constant per day and the marker would be noise. |
-| **amber ring on cell** | Any cell intersecting either cluster | The cell sits where vol or decay effects are concentrated; the tooltip's cluster warning explains how much to inflate the model estimate by. |
-
-When a hover tooltip lands on a cluster cell, it appends one of:
-
-- `⚠ strike near VEX cluster — vol shock could move premium ~1.3× this estimate`
-- `⚠ horizon in TEX cluster — actual decay may be ~1.4× this estimate`
-
-These multipliers are rough rules of thumb, not precise corrections — treat them as flags to widen your mental error bars on that cell, not exact adjustments.
+The "current spot" row is tagged with a green dot in the left margin, and the "now × current spot" cell is ringed in emerald.
 
 ### When the Lookup refreshes
 
@@ -540,62 +420,6 @@ If you're watching a position and the spread starts moving, hit Refresh chain & 
 - The center cell is anchored to the live mid; surrounding cells use Black-Scholes sensitivity from there.
 
 If a leg is missing IV data, the cell falls back to intrinsic value and the card shows `(some legs missing IV — intrinsic fallback)` in amber italics.
-
----
-
-## VEX / TEX lenses — going beyond GEX
-
-EdgeLane's primary bias engine is built around **GEX** (gamma exposure × open interest) — the structural map of where dealers must hedge. Two adjacent lenses live alongside it for the cases where gamma alone doesn't tell the full story.
-
-Two genuinely different VEX/TEX use cases, on two different tabs.
-
-- **Tickets tab** — *"is this trade worth doing right now?"* The lens is positioning: where do the GEX, VEX, and TEX walls sit relative to my strikes? Static answer. Helps pick the spread.
-- **Lookup tab** — *"how does my trade evolve in the next 3 hours and across spots?"* The lens is flow over time and price: where will vol-driven and theta-driven dealer hedging be strongest? Dynamic answer. Helps decide when to bail or hold.
-
-### Where each lives
-
-- **Tickets tab** gets the optional **3-lens positioning strip** (only when divergent) — for trade selection.
-- **Lookup tab** gets **margin annotations + tooltip decomposition** — for trade-evolution awareness.
-
-### Tickets tab — 3-lens positioning strip
-
-The strip only appears when GEX, VEX, and TEX disagree by more than 5 strikes. When it shows up, the three lenses tell you *what kind of risk dominates this trade*:
-
-- **GEX wall** — where dealers pin price (the structural magnet).
-- **VEX wall** — where vol gets re-priced fastest (the IV-shock magnet).
-- **TEX wall** — where theta bleed concentrates (the time-decay magnet).
-
-What you do when you see it:
-
-- **All three line up with your credit zone** → take the trade with normal size. (You'd never see the strip in this case — it would be hidden, since the lenses agree.)
-- **Lenses diverge, with VEX and TEX pulling *below* the GEX wall** (like the strip's example) → price has a second gravity well your spread isn't structured for. Either tighten the short strike toward the VEX/TEX side, cut size, or skip and wait for the lenses to re-converge.
-- **Divergence with VEX/TEX pulling *above*** → mirror logic on the upside.
-
-The strip is hidden by default and dashed-amber-bordered when it appears, so it doesn't add noise to the 99% of cards where the three lenses agree.
-
-### Lookup tab — margin annotations & tooltip decomposition
-
-Two layers on top of the existing premium grid:
-
-- Spot-rows whose closest strike sits in a **VEX cluster** (top quartile of vega × OI) get an amber **●** in the left margin. Premium at those rows will move faster than the linear model predicts when IV ticks.
-- Time-columns inside a **TEX cluster** (back half of the time axis for ≤1 DTE spreads) get an amber **⌛** in the column header. Theta bleeds harder than the linear estimate at those horizons.
-- The hover tooltip on every cell breaks the close-now P&L into **theta / delta / γ-vega** components, so you can see *why* a cell is profitable (or not). When a cluster intersects, the tooltip appends a multiplier hint.
-
-What you do with it: scan the grid before you commit to sitting on a trade for hours. If your planned exit horizon lands on a ⌛ column, plan to harvest theta there rather than wait. If the **●** is on a row your spot keeps drifting toward, pre-stage a roll because vega will hit you before delta does. The tooltip is for the moment you ask *"why is this cell green?"* — it tells you whether you're being paid for time, direction, or vol, which determines what kills the position if it reverses.
-
-### How to think about the two together
-
-A short, useful rule of thumb:
-
-> A is for **picking** the trade (one-shot signal at entry).
-> B is for **managing** the trade (continuous signal across the day).
->
-> If you mostly enter, set GTC, and walk away → A is the higher-value add.
-> If you actively babysit positions and exit dynamically → B pays off more.
->
-> They don't overlap; they're entry vs. lifecycle.
-
-Both features stay quiet most of the time. The strip only appears when there's real divergence to flag, the dots only mark genuine cluster strikes, and the ⌛ only shows up on same-day spreads. That's by design — they're meant to be *signals*, not decoration.
 
 ---
 

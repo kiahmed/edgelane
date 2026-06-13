@@ -35,7 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils import load_config, atlas_call
+from utils import load_config, atlas_call, resolve_tradier_creds
 from data_providers.gex_local import compute_dealer_exposures
 
 
@@ -123,10 +123,14 @@ def atlas_extract_walls(atlas_resp: dict) -> tuple:
 
 def probe_symbol(symbol: str, cfg: dict) -> dict:
     atlas_key = cfg["ATLAS_KEY"]
-    tradier_token = cfg.get("TRADIER_ACCESS_TOKEN")
-    tradier_base = cfg.get("TRADIER_BASE_URL", "https://sandbox.tradier.com")
+    # v4.7.31a: use the shared resolver — config moved from a single
+    # TRADIER_ACCESS_TOKEN to DEVMODE-keyed TRADIER_SANDBOX_TOKEN /
+    # TRADIER_PROD_TOKEN. Falls back to TRADIER_ACCESS_TOKEN for the old layout.
+    tradier_token, tradier_base, env_label = resolve_tradier_creds(cfg)
     if not tradier_token:
-        return {"error": "TRADIER_ACCESS_TOKEN not in config"}
+        return {"error": f"No Tradier {env_label} token in config "
+                         f"(DEVMODE={cfg.get('DEVMODE', 'true')}); "
+                         f"set TRADIER_{env_label.upper()}_TOKEN"}
 
     print(f"\n{BOLD}─── {symbol} ───{N}")
 
@@ -257,9 +261,10 @@ def grade(result: dict) -> tuple:
 def main():
     symbols = sys.argv[1:] if len(sys.argv) > 1 else SYMBOLS_DEFAULT
     cfg = load_config()
+    _, base_for_banner, env_label = resolve_tradier_creds(cfg)
     print(f"{BOLD}Tradier vs Atlas validation probe{N}")
     print(f"{D}symbols: {', '.join(symbols)}{N}")
-    print(f"{D}tradier base: {cfg.get('TRADIER_BASE_URL', 'https://sandbox.tradier.com')}{N}")
+    print(f"{D}tradier env: {env_label} ({base_for_banner}){N}")
 
     results = []
     for sym in symbols:

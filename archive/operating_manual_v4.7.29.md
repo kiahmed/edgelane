@@ -4,100 +4,11 @@ What every badge, label, and number on the page means, and how to use the tool e
 
 ---
 
-## Sign in & user session
-
-EdgeLane gates on a sign-in before showing the optimizer. The dialog appears the first time you load the app in a tab; once signed in, the session lives in your browser's tab memory and is restored automatically on reload (until you close the tab).
-
-### Sign-in options
-
-The dialog offers two paths:
-
-- **Social sign-in** — single-click buttons for Google, Microsoft, X, Facebook, Instagram, LinkedIn. **In this build the OAuth flows are simulated** — buttons synthesize a believable user object client-side; no real identity provider is contacted. A future release will swap them for real OAuth once the backend exists.
-- **Email + password** — full sign-up flow with confirm-password, plus a "Forgot password?" link that prompts for your email and then lets you set a new password locally.
-
-Accounts created via email/password are stored in your browser's session memory, hashed with SHA-256. They clear when you close the tab. Not a substitute for a real backend — adequate for prototyping.
-
-### Profile menu (top-right)
-
-Once signed in, an emerald avatar circle appears in the header's top-right corner showing your initial. Clicking it opens a dropdown with:
-
-- **Settings** — opens the broker-connections page (see below).
-- **Sign out** — clears your session and returns to the sign-in dialog.
-
----
-
-## Broker connections (Settings page)
-
-EdgeLane separates two flows: the **market-data** plumbing the app itself uses to fetch quotes/chains/greeks (configured once at deploy time by the operator) and **your own broker connection** used to push trades to your account. The settings page is where you configure the second.
-
-### Providers
-
-| Provider | Status | Required fields | Notes |
-|---|---|---|---|
-| **Tradier** | Live | Access token, Environment (sandbox / production) | Full multi-leg option order support. Sandbox accepts paper-trading fills against simulated quotes. Get a token at https://dash.tradier.com/settings/api (production) or https://developer.tradier.com (sandbox). |
-| **WeBull** | Stub | App key, App secret | UI shell only. WeBull's official OpenAPI requires HMAC request signing which leaks the secret if done in-browser. Lights up once a signing proxy server is in place. |
-
-### Connection lifecycle
-
-Each connection has a label (free-form, e.g. *"Tradier sandbox · personal"*), a provider, and the provider-specific credentials. Multiple connections can coexist; **only one is active at a time**. The active one is the one your push-to-broker dialog uses for order routing.
-
-From any connection card you can:
-
-- **Test connection** — runs `GET /user/profile` against the provider and reports latency, account number, and option-trading level (Tradier needs level ≥ 3 for credit spreads, level 4+ for iron condors).
-- **Set active** — promote this connection to the active one. Marked with an emerald "Active" pill.
-- **Edit** — change label or credentials.
-- **Remove** — drop the connection. If it was active, the next remaining connection becomes active automatically.
-
-A green ✓ next to a connection means the most recent test succeeded; a red ✗ means it failed (with the provider's error message). Test results timestamp themselves so you can see how stale the health read is.
-
-### Storage & warning
-
-All credentials are stored in `sessionStorage`. **They clear when you close the tab.** That's deliberate — there's no encrypted backend yet, so persisting tokens permanently would be reckless. Expect to re-enter your token at the start of each session for now. A small amber line at the bottom of the Settings page reminds you of this.
-
----
-
-## Pushing trades to your broker
-
-The **↗** button on each candidate card opens the push-to-broker dialog. It's no longer a placeholder — when an active broker connection exists, the button is enabled.
-
-### What the dialog shows
-
-- **Title row** — `{symbol} · {Conservative|Balanced|Aggressive} · {structure}` with the leg summary below (e.g. `BUY put 535 · SELL put 540 · SELL call 555 · BUY call 560`).
-- **Connection-status banner** — checks your active broker connection on open:
-  - **✓ Healthy** *(emerald)* — green light. The Execute button is enabled.
-  - **✗ Unhealthy** *(rose)* — the connection's `/user/profile` call failed, or there is no active connection. Execute stays disabled. Open Settings to fix it.
-- **Order type toggle** — Market or Limit:
-  - **Market** is pre-selected when the live mid already meets fair value (live edge ≥ 0). The price field is hidden because there's nothing to set.
-  - **Limit** is pre-selected when the live mid is sub-fair. The price field is pre-filled with the candidate's "modest tier" target — the same one the Tickets card shows as the easiest reachable edge.
-  - You can always switch and override.
-- **Limit price** — fully editable when in Limit mode. Suggested price, breakeven, and live mid are shown directly under the field so you can compare without leaving the dialog.
-- **Time-in-force** — Day or GTC.
-
-### What "Execute" does
-
-For Tradier, the dialog does a **preview then live** flow:
-
-1. Resolves your account number (cached after the first successful test).
-2. POSTs the order with `preview=true` — Tradier validates it (margin, option level, strike spacing) without filling. If preview fails, you see the rejection reason inline and nothing is submitted.
-3. If preview passes, POSTs the same payload live. Returns the order ID and initial status.
-
-You'll see a confirmation card with the order ID and status. Track the fill in your broker terminal — the dialog doesn't poll. For WeBull, Execute throws `WeBull integration not yet implemented` until the signing-proxy backend ships.
-
-### When Execute is grayed out
-
-Three reasons:
-
-- **No active broker connection** — Settings is empty or you haven't promoted one to active.
-- **Connection healthcheck failed** — token expired, sandbox/production mismatch, network issue. The banner shows the provider's exact error.
-- **Submitting** — pressed once, request in flight. Resolves to either a success card or an error inline.
-
----
-
 ## Page layout at a glance
 
 The screen flows roughly from setup at the top to analysis below:
 
-1. **Header row** — title, status pills (bias cached / chain cached / last fetched), a **Reload all data** button, and your **profile avatar** in the top-right.
+1. **Header row** — title, status pills (bias cached / chain cached / last fetched), and a **Reload all data** button.
 2. **Inputs panel** — symbol, expiration, strategy buttons, target delta, wing width preference, and the green **Detect bias from Greeks** button.
 3. **Bias card** (appears after detect) — the dealer-positioning read: bias label, directional score, recommended strategies, and an expandable narrative.
 4. **Stats strip** — Spot price, expected move, ATM IV, DTE, current width preference, and the GEX wall location.
@@ -436,7 +347,7 @@ Two small icon buttons at the bottom right of each card:
 | Icon | What | Behavior |
 |---|---|---|
 | **⎘** | Copy trade ticket | Copies a single-line trade ticket to clipboard. If EV ≥ 0 → MARKET ticket; if EV negative but limit-feasible → LIMIT @ target GTC; otherwise → LIMIT @ breakeven with a `[WARN]` flag appended. Shows `✓` for 1.5s on success. |
-| **↗** | Push to broker | Opens the [push-to-broker dialog](#pushing-trades-to-your-broker) pre-filled with this candidate. Enabled when you have an active broker connection under Settings; otherwise tooltip says *"No active broker connection — add one under Settings to enable"*. |
+| **↗** | Push to broker | Disabled placeholder for a future broker-integration hook. No-op currently. |
 
 ### Rationale line
 
@@ -559,86 +470,4 @@ Two genuinely different VEX/TEX use cases, on two different tabs.
 
 ### Tickets tab — 3-lens positioning strip
 
-The strip only appears when GEX, VEX, and TEX disagree by more than 5 strikes. When it shows up, the three lenses tell you *what kind of risk dominates this trade*:
-
-- **GEX wall** — where dealers pin price (the structural magnet).
-- **VEX wall** — where vol gets re-priced fastest (the IV-shock magnet).
-- **TEX wall** — where theta bleed concentrates (the time-decay magnet).
-
-What you do when you see it:
-
-- **All three line up with your credit zone** → take the trade with normal size. (You'd never see the strip in this case — it would be hidden, since the lenses agree.)
-- **Lenses diverge, with VEX and TEX pulling *below* the GEX wall** (like the strip's example) → price has a second gravity well your spread isn't structured for. Either tighten the short strike toward the VEX/TEX side, cut size, or skip and wait for the lenses to re-converge.
-- **Divergence with VEX/TEX pulling *above*** → mirror logic on the upside.
-
-The strip is hidden by default and dashed-amber-bordered when it appears, so it doesn't add noise to the 99% of cards where the three lenses agree.
-
-### Lookup tab — margin annotations & tooltip decomposition
-
-Two layers on top of the existing premium grid:
-
-- Spot-rows whose closest strike sits in a **VEX cluster** (top quartile of vega × OI) get an amber **●** in the left margin. Premium at those rows will move faster than the linear model predicts when IV ticks.
-- Time-columns inside a **TEX cluster** (back half of the time axis for ≤1 DTE spreads) get an amber **⌛** in the column header. Theta bleeds harder than the linear estimate at those horizons.
-- The hover tooltip on every cell breaks the close-now P&L into **theta / delta / γ-vega** components, so you can see *why* a cell is profitable (or not). When a cluster intersects, the tooltip appends a multiplier hint.
-
-What you do with it: scan the grid before you commit to sitting on a trade for hours. If your planned exit horizon lands on a ⌛ column, plan to harvest theta there rather than wait. If the **●** is on a row your spot keeps drifting toward, pre-stage a roll because vega will hit you before delta does. The tooltip is for the moment you ask *"why is this cell green?"* — it tells you whether you're being paid for time, direction, or vol, which determines what kills the position if it reverses.
-
-### How to think about the two together
-
-A short, useful rule of thumb:
-
-> A is for **picking** the trade (one-shot signal at entry).
-> B is for **managing** the trade (continuous signal across the day).
->
-> If you mostly enter, set GTC, and walk away → A is the higher-value add.
-> If you actively babysit positions and exit dynamically → B pays off more.
->
-> They don't overlap; they're entry vs. lifecycle.
-
-Both features stay quiet most of the time. The strip only appears when there's real divergence to flag, the dots only mark genuine cluster strikes, and the ⌛ only shows up on same-day spreads. That's by design — they're meant to be *signals*, not decoration.
-
----
-
-## Buttons & refreshes
-
-Three different refresh actions across two locations:
-
-| Button | Location | Refreshes | When to click | Provider cost |
-|---|---|---|---|---|
-| **Detect bias from Greeks** | Inputs panel | Bias card | First analysis of a ticker, or after major market move | 2 calls |
-| **↻ Re-detect bias from Greeks** | Inputs panel | Bias card — **force-refetch** past cache | When the tape clearly moved and you want a fresh GEX read on the same symbol/expiration | 2 calls |
-| **↻ Refresh chain & re-rank** | Inputs panel | Chain prices, IV, candidates | Every few minutes while watching a setup; before placing a limit order | 1 call |
-| **↻ Reload all data** | Status row (top) | Both bias + chain | Ticker change, or "start fresh" | 3 calls |
-
-Bias data is slow-moving (GEX walls stable 30 – 60 min). Chain prices are tick-by-tick. Use the chain refresh frequently; bias refresh only when warranted. The status row shows the **last-fetched timestamp** for each cache so you can see how stale the data is.
-
-The Spot price in the stats strip updates immediately on every chain refresh, even before the bias narrative finishes recomputing.
-
----
-
-## Typical workflow
-
-1. Type symbol, pick expiration, hit **Detect bias from Greeks**.
-2. Read the bias card — note the label, score, confidence, and recommended strategies.
-3. Adjust strategy / target delta / width if needed; the three candidate cards re-rank instantly.
-4. Check the composite tradeability banner. If rose, skip this setup.
-5. On the engine pick, look at the limit-order tier card. If green at market, take it; if "sub-fair, limit-only," apply the reality-check triage.
-6. Optional: switch to **Lookup** and check how the spread would look 30 – 60 minutes from now or if spot moves to specific levels.
-7. Click **⎘** to copy the trade ticket. Paste into your broker, verify, place.
-8. While watching: hit **↻ Refresh chain & re-rank** every few minutes. Update the limit price if conditions change.
-9. If the bias deteriorates materially: re-detect bias to see if the wall moved.
-
-This is the rare disciplined options play: instead of taking what the market gives, you tell the market what you'd accept. Most days you don't fill. The days you do, you've extracted real edge from a market that briefly mispriced your structure.
-
----
-
-## Troubleshooting
-
-| What you see | What's happening |
-|---|---|
-| Heavy single-name ticker (MU, AMD, SMCI, COIN, PLTR, ARM, AVGO, MARA, MSTR) takes 20 – 30 s on first bias detect | The full options chain is being pulled in pieces. Normal for these tickers. |
-| Second bias detect on same symbol returns instantly | Result is cached for 5 minutes. |
-| **↻ Re-detect bias from Greeks** label appeared | Bias is cached. Clicking force-refetches past the cache. |
-| Spot price updated but bias narrative looks stale | Spot is decoupled from the bias pipeline. Click re-detect to refresh the narrative. |
-| Lookup cell says "intrinsic fallback" | At least one leg is missing IV data from the provider; that cell uses intrinsic value instead. |
-| Symbol fails after ~75 s with a timeout error | Provider didn't respond. Try again in a minute; if persistent, the symbol may need a wider timeout configuration. |
+The

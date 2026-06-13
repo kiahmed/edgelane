@@ -1,0 +1,1575 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EdgeLane MARKET</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { background: #07090d; }
+    body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    .neon { text-shadow: 0 0 8px rgba(120,255,180,.45); }
+    .pill { display:inline-flex; align-items:center; gap:.4rem; padding:.25rem .65rem; border-radius:9999px; font-size:.72rem; font-weight:600; letter-spacing:.04em; text-transform:uppercase; }
+    .dot { width:.5rem; height:.5rem; border-radius:9999px; display:inline-block; }
+    .dot-pulse { box-shadow: 0 0 0 0 currentColor; animation: pulse 1.6s infinite; }
+    @keyframes pulse {
+      0%   { box-shadow: 0 0 0 0 rgba(34,197,94,.55); }
+      70%  { box-shadow: 0 0 0 8px rgba(34,197,94,0); }
+      100% { box-shadow: 0 0 0 0 rgba(34,197,94,0); }
+    }
+    .card { background: linear-gradient(180deg, rgba(20,28,40,.85), rgba(12,18,28,.85)); border: 1px solid rgba(60,80,110,.35); border-radius: 14px; }
+    .stripe-bull { background: linear-gradient(90deg, rgba(34,197,94,.18), transparent 60%); }
+    .stripe-bear { background: linear-gradient(90deg, rgba(244,63,94,.18), transparent 60%); }
+    .stripe-neutral { background: linear-gradient(90deg, rgba(148,163,184,.16), transparent 60%); }
+    .badge-healthy { background: rgba(34,197,94,.18); color: #86efac; }
+    .badge-thin { background: rgba(234,179,8,.18); color: #fde68a; }
+    .badge-directional { background: rgba(56,189,248,.18); color: #7dd3fc; }
+    .badge-broken, .badge-capital_trap { background: rgba(244,63,94,.20); color: #fda4af; }
+    .liq-high { background: rgba(34,197,94,.18); color: #86efac; }
+    .liq-mid { background: rgba(234,179,8,.18); color: #fde68a; }
+    .liq-low { background: rgba(244,63,94,.18); color: #fda4af; }
+    .composite-good { color: #86efac; }
+    .composite-meh { color: #fde68a; }
+    .composite-bad { color: #fda4af; }
+    .recommended-glow { box-shadow: 0 0 0 1px rgba(120,255,180,.45), 0 0 18px rgba(120,255,180,.18); }
+    .toast { position:fixed; bottom:1rem; left:50%; transform:translateX(-50%); background:#0f172a; border:1px solid rgba(120,255,180,.35); padding:.6rem 1rem; border-radius:8px; color:#d1fae5; font-size:.85rem; opacity:0; transition:opacity .3s; z-index:50; }
+    .toast.show { opacity:1; }
+    button.btn { background:#1e293b; border:1px solid rgba(120,140,170,.3); padding:.35rem .7rem; border-radius:6px; font-size:.72rem; color:#e2e8f0; cursor:pointer; transition: all .15s; }
+    button.btn:hover { background:#334155; border-color:rgba(120,255,180,.4); }
+    button.btn-primary { background:rgba(34,197,94,.18); border-color:rgba(34,197,94,.45); color:#bbf7d0; }
+    button.btn-primary:hover { background:rgba(34,197,94,.28); }
+    select { background:#0f172a; border:1px solid rgba(120,140,170,.3); color:#e2e8f0; padding:.35rem .7rem; border-radius:6px; font-size:.85rem; }
+    code.kv { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .78rem; color: #cbd5e1; }
+    /* Order dialog --------------------------------------------------- */
+    .modal-mask {
+      position: fixed; inset: 0; background: rgba(0,0,0,.65);
+      display: none; align-items: center; justify-content: center; z-index: 60;
+    }
+    .modal-mask.show { display: flex; }
+    .modal-card {
+      width: min(560px, calc(100vw - 2rem));
+      max-height: calc(100vh - 2rem); overflow: auto;
+      background: linear-gradient(180deg, #11182a, #0a0f1c);
+      border: 1px solid rgba(120,140,170,.35);
+      border-radius: 14px; padding: 1.25rem;
+      box-shadow: 0 24px 80px rgba(0,0,0,.7);
+    }
+    .modal-card h3 { font-size: 1rem; font-weight: 700; letter-spacing: .02em; }
+    .modal-card .leg-row {
+      display:grid; grid-template-columns: auto 1fr auto; gap:.4rem;
+      padding:.35rem .55rem; border-radius:6px; background:rgba(15,23,42,.65);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.78rem;
+    }
+    .leg-buy  { color:#86efac; }
+    .leg-sell { color:#fda4af; }
+    .modal-card input, .modal-card select {
+      background:#0f172a; border:1px solid rgba(120,140,170,.3); color:#e2e8f0;
+      padding:.35rem .55rem; border-radius:6px; font-size:.85rem; width:100%;
+    }
+    .modal-card label { font-size: .68rem; text-transform: uppercase;
+      letter-spacing: .05em; color:#94a3b8; }
+    .preview-pane {
+      background:#0a0f1c; border:1px solid rgba(120,140,170,.3);
+      border-radius:8px; padding:.7rem; font-size:.75rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      color:#cbd5e1; max-height: 9rem; overflow:auto; white-space:pre-wrap;
+    }
+    .danger-btn {
+      position: relative; overflow: hidden;
+      background: rgba(244,63,94,.18); border: 1px solid rgba(244,63,94,.5);
+      color:#fecaca; padding:.5rem 1rem; border-radius:8px; font-weight:700;
+      font-size:.85rem; cursor:pointer; transition: all .15s;
+      letter-spacing:.04em;
+    }
+    .danger-btn:hover:not(:disabled) { background: rgba(244,63,94,.28); }
+    .danger-btn:disabled { opacity:.35; cursor:not-allowed; }
+    .danger-btn .hold-arc {
+      position:absolute; left:0; bottom:0; height:3px; width:0%;
+      background:#f43f5e; transition: width .05s linear;
+    }
+    /* Tooltip helper — dotted underline cue + native title fallback works
+       on hover (desktop) and tap-and-hold (mobile). Tight, no JS needed. */
+    .tt { cursor:help; border-bottom:1px dotted rgba(148,163,184,.5); }
+    /* Limit-tier strip (Feature 1) */
+    .lt-row { display:flex; justify-content:space-between; gap:.5rem;
+              font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+              font-size:.7rem; padding:.05rem .2rem; border-radius:3px; }
+    .lt-met { color:#86efac; }
+    .lt-reach { color:#cbd5e1; }
+    .lt-infeas { color:#475569; text-decoration: line-through; }
+    .lt-card { margin-top:.4rem; padding:.45rem .55rem; border-radius:6px;
+               background: rgba(15,23,42,.55); border:1px solid rgba(60,80,110,.30); }
+    /* Tabs (Feature 4) */
+    .tab-btn { padding:.5rem 1rem; font-size:.8rem; font-weight:600;
+               letter-spacing:.04em; text-transform:uppercase; color:#94a3b8;
+               background:transparent; border:none; border-bottom:2px solid transparent;
+               cursor:pointer; transition: color .15s, border-color .15s; }
+    .tab-btn:hover { color:#cbd5e1; }
+    .tab-btn.active { color:#86efac; border-bottom-color:#22c55e; }
+    /* Profile circle + settings panel (Feature 3) */
+    .avatar-btn { width:2.25rem; height:2.25rem; border-radius:9999px;
+                  background:#0f766e; color:#ecfeff; font-weight:700;
+                  display:flex; align-items:center; justify-content:center;
+                  border:1px solid rgba(34,197,94,.5); cursor:pointer;
+                  transition: background .15s; }
+    .avatar-btn:hover { background:#0d9488; }
+    .settings-panel { position:absolute; right:0; top:calc(100% + .5rem);
+                      width:360px; max-height:80vh; overflow-y:auto;
+                      background:#0f172a; border:1px solid rgba(120,140,170,.35);
+                      border-radius:10px; box-shadow: 0 24px 80px rgba(0,0,0,.7);
+                      padding:1rem; z-index:55; }
+    .settings-panel h3 { font-size:.7rem; text-transform:uppercase;
+                         letter-spacing:.08em; color:#64748b; font-weight:700;
+                         margin-bottom:.5rem; }
+    .settings-section { padding:.65rem 0; border-bottom:1px solid rgba(60,80,110,.30); }
+    .settings-section:last-child { border-bottom:none; }
+    .radio-row { display:flex; gap:.75rem; font-size:.8rem; }
+    .radio-row label { display:flex; align-items:center; gap:.3rem; cursor:pointer; }
+    /* Lookup grid heatmap (Feature 4) */
+    .lk-grid { width:100%; border-collapse:separate; border-spacing:2px;
+               table-layout:fixed; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.7rem; }
+    .lk-grid th { padding:.25rem .15rem; color:#64748b; font-weight:600;
+                  text-transform:uppercase; font-size:.6rem; letter-spacing:.05em; text-align:center; }
+    .lk-grid td { padding:.25rem .15rem; text-align:center; border-radius:3px; }
+    .lk-grid td.lk-axis { color:#94a3b8; text-align:right; padding-right:.4rem; }
+    .lk-grid td.lk-center { color:#bef264; font-weight:700; }
+    .lk-lvl-3  { background: rgba(34,197,94,.7);  color:#f0fdf4; font-weight:700; }
+    .lk-lvl-2  { background: rgba(22,163,74,.5);  color:#dcfce7; }
+    .lk-lvl-1  { background: rgba(21,128,61,.35); color:#bbf7d0; }
+    .lk-lvl-0  { background: rgba(51,65,85,.35);  color:#cbd5e1; }
+    .lk-lvl--1 { background: rgba(190,18,60,.35); color:#fecaca; }
+    .lk-lvl--2 { background: rgba(225,29,72,.5);  color:#fed7d7; }
+    .lk-lvl--3 { background: rgba(244,63,94,.7);  color:#fff1f2; font-weight:700; }
+  </style>
+</head>
+<body class="text-slate-200">
+<div id="app" class="max-w-6xl mx-auto p-4 md:p-6 space-y-4">
+
+  <!-- Top bar -->
+  <header class="flex flex-wrap items-center justify-between gap-3 mb-2">
+    <div class="flex items-baseline gap-3">
+      <h1 class="text-2xl md:text-3xl font-black tracking-tight neon">EDGELANE <span class="text-emerald-400">MARKET</span></h1>
+      <span id="version" class="text-xs text-slate-500"></span>
+    </div>
+    <div class="flex items-center gap-2 flex-wrap">
+      <span id="modePill" class="pill bg-slate-700 text-slate-200" title="Data source: MOCK = synthetic deterministic chain (no token); PRODUCTION/SANDBOX = live Tradier feed.">…</span>
+      <span id="marketPill" class="pill bg-slate-700 text-slate-200" title="Regular-session market hours (NYSE Mon-Fri 9:30-16:00 ET). DEVMODE polls anytime.">…</span>
+      <span id="statusPill" class="pill bg-slate-700 text-slate-200" title="Backend poller health. Live = polling on cadence; Down = poll loop failing or backend unreachable."><span class="dot bg-slate-400"></span>Connecting</span>
+      <span id="accuracyPill" class="pill bg-slate-700 text-slate-300" title="Rolling win rate over last N decisions (config: EVAL_ROLLING_WINDOW). Green >=60%, amber middle, red <=40%.">Accuracy —</span>
+      <label class="text-xs text-slate-400 ml-2">Symbol</label>
+      <select id="symbolSel"><option>SPX</option></select>
+      <button class="btn" id="refreshBtn">Refresh</button>
+
+      <!-- Feature 3: profile circle + settings panel ---------------------- -->
+      <div class="relative" id="profileWrap">
+        <button id="profileBtn" class="avatar-btn" title="Profile &amp; settings">
+          <span id="profileInitial">O</span>
+        </button>
+        <div id="settingsPanel" class="settings-panel hidden">
+          <div class="flex items-baseline justify-between mb-2">
+            <div>
+              <div id="settingsUserName" class="text-sm font-bold text-slate-100">Operator</div>
+              <div class="text-[10px] text-slate-500 uppercase tracking-wider">local session</div>
+            </div>
+            <button id="settingsCloseBtn" class="text-slate-400 hover:text-slate-100 text-lg leading-none">&times;</button>
+          </div>
+
+          <div class="settings-section">
+            <h3>Tradier Connection</h3>
+            <div id="brokerStatus" class="text-xs text-slate-300 mb-2">checking…</div>
+            <div class="radio-row mb-2">
+              <label><input type="radio" name="tradierEnv" value="production" /> Production</label>
+              <label><input type="radio" name="tradierEnv" value="sandbox" /> Sandbox</label>
+            </div>
+            <div class="text-[11px] text-slate-400 mb-2">
+              Account: <code id="brokerAccount" class="kv">—</code>
+            </div>
+            <div class="text-[10px] text-slate-500 italic mb-2 leading-snug">
+              Token is configured server-side in <code class="kv">edgelane_market.config</code> —
+              restart the backend after edits.
+            </div>
+            <div class="flex gap-2">
+              <button id="testConnBtn" class="btn">Test connection</button>
+              <span id="testConnResult" class="text-[11px] self-center text-slate-400"></span>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <h3>Settings</h3>
+            <label class="text-xs text-slate-300 block mb-1">Auto-refresh interval (<span id="pollIntLabel">5</span>s)</label>
+            <input id="pollInt" type="range" min="5" max="30" step="5" value="5" class="w-full" />
+            <label class="text-xs text-slate-300 mt-2 flex items-center gap-2">
+              <input id="diagToggle" type="checkbox" /> Show diagnostics (placeholder)
+            </label>
+            <button id="resetUiBtn" class="btn mt-3 w-full">Reset UI state</button>
+          </div>
+
+          <div class="settings-section">
+            <button id="signOutBtn" class="text-xs text-rose-300 hover:text-rose-200">Sign out (clear local session)</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <p id="lastUpdate" class="text-xs text-slate-500"></p>
+
+  <!-- Feature 4: Tab strip ------------------------------------------------- -->
+  <div class="flex items-center gap-1 border-b border-slate-800 mb-2">
+    <button class="tab-btn active" data-tab="engine" id="tabEngine">Engine pick</button>
+    <button class="tab-btn" data-tab="lookup" id="tabLookup">Lookup</button>
+  </div>
+
+  <!-- ENGINE VIEW (existing UI) ----------------------------------------- -->
+  <div id="view-engine">
+
+  <!-- Regime-shift banner — hidden by default, surfaced when evaluator flags N consec losses -->
+  <section id="regimeBanner" class="hidden card border-rose-500/40 bg-rose-900/30 p-3 text-rose-100 text-sm flex items-center justify-between">
+    <div>
+      <span class="font-bold uppercase tracking-wider text-rose-200">Regime shift detected</span>
+      <span id="regimeMsg" class="ml-2">—</span>
+    </div>
+    <span id="regimeTs" class="text-xs text-rose-300/80"></span>
+  </section>
+
+  <!-- Spot + bias + walls row -->
+  <section class="grid grid-cols-1 md:grid-cols-3 gap-4">
+    <div class="card p-4">
+      <div class="text-xs uppercase tracking-wide text-slate-500">Spot</div>
+      <div class="flex items-baseline gap-3 mt-1">
+        <div id="spotPrice" class="text-3xl font-bold">—</div>
+        <div id="dteExp" class="text-xs text-slate-500"></div>
+      </div>
+      <div id="expectedMove" class="mt-1 text-xs text-slate-400"></div>
+    </div>
+
+    <div id="biasCard" class="card p-4">
+      <div class="text-xs uppercase tracking-wide text-slate-500">Bias</div>
+      <div id="biasPill" class="mt-2 inline-flex items-center gap-2 px-3 py-1 rounded-full font-bold text-lg">—</div>
+      <div class="mt-2 text-sm text-slate-300">
+        <span class="text-slate-500">Score </span><span id="biasScore">—</span>
+        <span class="mx-2 text-slate-600">|</span>
+        <span class="text-slate-500">Conf </span><span id="biasConf">—</span>
+      </div>
+      <div id="biasFacts" class="mt-2 text-xs text-slate-400"></div>
+      <div id="biasSource" class="mt-1 text-xs text-slate-500"></div>
+    </div>
+
+    <div class="card p-4">
+      <div class="flex items-baseline justify-between">
+        <div class="text-xs uppercase tracking-wide text-slate-500">Walls</div>
+        <div class="text-[10px] text-slate-500">price drifts to put · gets blocked by call</div>
+      </div>
+      <div class="mt-2 grid grid-cols-2 gap-3 text-sm">
+        <div>
+          <div class="text-xs text-emerald-400/80 tt" title="Put wall = strongest put-side gamma cluster. Intraday spot tends to drift toward this strike (dealer hedging is the magnet).">Put wall · MAGNET ↘</div>
+          <div id="putWall" class="font-bold text-emerald-300 text-lg">—</div>
+          <div id="putWallStr" class="text-xs text-slate-500"></div>
+        </div>
+        <div>
+          <div class="text-xs text-rose-400/80 tt" title="Call wall = strongest call-side gamma cluster. Acts as resistance — rallies often stall here as dealers sell into upside.">Call wall · RESISTANCE ▲</div>
+          <div id="callWall" class="font-bold text-rose-300 text-lg">—</div>
+          <div id="callWallStr" class="text-xs text-slate-500"></div>
+        </div>
+      </div>
+      <!-- Legacy dominant single-wall (kept hidden for 0DTE; multi-day plays
+           will re-enable via the diagnostics toggle in Phase C). -->
+      <div class="hidden">
+        <span id="gexWall"></span><span id="gexWallStr"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- Engine pick highlight -->
+  <section id="pickCard" class="card p-4 hidden">
+    <div class="flex items-center justify-between flex-wrap gap-2">
+      <div>
+        <span class="text-xs uppercase tracking-wide text-emerald-400">Engine pick</span>
+        <span id="pickName" class="ml-2 font-bold text-lg">—</span>
+        <span id="pickLabel" class="ml-2 text-xs text-slate-400"></span>
+      </div>
+      <div class="flex items-center gap-2">
+        <span id="pickComposite" class="pill bg-emerald-500/20 text-emerald-200">composite —</span>
+        <span id="pickVerdict" class="pill bg-slate-700 text-slate-200">—</span>
+      </div>
+    </div>
+    <div id="pickStructure" class="mt-2 text-sm text-slate-300"></div>
+    <div id="pickMetrics" class="mt-2 grid grid-cols-2 md:grid-cols-5 gap-2 text-xs"></div>
+  </section>
+
+  <!-- Strategy grid -->
+  <section>
+    <div class="flex items-center justify-between mb-2">
+      <h2 class="text-sm uppercase tracking-wide text-slate-400">Strategies (8)</h2>
+      <div class="text-xs text-slate-500">★ recommended by bias</div>
+    </div>
+    <div id="stratGrid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+      <!-- pills injected here -->
+    </div>
+  </section>
+
+  <!-- Errors -->
+  <section id="errBox" class="hidden card border-rose-500/40 bg-rose-900/20 p-3 text-rose-200 text-sm"></section>
+
+  <!-- Recent outcomes — last 10 evaluations, populated by /accuracy poll -->
+  <section class="card p-4">
+    <div class="flex items-center justify-between mb-2">
+      <h2 class="text-sm uppercase tracking-wide text-slate-400">Recent outcomes</h2>
+      <span id="outcomeMeta" class="text-xs text-slate-500">—</span>
+    </div>
+    <div id="outcomeList" class="space-y-1 text-xs font-mono text-slate-300">
+      <div class="text-slate-500 italic">No evaluations yet — first outcomes will land 3 minutes after the first bias decision.</div>
+    </div>
+  </section>
+
+  </div><!-- /view-engine -->
+
+  <!-- LOOKUP VIEW (Feature 4) ------------------------------------------- -->
+  <div id="view-lookup" class="hidden space-y-3">
+    <section class="card p-3 text-[12px] text-slate-300 leading-relaxed">
+      <span class="font-bold uppercase tracking-widest text-slate-200 mr-2">Lookup:</span>
+      Black-Scholes spread projection grid for the current
+      <span class="text-emerald-300">engine pick</span>. Rows are hypothetical spot levels;
+      columns walk wall-clock time (15-min steps, ET-session-aware) until expiry.
+      <span class="text-emerald-300">Green</span> = closing here would lock a profit;
+      <span class="text-rose-300">red</span> = at a loss.
+      Anchored to live mid premium; projected with sticky-strike IV (decision-relevant; not a guarantee).
+    </section>
+    <div id="lookupHost">
+      <div class="text-slate-500 italic text-sm">Waiting for first snapshot…</div>
+    </div>
+  </div>
+
+  <footer class="text-center text-xs text-slate-600 pt-4">
+    Polls every 5s · backend cadence configurable via POLL_INTERVAL_SEC
+  </footer>
+</div>
+
+
+<!-- Order dialog --------------------------------------------------- -->
+<div id="orderModal" class="modal-mask" role="dialog" aria-modal="true">
+  <div class="modal-card space-y-3">
+    <div class="flex items-baseline justify-between gap-3">
+      <div>
+        <h3 class="text-slate-100">Place Order</h3>
+        <div id="orderHeader" class="text-xs text-slate-400 mt-0.5">—</div>
+      </div>
+      <button id="orderCloseBtn" class="btn">Close</button>
+    </div>
+
+    <div>
+      <div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Structure</div>
+      <div id="orderLegs" class="space-y-1"></div>
+    </div>
+
+    <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+      <div>
+        <label for="orderQty">Quantity</label>
+        <input id="orderQty" type="number" min="1" max="100" step="1" value="1" />
+      </div>
+      <div>
+        <label for="orderLimit">Limit price</label>
+        <input id="orderLimit" type="number" min="0" step="0.01" value="" />
+      </div>
+      <div>
+        <label for="orderDuration">Duration</label>
+        <select id="orderDuration">
+          <option value="day" selected>DAY</option>
+          <option value="gtc">GTC</option>
+        </select>
+      </div>
+      <div class="col-span-2 md:col-span-3">
+        <label for="orderAccount">Tradier account id</label>
+        <input id="orderAccount" type="text" placeholder="VA00000000" value="" />
+      </div>
+    </div>
+
+    <div id="orderCost" class="text-xs text-slate-300">
+      <span class="text-slate-500">Approx capital at risk:</span>
+      <span id="orderCostVal" class="font-bold text-slate-100">—</span>
+    </div>
+
+    <div>
+      <div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Tradier response</div>
+      <pre id="orderPreviewPane" class="preview-pane">No preview yet. Click "Preview" to validate against Tradier.</pre>
+    </div>
+
+    <div class="flex items-center justify-between flex-wrap gap-2 pt-1">
+      <span id="orderStatus" class="text-xs text-slate-400"></span>
+      <div class="flex gap-2">
+        <button id="orderPreviewBtn" class="btn btn-primary">Preview</button>
+        <button id="orderSubmitBtn" class="danger-btn" disabled
+                title="Run Preview first; then HOLD this button for 2 seconds to submit live">
+          <span>Submit Live (hold 2s)</span>
+          <span class="hold-arc"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+(() => {
+  // ───────────────────────────────────────────────────────────────────────
+  // API base URL resolver
+  //   1. ?api=http://host:port query param (sticky — saved to localStorage)
+  //   2. localStorage 'edgelane_api_base' (set by step 1 or manually)
+  //   3. Same origin as the UI if it's served over http(s) — common dev case
+  //   4. http://127.0.0.1:8789 (matches Makefile default PORT)
+  // To override: open index.html?api=http://127.0.0.1:8788
+  // To reset:    localStorage.removeItem('edgelane_api_base'); reload.
+  // ───────────────────────────────────────────────────────────────────────
+  function _resolveApiBase() {
+    const url = new URL(location.href);
+    const qp = url.searchParams.get('api');
+    if (qp) {
+      try { localStorage.setItem('edgelane_api_base', qp); } catch(e) {}
+      return qp.replace(/\/+$/, '');
+    }
+    try {
+      const stored = localStorage.getItem('edgelane_api_base');
+      if (stored) return stored.replace(/\/+$/, '');
+    } catch(e) {}
+    if ((location.protocol === 'http:' || location.protocol === 'https:') && location.host) {
+      return `${location.protocol}//${location.host}`;
+    }
+    return 'http://127.0.0.1:8789';
+  }
+  const API_BASE = _resolveApiBase();
+  console.info('[edgelane] API_BASE =', API_BASE,
+    '  (override with ?api=http://host:port; clear with localStorage.removeItem("edgelane_api_base"))');
+
+  const $ = (id) => document.getElementById(id);
+  const fmt = {
+    money: (v, d=2) => (v === null || v === undefined || Number.isNaN(v)) ? '—' : Number(v).toFixed(d),
+    pct:   (v, d=1) => (v === null || v === undefined || Number.isNaN(v)) ? '—' : `${Number(v).toFixed(d)}%`,
+    strike:(v) => (v === null || v === undefined) ? '—' : Number(v).toLocaleString(undefined, {maximumFractionDigits:2}),
+    when:  (iso) => { if(!iso) return '—'; try { return new Date(iso).toLocaleTimeString(); } catch { return iso; } },
+    sigInt:(v) => (v === null || v === undefined || Number.isNaN(v)) ? '—' : Math.round(Number(v)).toLocaleString(),
+  };
+
+  const BIAS_COLOR = {
+    bullish:      { bg:'bg-emerald-500/25', text:'text-emerald-200', stripe:'stripe-bull' },
+    mild_bullish: { bg:'bg-emerald-500/15', text:'text-emerald-300', stripe:'stripe-bull' },
+    neutral:      { bg:'bg-slate-500/20',   text:'text-slate-200',   stripe:'stripe-neutral' },
+    mild_bearish: { bg:'bg-rose-500/15',    text:'text-rose-300',    stripe:'stripe-bear' },
+    bearish:      { bg:'bg-rose-500/25',    text:'text-rose-200',    stripe:'stripe-bear' },
+  };
+
+  const STRATEGY_NAMES = {
+    bull_put: 'Bull Put', bear_call: 'Bear Call',
+    iron_condor: 'Iron Condor', iron_butterfly: 'Iron Fly',
+    bull_call: 'Bull Call', bear_put: 'Bear Put',
+    call_butterfly: 'Call Fly', put_butterfly: 'Put Fly',
+  };
+
+  // ── Feature 2: tooltip text dictionaries ────────────────────────────────
+  // Ported from legacy JSX (search HEALTH_BADGES + tooltipBody in JSX).
+  const TT_BIAS = "Asymmetric EdgelaneProvider scorer: put wall = magnet, call wall = resistance. Score on -100/+100 scale; >=60 = directional conviction.";
+  const TT_CONF = "Combines wall strength x dex alignment x intraday reachability. Demoted automatically when the wall is >1.5% away with <1.5 DTE remaining.";
+  const TT_WALL_STR = "Tiered by |net_gex| magnitude relative to chain-wide max. high = dominant, medium = significant, low = present but weak.";
+  const TT_LIQ = "Composite of bid-ask spread + per-leg open interest. high = tight spread + deep OI on every leg; low = wide spread or thin OI somewhere.";
+  const TT_COMPOSITE = "Composite 0-100: EV cap +40, healthy badge +15, high liquidity +10, limit feasibility +10 to +30, POP tiebreaker. Centered at 50.";
+  const TT_HEALTH = {
+    healthy:      "Healthy — strikes outside the wall, balanced delta, premium worth the capital. Default state for a tradeable spread.",
+    thin:         "Thin — premium is small relative to max loss. Risk/reward is unfavorable; consider passing or widening strikes.",
+    directional: "Directional — net delta is high enough that this is really a directional bet, not a neutral spread. Size accordingly.",
+    broken:       "Broken — structure is malformed (e.g. credit spread with capped profit below zero EV at every reasonable price). Do not trade.",
+    capital_trap: "Capital trap — max loss is many multiples of max profit. Even high POP cannot justify holding through adverse moves. Skip.",
+  };
+  const TT_VERDICT = {
+    'tradeable now':       "Composite >= 60 and EV >= 0 — current market premium is already an edge. Fill at market.",
+    'tradeable on limit':  "Composite >= 60 via limit-tier feasibility — current premium is sub-fair; place a GTC limit at one of the tier targets.",
+    'marginal':            "Score 40-59 — borderline setup. Wait for the chain to come to you; don't chase.",
+    'do not trade':        "Score < 40 — structure is unhealthy, premium is bad, or both. Skip and rebid the bias next cycle.",
+  };
+
+  let state = {
+    symbol: 'SPX',
+    symbols: ['SPX'],
+    snapshot: null,
+    status: null,
+  };
+
+  function toast(msg) {
+    const t = $('toast'); t.textContent = msg; t.classList.add('show');
+    clearTimeout(t._tt); t._tt = setTimeout(() => t.classList.remove('show'), 1800);
+  }
+
+  function showError(msg) {
+    const box = $('errBox');
+    box.textContent = String(msg);
+    box.classList.remove('hidden');
+  }
+  function clearError() { $('errBox').classList.add('hidden'); }
+
+  // ── fetch helpers ──
+  async function getJSON(path) {
+    const r = await fetch(`${API_BASE}${path}`, { mode:'cors' });
+    if (r.status === 404) return { __404: true };
+    if (!r.ok) throw new Error(`${path} → HTTP ${r.status}`);
+    return r.json();
+  }
+
+  // ── renderers ──
+  function renderStatus(st) {
+    state.status = st;
+    if (!st) return;
+    $('version').textContent = `v${st.version || ''}`;
+    const polling = !!st.polling;
+    const mock = !!st.using_mock;
+    // Mode pill
+    const mp = $('modePill');
+    mp.className = `pill ${mock ? 'bg-amber-500/20 text-amber-200' : 'bg-sky-500/20 text-sky-200'}`;
+    mp.innerHTML = `<span class="dot ${mock?'bg-amber-400':'bg-sky-400'}"></span>${mock ? 'MOCK' : (st.tradier_env||'live').toUpperCase()}`;
+    // Market pill
+    state.marketOpen = !!st.market_open;
+    const mkt = $('marketPill');
+    if (st.market_open) {
+      mkt.className = 'pill bg-emerald-500/20 text-emerald-200';
+      mkt.innerHTML = '<span class="dot bg-emerald-400 dot-pulse"></span>Market Open';
+    } else {
+      mkt.className = 'pill bg-amber-500/20 text-amber-200';
+      mkt.innerHTML = `<span class="dot bg-amber-400"></span>Closed · ${st.market_reason || ''}`;
+    }
+    // Status pill
+    const sp = $('statusPill');
+    if (polling) {
+      sp.className = 'pill bg-emerald-500/20 text-emerald-200';
+      sp.innerHTML = '<span class="dot bg-emerald-400 dot-pulse"></span>Live';
+    } else {
+      sp.className = 'pill bg-rose-500/20 text-rose-200';
+      sp.innerHTML = '<span class="dot bg-rose-400"></span>Poller Down';
+    }
+    if (st.last_error && Object.keys(st.last_error).length) {
+      const lines = Object.entries(st.last_error).map(([s,e]) => `${s}: ${e}`).join('\n');
+      $('lastUpdate').textContent = `Last poll ${fmt.when(st.last_poll_ts)} · errors: ${lines}`;
+    } else {
+      $('lastUpdate').textContent = `Last poll ${fmt.when(st.last_poll_ts)} (${st.last_poll_symbol || '—'})`;
+    }
+    // Populate symbol dropdown if changed
+    const sel = $('symbolSel');
+    const incoming = (st.symbols || []).join(',');
+    const current = (state.symbols || []).join(',');
+    if (incoming && incoming !== current) {
+      state.symbols = st.symbols;
+      sel.innerHTML = st.symbols.map(s => `<option ${s===state.symbol?'selected':''}>${s}</option>`).join('');
+    }
+  }
+
+  function renderSnapshot(snap) {
+    state.snapshot = snap;
+    if (!snap || snap.__404) {
+      $('spotPrice').textContent = '—';
+      $('dteExp').textContent = '';
+      $('expectedMove').textContent = 'Waiting for first poll…';
+      $('biasPill').textContent = '—';
+      $('biasPill').className = 'mt-2 inline-flex items-center gap-2 px-3 py-1 rounded-full font-bold text-lg bg-slate-500/20 text-slate-200';
+      $('biasScore').textContent = '—';
+      $('biasConf').textContent  = '—';
+      $('biasFacts').textContent = '';
+      $('putWall').textContent = '—'; $('putWallStr').textContent = '';
+      $('callWall').textContent = '—'; $('callWallStr').textContent = '';
+      $('gexWall').textContent = '—'; $('gexWallStr').textContent = '';
+      $('pickCard').classList.add('hidden');
+      $('stratGrid').innerHTML = '';
+      return;
+    }
+    clearError();
+    // Spot + DTE + EM
+    $('spotPrice').textContent = fmt.money(snap.spot);
+    $('dteExp').textContent = `DTE ${snap.dte} · exp ${snap.expiration}`;
+    const em = Number(snap.expected_move || 0);
+    const emPct = snap.spot ? (em / snap.spot) * 100 : 0;
+    $('expectedMove').textContent = `Expected move ±${fmt.money(em,2)} (≈${fmt.pct(emPct,2)})`;
+
+    // Bias
+    const bias = snap.bias || {};
+    const lbl = bias.bias_label || 'neutral';
+    const col = BIAS_COLOR[lbl] || BIAS_COLOR.neutral;
+    const pill = $('biasPill');
+    pill.textContent = lbl.replace('_',' ').toUpperCase();
+    pill.className = `mt-2 inline-flex items-center gap-2 px-3 py-1 rounded-full font-bold text-lg ${col.bg} ${col.text}`;
+    pill.title = TT_BIAS;
+    $('biasScore').textContent = bias.directional_score !== undefined ? Number(bias.directional_score).toFixed(1) : '—';
+    $('biasScore').title = TT_BIAS;
+    $('biasConf').textContent = (bias.confidence || '—').toUpperCase();
+    $('biasConf').title = TT_CONF;
+    const facts = bias._facts || {};
+    // Plain-English read: connect walls → bias direction so the user sees
+    // the causal chain ("magnet at X below spot → bearish drift; ceiling at Y above").
+    // Mirrors the EdgelaneProvider asymmetric model running in the backend bias engine.
+    const spot = Number(snap.spot || 0);
+    const pw = bias.put_wall_strike, cw = bias.call_wall_strike;
+    const fmtK = (v) => v == null ? null : Number(v).toLocaleString(undefined,{maximumFractionDigits:0});
+    const parts = [];
+    if (pw != null && spot) {
+      const side = pw > spot ? 'above spot' : pw < spot ? 'below spot' : 'at spot';
+      const pull = pw > spot ? 'pulls up' : pw < spot ? 'pulls down' : 'pins price';
+      parts.push(`Magnet ${fmtK(pw)} (${side}) ${pull}`);
+    }
+    if (cw != null && spot) {
+      const side = cw > spot ? 'above' : cw < spot ? 'below' : 'at';
+      const role = cw > spot ? 'ceiling' : 'broken — rallies are unconstrained above';
+      parts.push(`Resistance ${fmtK(cw)} (${side}) ${role}`);
+    }
+    if (parts.length) {
+      const arrow = (lbl.includes('bull')) ? '→ upward drift' :
+                    (lbl.includes('bear')) ? '→ downward drift' :
+                    '→ range-bound';
+      $('biasFacts').textContent = `${parts.join(' · ')}  ${arrow}`;
+    } else {
+      $('biasFacts').textContent = `wall ${facts.wall_side||'—'} · gamma ${facts.gamma_regime||'—'} · dex ${facts.dex_skew_side||'—'}`;
+    }
+    $('biasCard').className = `card p-4 ${col.stripe}`;
+
+    // Data source line — EdgelaneProvider extension overlay vs Tradier OI fallback
+    const dataSource = bias._data_source;
+    const sourceEl = $('biasSource');
+    if (sourceEl) {
+      if (dataSource === 'edgelane_provider') {
+        const isoTs = bias._external_received_at;
+        let ageStr = '';
+        if (isoTs) {
+          const t = Date.parse(isoTs);
+          if (!isNaN(t)) {
+            const ageSec = Math.max(0, Math.round((Date.now() - t) / 1000));
+            ageStr = ageSec < 60 ? `${ageSec}s ago`
+                   : ageSec < 3600 ? `${Math.floor(ageSec/60)}m ago`
+                   : `${Math.floor(ageSec/3600)}h ago`;
+          }
+        }
+        sourceEl.textContent = `[Source: EdgelaneProvider ext${ageStr ? ' · ' + ageStr : ''}]`;
+        sourceEl.className = 'mt-1 text-xs text-emerald-400';
+      } else if (dataSource === 'tradier_oi') {
+        sourceEl.textContent = '[Source: Tradier OI computed]';
+        sourceEl.className = 'mt-1 text-xs text-slate-500';
+      } else {
+        sourceEl.textContent = '';
+      }
+    }
+
+    // Walls
+    $('putWall').textContent  = fmt.strike(bias.put_wall_strike);
+    $('putWallStr').textContent  = bias.put_wall_strength ? `${bias.put_wall_strength} · gex ${fmt.sigInt(bias.put_wall_net_gex)}` : '';
+    $('putWallStr').title = TT_WALL_STR;
+    $('callWall').textContent = fmt.strike(bias.call_wall_strike);
+    $('callWallStr').textContent = bias.call_wall_strength ? `${bias.call_wall_strength} · gex ${fmt.sigInt(bias.call_wall_net_gex)}` : '';
+    $('callWallStr').title = TT_WALL_STR;
+    $('gexWall').textContent  = fmt.strike(bias.gex_wall_strike);
+    $('gexWallStr').textContent  = bias.gex_wall_strength ? `${bias.gex_wall_strength} · ${bias.gex_wall_type||''}` : '';
+
+    // Engine pick
+    const pick = snap.engine_pick;
+    if (pick) {
+      $('pickCard').classList.remove('hidden');
+      $('pickName').textContent = `${STRATEGY_NAMES[pick.strategy] || pick.strategy}`;
+      $('pickLabel').textContent = `${pick.label || ''} · ${pick.width_preset || ''}`;
+      $('pickComposite').textContent = `composite ${Number(pick.composite_score||0).toFixed(1)}`;
+      $('pickComposite').title = TT_COMPOSITE;
+      const v = pick.composite_verdict || {};
+      $('pickVerdict').textContent = (v.label||'').toUpperCase();
+      $('pickVerdict').className = `pill ${verdictClass(v.color)}`;
+      $('pickVerdict').title = TT_VERDICT[(v.label||'').toLowerCase()] || '';
+      $('pickStructure').textContent = pick.structure_text || '';
+      $('pickMetrics').innerHTML = `
+        <div><div class="text-slate-500">Net prem</div><div>${fmt.money(pick.net_premium)}</div></div>
+        <div><div class="text-slate-500">Max P</div><div class="text-emerald-300">${fmt.money(pick.max_profit)}</div></div>
+        <div><div class="text-slate-500">Max L</div><div class="text-rose-300">${fmt.money(pick.max_loss)}</div></div>
+        <div><div class="text-slate-500">POP</div><div>${fmt.pct(pick.pop_pct,1)}</div></div>
+        <div><div class="text-slate-500">EV</div><div>${fmt.money(pick.ev,2)}</div></div>
+      `;
+    } else {
+      $('pickCard').classList.add('hidden');
+    }
+
+    // Strategy pills (8)
+    const grid = $('stratGrid');
+    grid.innerHTML = '';
+    const strats = snap.strategies || {};
+    const order = ['bull_put','bear_call','iron_condor','iron_butterfly','bull_call','bear_put','call_butterfly','put_butterfly'];
+    for (const key of order) {
+      const s = strats[key];
+      grid.insertAdjacentHTML('beforeend', renderStrategyPill(key, s));
+    }
+    // Bind buttons
+    grid.querySelectorAll('button[data-action]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const act = btn.dataset.action; const strat = btn.dataset.strategy;
+        if (act === 'copy') copyTicket(strat);
+        else if (act === 'place') placeOrder(strat);
+      });
+    });
+  }
+
+  function verdictClass(color) {
+    if (color === 'emerald') return 'bg-emerald-500/20 text-emerald-200';
+    if (color === 'amber')   return 'bg-amber-500/20 text-amber-200';
+    if (color === 'rose')    return 'bg-rose-500/20 text-rose-200';
+    return 'bg-slate-700 text-slate-200';
+  }
+
+  function badgeClass(h) {
+    const m = {healthy:'badge-healthy',thin:'badge-thin',directional:'badge-directional',broken:'badge-broken',capital_trap:'badge-capital_trap'};
+    return `pill ${m[h] || 'bg-slate-700 text-slate-300'}`;
+  }
+  function liqClass(l) { return `pill ${({high:'liq-high',mid:'liq-mid',low:'liq-low'})[l] || 'bg-slate-700 text-slate-300'}`; }
+  function compositeClass(score) {
+    if (score >= 60) return 'composite-good';
+    if (score >= 40) return 'composite-meh';
+    return 'composite-bad';
+  }
+
+  function renderStrategyPill(key, s) {
+    if (!s) return '';
+    const best = s.best;
+    const star = s.is_recommended ? '<span class="text-amber-300 ml-1" title="recommended by bias">★</span>' : '';
+    const recCls = s.is_recommended ? ' recommended-glow' : '';
+    if (!best) {
+      return `<div class="card p-3${recCls}">
+        <div class="flex justify-between items-baseline">
+          <div class="font-semibold">${STRATEGY_NAMES[key] || key}${star}</div>
+          <span class="pill bg-slate-700 text-slate-400">no candidate</span>
+        </div>
+        <div class="mt-2 text-xs text-slate-500">No tradeable structure found at this chain/DTE.</div>
+      </div>`;
+    }
+    const cs = Number(best.composite_score || 0);
+    const v = best.composite_verdict || {};
+    const legsCount = Array.isArray(best.legs) ? best.legs.length : 0;
+    const ticket = buildTicketObj(key, s, best);
+    const ticketStr = JSON.stringify(ticket, null, 2).replace(/"/g, '&quot;');
+    const healthTip = (TT_HEALTH[best.health] || '').replace(/"/g, '&quot;');
+    const liqTip    = TT_LIQ.replace(/"/g, '&quot;');
+    const compTip   = TT_COMPOSITE.replace(/"/g, '&quot;');
+    const verdictTip= (TT_VERDICT[(v.label||'').toLowerCase()] || '').replace(/"/g, '&quot;');
+    const tierStrip = renderLimitTierStrip(best);
+    return `<div class="card p-3${recCls}">
+      <div class="flex justify-between items-start gap-2">
+        <div>
+          <div class="font-semibold">${STRATEGY_NAMES[key] || key}${star}</div>
+          <div class="text-xs text-slate-500">${best.label || ''} · ${best.width_preset || ''} · ${legsCount} legs</div>
+        </div>
+        <div class="text-right">
+          <div class="font-bold ${compositeClass(cs)} tt" title="${compTip}">${cs.toFixed(1)}</div>
+          <div class="text-[10px] text-slate-500">composite</div>
+        </div>
+      </div>
+      <div class="mt-2 text-xs text-slate-300">${best.structure_text || ''}</div>
+      <div class="mt-2 grid grid-cols-3 gap-1 text-xs">
+        <div><div class="text-slate-500">Net</div>${fmt.money(best.net_premium)}</div>
+        <div><div class="text-slate-500">MaxP</div><span class="text-emerald-300">${fmt.money(best.max_profit)}</span></div>
+        <div><div class="text-slate-500">MaxL</div><span class="text-rose-300">${fmt.money(best.max_loss)}</span></div>
+        <div><div class="text-slate-500">POP</div>${fmt.pct(best.pop_pct,1)}</div>
+        <div><div class="text-slate-500">EV</div>${fmt.money(best.ev,2)}</div>
+        <div><div class="text-slate-500">Adj EV</div>${fmt.money(best.ev_adjusted,2)}</div>
+      </div>
+      <div class="mt-2 flex flex-wrap gap-1">
+        <span class="${badgeClass(best.health)}" title="${healthTip}">${best.health || '—'}</span>
+        <span class="${liqClass(best.liquidity)}" title="${liqTip}">liq ${best.liquidity || '—'}</span>
+        <span class="${verdictClass(v.color)} pill" title="${verdictTip}">${(v.label||'').toUpperCase()}</span>
+      </div>
+      ${tierStrip}
+      <div class="mt-2 flex gap-2" data-ticket="${ticketStr}">
+        <button class="btn" data-action="copy" data-strategy="${key}">Copy ticket</button>
+        <button class="btn btn-primary" data-action="place" data-strategy="${key}">Place order</button>
+      </div>
+    </div>`;
+  }
+
+  // ── Feature 1: limit-tier strip ────────────────────────────────────────
+  // Annotates each tier (modest/balanced/strong) as met / reachable /
+  // infeasible based on the candidate's current EV edge over breakeven.
+  // Ported (visually condensed) from JSX lines ~4458-4530.
+  function renderLimitTierStrip(c) {
+    const lp = c && c.limit_premiums;
+    if (!lp || !Array.isArray(lp.tiers) || !lp.tiers.length) return '';
+    const isCredit = lp.side === 'credit';
+    const verb = isCredit ? 'Sell @' : 'Buy @';
+    const currentEV = isCredit ? (lp.current - lp.breakeven) : (lp.breakeven - lp.current);
+    const fmtM = (v) => '$' + Number(v).toFixed(2);
+    const signed = (v) => (v >= 0 ? '+' : '−') + '$' + Math.abs(v).toFixed(2);
+    const rows = lp.tiers.map(t => {
+      const targetEV = Number(t.target_ev || t.targetEV || 0);
+      let status;
+      if (currentEV >= targetEV) status = 'met';
+      else if (t.feasible)       status = 'reach';
+      else                        status = 'infeas';
+      const cls = status === 'met' ? 'lt-met' : status === 'reach' ? 'lt-reach' : 'lt-infeas';
+      const icon = status === 'met' ? '✓' : status === 'reach' ? '○' : '✗';
+      const name = (t.name || t.label || '').toLowerCase();
+      return `<div class="lt-row ${cls}">
+        <span class="uppercase tracking-wider text-[10px] w-20">${icon} ${name}</span>
+        <span>${verb} <strong>${fmtM(Number(t.target||0))}</strong></span>
+        <span class="text-[10px] opacity-70">EV +${Number(targetEV).toFixed(2)}</span>
+      </div>`;
+    }).join('');
+    const headTip = isCredit
+      ? `Credit-side limit tiers — live edge ${signed(currentEV)} over fair (breakeven ${fmtM(lp.breakeven)}, live ${fmtM(lp.current)}).`
+      : `Debit-side limit tiers — live edge ${signed(currentEV)} under fair (breakeven ${fmtM(lp.breakeven)}, live ${fmtM(lp.current)}).`;
+    return `<div class="lt-card" title="${headTip.replace(/"/g,'&quot;')}">
+      <div class="text-[10px] uppercase tracking-wider text-slate-400 mb-1">limit tiers (${lp.side})</div>
+      ${rows}
+    </div>`;
+  }
+
+  function buildTicketObj(strategy, s, best) {
+    return {
+      symbol: state.snapshot?.symbol,
+      expiration: state.snapshot?.expiration,
+      strategy,
+      label: best.label,
+      width_preset: best.width_preset,
+      structure: best.structure_text,
+      net_premium: best.net_premium,
+      max_profit: best.max_profit,
+      max_loss: best.max_loss,
+      pop_pct: best.pop_pct,
+      composite_score: best.composite_score,
+      legs: best.legs || [],
+      decision_id: state.snapshot?.engine_pick?.decision_id ?? null,
+      generated_at: new Date().toISOString(),
+    };
+  }
+
+  async function copyTicket(strategy) {
+    const snap = state.snapshot; if (!snap) return;
+    const s = (snap.strategies||{})[strategy];
+    if (!s || !s.best) { toast('No candidate to copy'); return; }
+    const ticket = buildTicketObj(strategy, s, s.best);
+    const text = JSON.stringify(ticket, null, 2);
+    try {
+      await navigator.clipboard.writeText(text);
+      toast(`Copied ${strategy} ticket`);
+    } catch {
+      // fallback
+      const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
+      ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+      toast(`Copied ${strategy} ticket (fallback)`);
+    }
+  }
+
+  // ── Order modal (preview + hold-to-confirm live submit) ────────────────
+  const orderModal = {
+    strategy: null,
+    candidate: null,
+    snap: null,
+    previewOk: false,
+    holdTimer: null,
+    holdStart: 0,
+  };
+
+  function _legActionLabel(longShort) {
+    return (Number(longShort) > 0) ? 'BUY' : 'SELL';
+  }
+  function _legAbsQty(longShort, baseQty) {
+    return Math.max(1, Math.abs(Number(longShort) || 1)) * baseQty;
+  }
+
+  function _readBrokerAccountId() {
+    // sessionStorage holds per-user broker connections keyed by
+    // `edgelane_broker_connections_v1_{userId}`. We don't know the userId
+    // here, so scan all matching keys for an active tradier connection.
+    try {
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const k = sessionStorage.key(i);
+        if (!k || !k.startsWith('edgelane_broker_connections_v1')) continue;
+        const raw = sessionStorage.getItem(k);
+        if (!raw) continue;
+        const obj = JSON.parse(raw);
+        const conns = obj.connections || [];
+        const active = conns.find(c => c.id === obj.activeId) || conns[0];
+        if (active && active.config && active.config.account_id) return active.config.account_id;
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function _renderModalLegs(candidate, qty) {
+    const rows = (candidate.legs || []).map(leg => {
+      const action = _legActionLabel(leg.long_short);
+      const cls = action === 'BUY' ? 'leg-buy' : 'leg-sell';
+      const q = _legAbsQty(leg.long_short, qty);
+      const sideTxt = (leg.side || '').toUpperCase();
+      return `<div class="leg-row">
+        <span class="${cls} font-bold">${action}</span>
+        <span>${q} × ${sideTxt} ${Number(leg.strike).toLocaleString()}</span>
+        <span class="text-slate-500">${leg.symbol || ''}</span>
+      </div>`;
+    });
+    $('orderLegs').innerHTML = rows.join('') || '<div class="text-xs text-slate-500">No legs.</div>';
+  }
+
+  function _renderCostEstimate(candidate, qty) {
+    const ml = Number(candidate.max_loss || 0);
+    const mp = Number(candidate.max_profit || 0);
+    const isCredit = (candidate.type || '').toLowerCase() === 'credit';
+    const cap = (isCredit ? ml : ml) * qty * 100;
+    const credit = isCredit ? mp * qty * 100 : 0;
+    const txt = isCredit
+      ? `${qty} × max loss = $${cap.toFixed(2)} risk (max profit $${credit.toFixed(2)})`
+      : `${qty} × debit = $${(Number(candidate.net_premium || 0) * qty * 100).toFixed(2)}`;
+    $('orderCostVal').textContent = txt;
+  }
+
+  function openOrderDialog(strategy) {
+    const snap = state.snapshot;
+    if (!snap) { toast('No snapshot yet'); return; }
+    const bucket = (snap.strategies || {})[strategy];
+    if (!bucket || !bucket.best) { toast('No candidate available'); return; }
+    const cand = bucket.best;
+    orderModal.strategy = strategy;
+    orderModal.candidate = cand;
+    orderModal.snap = snap;
+    orderModal.previewOk = false;
+
+    const labelName = STRATEGY_NAMES[strategy] || strategy;
+    $('orderHeader').textContent =
+      `${labelName} · ${cand.label || ''} · ${snap.symbol} · exp ${snap.expiration}`;
+    $('orderQty').value = 1;
+    $('orderLimit').value = (cand.limit_price != null ? cand.limit_price : cand.net_premium) || '';
+    $('orderDuration').value = 'day';
+    // Account id: prefer the backend's configured TRADIER_ACCOUNT_ID (surfaced
+    // via /status); fall back to sessionStorage broker connection.
+    const cfgAcc = (state.status && state.status.tradier_account_id) || '';
+    $('orderAccount').value = cfgAcc || _readBrokerAccountId() || '';
+    $('orderPreviewPane').textContent = 'No preview yet. Click "Preview" to validate against Tradier.';
+    $('orderStatus').textContent = '';
+    $('orderSubmitBtn').disabled = true;
+
+    _renderModalLegs(cand, 1);
+    _renderCostEstimate(cand, 1);
+    $('orderModal').classList.add('show');
+  }
+
+  function closeOrderDialog() {
+    $('orderModal').classList.remove('show');
+    _cancelHold();
+    orderModal.strategy = null;
+    orderModal.candidate = null;
+  }
+
+  function _buildOrderReq() {
+    return {
+      symbol: orderModal.snap.symbol,
+      strategy: orderModal.strategy,
+      candidate_label: orderModal.candidate.label,
+      quantity: Math.max(1, parseInt($('orderQty').value || '1', 10)),
+      limit_price: ($('orderLimit').value === '') ? null : parseFloat($('orderLimit').value),
+      duration: $('orderDuration').value || 'day',
+      account_id: $('orderAccount').value.trim() || null,
+    };
+  }
+
+  async function _postOrder(path, body) {
+    const r = await fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      mode: 'cors',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    let payload = null;
+    try { payload = await r.json(); } catch { payload = { detail: await r.text() }; }
+    return { ok: r.ok, status: r.status, payload };
+  }
+
+  async function doPreview() {
+    if (!orderModal.candidate) return;
+    const body = _buildOrderReq();
+    $('orderStatus').textContent = 'Previewing…';
+    $('orderPreviewPane').textContent = '';
+    $('orderSubmitBtn').disabled = true;
+    orderModal.previewOk = false;
+    const { ok, status, payload } = await _postOrder('/orders/preview', body);
+    $('orderPreviewPane').textContent = JSON.stringify(payload, null, 2);
+    if (ok) {
+      const order = (payload && payload.tradier_response && payload.tradier_response.order) || {};
+      const st = (order.status || 'ok').toLowerCase();
+      const rejected = order.result === false || st === 'rejected';
+      if (rejected) {
+        $('orderStatus').innerHTML = `<span class="text-rose-300">Preview rejected: ${order.reason_description || st}</span>`;
+        orderModal.previewOk = false;
+      } else {
+        $('orderStatus').innerHTML = `<span class="text-emerald-300">Preview OK · ${st}</span>`;
+        orderModal.previewOk = true;
+        $('orderSubmitBtn').disabled = false;
+      }
+    } else {
+      $('orderStatus').innerHTML = `<span class="text-rose-300">HTTP ${status}: ${(payload && (payload.detail || payload.error)) || 'unknown'}</span>`;
+    }
+  }
+
+  async function doSubmit() {
+    if (!orderModal.previewOk) { toast('Run Preview first'); return; }
+    const body = _buildOrderReq();
+    body.confirm = true;
+    $('orderStatus').textContent = 'Submitting live…';
+    const { ok, status, payload } = await _postOrder('/orders/submit', body);
+    $('orderPreviewPane').textContent = JSON.stringify(payload, null, 2);
+    if (ok) {
+      const oid = payload.order_id || '?';
+      $('orderStatus').innerHTML = `<span class="text-emerald-300">Submitted · order id ${oid}</span>`;
+      toast(`Order ${oid} submitted`);
+      setTimeout(closeOrderDialog, 3000);
+    } else {
+      $('orderStatus').innerHTML = `<span class="text-rose-300">HTTP ${status}: ${(payload && (payload.detail || payload.error)) || 'unknown'}</span>`;
+    }
+  }
+
+  // Hold-to-confirm — fill the arc over 2s, fire submit at 100%.
+  const HOLD_MS = 2000;
+  function _startHold() {
+    const btn = $('orderSubmitBtn');
+    if (btn.disabled) return;
+    const arc = btn.querySelector('.hold-arc');
+    orderModal.holdStart = performance.now();
+    _cancelHold();
+    orderModal.holdTimer = setInterval(() => {
+      const elapsed = performance.now() - orderModal.holdStart;
+      const pct = Math.min(100, (elapsed / HOLD_MS) * 100);
+      arc.style.width = pct + '%';
+      if (pct >= 100) {
+        _cancelHold();
+        doSubmit();
+      }
+    }, 40);
+  }
+  function _cancelHold() {
+    if (orderModal.holdTimer) { clearInterval(orderModal.holdTimer); orderModal.holdTimer = null; }
+    const btn = $('orderSubmitBtn');
+    if (btn) { const arc = btn.querySelector('.hold-arc'); if (arc) arc.style.width = '0%'; }
+  }
+
+  // Re-render legs + cost when qty changes.
+  document.addEventListener('input', (e) => {
+    if (!orderModal.candidate) return;
+    if (e.target && e.target.id === 'orderQty') {
+      const q = Math.max(1, parseInt(e.target.value || '1', 10));
+      _renderModalLegs(orderModal.candidate, q);
+      _renderCostEstimate(orderModal.candidate, q);
+    }
+  });
+
+  function placeOrder(strategy) {
+    openOrderDialog(strategy);
+  }
+
+  // Bind modal controls (one-time)
+  function _bindOrderModalControls() {
+    $('orderCloseBtn').addEventListener('click', closeOrderDialog);
+    $('orderModal').addEventListener('click', (e) => {
+      if (e.target.id === 'orderModal') closeOrderDialog();
+    });
+    $('orderPreviewBtn').addEventListener('click', doPreview);
+    const sb = $('orderSubmitBtn');
+    sb.addEventListener('mousedown', _startHold);
+    sb.addEventListener('mouseup', _cancelHold);
+    sb.addEventListener('mouseleave', _cancelHold);
+    sb.addEventListener('touchstart', (e) => { e.preventDefault(); _startHold(); }, {passive:false});
+    sb.addEventListener('touchend', _cancelHold);
+    sb.addEventListener('touchcancel', _cancelHold);
+  }
+  _bindOrderModalControls();
+
+  // ── poll loop ──
+  async function poll() {
+    try {
+      const [status, snap] = await Promise.all([
+        getJSON('/status').catch(e => { throw new Error(`backend unreachable: ${e.message}`); }),
+        getJSON(`/snapshot/${encodeURIComponent(state.symbol)}`).catch(e => ({ __err: e.message })),
+      ]);
+      renderStatus(status);
+      if (snap && !snap.__err) renderSnapshot(snap);
+      else if (snap && snap.__err) {
+        renderSnapshot(null);
+      }
+    } catch (e) {
+      showError(e.message || String(e));
+      const sp = $('statusPill');
+      sp.className = 'pill bg-rose-500/30 text-rose-100';
+      sp.innerHTML = '<span class="dot bg-rose-400"></span>Backend Down';
+    }
+  }
+
+  // ── Accuracy + regime renderer ─────────────────────────────────────────
+  const RESULT_CLASS = {
+    win:     'text-emerald-300',
+    loss:    'text-rose-300',
+    neutral: 'text-slate-400',
+  };
+
+  function tierClass(tier) {
+    switch (tier) {
+      case 'green':  return 'bg-emerald-500/20 text-emerald-200';
+      case 'yellow': return 'bg-amber-500/20 text-amber-200';
+      case 'red':    return 'bg-rose-500/20 text-rose-200';
+      default:       return 'bg-slate-700 text-slate-300';
+    }
+  }
+
+  function renderAccuracy(acc) {
+    if (!acc) return;
+    const pill = $('accuracyPill');
+    const banner = $('regimeBanner');
+    // Self-eval is paused while the market is closed — the backend stops
+    // scoring outcomes, so reflect that rather than showing a stale win rate.
+    if (state.marketOpen === false) {
+      pill.className = 'pill bg-slate-600/40 text-slate-300';
+      pill.textContent = 'Self-eval paused · market closed';
+      pill.title = 'Outcome evaluation resumes at market open';
+      banner.classList.add('hidden');
+    } else {
+      pill.className = `pill ${tierClass(acc.tier)}`;
+      if (acc.tier === 'unknown' || (acc.n || 0) === 0) {
+        pill.textContent = 'Accuracy collecting…';
+        pill.title = 'No outcomes evaluated yet';
+      } else {
+        const a = Number(acc.accuracy_pct || 0).toFixed(0);
+        pill.textContent = `Accuracy ${a}% (${acc.wins}W / ${acc.losses}L / ${acc.neutrals}N)`;
+        pill.title = `rolling window of ${acc.window} · ${acc.n} outcomes counted`;
+      }
+      // Regime banner
+      if (acc.regime_alert) {
+        banner.classList.remove('hidden');
+        $('regimeMsg').textContent = `${acc.regime_consec_losses} consecutive losses — engine confidence rebuilding…`;
+        $('regimeTs').textContent = acc.regime_triggered_at
+          ? `since ${new Date(acc.regime_triggered_at).toLocaleTimeString()}`
+          : '';
+      } else {
+        banner.classList.add('hidden');
+      }
+    }
+    // Recent outcomes list
+    const list = $('outcomeList');
+    const rows = acc.recent_outcomes || [];
+    $('outcomeMeta').textContent = acc.last_evaluated_at
+      ? `last eval ${new Date(acc.last_evaluated_at).toLocaleTimeString()} · ${acc.n}/${acc.window} in window`
+      : 'awaiting first sweep';
+    if (!rows.length) {
+      list.innerHTML = '<div class="text-slate-500 italic">No evaluations yet — first outcomes will land ' +
+        '3 minutes after the first bias decision.</div>';
+      return;
+    }
+    list.innerHTML = rows.map(r => {
+      const t = r.evaluated_at ? new Date(r.evaluated_at).toLocaleString() : '—';
+      const mv = (r.actual_move_pct >= 0 ? '+' : '') + Number(r.actual_move_pct || 0).toFixed(3) + '%';
+      const cls = RESULT_CLASS[r.result] || 'text-slate-400';
+      return `<div class="flex flex-wrap gap-x-3 gap-y-0 items-baseline">
+        <span class="text-slate-500">${t}</span>
+        <span class="text-slate-300">${r.label || '—'}</span>
+        <span class="text-slate-400">predicted <span class="text-slate-200">${r.predicted_direction || '—'}</span></span>
+        <span class="text-slate-400">actual <span class="text-slate-200">${mv}</span></span>
+        <span class="${cls} font-bold uppercase ml-auto">${r.result || '—'}</span>
+      </div>`;
+    }).join('');
+  }
+
+  async function pollAccuracy() {
+    try {
+      const acc = await getJSON(`/accuracy/${encodeURIComponent(state.symbol)}`);
+      if (acc && !acc.__404) renderAccuracy(acc);
+    } catch (_) {
+      // soft-fail — accuracy is non-critical; just leave the pill in its last state
+    }
+  }
+  $('symbolSel').addEventListener('change', (e) => { state.symbol = e.target.value; poll(); pollAccuracy(); renderLookup(); });
+  $('refreshBtn').addEventListener('click', () => { poll(); pollAccuracy(); });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Feature 3 — Profile circle + Settings panel
+  // ═══════════════════════════════════════════════════════════════════════
+  const USER_KEY = 'edgelane_user_v1';
+  const POLL_INTERVAL_KEY = 'edgelane_poll_interval_v1';
+
+  function _loadUser() {
+    try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null'); } catch { return null; }
+  }
+  function _saveUser(u) {
+    try { localStorage.setItem(USER_KEY, JSON.stringify(u)); } catch {}
+  }
+
+  function _renderSettings() {
+    const u = _loadUser() || { displayName: 'Operator' };
+    $('settingsUserName').textContent = u.displayName || 'Operator';
+    $('profileInitial').textContent = (u.displayName || 'O').trim()[0].toUpperCase();
+    // Tradier env from /status
+    const st = state.status || {};
+    const env = (st.tradier_env || 'production').toLowerCase();
+    document.querySelectorAll('input[name="tradierEnv"]').forEach(el => {
+      el.checked = (el.value === env);
+    });
+    if (st.using_mock) {
+      $('brokerStatus').innerHTML = '<span class="text-amber-300">● MOCK mode</span> — no live Tradier token configured';
+    } else {
+      $('brokerStatus').innerHTML = `<span class="text-emerald-300">● Connected</span> · ${env.toUpperCase()}`;
+    }
+    $('brokerAccount').textContent = st.tradier_account_id || '(auto-resolving…)';
+    const ival = parseInt(localStorage.getItem(POLL_INTERVAL_KEY) || '5', 10);
+    $('pollInt').value = ival;
+    $('pollIntLabel').textContent = ival;
+  }
+
+  function toggleSettings(force) {
+    const p = $('settingsPanel');
+    const open = force !== undefined ? force : p.classList.contains('hidden');
+    if (open) { _renderSettings(); p.classList.remove('hidden'); }
+    else      { p.classList.add('hidden'); }
+  }
+
+  $('profileBtn').addEventListener('click', () => toggleSettings());
+  $('settingsCloseBtn').addEventListener('click', () => toggleSettings(false));
+  // Click-outside-to-close
+  document.addEventListener('click', (e) => {
+    const wrap = $('profileWrap');
+    if (!wrap.contains(e.target) && !$('settingsPanel').classList.contains('hidden')) {
+      toggleSettings(false);
+    }
+  });
+
+  $('testConnBtn').addEventListener('click', async () => {
+    const out = $('testConnResult');
+    out.textContent = 'testing…';
+    out.className = 'text-[11px] self-center text-slate-400';
+    try {
+      const r = await fetch(`${API_BASE}/diag/tradier`, { mode:'cors' });
+      const j = await r.json();
+      if (j.ok) {
+        out.innerHTML = `<span class="text-emerald-300">OK · ${j.latency_ms || '?'}ms</span>`;
+      } else {
+        out.innerHTML = `<span class="text-rose-300">${j.error || 'failed'}</span>`;
+      }
+    } catch (e) {
+      out.innerHTML = `<span class="text-rose-300">${e.message || 'unreachable'}</span>`;
+    }
+  });
+
+  $('pollInt').addEventListener('input', (e) => {
+    const v = parseInt(e.target.value || '5', 10);
+    $('pollIntLabel').textContent = v;
+    try { localStorage.setItem(POLL_INTERVAL_KEY, String(v)); } catch {}
+    _applyPollInterval(v);
+  });
+
+  $('resetUiBtn').addEventListener('click', () => {
+    if (!confirm('Clear all local UI state and reload?')) return;
+    try {
+      Object.keys(localStorage)
+        .filter(k => k.startsWith('edgelane_'))
+        .forEach(k => localStorage.removeItem(k));
+    } catch {}
+    location.reload();
+  });
+
+  $('signOutBtn').addEventListener('click', () => {
+    try { localStorage.removeItem(USER_KEY); } catch {}
+    _renderSettings();
+    toast('Local session cleared');
+    toggleSettings(false);
+  });
+
+  let _pollTimer = setInterval(poll, 5000);
+  function _applyPollInterval(secs) {
+    clearInterval(_pollTimer);
+    _pollTimer = setInterval(poll, Math.max(5, Number(secs)||5) * 1000);
+  }
+
+  // Initial profile circle
+  (function _initProfile() {
+    const u = _loadUser() || { displayName: 'Operator', createdAt: new Date().toISOString() };
+    _saveUser(u);
+    $('profileInitial').textContent = (u.displayName || 'O').trim()[0].toUpperCase();
+  })();
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Feature 4 — Tab strip + Lookup tab (Black-Scholes projection grid)
+  // Ported from legacy JSX (lines 1875-2310). Pure compute, no React deps.
+  // ═══════════════════════════════════════════════════════════════════════
+  let activeTab = 'engine';
+  function switchTab(tab) {
+    activeTab = tab;
+    document.querySelectorAll('.tab-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.tab === tab);
+    });
+    $('view-engine').classList.toggle('hidden', tab !== 'engine');
+    $('view-lookup').classList.toggle('hidden', tab !== 'lookup');
+    if (tab === 'lookup') renderLookup();
+  }
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    b.addEventListener('click', () => switchTab(b.dataset.tab));
+  });
+
+  // ── Black-Scholes core (ported from JSX _normCdf / _bsPrice) ──
+  function _normCdf(x) {
+    const a1 =  0.254829592, a2 = -0.284496736, a3 =  1.421413741;
+    const a4 = -1.453152027, a5 =  1.061405429, p  =  0.3275911;
+    const sign = x < 0 ? -1 : 1;
+    const ax = Math.abs(x) / Math.SQRT2;
+    const t = 1.0 / (1.0 + p * ax);
+    const erf = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-ax * ax);
+    return 0.5 * (1.0 + sign * erf);
+  }
+  function _bsPrice(S, K, T, r, sigma, side) {
+    if (S == null || K == null || S <= 0 || K <= 0) return null;
+    if (T <= 0) return side === 'call' ? Math.max(0, S - K) : Math.max(0, K - S);
+    if (sigma == null || sigma <= 0) {
+      return side === 'call'
+        ? Math.max(0, S - K * Math.exp(-r * T))
+        : Math.max(0, K * Math.exp(-r * T) - S);
+    }
+    const sqT = Math.sqrt(T);
+    const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqT);
+    const d2 = d1 - sigma * sqT;
+    return side === 'call'
+      ? S * _normCdf(d1) - K * Math.exp(-r * T) * _normCdf(d2)
+      : K * Math.exp(-r * T) * _normCdf(-d2) - S * _normCdf(-d1);
+  }
+  function _priceSpreadAtSpot(legs, S, T, r) {
+    if (!legs || !legs.length || S == null) return null;
+    if (r == null) r = 0.05;
+    let total = 0, missing = false;
+    for (const leg of legs) {
+      const sigma = leg.iv != null && leg.iv > 0 ? leg.iv : null;
+      if (sigma == null) missing = true;
+      const ls = leg.long_short != null ? leg.long_short : leg.longShort;
+      const px = _bsPrice(S, leg.strike, T, r, sigma, leg.side);
+      if (px == null) return null;
+      total += (Number(ls) || 0) * px;
+    }
+    return { total, missingIv: missing };
+  }
+
+  // ── ET clock-time helpers (ported from JSX _etParts / _inSessionET etc.) ──
+  const _ET_OPEN_MIN = 9 * 60 + 30;
+  const _ET_CLOSE_MIN = 16 * 60;
+  function _etParts(ms) {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: 'numeric', minute: 'numeric', hour12: false,
+    }).formatToParts(new Date(ms));
+    const get = k => parts.find(p => p.type === k)?.value;
+    return {
+      weekday: get('weekday'),
+      year: Number(get('year')),
+      month: Number(get('month')),
+      day: Number(get('day')),
+      hour: Number(get('hour')) % 24,
+      minute: Number(get('minute')),
+    };
+  }
+  function _formatClockLocal(ms) {
+    const parts = new Intl.DateTimeFormat('en-US', { hour:'numeric', minute:'2-digit', hour12:true }).formatToParts(new Date(ms));
+    const get = k => parts.find(p => p.type === k)?.value;
+    const ampm = (get('dayPeriod')||'').toLowerCase().startsWith('p') ? 'p' : 'a';
+    return `${get('hour')||'?'}:${get('minute')||'00'}${ampm}`;
+  }
+  function _formatClockLocalWithDay(ms) {
+    const day = new Intl.DateTimeFormat('en-US', { weekday:'short' }).format(new Date(ms));
+    return `${day} ${_formatClockLocal(ms)}`;
+  }
+  function _msAtETClock(dateStr, hour, minute) {
+    for (const off of [4, 5]) {
+      const hh = String(hour).padStart(2,'0'), mm = String(minute).padStart(2,'0');
+      const ms = Date.parse(`${dateStr}T${hh}:${mm}:00-0${off}:00`);
+      if (isNaN(ms)) continue;
+      const p = _etParts(ms);
+      if (p.hour === hour && p.minute === minute) return ms;
+    }
+    const hh = String(hour).padStart(2,'0'), mm = String(minute).padStart(2,'0');
+    return Date.parse(`${dateStr}T${hh}:${mm}:00-05:00`);
+  }
+  function _inSessionET(ms) {
+    const p = _etParts(ms);
+    if (p.weekday === 'Sat' || p.weekday === 'Sun') return false;
+    const mod = p.hour * 60 + p.minute;
+    return mod >= _ET_OPEN_MIN && mod < _ET_CLOSE_MIN;
+  }
+  function _ceil15MinET(ms) {
+    const p = _etParts(ms);
+    const r = p.minute % 15;
+    if (r === 0) return ms;
+    return ms + (15 - r) * 60_000;
+  }
+  function _nextSessionOpenET(afterMs) {
+    const p0 = _etParts(afterMs);
+    const isWknd = p0.weekday === 'Sat' || p0.weekday === 'Sun';
+    const mod = p0.hour * 60 + p0.minute;
+    if (!isWknd && mod < _ET_OPEN_MIN) {
+      const ds = `${p0.year}-${String(p0.month).padStart(2,'0')}-${String(p0.day).padStart(2,'0')}`;
+      return _msAtETClock(ds, 9, 30);
+    }
+    let cursor = Date.UTC(p0.year, p0.month - 1, p0.day, 12, 0, 0);
+    for (let i = 0; i < 7; i++) {
+      cursor += 86_400_000;
+      const pp = _etParts(cursor);
+      if (pp.weekday !== 'Sat' && pp.weekday !== 'Sun') {
+        const ds = `${pp.year}-${String(pp.month).padStart(2,'0')}-${String(pp.day).padStart(2,'0')}`;
+        return _msAtETClock(ds, 9, 30);
+      }
+    }
+    return afterMs + 86_400_000;
+  }
+
+  // ── Projection grid builder (ported from JSX _buildProjectionGrid) ──
+  function _buildProjectionGrid(candidate, currentSpot, opts) {
+    if (!candidate || !candidate.legs || !candidate.legs.length) return null;
+    if (currentSpot == null) return null;
+    const isCredit = (candidate.type || '').toLowerCase() === 'credit'
+      || candidate.net_premium > 0 && candidate.label !== undefined && (candidate.short_delta !== undefined);
+    // For MARKET, infer credit/debit from `type` if present, otherwise from
+    // limit_premiums.side; default to credit-like sign convention as JSX did.
+    const sideHint = candidate.limit_premiums?.side
+                  || (candidate.type ? candidate.type.toLowerCase() : 'credit');
+    const credit = sideHint === 'credit';
+    const expStr = candidate.expiration || (opts && opts.expiration);
+    const expirationMs = expStr ? _msAtETClock(String(expStr), 16, 0)
+                                : (Date.now() + Math.max(0, candidate.dte || 0) * 86_400_000);
+    const dteNow = Math.max(0, (expirationMs - Date.now()) / 86_400_000);
+    const T0 = Math.max(0, dteNow / 365);
+    const anchor = _priceSpreadAtSpot(candidate.legs, currentSpot, T0, 0.05);
+    if (!anchor) return null;
+    const liveSigned = credit ? -Math.abs(candidate.net_premium) : Math.abs(candidate.net_premium);
+    const offset = liveSigned - anchor.total;
+
+    const STEP = currentSpot > 1000 ? 1 : 0.5;
+    const HALF = 15;
+    const centerSnap = Math.round(currentSpot / STEP) * STEP;
+    const spotAxis = [];
+    for (let i = -HALF; i <= HALF; i++) spotAxis.push(centerSnap + i * STEP);
+
+    const MAX_COLS = 10;
+    const MIN_STEP = 15;
+    const nowMs = Date.now();
+    let cursor = _inSessionET(nowMs) ? nowMs : _nextSessionOpenET(nowMs);
+    const firstLocalDay = new Date(nowMs).getDay();
+    const firstLocalDate = new Date(nowMs).getDate();
+    const cells = [];
+    cells.push({
+      ms: Math.min(cursor, expirationMs),
+      label: cursor === nowMs ? 'now' : _formatClockLocalWithDay(cursor),
+      dteRem: Math.max(0, (expirationMs - Math.min(cursor, expirationMs)) / 86_400_000),
+    });
+    cursor = _ceil15MinET(cursor + 60_000);
+    while (cells.length < MAX_COLS - 1) {
+      if (cursor >= expirationMs) break;
+      if (!_inSessionET(cursor)) {
+        cursor = _nextSessionOpenET(cursor);
+        if (cursor >= expirationMs) break;
+      }
+      const cDay = new Date(cursor).getDay();
+      const cDate = new Date(cursor).getDate();
+      const sameDay = cDay === firstLocalDay && cDate === firstLocalDate;
+      const dteRem = Math.max(0, (expirationMs - cursor) / 86_400_000);
+      cells.push({
+        ms: cursor,
+        label: sameDay ? _formatClockLocal(cursor) : _formatClockLocalWithDay(cursor),
+        dteRem,
+      });
+      cursor += MIN_STEP * 60_000;
+    }
+    if (!cells.length || cells[cells.length-1].ms < expirationMs) {
+      cells.push({ ms: expirationMs, label: 'exp', dteRem: 0 });
+    }
+    const grid = spotAxis.map(S =>
+      cells.map(t => {
+        const T = Math.max(0, t.dteRem / 365);
+        const px = _priceSpreadAtSpot(candidate.legs, S, T, 0.05);
+        if (!px) return null;
+        const adjusted = px.total + offset;
+        return credit ? -adjusted : adjusted;
+      })
+    );
+    let centerRow = 0, best = Infinity;
+    for (let i = 0; i < spotAxis.length; i++) {
+      const d = Math.abs(spotAxis[i] - currentSpot);
+      if (d < best) { best = d; centerRow = i; }
+    }
+    return {
+      spotAxis, timeAxis: cells, grid,
+      currentSpot, currentPremium: Math.abs(candidate.net_premium || 0),
+      isCredit: credit, centerRow, missingIv: anchor.missingIv,
+    };
+  }
+
+  function renderLookup() {
+    const host = $('lookupHost');
+    const snap = state.snapshot;
+    if (!snap || !snap.engine_pick) {
+      host.innerHTML = '<div class="text-slate-500 italic text-sm">No engine pick available yet.</div>';
+      return;
+    }
+    const pick = snap.engine_pick;
+    const grid = _buildProjectionGrid(pick, snap.spot, { expiration: snap.expiration });
+    if (!grid) {
+      host.innerHTML = `<div class="card p-3 text-slate-400 text-sm">
+        <span class="font-bold text-slate-200">${STRATEGY_NAMES[pick.strategy] || pick.strategy}</span>
+        — projection unavailable (missing leg IV or DTE).
+      </div>`;
+      return;
+    }
+    const live = grid.currentPremium;
+    const isCredit = grid.isCredit;
+    const maxP = Math.max(0.05, Number(pick.max_profit) || 0);
+    const maxL = Math.max(0.05, Number(pick.max_loss)   || 0);
+
+    let head = `<div class="card p-3 mb-2">
+      <div class="flex items-baseline justify-between flex-wrap gap-2">
+        <div>
+          <span class="text-emerald-300 font-bold">${STRATEGY_NAMES[pick.strategy] || pick.strategy}</span>
+          <span class="text-slate-400 ml-2 text-xs">${pick.label || ''} · ${pick.width_preset || ''}</span>
+          <span class="text-slate-500 ml-2 text-xs">${snap.symbol} · exp ${snap.expiration} (DTE ${snap.dte})</span>
+        </div>
+        <div class="text-xs text-slate-400">
+          Live ${isCredit ? 'credit' : 'debit'}:
+          <span class="font-bold text-slate-100">${isCredit?'+':'−'}$${live.toFixed(2)}</span>
+          ${grid.missingIv ? '<span class="ml-2 text-amber-400 italic">(intrinsic fallback — missing IV)</span>' : ''}
+        </div>
+      </div>
+      <div class="mt-1 text-[11px] text-slate-500">${pick.structure_text || ''}</div>
+    </div>`;
+
+    let rows = '<thead><tr><th class="text-left text-slate-500" style="width:80px">Spot ↓ / Time →</th>';
+    for (const t of grid.timeAxis) rows += `<th>${t.label}</th>`;
+    rows += '</tr></thead><tbody>';
+    grid.grid.forEach((row, i) => {
+      const isCenter = i === grid.centerRow;
+      rows += `<tr><td class="lk-axis ${isCenter?'lk-center':''}">${isCenter?'▸ ':''}$${grid.spotAxis[i].toFixed(grid.spotAxis[i]>=1000?0:2)}</td>`;
+      row.forEach((px, j) => {
+        if (px == null) { rows += '<td class="text-slate-700">—</td>'; return; }
+        const pnl = isCredit ? (live - Math.abs(px)) : (Math.abs(px) - live);
+        const denom = pnl > 0 ? maxP : maxL;
+        const norm = Math.max(-1, Math.min(1, pnl / denom));
+        let lvl;
+        if (Math.abs(norm) < 0.08) lvl = 0;
+        else if (norm > 0) lvl = norm < 0.25 ? 1 : norm < 0.55 ? 2 : 3;
+        else                lvl = norm > -0.25 ? -1 : norm > -0.55 ? -2 : -3;
+        const sign = isCredit ? '+' : '−';
+        const tip = `Spot $${grid.spotAxis[i].toFixed(2)} · ${grid.timeAxis[j].label}\npremium ${sign}$${Math.abs(px).toFixed(2)} · close-now P&L ${(pnl>=0?'+':'−')}$${Math.abs(pnl*100).toFixed(0)}/contract`;
+        rows += `<td class="lk-lvl-${lvl}" title="${tip}">${sign}$${Math.abs(px).toFixed(2)}</td>`;
+      });
+      rows += '</tr>';
+    });
+    rows += '</tbody>';
+
+    host.innerHTML = head + `<div class="card p-3 overflow-x-auto"><table class="lk-grid">${rows}</table>
+      <div class="mt-2 text-[10px] text-slate-500 italic">
+        Center row (▸) marks current spot. Color intensity scales with how close cell P&L is to this spread's max profit (deep green) or max loss (deep red).
+        Projected via Black-Scholes assuming today's IV holds; time columns are wall-clock until expiry close (4:00pm ET).
+      </div></div>`;
+  }
+
+  // Re-render Lookup every poll cycle so spot drift + IV updates flow through.
+  const _origRenderSnapshot = renderSnapshot;
+  // (Already wrapped via state.snapshot updates — call renderLookup after each poll)
+  setInterval(() => { if (activeTab === 'lookup') renderLookup(); }, 5000);
+
+  poll();
+  pollAccuracy();
+  setInterval(pollAccuracy, 10000);
+})();
+</script>
+</body>
+</html>

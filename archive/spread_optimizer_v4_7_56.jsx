@@ -1177,98 +1177,6 @@ function _strikeFromRow(row) {
   return Number(row?.strike ?? row?.strike_price ?? row?.K);
 }
 
-// v4.7.67: EdgelaneProvider-style bilateral wall finder. Returns the dominant PUT
-// wall (highest positive net_gex — puts dominate) and dominant CALL wall
-// (most negative net_gex — calls dominate) SEPARATELY rather than collapsing
-// them into a single "GEX wall" by absolute magnitude.
-//
-// Why: per EdgelaneProvider empirical model and consistent with the user's own
-// observations of their 0DTE GEX tool, call walls and put walls behave
-// asymmetrically:
-//   • PUT walls   → MAGNET (price drifts toward)         — dealers short gamma
-//   • CALL walls  → RESISTANCE (price gets blocked at)   — dealers long gamma
-// Treating both as magnets (v4.7.63-65) misreads call-wall setups.
-function _findGexWallsBilateral(greeksRaw, exposuresForChosen) {
-  const rows = _strikeRowsFrom(exposuresForChosen);
-  const enriched = rows.map(r => ({
-    strike: _strikeFromRow(r),
-    netGex: _gexFromRow(r),
-    callGex: Number((r && (r.call_gex !== undefined ? r.call_gex : r.callGex)) || 0),
-    putGex:  Number((r && (r.put_gex  !== undefined ? r.put_gex  : r.putGex))  || 0),
-  })).filter(o => o.strike != null && !isNaN(o.strike));
-
-  if (enriched.length === 0) return { putWall: null, callWall: null };
-
-  let totalAbs = 0;
-  for (const o of enriched) totalAbs += Math.abs(o.netGex);
-
-  const classify = (gexAbs) => {
-    if (!gexAbs || !totalAbs) return 'low';
-    const share = gexAbs / totalAbs;
-    return share > 0.20 ? 'high' : share > 0.10 ? 'medium' : 'low';
-  };
-
-  let putWall = null;
-  for (const o of enriched) {
-    if (o.netGex > 0 && (!putWall || o.netGex > putWall.netGex)) putWall = Object.assign({}, o);
-  }
-  if (putWall) putWall.strength = classify(Math.abs(putWall.netGex));
-
-  let callWall = null;
-  for (const o of enriched) {
-    if (o.netGex < 0 && (!callWall || o.netGex < callWall.netGex)) callWall = Object.assign({}, o);
-  }
-  if (callWall) callWall.strength = classify(Math.abs(callWall.netGex));
-
-  return { putWall, callWall };
-}
-
-// v4.7.67: EdgelaneProvider-style asymmetric directional score for 0DTE / 1DTE.
-//
-//   • Put wall is the MAGNET (sets direction). Price drifts toward it.
-//   • Call wall is RESISTANCE (modulates magnitude). If it sits between
-//     spot and the put wall on the same side, the magnet pull is reduced.
-//   • Score sign comes from put-wall position vs spot:
-//        put wall ABOVE spot → bullish drift
-//        put wall BELOW spot → bearish drift
-//   • Magnitude scales with put-wall strength and proximity.
-function _computeEdgelaneProviderScore(spot, putWall, callWall) {
-  if (!spot || !putWall || !putWall.strike) {
-    if (callWall && callWall.strike) {
-      const callDist = (callWall.strike - spot) / spot;
-      const sm = callWall.strength === 'high' ? 1.5 : callWall.strength === 'medium' ? 1.0 : 0.5;
-      return Math.max(-30, Math.min(30, Math.round(-Math.sign(callDist) * 20 * sm * 10) / 10));
-    }
-    return 0;
-  }
-  const putDistPct = (putWall.strike - spot) / spot;
-  const putDir = Math.sign(putDistPct);
-  const distAbs = Math.abs(putDistPct);
-
-  const reach = distAbs < 0.005 ? 1.0
-              : distAbs < 0.01  ? 0.80
-              : distAbs < 0.02  ? 0.55
-              : distAbs < 0.03  ? 0.35
-              : 0.15;
-
-  const sm = putWall.strength === 'high' ? 1.5 : putWall.strength === 'medium' ? 1.0 : 0.5;
-  let magnetScore = putDir * 90 * sm * reach;
-
-  if (callWall && callWall.strike) {
-    const callDistPct = (callWall.strike - spot) / spot;
-    const sameSide = Math.sign(callDistPct) === putDir;
-    const closer   = Math.abs(callDistPct) < distAbs;
-    if (sameSide && closer) {
-      const callMag = Math.abs(callWall.netGex);
-      const putMag  = Math.abs(putWall.netGex);
-      const blockRatio = callMag / Math.max(callMag + putMag, 1e-9);
-      magnetScore *= (1 - blockRatio * 0.75);
-    }
-  }
-  return Math.max(-100, Math.min(100, Math.round(magnetScore * 10) / 10));
-}
-
-
 // Find the dominant gamma wall + classify its strength relative to others.
 // Atlas often pre-computes call_wall / put_wall in key_levels — prefer those.
 function _findGexWall(greeksRaw, exposuresForChosen) {
@@ -1277,15 +1185,10 @@ function _findGexWall(greeksRaw, exposuresForChosen) {
   const atlasCallWall = Number(kl.call_wall ?? kl.callWall ?? kl.gex_call_wall ?? 0) || null;
   const atlasPutWall  = Number(kl.put_wall  ?? kl.putWall  ?? kl.gex_put_wall  ?? 0) || null;
 
-  // 2. Compute from per-strike GEX (signed: + = puts dominate, - = calls dominate)
+  // 2. Compute from per-strike GEX
   const rows = _strikeRowsFrom(exposuresForChosen);
   const gexByStrike = rows
-    .map(r => ({
-      strike: _strikeFromRow(r),
-      gex: _gexFromRow(r),
-      callGex: Number(r?.call_gex ?? r?.callGex ?? 0) || 0,
-      putGex:  Number(r?.put_gex  ?? r?.putGex  ?? 0) || 0,
-    }))
+    .map(r => ({ strike: _strikeFromRow(r), gex: _gexFromRow(r) }))
     .filter(o => o.strike != null && !isNaN(o.strike));
 
   let best = null;
@@ -1303,39 +1206,11 @@ function _findGexWall(greeksRaw, exposuresForChosen) {
     strength = 'high';
   }
 
-  // v4.7.65: classify the wall as PUT, CALL, or MIXED based on which side
-  // dominates GEX at the dominant strike.
-  //   net_gex = putGex - callGex
-  //     positive → puts dominate → "put wall"
-  //     negative → calls dominate → "call wall"
-  //     near zero (within 30% diff) → "mixed wall"
-  // This is intel the engine had all along (per-leg call_gex / put_gex are
-  // already computed in _computeDealerExposures) but was being thrown away
-  // when picking the max-|gex| strike. Now we surface it.
-  let wallType = null;
-  if (best) {
-    const cgex = Math.abs(best.callGex);
-    const pgex = Math.abs(best.putGex);
-    if (cgex + pgex > 0) {
-      const dominanceRatio = Math.max(cgex, pgex) / Math.max(1e-9, Math.min(cgex, pgex));
-      if (dominanceRatio < 1.3) {
-        wallType = 'mixed';
-      } else if (pgex > cgex) {
-        wallType = 'put';
-      } else {
-        wallType = 'call';
-      }
-    }
-  }
-
-  // Final wall: prefer computed best; fall back to atlas pre-computed levels
+  // Final wall: prefer the larger of (computed, atlas call_wall, atlas put_wall)
+  // by |GEX|, but if computed is null, take whichever atlas value exists.
   const wallStrike = best?.strike ?? atlasCallWall ?? atlasPutWall ?? null;
-  // If we fell back to an atlas wall, type comes from that:
-  if (best == null && wallStrike != null) {
-    wallType = (wallStrike === atlasCallWall) ? 'call' : (wallStrike === atlasPutWall) ? 'put' : null;
-  }
 
-  return { strike: wallStrike, strength, type: wallType, atlasCallWall, atlasPutWall, computedTopGex: best?.gex || 0 };
+  return { strike: wallStrike, strength, atlasCallWall, atlasPutWall, computedTopGex: best?.gex || 0 };
 }
 
 // Aggregate signed exposures for the chosen expiration.
@@ -1352,24 +1227,11 @@ function _aggregateExposures(exposuresForChosen, portfolioTotals) {
 }
 
 // Score directional bias on [-100, 100] from spot vs wall + DEX + gamma regime.
-//
-// Base intuition: wall BELOW spot = support = bullish; wall ABOVE = resistance =
-// bearish. That's the SHORT-GAMMA "wall as magnet/repeller" interpretation.
-//
-// v4.7.57: gamma regime now actively reshapes the score (not just dampens it).
-//   • LONG-GAMMA  (netGex > 0): wall is a STABILIZER, not a magnet. Indices in
-//     normal regimes sit here. Heavy dampen (×0.3) so wall geometry produces at
-//     most a mild bias. DEX sign flips: in long-gamma, dealer-long-delta is
-//     bullish flow (dealers want price up so their book decays favorably),
-//     opposite of the short-vol mental model that the old code assumed.
-//   • SHORT-GAMMA (netGex < 0): wall acts as magnet/repeller. Amplify slightly
-//     (×1.2). Original DEX convention applies (dealer-short-delta hedges into
-//     rallies = bearish flow contribution).
-//
-// Pre-v4.7.57, the engine used short-gamma sign conventions unconditionally —
-// which is why index tickers in long-gamma kept reading as mild_bearish on
-// otherwise benign setups, sandbagging bull_put and steering toward bear_call.
-function _computeDirectionalScore(spot, wall, netGex, netDex, dte) {
+// Wall ABOVE spot → resistance → bearish. Wall BELOW spot → support → bullish.
+// Strength multiplies the effect. Positive net gamma (pinning) dampens, negative
+// (amplifying) leaves it. Net DEX adds a small skew (positive dealer delta =
+// dealers sell rallies = bearish flow contribution).
+function _computeDirectionalScore(spot, wall, netGex, netDex) {
   if (!spot || wall.strike == null) return 0;
   const pctFromWall = (spot - wall.strike) / wall.strike;
   let score = pctFromWall * 200;  // 5% above = +10; 25% above = +50
@@ -1377,50 +1239,12 @@ function _computeDirectionalScore(spot, wall, netGex, netDex, dte) {
   const strengthMult = wall.strength === 'high' ? 1.5 : wall.strength === 'medium' ? 1.0 : 0.5;
   score *= strengthMult;
 
-  // v4.7.63: TWO mental models for the wall, depending on horizon:
-  //   • MULTI-DAY (DTE ≥ 1.5): wall = barrier/resistance. Wall above spot
-  //     pushes price down (resistance) → bearish. Wall below = support →
-  //     bullish. This matches the geometric `pctFromWall * 200` baseline.
-  //   • INTRADAY (DTE < 1.5): wall = magnet/pin. Gamma concentration at
-  //     near-expiration pulls price TOWARD high-OI strikes. Wall above spot
-  //     means price drifts UP to it (bullish drift). Wall below = bearish
-  //     drift. This is the empirical 0DTE pinning effect; the baseline
-  //     barrier sign must be FLIPPED to get it right.
-  //
-  // Pre-v4.7.63 the engine used barrier convention regardless of DTE, which
-  // systematically inverted 0DTE direction reads — recommending bear_call
-  // on bullish-drift days (wall above) and bull_put on bearish-drift days
-  // (wall below). This was the root cause of the user's losses on intraday
-  // index plays. The flip + amplification below corrects it.
-  const intraday = dte != null && dte < 1.5;
-  if (!intraday && netGex > 0) {
-    // Multi-day long-gamma: wall = stabilizer, not magnet. Heavy dampen.
-    score *= 0.3;
-    if (netDex !== 0) score += 10 * Math.sign(netDex);   // positive DEX = bullish flow
-  } else if (intraday) {
-    // 0DTE/1DTE: wall = magnet. Flip sign + amplify based on REACH.
-    //
-    // Pin probability is high when wall is close (small pctFromWall) AND
-    // gamma is intensifying. We boost more for closer walls and less for
-    // far walls (unreachable in the remaining trade horizon).
-    //   < 0.5%  pin → 6× boost (very tight, near-certain magnet)
-    //   < 1%    pin → 4× boost
-    //   < 2%    pin → 2× boost
-    //   < 3%    pin → 1× boost
-    //   ≥ 3%    pin → 0.3× boost (likely unreachable in remaining time)
-    const distPct = Math.abs(pctFromWall);
-    const reach = distPct < 0.005 ? 6 : distPct < 0.01 ? 4 : distPct < 0.02 ? 2 : distPct < 0.03 ? 1 : 0.3;
-    score = -score * 8 * reach;
-    // 0DTE DEX: positive net dealer delta typically means dealers are long
-    // delta from short-put exposure. They want price to STAY UP / RISE so
-    // those puts expire OTM — bullish flow contribution.
-    if (netDex !== 0) score += 15 * Math.sign(netDex);
-  } else if (netGex < 0) {
-    // Multi-day short-gamma: wall = barrier (original convention).
-    score *= 1.2;
-    if (netDex !== 0) score += -10 * Math.sign(netDex);  // positive DEX = bearish flow
-  }
-  // netGex == 0 multi-day → no regime contribution (geometric only).
+  // Gamma regime modulator
+  if (netGex > 0) score *= 0.7;       // positive gamma = pinning, dampen
+  else if (netGex < 0) score *= 1.2;  // negative = amplifying
+
+  // DEX skew (small contribution, max ±10)
+  if (netDex !== 0) score += -10 * Math.sign(netDex);
 
   return Math.max(-100, Math.min(100, Math.round(score * 10) / 10));
 }
@@ -1435,15 +1259,7 @@ function _scoreToBiasLabel(score) {
 
 // Confidence: high when wall is strong AND |score| > 30 AND DEX direction
 // agrees with wall-position direction. Low when wall is weak or score tiny.
-// v4.7.59: intraday "wall reachability" — for DTE < 1.5, a wall the underlying
-// can't realistically reach in the trade horizon shouldn't drive a high-
-// confidence directional read. Rough heuristic: if |spot - wall| > 1.5% AND
-// it's intraday, knock confidence down a notch. (1.5% ≈ a typical full-day
-// move for SPX/NDX; if the trader holds for 1-2 hours, expected reach is much
-// less.) This naturally suppresses composite scores on "magnet too far away"
-// setups without adding a new UI element — confidence already flows into
-// the health-badge / composite pipeline.
-function _computeConfidence(score, wall, netDex, spot, dte) {
+function _computeConfidence(score, wall, netDex, spot) {
   const absScore = Math.abs(score);
   if (wall.strength === 'low' || wall.strike == null) return 'low';
   if (absScore < 15) return 'low';
@@ -1452,22 +1268,9 @@ function _computeConfidence(score, wall, netDex, spot, dte) {
   const dexDir = -Math.sign(netDex);  // positive DEX = bearish flow → -1
   const aligned = wallDir !== 0 && dexDir !== 0 && wallDir === dexDir;
 
-  // Intraday reachability gate
-  const intraday = dte != null && dte < 1.5;
-  const wallDistPct = (wall.strike != null && spot) ? Math.abs(spot - wall.strike) / spot : 0;
-  const unreachableIntraday = intraday && wallDistPct > 0.015;
-
-  let base;
-  if (wall.strength === 'high' && absScore > 30 && aligned) base = 'high';
-  else if (absScore < 25) base = 'low';
-  else base = 'medium';
-
-  if (unreachableIntraday) {
-    if (base === 'high') return 'medium';
-    if (base === 'medium') return 'low';
-    return 'low';
-  }
-  return base;
+  if (wall.strength === 'high' && absScore > 30 && aligned) return 'high';
+  if (absScore < 25) return 'low';
+  return 'medium';
 }
 
 // Pick recommended strategies: primary from BIAS_TO_STRATEGY, then any other
@@ -1506,29 +1309,12 @@ function _extractGreekWall(greeksRaw, exposuresForChosen, keyName, fallbackRowFi
   return (best && best.value !== 0) ? best : null;
 }
 
-function _computeBiasSignals(symbol, expiration, spot, greeksRaw, exposuresForChosen, regimeOverride = null, chosenDte = null) {
+function _computeBiasSignals(symbol, expiration, spot, greeksRaw, exposuresForChosen) {
   const wall = _findGexWall(greeksRaw, exposuresForChosen);
-  // v4.7.67: also extract dominant put + call walls separately.
-  const { putWall, callWall } = _findGexWallsBilateral(greeksRaw, exposuresForChosen);
-  // v4.7.58: regime (netGex/netDex) can be supplied externally — used by
-  // detectBias to smooth across 0/1/2/3 DTE for short-dated plays.
-  // v4.7.59: smoothed regime is IGNORED for intraday plays (DTE < 1.5) because
-  // multi-day regime sign is meaningless at near-expiration anyway — gamma
-  // concentration at the trading expiration dominates. Wall detection still
-  // stays per-chosen-expiration (correct in both regimes).
-  const fallback = _aggregateExposures(exposuresForChosen, greeksRaw?.portfolio_totals);
-  const intraday = chosenDte != null && chosenDte < 1.5;
-  const netGex = (!intraday && regimeOverride && regimeOverride.netGex != null) ? regimeOverride.netGex : fallback.netGex;
-  const netDex = (!intraday && regimeOverride && regimeOverride.netDex != null) ? regimeOverride.netDex : fallback.netDex;
-  // v4.7.67: for intraday (DTE < 1.5), use EdgelaneProvider-style asymmetric
-  // scoring (put = magnet, call = resistance). For multi-day, keep the
-  // legacy barrier model.
-  const intradayForScore = chosenDte != null && chosenDte < 1.5;
-  const score = intradayForScore
-    ? _computeEdgelaneProviderScore(spot, putWall, callWall)
-    : _computeDirectionalScore(spot, wall, netGex, netDex, chosenDte);
+  const { netGex, netDex } = _aggregateExposures(exposuresForChosen, greeksRaw?.portfolio_totals);
+  const score = _computeDirectionalScore(spot, wall, netGex, netDex);
   const biasLabel = _scoreToBiasLabel(score);
-  const confidence = _computeConfidence(score, wall, netDex, spot, chosenDte);
+  const confidence = _computeConfidence(score, wall, netDex, spot);
   const recommended = _recommendStrategies(biasLabel);
 
   // v4.7.29: VEX/TEX walls for the optional 3-lens divergence strip (Tickets tab).
@@ -1547,23 +1333,8 @@ function _computeBiasSignals(symbol, expiration, spot, greeksRaw, exposuresForCh
     directional_score: score,
     bias_label: biasLabel,
     confidence,
-    // v4.7.57: net dealer gamma is now part of the bias result so the candidate
-    // scorer + wall-penalty math can regime-gate. Sign convention matches the
-    // bias engine: positive = long-gamma (stabilizing), negative = short-gamma.
-    net_gex: netGex,
-    dte: chosenDte,
     gex_wall_strike: wall.strike,
     gex_wall_strength: wall.strength,
-    gex_wall_type: wall.type,
-    // v4.7.67: bilateral walls — separate put and call. Used by the
-    // EdgelaneProvider-style intraday scorer and surfaced in the UI.
-    put_wall_strike:   putWall  ? putWall.strike   : null,
-    put_wall_strength: putWall  ? putWall.strength : null,
-    put_wall_net_gex:  putWall  ? putWall.netGex   : null,
-    call_wall_strike:   callWall ? callWall.strike   : null,
-    call_wall_strength: callWall ? callWall.strength : null,
-    call_wall_net_gex:  callWall ? callWall.netGex   : null,
-
     vex_wall_strike: vexWall?.strike ?? null,
     vex_wall_value:  vexWall?.value  ?? null,
     tex_wall_strike: texWall?.strike ?? null,
@@ -2374,23 +2145,11 @@ function _computeLimitPremiums(candidate) {
   };
 }
 
-// v4.7.57: signature gained `netGex` so we can regime-gate. The "wall as
-// magnet" geometry (penalize bull_put when wall is below short put, penalize
-// bear_call when wall is above short call) is ONLY correct in short-gamma
-// regimes (netGex < 0). In long-gamma regimes the wall is a stabilizing
-// support/resistance level and those geometries are actually GOOD for the
-// spread, not bad. Defaulting netGex to 0 keeps callers that don't pass it
-// in the original behavior path (treated as short-gamma magnet).
-function computeWallPenalty(strategy, strikes, breakevens, wallStrike, wallStrength, netGex = 0, dte = null) {
+function computeWallPenalty(strategy, strikes, breakevens, wallStrike, wallStrength) {
   if (!wallStrike || !strikes) return { factor: 1.0, reason: null, verdict: 'neutral' };
   const w = wallStrike;
   const s = WALL_STRENGTH_MULT[wallStrength] ?? 0.5;
   const fmt = (v) => Number(v).toFixed(2);
-  // v4.7.59: at intraday DTE (<1.5), gamma concentration overwhelms multi-day
-  // regime sign — force the "wall as magnet" interpretation. Only apply the
-  // long-gamma "stabilizing floor" reading for multi-day holds.
-  const intraday = dte != null && dte < 1.5;
-  const longGamma = !intraday && netGex > 0;
 
   switch (strategy) {
     case 'bull_put': {
@@ -2398,19 +2157,11 @@ function computeWallPenalty(strategy, strikes, breakevens, wallStrike, wallStren
       if (sp == null) return { factor: 1.0, reason: null, verdict: 'neutral' };
       if (w > sp) return { factor: 1.0, reason: `Wall ${fmt(w)} above short put — acts as upward support.`, verdict: 'good' };
       if (Math.abs(w - sp) < 0.01) return { factor: 1 - 0.4 * s, reason: `Wall AT short put ${fmt(sp)} — high pin risk on the short strike.`, verdict: 'bad' };
-      // Wall is BELOW the short put. Regime decides whether that's bad or good.
-      if (longGamma) {
-        return {
-          factor: 1.0,
-          reason: `Wall ${fmt(w)} below short put ${fmt(sp)} in long-gamma regime — put wall acts as support floor below the spread, stabilizing.`,
-          verdict: 'good',
-        };
-      }
       const distPct = (sp - w) / sp;
       const proximity = Math.max(0, 1 - distPct * 10);
       return {
         factor: 1 - 0.4 * proximity * s,
-        reason: `Wall ${fmt(w)} below short put ${fmt(sp)} (short-gamma) — no upward pull; price can drift through.`,
+        reason: `Wall ${fmt(w)} below short put ${fmt(sp)} — no upward pull; price can drift through.`,
         verdict: proximity > 0.5 ? 'bad' : 'warn',
       };
     }
@@ -2420,19 +2171,11 @@ function computeWallPenalty(strategy, strikes, breakevens, wallStrike, wallStren
       if (sc == null) return { factor: 1.0, reason: null, verdict: 'neutral' };
       if (w < sc) return { factor: 1.0, reason: `Wall ${fmt(w)} below short call — caps upside as resistance.`, verdict: 'good' };
       if (Math.abs(w - sc) < 0.01) return { factor: 1 - 0.4 * s, reason: `Wall AT short call ${fmt(sc)} — high pin risk on the short strike.`, verdict: 'bad' };
-      // Wall is ABOVE the short call. Regime decides whether that's bad or good.
-      if (longGamma) {
-        return {
-          factor: 1.0,
-          reason: `Wall ${fmt(w)} above short call ${fmt(sc)} in long-gamma regime — call wall acts as resistance ceiling above the spread, stabilizing.`,
-          verdict: 'good',
-        };
-      }
       const distPct = (w - sc) / sc;
       const proximity = Math.max(0, 1 - distPct * 10);
       return {
         factor: 1 - 0.4 * proximity * s,
-        reason: `Wall ${fmt(w)} above short call ${fmt(sc)} (short-gamma) — no downward push; price can drift through.`,
+        reason: `Wall ${fmt(w)} above short call ${fmt(sc)} — no downward push; price can drift through.`,
         verdict: proximity > 0.5 ? 'bad' : 'warn',
       };
     }
@@ -2446,22 +2189,20 @@ function computeWallPenalty(strategy, strikes, breakevens, wallStrike, wallStren
         const offCenter = Math.abs(w - mid) / half;
         const centered = 1 - offCenter;
         if (centered > 0.7) return { factor: 1.0, reason: `Wall ${fmt(w)} centered between shorts ${fmt(sp)}/${fmt(sc)} — ideal pin.`, verdict: 'good' };
-        const skewReason = longGamma
-          ? `Wall ${fmt(w)} inside body ${fmt(sp)}/${fmt(sc)} but skewed (long-gamma) — anchors price toward nearer short.`
-          : `Wall ${fmt(w)} inside body ${fmt(sp)}/${fmt(sc)} but skewed — pinning will pull price toward nearer short.`;
-        return { factor: 1 - 0.3 * (1 - centered) * s, reason: skewReason, verdict: 'warn' };
+        return {
+          factor: 1 - 0.3 * (1 - centered) * s,
+          reason: `Wall ${fmt(w)} inside body ${fmt(sp)}/${fmt(sc)} but skewed — pinning will pull price toward nearer short.`,
+          verdict: 'warn',
+        };
       }
       const dist = w < sp ? sp - w : w - sc;
       const distPct = dist / ((sp + sc) / 2);
       const proximity = Math.max(0, 1 - distPct * 10);
-      const sideDesc = w < sp ? 'below body' : 'above body';
-      // v4.7.58: wall-outside-body is bad for IC in BOTH regimes (anchor in
-      // long-gamma, magnet in short-gamma — different mechanism, same result).
-      // Text differs so the user sees the right mental model.
-      const reason = longGamma
-        ? `Wall ${fmt(w)} ${sideDesc} ${fmt(sp)}/${fmt(sc)} in long-gamma regime — anchors price ${(distPct*100).toFixed(1)}% from the profit zone.`
-        : `Wall ${fmt(w)} OUTSIDE shorts ${fmt(sp)}/${fmt(sc)} (short-gamma) — pinning drags price out of profit zone.`;
-      return { factor: 1 - 0.5 * proximity * s, reason, verdict: 'bad' };
+      return {
+        factor: 1 - 0.5 * proximity * s,
+        reason: `Wall ${fmt(w)} OUTSIDE shorts ${fmt(sp)}/${fmt(sc)} — pinning drags price out of profit zone.`,
+        verdict: 'bad',
+      };
     }
 
     case 'iron_butterfly':
@@ -2833,11 +2574,7 @@ function generateCandidates(strategy, contracts, dte, expectedMove, targetDelta,
     const c = builder(cfg.delta, cfg.width);
     if (!c) continue;
     // Strategy-aware GEX wall penalty. Adjusts EV used for ranking; keeps raw EV for display.
-    // v4.7.57: regime-aware via walls.netGex (long-gamma multi-day = wall is floor).
-    // v4.7.59: also DTE-gated — for intraday plays (DTE < 1.5), wall acts as
-    // magnet regardless of regime sign because gamma concentration at near-
-    // expiration overwhelms multi-day positioning.
-    const wallPen = computeWallPenalty(strategy, c.strikes, c.breakevens, walls?.strike, walls?.strength, walls?.netGex || 0, walls?.dte);
+    const wallPen = computeWallPenalty(strategy, c.strikes, c.breakevens, walls?.strike, walls?.strength);
     const evAdjusted = c.ev * wallPen.factor;
     let rationale = `${cfg.label} variant — short Δ target ${cfg.delta.toFixed(2)}, width factor ${cfg.width.toFixed(1)}×.`;
     if (wallPen.reason) rationale += ` ${wallPen.reason}`;
@@ -3944,29 +3681,11 @@ function OrderDialog({ candidate, symbol, expiration, connection, onClose }) {
   const liveEdge = lp ? (isCredit ? (lp.current - lp.breakeven) : (lp.breakeven - lp.current)) : 0;
   const beatsMarket = liveEdge >= 0;
   const initialMode = beatsMarket ? 'market' : 'limit';
-  // v4.7.60: default limit picks the BEST achievable price in the trade's
-  // direction, comparing the algorithm's modest tier target against the live
-  // market mid. Previously we always seeded with the modest tier — which
-  // sandbagged credit spreads when the live market was offering a better
-  // credit than the algorithm's conservative target (e.g. modest=$2.96 but
-  // market mid=$4.30 → user undersold by $1.34 if they accepted the default).
-  //   credit (sell): higher price = more credit, pick MAX
-  //   debit  (buy):  lower  price = less cost,   pick MIN
-  // Falls back to candidate.net_premium if nothing else is available.
-  const tierTarget   = lp?.tiers?.find(t => t.feasible)?.target;
-  const marketCur    = lp?.current;
-  const breakeven    = lp?.breakeven;
-  const limitOptions = [tierTarget, marketCur, breakeven]
-    .filter(v => v != null && !isNaN(Number(v)))
-    .map(Number);
-  let initialLimit;
-  if (limitOptions.length === 0) {
-    initialLimit = Number(candidate.net_premium) || 0;
-  } else if (isCredit) {
-    initialLimit = Math.max(...limitOptions);
-  } else {
-    initialLimit = Math.min(...limitOptions);
-  }
+  // Default limit price = the most achievable tier price (modest) if reachable,
+  // else breakeven price.
+  const initialLimit = lp
+    ? (lp.tiers?.find(t => t.feasible)?.target ?? lp.breakeven ?? lp.current ?? candidate.net_premium)
+    : candidate.net_premium;
 
   const [mode, setMode] = useState(initialMode);
   const [limitPrice, setLimitPrice] = useState(Number(initialLimit).toFixed(2));
@@ -4144,59 +3863,21 @@ function OrderDialog({ candidate, symbol, expiration, connection, onClose }) {
   );
 }
 
-// v4.7.61: direction-aware 3-lens positioning strip.
-//
-// Pre-v4.7.61: the strip always shouted "⚠ lenses diverge" whenever the
-// strike span between GEX/VEX/TEX exceeded 5 chain steps — even when all
-// three walls were on the SAME side of spot and PULLING IN THE SAME
-// DIRECTION. That's confirmation, not divergence. A bear-call setup with
-// all walls below spot was getting flagged as cautionary when the lenses
-// were actually supporting the trade.
-//
-// New logic:
-//   1. Compare wall strikes to spot (above / below / at).
-//   2. If walls split across spot → real divergence → amber warning.
-//   3. If all on same side, compare pull direction to the candidate's
-//      strategy thesis (bear_call/bear_put = down; bull_call/bull_put = up;
-//      IC/butterfly = neutral).
-//        - Match  → green "✓ lenses confirm"
-//        - Oppose → amber "⚠ pull against thesis"
-//        - Neutral thesis + aligned-elsewhere → amber informational
-//   4. Tight aligned cluster matching neutral thesis: hidden (no signal).
-//
-// Strike granularity (stepGuess) is still computed from candidate legs to
-// stay chain-aware for the span gate on info-only states.
-function _thesisDirection(candidate) {
-  // 'up' = profits when price rises / stays above; 'down' = inverse;
-  // 'neutral' = profits when price pins; null = unknown shape.
-  if (!candidate?.strikes) return null;
-  const s = candidate.strikes;
-  if (s.center != null) return 'neutral';   // butterfly / iron butterfly
-  const hasShortCall = s.short_call != null;
-  const hasShortPut  = s.short_put  != null;
-  const hasLongCall  = s.long_call  != null;
-  const hasLongPut   = s.long_put   != null;
-  const isCredit = candidate.type === 'credit';
-  if (isCredit) {
-    if (hasShortCall && hasShortPut) return 'neutral'; // iron condor
-    if (hasShortCall) return 'down';                    // bear_call
-    if (hasShortPut)  return 'up';                      // bull_put
-  } else {
-    if (hasLongCall && hasLongPut) return 'neutral';
-    if (hasLongCall) return 'up';                       // bull_call (debit)
-    if (hasLongPut)  return 'down';                     // bear_put (debit)
-  }
-  return null;
-}
-
+// v4.7.29: helper for the optional 3-lens positioning strip. Returns either
+// null (lenses agree → don't render) or a render-ready spec. Threshold is
+// "walls disagree by more than 5 strikes" — i.e. the span between the min and
+// max wall strike must exceed 5 of the same chain's strike granularity.
+//   For SPY/QQQ on liquid expirations that's $5 actual.
+//   For high-strike names ($300+) it's effectively $5 too.
+// We compute strike granularity from the candidate's own legs to stay
+// chain-aware (a $50-stock chain steps in $0.50 or $1; a $500-stock chain
+// usually steps in $5).
 function _buildLensesStrip(biasResult, candidate) {
   if (!biasResult) return null;
   const gex = biasResult.gex_wall_strike;
   const vex = biasResult.vex_wall_strike;
   const tex = biasResult.tex_wall_strike;
-  const spot = Number(biasResult.spot) || 0;
-  if (gex == null || vex == null || tex == null || !spot) return null;
-
+  if (gex == null || vex == null || tex == null) return null;
   // Strike granularity from candidate legs (median consecutive diff)
   const legs = (candidate?.legs || []).map(l => Number(l.strike)).filter(s => !isNaN(s));
   const sortedLegs = [...new Set(legs)].sort((a,b)=>a-b);
@@ -4208,69 +3889,17 @@ function _buildLensesStrip(biasResult, candidate) {
   }
   const strikes = [gex, vex, tex];
   const span = Math.max(...strikes) - Math.min(...strikes);
-
-  // Side of spot per wall
-  const sides = strikes.map(s => s < spot ? 'below' : s > spot ? 'above' : 'at');
-  const allBelow = sides.every(s => s === 'below');
-  const allAbove = sides.every(s => s === 'above');
-  const split    = !allBelow && !allAbove && sides.some(s => s === 'below') && sides.some(s => s === 'above');
-  const pullDir  = allBelow ? 'down' : allAbove ? 'up' : null;
-  const thesis   = _thesisDirection(candidate);
-
-  // Tag each wall relative to spot (clearer than relative to GEX)
-  const tagRelSpot = (val) => {
-    if (val == null) return '';
-    if (val < spot) return ' (pull below)';
-    if (val > spot) return ' (pull above)';
-    return ' (at spot)';
+  // Threshold: divergence > 5 strike steps. Below this, hide the strip.
+  if (span <= 5 * stepGuess) return null;
+  // Label each lens with its position relative to the GEX anchor.
+  const tag = (val) => {
+    if (val == null || val === gex) return '';
+    return val < gex ? ' (pull below)' : ' (pull above)';
   };
-
-  let status, label, tooltipHeader, tooltipBody;
-  if (split) {
-    status = 'diverge';
-    label  = '⚠ lenses diverge';
-    tooltipHeader = 'Lenses split across spot';
-    tooltipBody = 'GEX (structural magnet), VEX (vol magnet), and TEX (decay-burn zone) are on different sides of current price — competing gravity wells. Price has no clean direction. Consider tightening strikes, cutting size, or waiting for the lenses to re-converge.';
-  } else if (thesis === 'down' && pullDir === 'down') {
-    status = 'confirm';
-    label  = '✓ lenses confirm';
-    tooltipHeader = 'Lenses agree with thesis (pull down)';
-    tooltipBody = 'All three walls — GEX, VEX, TEX — pull below spot. This bearish spread profits when price stays down or drifts lower. Triple-lens agreement is higher conviction than the GEX wall alone.';
-  } else if (thesis === 'up' && pullDir === 'up') {
-    status = 'confirm';
-    label  = '✓ lenses confirm';
-    tooltipHeader = 'Lenses agree with thesis (pull up)';
-    tooltipBody = 'All three walls — GEX, VEX, TEX — pull above spot. This bullish spread profits when price stays up or drifts higher. Triple-lens agreement is higher conviction than the GEX wall alone.';
-  } else if ((thesis === 'down' && pullDir === 'up') || (thesis === 'up' && pullDir === 'down')) {
-    status = 'against';
-    label  = `⚠ pull against thesis`;
-    tooltipHeader = `Walls pull ${pullDir}, opposite of trade direction`;
-    tooltipBody = `All three walls pull ${pullDir}, but this spread profits when price moves the OTHER way. Even with a healthy composite, dealer-positioning is signaling drift toward the wrong side. Consider passing or re-sizing.`;
-  } else if (thesis === 'neutral' && pullDir) {
-    // IC / fly: walls clustering off-spot is bad (price drifts away from center).
-    if (span <= 5 * stepGuess) return null;
-    status = 'against';
-    label  = `⚠ lenses pull ${pullDir}`;
-    tooltipHeader = `Walls cluster ${pullDir} of spot`;
-    tooltipBody = `All three lenses pull ${pullDir} of current price. For a range-bound (neutral) strategy, this is bad — price is likely to drift away from your profit zone rather than pin between your shorts.`;
-  } else {
-    // Unknown thesis, aligned — informational only, gated by span threshold.
-    if (span <= 5 * stepGuess) return null;
-    status = 'info';
-    label  = `lenses aligned ${pullDir}`;
-    tooltipHeader = `Walls cluster ${pullDir} of spot`;
-    tooltipBody = `All three lenses pull ${pullDir}. No strategy-specific recommendation for this candidate shape.`;
-  }
-
   return {
     gex, vex, tex,
-    gexTag: tagRelSpot(gex),
-    vexTag: tagRelSpot(vex),
-    texTag: tagRelSpot(tex),
-    status,
-    label,
-    tooltipHeader,
-    tooltipBody,
+    vexTag: tag(vex),
+    texTag: tag(tex),
   };
 }
 
@@ -4414,45 +4043,27 @@ function CandidateCard({ candidate, isBest, symbol, expiration, biasResult, cont
         );
       })()}
 
-      {/* v4.7.61: 3-lens positioning strip — direction-aware.
-          Renders green when lenses CONFIRM the candidate's thesis, amber when
-          they oppose it or split across spot. The strip's helper function
-          decides which case applies; this just maps `status` to color+label. */}
-      {lenses && (() => {
-        const isConfirm = lenses.status === 'confirm';
-        const isInfo    = lenses.status === 'info';
-        // confirm → emerald; everything else (diverge / against / info-warn) → amber
-        const bgClass     = isConfirm ? 'border-emerald-800/70 bg-emerald-950/15 text-emerald-200'
-                                      : isInfo ? 'border-stone-700 bg-stone-900/30 text-stone-300'
-                                               : 'border-amber-800/70 bg-amber-950/15 text-amber-200';
-        const labelClass  = isConfirm ? 'text-emerald-400 font-bold'
-                                      : isInfo ? 'text-stone-200 font-bold'
-                                               : 'text-amber-400 font-bold';
-        const tagClass    = isConfirm ? 'text-emerald-700'
-                                      : isInfo ? 'text-stone-500'
-                                               : 'text-amber-700';
-        const numClass    = isConfirm ? 'text-emerald-200'
-                                      : isInfo ? 'text-stone-300'
-                                               : 'text-amber-200';
-        return (
-          <Tooltip content={
-            <div className="text-left text-[12px] leading-relaxed max-w-xs">
-              <div className="font-bold uppercase tracking-wider mb-1">{lenses.tooltipHeader}</div>
-              <div className="mb-1">{lenses.tooltipBody}</div>
-            </div>
-          }>
-            <div className={`mt-3 px-3 py-2 border border-dashed rounded-lg text-[11px] font-num cursor-help leading-snug ${bgClass}`}>
-              <span className={labelClass}>{lenses.label}</span>
-              <span className="text-stone-500 mx-2">·</span>
-              <span className="text-stone-300">GEX <span className="font-bold text-stone-100">${lenses.gex.toFixed(2)}</span><span className={tagClass}>{lenses.gexTag}</span></span>
-              <span className="text-stone-500 mx-2">·</span>
-              <span className={numClass}>VEX <span className="font-bold">${lenses.vex.toFixed(2)}</span><span className={tagClass}>{lenses.vexTag}</span></span>
-              <span className="text-stone-500 mx-2">·</span>
-              <span className={numClass}>TEX <span className="font-bold">${lenses.tex.toFixed(2)}</span><span className={tagClass}>{lenses.texTag}</span></span>
-            </div>
-          </Tooltip>
-        );
-      })()}
+      {/* v4.7.29: 3-lens positioning strip — only when GEX/VEX/TEX walls
+          diverge by more than 5 strikes. Hidden by default to avoid clutter. */}
+      {lenses && (
+        <Tooltip content={
+          <div className="text-left text-[12px] leading-relaxed max-w-xs">
+            <div className="font-bold uppercase tracking-wider mb-1">Lenses diverge</div>
+            <div className="mb-1">GEX (structural magnet), VEX (vol-magnet), and TEX (decay-burn zone) wall strikes don\'t line up. Price has more than one gravity well — your spread is structured around the GEX wall only.</div>
+            <div className="text-stone-300 mt-1">Either tighten the short strike toward the VEX/TEX side, cut size, or skip and wait for the lenses to re-converge.</div>
+          </div>
+        }>
+          <div className="mt-3 px-3 py-2 border border-dashed border-amber-800/70 rounded-lg bg-amber-950/15 text-[11px] font-num text-amber-200 cursor-help leading-snug">
+            <span className="text-amber-400 font-bold">⚠ lenses diverge</span>
+            <span className="text-stone-500 mx-2">·</span>
+            <span className="text-stone-300">GEX <span className="font-bold text-stone-100">${lenses.gex.toFixed(2)}</span></span>
+            <span className="text-stone-500 mx-2">·</span>
+            <span className="text-amber-200">VEX <span className="font-bold">${lenses.vex.toFixed(2)}</span><span className="text-amber-700">{lenses.vexTag}</span></span>
+            <span className="text-stone-500 mx-2">·</span>
+            <span className="text-amber-200">TEX <span className="font-bold">${lenses.tex.toFixed(2)}</span><span className="text-amber-700">{lenses.texTag}</span></span>
+          </div>
+        </Tooltip>
+      )}
 
       {/* Limit-order targets — scenario-aware tier table (v4.7.17) */}
       {c.limit_premiums && (() => {
@@ -4710,13 +4321,7 @@ export default function SpreadOptimizer() {
     const td = targetDelta / 100;
     const wf = WIDTH_PREFS[widthPref].factor;
     const walls = biasResult?.gex_wall_strike != null
-      ? {
-          strike: biasResult.gex_wall_strike,
-          strength: biasResult.gex_wall_strength || 'medium',
-          type: biasResult.gex_wall_type || null,    // v4.7.65: 'put' | 'call' | 'mixed'
-          netGex: Number(biasResult.net_gex) || 0,
-          dte: Number(biasResult.dte) || null,
-        }
+      ? { strike: biasResult.gex_wall_strike, strength: biasResult.gex_wall_strength || 'medium' }
       : null;
     // v4.7.47: derive live DTE from current time instead of using the static
     // chain-fetch-time snapshot. This makes the Tickets card numbers (POP /
@@ -4773,44 +4378,8 @@ export default function SpreadOptimizer() {
       const exposuresForChosen = ebd[chosen] || null;
       setLogSteps(s => [...s, `Spot ${spot.toFixed(2)}, exposures for ${chosen}. Running JS bias engine...`]);
 
-      // v4.7.58: for short-DTE plays (chosen expiration within ~2 days), the
-      // chosen chain alone reflects intraday flow rather than the durable
-      // dealer book. Smooth the REGIME signal (netGex/netDex) across the
-      // nearest 3 expirations weighted 0.5/0.3/0.2. The wall geometry stays
-      // per-chosen-expiration because the wall IS specific to the trade exit.
-      let regimeOverride = null;
-      const chosenDte = (() => {
-        if (!chosen) return null;
-        const t = new Date(chosen + 'T21:00:00Z');
-        return (t - new Date()) / 86400000;
-      })();
-      if (chosenDte != null && chosenDte < 2) {
-        const sortedDates = Object.keys(ebd).sort((a, b) => +new Date(a) - +new Date(b));
-        const idx = sortedDates.indexOf(chosen);
-        if (idx >= 0) {
-          const window = sortedDates.slice(idx, idx + 3);
-          const weights = [0.5, 0.3, 0.2];
-          let gxW = 0, dxW = 0, wSum = 0;
-          window.forEach((d, i) => {
-            const t = ebd[d] && ebd[d].totals;
-            const w = weights[i] != null ? weights[i] : 0.1;
-            if (t) { gxW += (t.net_gex || 0) * w; dxW += (t.net_dex || 0) * w; wSum += w; }
-          });
-          if (wSum > 0 && window.length >= 2) {
-            regimeOverride = { netGex: gxW / wSum, netDex: dxW / wSum };
-            console.info(`[bias regime] short-DTE (${chosenDte.toFixed(2)}d) smoothed across ${window.length} expirations [${window.join(', ')}]:`, regimeOverride);
-          }
-        }
-      }
-
       // STEP 2: deterministic JS bias engine
-      // v4.7.59: pass chosenDte so the engine can DTE-gate the regime
-      // interpretation (intraday → wall as magnet always; multi-day → regime-aware).
-      const computed = _computeBiasSignals(sym, expiration, spot, greeksRaw, exposuresForChosen, regimeOverride, chosenDte);
-      const dteRegimeNote = (chosenDte != null && chosenDte < 1.5)
-        ? ' (intraday — multi-day regime sign IGNORED; wall = magnet)'
-        : '';
-      console.info(`[bias engine] sym=${sym} exp=${chosen} dte=${chosenDte != null ? chosenDte.toFixed(2) : 'n/a'} netGex=${(regimeOverride?.netGex ?? _aggregateExposures(exposuresForChosen, greeksRaw?.portfolio_totals).netGex).toFixed(0)}${dteRegimeNote} → score=${computed.directional_score} → ${computed.bias_label}`);
+      const computed = _computeBiasSignals(sym, expiration, spot, greeksRaw, exposuresForChosen);
       setLogSteps(s => [...s, `Bias: ${computed.bias_label} (score ${computed.directional_score}, ${computed.confidence} conf). Asking Gemini for narrative...`]);
 
       // STEP 3: Gemini prose-only call. Pass JS-computed values as facts; the
@@ -4821,8 +4390,8 @@ export default function SpreadOptimizer() {
 FACTS:
 - Spot price: ${spot}
 - Directional bias: ${computed.bias_label.replace('_',' ')} (score ${computed.directional_score} on -100..100 scale, confidence ${computed.confidence})
-- Dominant gamma wall: ${computed.gex_wall_type ? (computed.gex_wall_type === 'mixed' ? 'mixed put/call wall' : `${computed.gex_wall_type} wall`) : 'wall'} at strike ${computed.gex_wall_strike} (${computed.gex_wall_strength} strength)
-- Spot is ${f.wallSide} this ${computed.gex_wall_type === 'mixed' ? 'mixed wall' : (computed.gex_wall_type || 'wall')} by ${computed.gex_wall_strike != null ? Math.abs(spot - computed.gex_wall_strike).toFixed(2) : 'N/A'}
+- Dominant gamma wall strike: ${computed.gex_wall_strike} (${computed.gex_wall_strength} strength)
+- Spot is ${f.wallSide} the wall by ${computed.gex_wall_strike != null ? Math.abs(spot - computed.gex_wall_strike).toFixed(2) : 'N/A'}
 - Net dealer gamma (chosen expiration): ${f.gammaRegime} (raw: ${f.netGex.toFixed(0)})
 - Net dealer delta exposure: ${f.dexSkewSide} (raw: ${f.netDex.toFixed(0)})
 - Recommended strategies (in order): ${computed.recommended_strategies.join(', ')}
@@ -4851,16 +4420,8 @@ OUTPUT JSON only:
         directional_score: computed.directional_score,
         bias_label: computed.bias_label,
         confidence: computed.confidence,
-        net_gex: computed.net_gex,  // v4.7.57: carried through for wall-penalty regime gating
         gex_wall_strike: computed.gex_wall_strike,
         gex_wall_strength: computed.gex_wall_strength,
-        gex_wall_type: computed.gex_wall_type,
-        put_wall_strike:    computed.put_wall_strike,
-        put_wall_strength:  computed.put_wall_strength,
-        put_wall_net_gex:   computed.put_wall_net_gex,
-        call_wall_strike:   computed.call_wall_strike,
-        call_wall_strength: computed.call_wall_strength,
-        call_wall_net_gex:  computed.call_wall_net_gex,
         // v4.7.29: VEX/TEX walls drive the optional 3-lens divergence strip on
         // candidate cards. Only render when all three are present AND they
         // disagree by more than 5 strikes (handled in CandidateCard).
@@ -5294,18 +4855,10 @@ OUTPUT JSON only:
                 <Stat label="ATM IV" value={`${chainData.atmIV?.toFixed(0)}%`} />
                 <Stat label="DTE" value={_formatDteForDisplay(chainData.dte)} />
                 <Stat label="Width Pref" value={WIDTH_PREFS[widthPref].name} />
-                {/* v4.7.67: split into Put Wall (magnet) + Call Wall (resistance)
-                    stat tiles. Mirrors EdgelaneProvider-style display where both walls
-                    are surfaced separately rather than collapsed into one. */}
                 <Stat
-                  label="Put Wall (magnet)"
-                  value={biasResult?.put_wall_strike != null ? `$${Number(biasResult.put_wall_strike).toFixed(2)}` : '—'}
-                  sub={biasResult?.put_wall_strike != null ? `${biasResult.put_wall_strength || 'low'} strength` : 'no put-side wall'}
-                />
-                <Stat
-                  label="Call Wall (resistance)"
-                  value={biasResult?.call_wall_strike != null ? `$${Number(biasResult.call_wall_strike).toFixed(2)}` : '—'}
-                  sub={biasResult?.call_wall_strike != null ? `${biasResult.call_wall_strength || 'low'} strength` : 'no call-side wall'}
+                  label="GEX Wall"
+                  value={biasResult?.gex_wall_strike != null ? `$${Number(biasResult.gex_wall_strike).toFixed(2)}` : '—'}
+                  sub={biasResult?.gex_wall_strike != null ? `${biasResult.gex_wall_strength || 'medium'} strength` : 'no wall data'}
                 />
               </div>
 
@@ -5562,4 +5115,30 @@ OUTPUT JSON only:
           )}
 
           <footer className="mt-12 pt-6 border-t border-stone-800/60 text-xs text-stone-600 font-num text-center">
-      
+            Not financial advice. Refresh to get the latest data.
+            <span className="mx-2 text-stone-700">·</span>
+            © {new Date().getFullYear()} EdgeLane. All rights reserved.
+          </footer>
+        </div>
+      </div>
+
+      {/* v4.7.30: settings + push-to-broker modals */}
+{settingsOpen && (
+        <SettingsModal
+          session={auth.session}
+          broker={broker}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
+      {orderDialog && (
+        <OrderDialog
+          candidate={orderDialog.candidate}
+          symbol={symbol}
+          expiration={expiration}
+          connection={broker.active}
+          onClose={() => setOrderDialog(null)}
+        />
+      )}
+    </>
+  );
+}

@@ -1,0 +1,74 @@
+# EdgeLane MARKET backend configuration
+# Copy this to edgelane_market.config and fill in real values.
+# Loaded by market/backend/app/config.py at startup.
+
+# ── Tradier credentials ──
+# Operator-level token used for both polling AND order submission. Loaded
+# from this file at startup (not from sessionStorage).
+TRADIER_TOKEN=
+TRADIER_TOKEN_SANDBOX=
+TRADIER_ENV=production         # production | sandbox
+# Account IDs: leave blank to auto-resolve from /v1/user/profile on startup
+# (recommended). Set explicitly only if you want to pin a non-default account.
+TRADIER_ACCOUNT_ID=            # production account (e.g. VA12345678)
+TRADIER_ACCOUNT_ID_SANDBOX=    # sandbox/paper account
+
+# Dev mode toggles many off-hours conveniences. When DEVMODE=true:
+#   - polling runs anytime (not just market hours)
+#   - sandbox token is preferred over production
+#   - extra debug logging
+DEVMODE=false
+
+# ── Polling ──
+SYMBOLS=SPX                    # comma-separated; dropdown populates from this
+POLL_INTERVAL_SEC=20
+MARKET_HOURS_TZ=America/New_York
+MARKET_OPEN=09:30
+MARKET_CLOSE=16:00
+
+# ── Strategy generation (internal — not user-controllable) ──
+WIDTH_PREFERENCES=balanced,generous   # tries both, picks higher composite
+TARGET_DELTAS=0.20,0.30                # explored per width
+COMPOSITE_PICK_TOP=3                   # candidates surfaced to UI
+
+# ── Self-evaluation ──
+EVAL_WINDOW_MIN=3                       # minutes after decision to evaluate
+EVAL_ROLLING_WINDOW=20                  # accuracy = last N decisions
+PILL_GREEN_PCT=60                       # >= this → green pill
+PILL_RED_PCT=40                         # <= this → red pill
+
+# ── Storage ──
+DB_PATH=~/.edgelane/market.duckdb
+
+# ── HTTP server ──
+HTTP_HOST=127.0.0.1
+HTTP_PORT=8788
+CORS_ALLOW_ORIGINS=http://localhost:5173
+
+# ── WebSocket ──
+WS_HEARTBEAT_SEC=30
+
+# ── Off-hours polling policy ──
+# Auto-derived: poller skips off-hours when DEVMODE=false AND a real Tradier
+# token is set (avoid burning quota when no one's looking). Override with:
+# FORCE_POLL_WHEN_CLOSED=true
+#
+# Resolution priority (see Settings.should_poll_when_market_closed):
+#   1. FORCE_POLL_WHEN_CLOSED=true → always poll  (manual override)
+#   2. DEVMODE=true                → always poll  (dev/sandbox env)
+#   3. No TRADIER_TOKEN (mock)     → always poll  (no API hit)
+#   4. otherwise (live prod)       → market hours ONLY (09:30–16:00 ET, Mon-Fri)
+# FORCE_POLL_WHEN_CLOSED=false
+
+# ── External GEX (browser-extension webhook) ──
+# When the extension is running and POSTing to /webhook/edgelane_provider_gex, the
+# bias engine prefers that wall data over its own Tradier-OI calculation if
+# the payload is younger than EXTERNAL_GEX_TIMEOUT_SEC. Bump
+# EXTENSION_POLICY_VERSION to force a connected extension to refetch its
+# selector policy from /extension/policy.json without a reinstall.
+USE_EXTERNAL_GEX=true
+EXTERNAL_GEX_TIMEOUT_SEC=30
+EXTENSION_POLICY_VERSION=1
+# The provider page the extension attaches to (served back via /extension/policy.json).
+# Also add this origin to CORS_ALLOW_ORIGINS so the extension can direct-POST.
+PROVIDER_TARGET_URL=

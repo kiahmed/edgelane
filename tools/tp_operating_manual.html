@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>tp — Operating Manual</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --bg-elev: #1a2330;
+    --bg-card: #1e2936;
+    --border: #2a3a52;
+    --border-strong: #3a4d6b;
+    --text: #cbd5e1;
+    --text-dim: #94a3b8;
+    --text-faint: #64748b;
+    --accent: #60a5fa;
+    --accent-warm: #fbbf24;
+    --green: #4ade80;
+    --red: #f87171;
+    --amber: #fcd34d;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+               font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+               line-height: 1.55; font-size: 15px; }
+  body { padding: 40px 24px 80px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 32px; font-weight: 800; letter-spacing: -0.5px; margin: 0 0 4px;
+       color: #e2e8f0; }
+  h1 .tagline { font-weight: 400; color: var(--text-faint); font-size: 16px; letter-spacing: 0; }
+  h2 { font-size: 22px; font-weight: 700; margin: 56px 0 16px; color: #e2e8f0;
+       border-bottom: 1px solid var(--border); padding-bottom: 10px; }
+  h2 .num { color: var(--accent); font-family: var(--mono); font-size: 18px; margin-right: 8px; }
+  h3 { font-size: 12px; font-weight: 600; margin: 24px 0 10px;
+       text-transform: uppercase; letter-spacing: 0.5px;
+       color: var(--text-dim); }
+  p { margin: 8px 0 14px; }
+  code { font-family: var(--mono); font-size: 13px;
+         background: rgba(96,165,250,0.1); border: 1px solid rgba(96,165,250,0.2);
+         color: #93c5fd; padding: 1px 6px; border-radius: 4px; }
+  pre { font-family: var(--mono); font-size: 13px; background: #0a0f17;
+        border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px;
+        overflow-x: auto; color: #cbd5e1; line-height: 1.5; margin: 12px 0; }
+  pre .cmd { color: var(--green); }
+  pre .flag { color: var(--accent-warm); }
+  pre .arg { color: #93c5fd; }
+  pre .comment { color: var(--text-faint); }
+  pre .out-pos { color: var(--green); }
+  pre .out-neg { color: var(--red); }
+  pre .out-dim { color: var(--text-faint); }
+  .card { background: var(--bg-card); border: 1px solid var(--border);
+          border-radius: 10px; padding: 18px 22px; margin: 14px 0; }
+  .card.warn { background: rgba(252,211,77,0.04); border-color: rgba(252,211,77,0.25); }
+  .card.warn .icon { color: var(--amber); }
+  .card.tip  { background: rgba(74,222,128,0.04); border-color: rgba(74,222,128,0.25); }
+  .card.tip .icon { color: var(--green); }
+  .card .icon { font-weight: 700; margin-right: 6px; text-transform: uppercase;
+                font-size: 11px; letter-spacing: 1px; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0;
+          font-size: 14px; }
+  th { text-align: left; background: var(--bg-elev); color: #e2e8f0;
+       font-weight: 600; padding: 10px 12px; border-bottom: 1px solid var(--border);
+       text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; }
+  td { padding: 10px 12px; border-bottom: 1px solid var(--border);
+       vertical-align: top; }
+  td:first-child { font-family: var(--mono); color: var(--accent-warm);
+                    white-space: nowrap; font-size: 13px; }
+  td.req { color: var(--red); font-family: var(--mono); font-size: 11px;
+           font-weight: 600; text-transform: uppercase; }
+  td.opt { color: var(--text-faint); font-family: var(--mono); font-size: 11px;
+           font-weight: 600; text-transform: uppercase; }
+  td.both { color: var(--accent); font-family: var(--mono); font-size: 11px;
+            font-weight: 600; text-transform: uppercase; }
+  .toc { background: var(--bg-card); border: 1px solid var(--border);
+         border-radius: 10px; padding: 16px 22px; margin: 24px 0 40px; }
+  .toc ol { margin: 4px 0; padding-left: 24px; }
+  .toc li { margin: 4px 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 4px;
+          font-family: var(--mono); font-size: 11px; font-weight: 600;
+          text-transform: uppercase; letter-spacing: 0.5px;
+          background: rgba(96,165,250,0.12); color: #93c5fd;
+          border: 1px solid rgba(96,165,250,0.25); margin-right: 4px; }
+  .pill.danger { background: rgba(248,113,113,0.12); color: #fca5a5;
+                 border-color: rgba(248,113,113,0.25); }
+  .pill.warn { background: rgba(252,211,77,0.12); color: #fcd34d;
+               border-color: rgba(252,211,77,0.25); }
+  .pill.ok { background: rgba(74,222,128,0.1); color: #86efac;
+             border-color: rgba(74,222,128,0.25); }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 32px 0; }
+  .footer { text-align: center; color: var(--text-faint); font-size: 12px;
+            margin-top: 60px; padding-top: 24px; border-top: 1px solid var(--border); }
+  .key-grid { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px;
+              font-size: 13px; margin: 8px 0 14px; }
+  .key-grid code { background: transparent; border: 0; padding: 0; color: var(--accent-warm); }
+  .scheme-table td:nth-child(2), .scheme-table td:nth-child(3) { text-align: center; }
+  .scheme-table .yes { color: var(--green); font-weight: 700; }
+  .scheme-table .no  { color: var(--text-faint); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>tp <span class="tagline">— Tradier position &amp; order manager (CLI)</span></h1>
+<p style="color: var(--text-dim); font-size: 14px;">
+  Shell alias for <code>python3 tools/tradier_positions.py</code>. Manages live
+  positions and working orders on a Tradier account directly from bash —
+  list, close, add, modify, cancel, open. Single uniform verb-flag scheme.
+  Sandbox vs production is picked by the <code>DEVMODE</code> flag in
+  <code>edge_lane_config.config</code>.
+</p>
+
+<div class="toc">
+  <strong style="color:#e2e8f0;">Operations</strong>
+  <ol>
+    <li><a href="#scheme">Flag scheme at a glance</a></li>
+    <li><a href="#list">List positions</a> &nbsp;·&nbsp; <code>tp</code></li>
+    <li><a href="#orders-list">List working orders</a> &nbsp;·&nbsp; <code>tp -O</code></li>
+    <li><a href="#close">Close (sell) a position</a> &nbsp;·&nbsp; <code>tp -S &lt;row&gt;</code></li>
+    <li><a href="#add">Add to an existing position</a> &nbsp;·&nbsp; <code>tp -A &lt;row&gt; -Q &lt;qty&gt;</code></li>
+    <li><a href="#new-single">Open new single-leg position</a> &nbsp;·&nbsp; <code>tp --buy / --sell SYM STRIKE EXP</code></li>
+    <li><a href="#new-multi">Open new multi-leg position</a> &nbsp;·&nbsp; <code>tp --buy / --sell '&lt;ticket&gt;'</code></li>
+    <li><a href="#modify">Modify a working order</a> &nbsp;·&nbsp; <code>tp -O &lt;row&gt; ...</code></li>
+    <li><a href="#cancel">Cancel a working order</a> &nbsp;·&nbsp; <code>tp -C &lt;row&gt;</code></li>
+    <li><a href="#gainloss">Closed-position P&amp;L</a> &nbsp;·&nbsp; <code>tp -G [date|--since N]</code></li>
+    <li><a href="#modifiers">Modifier flags &amp; conventions</a></li>
+    <li><a href="#install">Installation &amp; alias</a></li>
+  </ol>
+</div>
+
+<!-- ─── Scheme overview ──────────────────────────────────────────────── -->
+<h2 id="scheme"><span class="num">1</span>Flag scheme at a glance</h2>
+
+<p>The CLI follows a single rule:</p>
+
+<div class="key-grid">
+  <code>-X &lt;row&gt;</code><span><strong>Short</strong> flag — operates on an <strong>EXISTING</strong> item from the table (row number from the list).</span>
+  <code>--verb ...</code><span><strong>Long</strong> flag — opens a <strong>NEW</strong> position (single-leg via positionals, or multi-leg via ticket string).</span>
+</div>
+
+<table class="scheme-table">
+  <thead><tr><th>Operation</th><th>EXISTING</th><th>NEW</th><th>Flag</th></tr></thead>
+  <tbody>
+    <tr><td>List positions</td><td class="yes">✓</td><td class="no">—</td><td><code>tp</code> (default)</td></tr>
+    <tr><td>List working orders</td><td class="yes">✓</td><td class="no">—</td><td><code>tp -O</code></td></tr>
+    <tr><td>Sell (close) position</td><td class="yes">✓</td><td class="no">—</td><td><code>tp -S &lt;row&gt;</code></td></tr>
+    <tr><td>Add to position</td><td class="yes">✓</td><td class="no">—</td><td><code>tp -A &lt;row&gt; -Q &lt;qty&gt;</code></td></tr>
+    <tr><td>Modify working order</td><td class="yes">✓</td><td class="no">—</td><td><code>tp -O &lt;row&gt; ...</code></td></tr>
+    <tr><td>Cancel working order</td><td class="yes">✓</td><td class="no">—</td><td><code>tp -C &lt;row&gt;</code></td></tr>
+    <tr><td>Closed-position P&amp;L (daily)</td><td class="yes">✓</td><td class="no">—</td><td><code>tp -G [date|--since N]</code></td></tr>
+    <tr><td>Buy new (single-leg)</td><td class="no">—</td><td class="yes">✓</td><td><code>tp --buy SYM STRIKE EXP</code></td></tr>
+    <tr><td>Sell new (single-leg)</td><td class="no">—</td><td class="yes">✓</td><td><code>tp --sell SYM STRIKE EXP</code></td></tr>
+    <tr><td>Buy new (multi-leg, debit)</td><td class="no">—</td><td class="yes">✓</td><td><code>tp --buy '&lt;ticket&gt;'</code></td></tr>
+    <tr><td>Sell new (multi-leg, credit)</td><td class="no">—</td><td class="yes">✓</td><td><code>tp --sell '&lt;ticket&gt;'</code></td></tr>
+  </tbody>
+</table>
+
+<div class="card tip"><span class="icon">tip</span>
+Modifier flags — <code>-L</code> (limit price), <code>-Q</code> (quantity), <code>-M</code> (force market on modify), <code>-D</code> (duration), and <code>--execute</code> (required to actually submit) — work consistently across every operation.
+</div>
+
+<!-- ─── 2 List positions ─────────────────────────────────────────────── -->
+<h2 id="list"><span class="num">2</span>List positions</h2>
+<p>Default mode. Shows every open position grouped by spread. Multi-leg fills are aggregated back to one row by matching surviving positions against the originating filled multi-leg order.</p>
+
+<h3>Syntax</h3>
+<pre><span class="cmd">tp</span></pre>
+
+<h3>Columns</h3>
+<table>
+  <thead><tr><th>Column</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>#</td><td>Row number — use as the position-targeting argument for <code>-S</code> (close) and <code>-A</code> (add).</td></tr>
+    <tr><td>Ticker</td><td>Underlying + structure shorthand (e.g. <code>NVDA VE 220/225C</code>, <code>SPX IC 7300/7350P + 7450/7500C</code>).</td></tr>
+    <tr><td>Acquired</td><td>Date/time the originating order filled, rendered in local timezone.</td></tr>
+    <tr><td>Cost</td><td>Signed net cash: <span class="pill ok">+</span> debit (you paid) or <span class="pill danger">−</span> credit (you collected).</td></tr>
+    <tr><td>Bid / Ask</td><td>Current absolute spread mark — what the spread is worth right now, always positive.</td></tr>
+    <tr><td>P&amp;L $</td><td>Unrealized P&amp;L = current market value − cost basis. Green positive / red negative.</td></tr>
+    <tr><td>P&amp;L %</td><td>P&amp;L as percentage of |cost basis|.</td></tr>
+    <tr><td>Qty</td><td>Open quantity (contracts for options, shares for equities).</td></tr>
+  </tbody>
+</table>
+
+<h3>Example output</h3>
+<pre><span class="comment">$ tp</span>
+Tradier positions  <span class="out-dim">env: production  account: 6YB79610</span>
+
+  #  Ticker                                Acquired         Cost           Bid     Ask    P&amp;L $        P&amp;L %    Qty
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  1  SPX VE 7365/7385P 2026-05-21          2026-05-21 11:06   −$600.00   $3.80   $4.00     <span class="out-pos">+$210.00</span>      <span class="out-pos">+35.0%</span>      1
+  2  NVDA VE 220/225C 2026-05-23           2026-05-19 14:22   +$245.00   $3.10   $3.20     <span class="out-pos">+$72.00</span>       <span class="out-pos">+29.4%</span>      2
+  3  QQQ 746C 2026-06-04                   2026-06-01 11:30   +$375.00   $3.13   $3.14     <span class="out-pos">−$60.00</span>       <span class="out-neg">−16.0%</span>      1</pre>
+
+<!-- ─── 3 List working orders ───────────────────────────────────────── -->
+<h2 id="orders-list"><span class="num">3</span>List working orders</h2>
+<p>Shows orders that haven't filled yet — the ones you can still modify (with <code>-O &lt;row&gt;</code>) or cancel (with <code>-C &lt;row&gt;</code>). Includes statuses: <code>open</code>, <code>pending</code>, <code>partially_filled</code>, <code>submitted</code>, <code>queued</code>, <code>accepted</code>.</p>
+
+<h3>Syntax</h3>
+<pre><span class="cmd">tp</span> <span class="flag">-O</span></pre>
+
+<h3>Example output</h3>
+<pre><span class="comment">$ tp -O</span>
+Tradier orders  <span class="out-dim">env: production  account: 6YB79610</span>
+
+  #         ID  Ticker                              Type      Price   Qty  Status            Submitted
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────
+  1   12345678  SPX 7300/7350P + 7450/7500C         CREDIT    $4.00     1  open              2026-05-21 09:14
+  2   12345714  NVDA 220/225C                       DEBIT     $1.85     2  partially_filled  2026-05-21 10:02
+  3   12345780  SPY 540C                            LIMIT     $2.30     1  open              2026-05-21 11:30</pre>
+
+<!-- ─── 4 Close ─────────────────────────────────────────────────────── -->
+<h2 id="close"><span class="num">4</span>Close (sell) a position</h2>
+<p>Submit a closing order for a position by its row number from the list table. Defaults to a MARKET close at full quantity. Sides are flipped automatically (<code>buy_to_open</code> → <code>sell_to_close</code>, <code>sell_to_open</code> → <code>buy_to_close</code>).</p>
+
+<h3>Syntax</h3>
+<pre><span class="cmd">tp</span> <span class="flag">-S</span> <span class="arg">&lt;row#&gt;</span> [<span class="flag">-L</span> <span class="arg">&lt;price&gt;</span>] [<span class="flag">-Q</span> <span class="arg">&lt;qty&gt;</span>] [<span class="flag">--execute</span>]</pre>
+
+<h3>Flags</h3>
+<table>
+  <thead><tr><th>Flag</th><th>Required?</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>-S &lt;row#&gt;</td><td class="req">required</td><td>Position row number from <code>tp</code> list.</td></tr>
+    <tr><td>-L &lt;price&gt;</td><td class="opt">optional</td><td>Limit price for the close. Omit for MARKET. Multi-leg uses <code>type=credit|debit|even</code>; single-leg uses <code>type=limit</code>.</td></tr>
+    <tr><td>-Q &lt;qty&gt;</td><td class="opt">optional</td><td>Quantity to close. Defaults to full position size (partial close otherwise).</td></tr>
+    <tr><td>--execute / -x</td><td class="opt">optional</td><td>Required to actually submit. Without it, runs PREVIEW-ONLY.</td></tr>
+  </tbody>
+</table>
+
+<h3>Examples</h3>
+<pre><span class="comment"># Close position #3 at MARKET, full quantity (preview)</span>
+<span class="cmd">tp</span> <span class="flag">-S</span> <span class="arg">3</span>
+
+<span class="comment"># Close position #3 at LIMIT $1.20 (preview)</span>
+<span class="cmd">tp</span> <span class="flag">-S</span> <span class="arg">3</span> <span class="flag">-L</span> <span class="arg">1.20</span>
+
+<span class="comment"># Close 2 of 5 contracts at MARKET</span>
+<span class="cmd">tp</span> <span class="flag">-S</span> <span class="arg">3</span> <span class="flag">-Q</span> <span class="arg">2</span>
+
+<span class="comment"># Close 2 contracts at LIMIT $1.20 — live</span>
+<span class="cmd">tp</span> <span class="flag">-S</span> <span class="arg">3</span> <span class="flag">-L</span> <span class="arg">1.20</span> <span class="flag">-Q</span> <span class="arg">2</span> <span class="flag">--execute</span></pre>
+
+<!-- ─── 5 Add ───────────────────────────────────────────────────────── -->
+<h2 id="add"><span class="num">5</span>Add to an existing position</h2>
+<p>Open more contracts of an existing position, repeating its original sides
+(<code>buy_to_open</code> stays <code>buy_to_open</code>; <code>sell_to_open</code> stays <code>sell_to_open</code>). Order type matches the existing position's direction: credit position → credit order; debit position → debit order. <strong><code>-Q</code> is required for add</strong> (number of contracts to add).</p>
+
+<h3>Syntax</h3>
+<pre><span class="cmd">tp</span> <span class="flag">-A</span> <span class="arg">&lt;row#&gt;</span> <span class="flag">-Q</span> <span class="arg">&lt;qty&gt;</span> [<span class="flag">-L</span> <span class="arg">&lt;price&gt;</span>] [<span class="flag">--execute</span>]</pre>
+
+<h3>Flags</h3>
+<table>
+  <thead><tr><th>Flag</th><th>Required?</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>-A &lt;row#&gt;</td><td class="req">required</td><td>Position row number to add to.</td></tr>
+    <tr><td>-Q &lt;qty&gt;</td><td class="req">required</td><td>Number of contracts to add (≥ 1).</td></tr>
+    <tr><td>-L &lt;price&gt;</td><td class="opt">optional</td><td>Limit price. Omit for MARKET. Type is auto-determined from existing direction.</td></tr>
+    <tr><td>--execute</td><td class="opt">optional</td><td>Required to submit. Without it, runs PREVIEW-ONLY.</td></tr>
+  </tbody>
+</table>
+
+<h3>Examples</h3>
+<pre><span class="comment"># Add 2 contracts to position #3 at MARKET (preview)</span>
+<span class="cmd">tp</span> <span class="flag">-A</span> <span class="arg">3</span> <span class="flag">-Q</span> <span class="arg">2</span>
+
+<span class="comment"># Add 2 at LIMIT $1.30 (preview)</span>
+<span class="cmd">tp</span> <span class="flag">-A</span> <span class="arg">3</span> <span class="flag">-Q</span> <span class="arg">2</span> <span class="flag">-L</span> <span class="arg">1.30</span>
+
+<span class="comment"># Live add 5 to position #1 at $2.90</span>
+<span class="cmd">tp</span> <span class="flag">-A</span> <span class="arg">1</span> <span class="flag">-Q</span> <span class="arg">5</span> <span class="flag">-L</span> <span class="arg">2.90</span> <span class="flag">--execute</span></pre>
+
+<div class="card tip"><span class="icon">tip</span>
+The original sides are inferred from the position's source order. For a bull-put credit spread, that means future adds will collect more credit (the short put resells; the long put rebuys), not flip into a debit. The order type also picks credit/debit automatically based on existing <code>cost_basis</code> sign.
+</div>
+
+<!-- ─── 6 New single-leg ──────────────────────────────────────────── -->
+<h2 id="new-single"><span class="num">6</span>Open new single-leg position</h2>
+<p>Open a single option contract directly without an EdgeLane ticket. Three positional args after <code>--buy</code> or <code>--sell</code>: symbol, strike+side, expiration. Canonical OCC root lookup runs automatically — NDX → NDXP, SPX → SPXW, etc. The parent symbol on the order body stays as user-typed (NDX); the <code>option_symbol</code> field gets the canonical variant (NDXP).</p>
+
+<h3>Syntax</h3>
+<pre><span class="cmd">tp</span> <span class="flag">--buy</span> <span class="arg">&lt;SYMBOL&gt;</span> <span class="arg">&lt;STRIKE+side&gt;</span> <span class="arg">&lt;YYYY-MM-DD&gt;</span> [<span class="flag">-Q</span> <span class="arg">&lt;qty&gt;</span>] [<span class="flag">-L</span> <span class="arg">&lt;price&gt;</span>] [<span class="flag">-D</span> <span class="arg">&lt;duration&gt;</span>] [<span class="flag">--execute</span>]
+<span class="cmd">tp</span> <span class="flag">--sell</span> <span class="arg">&lt;SYMBOL&gt;</span> <span class="arg">&lt;STRIKE+side&gt;</span> <span class="arg">&lt;YYYY-MM-DD&gt;</span> [<span class="flag">-Q</span> <span class="arg">&lt;qty&gt;</span>] [<span class="flag">-L</span> <span class="arg">&lt;price&gt;</span>] [<span class="flag">-D</span> <span class="arg">&lt;duration&gt;</span>] [<span class="flag">--execute</span>]</pre>
+
+<h3>Positional args (in order)</h3>
+<table>
+  <thead><tr><th>Arg</th><th>Format</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td>SYMBOL</td><td>Underlying ticker. Indices auto-route to their settlement-variant root.</td><td><code>QQQ</code>, <code>SPY</code>, <code>NVDA</code>, <code>NDX</code></td></tr>
+    <tr><td>STRIKE+side</td><td>Numeric strike immediately followed by <code>C</code> (call) or <code>P</code> (put).</td><td><code>746C</code>, <code>540P</code>, <code>220.5C</code></td></tr>
+    <tr><td>EXPIRATION</td><td>ISO date <code>YYYY-MM-DD</code>.</td><td><code>2026-06-04</code></td></tr>
+  </tbody>
+</table>
+
+<h3>Flags</h3>
+<table>
+  <thead><tr><th>Flag</th><th>Required?</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>-Q &lt;qty&gt;</td><td class="opt">optional</td><td>Number of contracts. Defaults to 1.</td></tr>
+    <tr><td>-L &lt;price&gt;</td><td class="opt">optional</td><td>Limit price. Without it, order is MARKET.</td></tr>
+    <tr><td>-D &lt;dur&gt;</td><td class="opt">optional</td><td>Duration: <code>day</code> / <code>gtc</code> / <code>pre</code> / <code>post</code>. Default <code>gtc</code>.</td></tr>
+    <tr><td>--execute</td><td class="opt">optional</td><td>Required to submit live. Without it, runs PREVIEW-ONLY.</td></tr>
+  </tbody>
+</table>
+
+<h3>Examples</h3>
+<pre><span class="comment"># Long call: buy 1 QQQ 746C exp 2026-06-04 at MARKET (preview)</span>
+<span class="cmd">tp</span> <span class="flag">--buy</span> <span class="arg">QQQ</span> <span class="arg">746C</span> <span class="arg">2026-06-04</span>
+
+<span class="comment"># Long call at LIMIT, 2 contracts (preview)</span>
+<span class="cmd">tp</span> <span class="flag">--buy</span> <span class="arg">QQQ</span> <span class="arg">746C</span> <span class="arg">2026-06-04</span> <span class="flag">-Q</span> <span class="arg">2</span> <span class="flag">-L</span> <span class="arg">2.90</span>
+
+<span class="comment"># Short put for credit (live)</span>
+<span class="cmd">tp</span> <span class="flag">--sell</span> <span class="arg">SPY</span> <span class="arg">540P</span> <span class="arg">2026-06-30</span> <span class="flag">-L</span> <span class="arg">1.50</span> <span class="flag">--execute</span>
+
+<span class="comment"># Day-only duration override</span>
+<span class="cmd">tp</span> <span class="flag">--buy</span> <span class="arg">NVDA</span> <span class="arg">220C</span> <span class="arg">2026-06-30</span> <span class="flag">-L</span> <span class="arg">4.50</span> <span class="flag">-D</span> <span class="arg">day</span> <span class="flag">--execute</span>
+
+<span class="comment"># Index option — canonical root auto-resolved (NDX → NDXP for PM-settled)</span>
+<span class="cmd">tp</span> <span class="flag">--buy</span> <span class="arg">NDX</span> <span class="arg">30000C</span> <span class="arg">2026-06-04</span> <span class="flag">-L</span> <span class="arg">50.00</span></pre>
+
+<div class="card warn"><span class="icon">bash quoting</span>
+Strike+side is a single bareword token (no space between the digits and the
+<code>C</code> / <code>P</code>). Bash won't expand it; no quoting needed.
+Just remember the EXPIRATION must be in <code>YYYY-MM-DD</code> form — otherwise the parser rejects it.
+</div>
+
+<!-- ─── 7 New multi-leg ────────────────────────────────────────────── -->
+<h2 id="new-multi"><span class="num">7</span>Open new multi-leg position</h2>
+<p>Multi-leg new positions use the same <code>--buy</code> / <code>--sell</code> flag with a single ticket-string argument — the exact format EdgeLane's "Copy ticket" button produces. Detection is automatic: if the first arg after <code>--buy</code> / <code>--sell</code> contains the <code>·</code> separator, it's parsed as a multi-leg ticket.</p>
+
+<p>The ticket's own verb (Buy/Sell at the start) determines the order direction. Use <code>--buy</code> for debit (long) spreads and <code>--sell</code> for credit (short) spreads.</p>
+
+<h3>Syntax</h3>
+<pre><span class="cmd">tp</span> <span class="flag">--buy</span> <span class="arg">'&lt;ticket-string&gt;'</span> [<span class="flag">--execute</span>]
+<span class="cmd">tp</span> <span class="flag">--sell</span> <span class="arg">'&lt;ticket-string&gt;'</span> [<span class="flag">--execute</span>]</pre>
+
+<h3>Examples</h3>
+<pre><span class="comment"># Credit spread — preview only</span>
+<span class="cmd">tp</span> <span class="flag">--sell</span> <span class="arg">'Sell Balanced · SPX · 2026-05-21 · Short 7385P / Long 7365P · LIMIT credit $6.00 GTC · 1 contract'</span>
+
+<span class="comment"># Iron condor — live</span>
+<span class="cmd">tp</span> <span class="flag">--sell</span> <span class="arg">'Sell Range · NDX · 2026-05-19 · 7300/7350P + 7450/7500C · LIMIT credit $4.00 DAY · 1 contract'</span> <span class="flag">--execute</span>
+
+<span class="comment"># Debit spread (long call spread)</span>
+<span class="cmd">tp</span> <span class="flag">--buy</span> <span class="arg">'Buy Aggressive · NVDA · 2026-06-30 · 220/225C · LIMIT debit $1.80 GTC · 1 contract'</span> <span class="flag">--execute</span></pre>
+
+<div class="card warn"><span class="icon">bash quoting</span>
+Always <strong>single-quote</strong> the ticket string. Inside double quotes, bash treats
+<code>$6.00</code> as positional <code>$6</code> + <code>.00</code> and the dollar amount silently disappears.
+</div>
+
+<div class="card tip"><span class="icon">tip</span>
+NDX / SPX / RUT / XSP tickets auto-route to their canonical OCC root (NDXP, SPXW, etc.) and the parent symbol on the order body stays as user-typed. This is the combination Tradier's order endpoint requires for index options.
+</div>
+
+<!-- ─── 8 Modify ──────────────────────────────────────────────────── -->
+<h2 id="modify"><span class="num">8</span>Modify a working order</h2>
+<p>Change the limit price, quantity, or order type on a still-working order. At least one of <code>-L</code>, <code>-Q</code>, or <code>-M</code> must be supplied. Tradier accepts the modify via PUT — the order ID stays the same.</p>
+
+<h3>Syntax</h3>
+<pre><span class="cmd">tp</span> <span class="flag">-O</span> <span class="arg">&lt;row#&gt;</span> [<span class="flag">-L</span> <span class="arg">&lt;price&gt;</span>] [<span class="flag">-Q</span> <span class="arg">&lt;qty&gt;</span>] [<span class="flag">-M</span>] [<span class="flag">--execute</span>]</pre>
+
+<h3>Flags</h3>
+<table>
+  <thead><tr><th>Flag</th><th>Required?</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>-O &lt;row#&gt;</td><td class="req">required</td><td>Working-order row number from <code>tp -O</code>.</td></tr>
+    <tr><td>-L &lt;price&gt;</td><td class="opt">one of</td><td>New limit price. Auto-promotes a market order to limit. Multi-leg keeps existing credit/debit/even direction.</td></tr>
+    <tr><td>-Q &lt;qty&gt;</td><td class="opt">one of</td><td>New quantity.</td></tr>
+    <tr><td>-M</td><td class="opt">one of</td><td>Flip the order to MARKET (drops price). Mutually exclusive with <code>-L</code>.</td></tr>
+    <tr><td>--execute</td><td class="opt">optional</td><td>Send PUT live. Without it, prints the PUT body and exits.</td></tr>
+  </tbody>
+</table>
+
+<h3>Examples</h3>
+<pre><span class="comment"># Lower limit on order #2 from $1.50 to $1.30 (preview)</span>
+<span class="cmd">tp</span> <span class="flag">-O</span> <span class="arg">2</span> <span class="flag">-L</span> <span class="arg">1.30</span>
+
+<span class="comment"># Flip order #2 from LIMIT to MARKET (live)</span>
+<span class="cmd">tp</span> <span class="flag">-O</span> <span class="arg">2</span> <span class="flag">-M</span> <span class="flag">--execute</span>
+
+<span class="comment"># Change quantity only — preserves existing type / price</span>
+<span class="cmd">tp</span> <span class="flag">-O</span> <span class="arg">2</span> <span class="flag">-Q</span> <span class="arg">3</span>
+
+<span class="comment"># Combine price + quantity, live</span>
+<span class="cmd">tp</span> <span class="flag">-O</span> <span class="arg">2</span> <span class="flag">-L</span> <span class="arg">1.30</span> <span class="flag">-Q</span> <span class="arg">2</span> <span class="flag">--execute</span></pre>
+
+<!-- ─── 9 Cancel ──────────────────────────────────────────────────── -->
+<h2 id="cancel"><span class="num">9</span>Cancel a working order</h2>
+<p>Submit a DELETE to Tradier to cancel the order. Cannot be undone — once the cancel reaches the venue, that order ID is gone.</p>
+
+<h3>Syntax</h3>
+<pre><span class="cmd">tp</span> <span class="flag">-C</span> <span class="arg">&lt;row#&gt;</span> [<span class="flag">--execute</span>]</pre>
+
+<h3>Examples</h3>
+<pre><span class="comment"># Preview: prints "DELETE accounts/.../orders/12345678" and exits</span>
+<span class="cmd">tp</span> <span class="flag">-C</span> <span class="arg">2</span>
+
+<span class="comment"># Live cancel</span>
+<span class="cmd">tp</span> <span class="flag">-C</span> <span class="arg">2</span> <span class="flag">--execute</span></pre>
+
+<!-- ─── 10 Gainloss ─────────────────────────────────────────────────── -->
+<h2 id="gainloss"><span class="num">10</span>Closed-position P&amp;L (daily)</h2>
+<p>Pulls Tradier's <code>/accounts/{id}/gainloss</code> endpoint — realized P&amp;L on closures within a date range. Multi-leg spread closes are aggregated by close-timestamp so a 4-leg iron condor close shows as one row, not four. The bottom of the table sums total cost, proceeds, and P&amp;L for the range.</p>
+
+<h3>Syntax</h3>
+<pre><span class="cmd">tp</span> <span class="flag">-G</span> [<span class="arg">&lt;YYYY-MM-DD&gt;</span>] [<span class="flag">--since</span> <span class="arg">&lt;N&gt;</span>]</pre>
+
+<h3>Arguments</h3>
+<table>
+  <thead><tr><th>Arg</th><th>Default</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>(no args)</td><td>today</td><td>Just the current day's closures.</td></tr>
+    <tr><td>&lt;YYYY-MM-DD&gt;</td><td>—</td><td>Specific date.</td></tr>
+    <tr><td>--since &lt;N&gt;</td><td>—</td><td>Closures over the last N days (today − N → today).</td></tr>
+  </tbody>
+</table>
+
+<h3>Columns</h3>
+<table>
+  <thead><tr><th>Column</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>#</td><td>Row index (informational only — these are CLOSED positions, no operations available on them).</td></tr>
+    <tr><td>Ticker</td><td>Underlying + structure shorthand. Multi-leg closures aggregate (e.g. <code>SPX 6000/6020P</code>, <code>NDX 7300/7350P + 7450/7500C</code>).</td></tr>
+    <tr><td>Expiration</td><td>The closed position's expiration date (the option-contract expiry, not the close date).</td></tr>
+    <tr><td>Opened / Closed</td><td>Order-fill timestamps for entry and exit.</td></tr>
+    <tr><td>Qty</td><td>Contract count.</td></tr>
+    <tr><td>Cost / Proceeds</td><td>Total cash paid to open / received on close. Signs follow Tradier's convention (negative on credit collections).</td></tr>
+    <tr><td>P&amp;L $</td><td>Realized P&amp;L = proceeds − cost. Green positive, red negative.</td></tr>
+    <tr><td>P&amp;L %</td><td>P&amp;L as a percentage of |cost basis|.</td></tr>
+  </tbody>
+</table>
+
+<h3>Examples</h3>
+<pre><span class="comment"># Today's closures + total realized P&amp;L</span>
+<span class="cmd">tp</span> <span class="flag">-G</span>
+
+<span class="comment"># Specific date</span>
+<span class="cmd">tp</span> <span class="flag">-G</span> <span class="arg">2026-06-04</span>
+
+<span class="comment"># Last 7 days</span>
+<span class="cmd">tp</span> <span class="flag">-G</span> <span class="flag">--since</span> <span class="arg">7</span>
+
+<span class="comment"># Last 30 days</span>
+<span class="cmd">tp</span> <span class="flag">-G</span> <span class="flag">--since</span> <span class="arg">30</span></pre>
+
+<h3>Sample output</h3>
+<pre><span class="comment">$ tp -G</span>
+Tradier closed-position P&amp;L  <span class="out-dim">env: production  account: 6YB79610  range: 2026-06-04 (today)</span>
+
+  #  Ticker                                Expiration    Opened       Closed             Qty         Cost     Proceeds        P&amp;L $     P&amp;L %
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  1  SPXW 6000/6020P                       2026-06-20    2026-05-21   2026-06-04 14:30     1     −$175.00      −$80.00      <span class="out-pos">+$95.00</span>    <span class="out-pos">+54.3%</span>
+  2  NVDA 220C                             2026-06-20    2026-06-01   2026-06-04 16:45     2     +$375.00     +$290.00      <span class="out-neg">−$85.00</span>    <span class="out-neg">−22.7%</span>
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  <strong>Total (2 closures):</strong>  cost +$200.00   proceeds +$210.00   P&amp;L <span class="out-pos">+$10.00</span> (<span class="out-pos">+5.0%</span>)</pre>
+
+<div class="card tip"><span class="icon">tip</span>
+This is purely informational — no row argument, no <code>--execute</code>, no destructive action. Safe to run at any frequency.
+</div>
+
+<!-- ─── 11 Modifiers ─────────────────────────────────────────────────── -->
+<h2 id="modifiers"><span class="num">11</span>Modifier flags &amp; conventions</h2>
+
+<h3>Modifier flags (apply to every operation)</h3>
+<table>
+  <thead><tr><th>Flag</th><th>Applies to</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>-L &lt;price&gt;</td><td class="both">close / add / new / modify</td><td>Limit price. Omit for MARKET.</td></tr>
+    <tr><td>-Q &lt;qty&gt;</td><td class="both">close (partial) / add / new (contracts) / modify</td><td>Contract count. For close, defaults to full size. For add, REQUIRED.</td></tr>
+    <tr><td>-M</td><td class="opt">modify only</td><td>Force MARKET on modify (clears price).</td></tr>
+    <tr><td>-D &lt;dur&gt;</td><td class="opt">new single-leg</td><td><code>day</code> / <code>gtc</code> / <code>pre</code> / <code>post</code>. Default <code>gtc</code>.</td></tr>
+    <tr><td>--execute, -x</td><td class="both">all destructive ops</td><td>Required to submit live. Without it, PREVIEW-ONLY.</td></tr>
+  </tbody>
+</table>
+
+<h3>Execute vs preview</h3>
+<p>All destructive actions (close, add, modify, cancel, open new) default to
+PREVIEW mode. Add <code>--execute</code> (or <code>-x</code>) to actually submit.
+This makes the same command-line safe as a dry-run dispatcher: paste, inspect, then re-run with <code>--execute</code>.</p>
+
+<h3>Sandbox vs production</h3>
+<p>Controlled by <code>DEVMODE</code> in <code>edge_lane_config.config</code>:</p>
+<div class="key-grid">
+  <code>DEVMODE=true</code><span>→ Tradier sandbox (<code>api.sandbox.tradier.com</code>)</span>
+  <code>DEVMODE=false</code><span>→ Tradier production (<code>api.tradier.com</code>)</span>
+</div>
+<p>Typos default silently to sandbox. The selected env is printed at the top of every command (<code>env: production</code> or <code>env: sandbox</code>) so you always know which account is being touched.</p>
+
+<h3>Help</h3>
+<pre><span class="cmd">tp</span> <span class="flag">-h</span>          <span class="comment"># prints the file's docstring summary</span>
+<span class="cmd">tp</span> <span class="flag">--help</span>
+<span class="cmd">tp</span> <span class="flag">help</span></pre>
+
+<h3>Exit codes</h3>
+<table>
+  <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>Success (list, preview, or live submit accepted).</td></tr>
+    <tr><td>1</td><td>Tradier rejected the request, or local validation failed (bad row number, missing required flag, malformed ticket, etc.).</td></tr>
+  </tbody>
+</table>
+
+<h3>Order-type selection (automatic)</h3>
+<p>Tradier requires different <code>type=</code> values depending on whether the order is single-leg or multi-leg. The tool picks the right one automatically:</p>
+<table>
+  <thead><tr><th>Scenario</th><th>Selected <code>type=</code></th></tr></thead>
+  <tbody>
+    <tr><td>No <code>-L</code> (market order)</td><td><code>market</code></td></tr>
+    <tr><td>Single-leg with <code>-L</code></td><td><code>limit</code></td></tr>
+    <tr><td>Multi-leg close, original was credit</td><td><code>debit</code> (closing pays debit)</td></tr>
+    <tr><td>Multi-leg close, original was debit</td><td><code>credit</code> (closing collects credit)</td></tr>
+    <tr><td>Multi-leg add, position is credit</td><td><code>credit</code> (matches direction)</td></tr>
+    <tr><td>Multi-leg add, position is debit</td><td><code>debit</code> (matches direction)</td></tr>
+    <tr><td>Multi-leg open via ticket</td><td>Whatever the ticket's <code>LIMIT credit|debit ...</code> field says</td></tr>
+  </tbody>
+</table>
+
+<div class="card warn"><span class="icon">tradier note</span>
+The <code>credit</code> / <code>debit</code> / <code>even</code> order types are valid only on <code>class=multileg</code>. Single-leg orders (<code>class=option</code> or <code>class=equity</code>) must use <code>type=limit</code>. The tool handles this correctly under the hood — if you ever see "Invalid parameter, type: is not valid" from Tradier, that's a regression worth reporting.
+</div>
+
+<!-- ─── 12 Install ────────────────────────────────────────────────────── -->
+<h2 id="install"><span class="num">12</span>Installation &amp; alias</h2>
+<p>Tradier credentials and DEVMODE flag live in
+<code>edge_lane_config.config</code> at the repo root. The tool reads them via
+<code>tests/utils.py</code> — no additional setup required if EdgeLane itself
+already works.</p>
+
+<h3>Make <code>tp</code> a shell alias</h3>
+<pre><span class="comment"># One-shot — adds the alias to your bashrc</span>
+echo "alias tp='python3 /mnt/c/soljet_dev/EdgeLane/tools/tradier_positions.py'" &gt;&gt; ~/.bashrc
+source ~/.bashrc
+
+<span class="comment"># Verify</span>
+tp -h</pre>
+
+<h3>Or use a wrapper script (better arg-passing for complex strings)</h3>
+<pre>mkdir -p ~/.local/bin
+cat &gt; ~/.local/bin/tp &lt;&lt;'EOF'
+#!/usr/bin/env bash
+exec python3 /mnt/c/soljet_dev/EdgeLane/tools/tradier_positions.py "$@"
+EOF
+chmod +x ~/.local/bin/tp
+
+<span class="comment"># Make sure ~/.local/bin is on PATH</span>
+echo 'export PATH="$HOME/.local/bin:$PATH"' &gt;&gt; ~/.bashrc
+source ~/.bashrc</pre>
+
+<div class="footer">
+  EdgeLane tools · <code>tp</code> uniform verb-flag CLI · positions + orders manager<br>
+  See also: <code>tradier_execute_ticket.py</code> (ticket-string parser used internally by <code>--buy</code> / <code>--sell</code> multi-leg form)
+</div>
+
+</div>
+</body>
+</html>

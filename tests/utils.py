@@ -34,7 +34,29 @@ def load_config(path: str | Path | None = None) -> dict:
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        cfg[k.strip()] = v.strip().strip('"').strip("'")
+        v = v.strip()
+        # Strip inline comments — bash sourcing tolerates these, our parser
+        # didn't, so DEVMODE=true # sandbox became literally "true # sandbox"
+        # and DEVMODE checks fell through to prod. v4.7.31b: handle them.
+        # Only strip # comments OUTSIDE of quoted values (so a # inside
+        # "abc#def" is preserved).
+        if v.startswith('"') or v.startswith("'"):
+            quote = v[0]
+            end = v.find(quote, 1)
+            if end >= 0:
+                v = v[1:end]   # take only what's inside the quotes
+            else:
+                v = v[1:].strip()
+        else:
+            # Unquoted — anything from a ' #' or '\t#' is a comment.
+            hash_idx = -1
+            for i, ch in enumerate(v):
+                if ch == "#" and (i == 0 or v[i-1] in (" ", "\t")):
+                    hash_idx = i
+                    break
+            if hash_idx >= 0:
+                v = v[:hash_idx].rstrip()
+        cfg[k.strip()] = v
     return cfg
 
 
@@ -48,16 +70,28 @@ def resolve_tradier_creds(cfg: dict) -> tuple[str, str, str]:
     """Pick Tradier (token, base_url, env_label) based on cfg[DEVMODE].
     Returns ('', '', 'unset') if no token configured for the active env.
 
-    DEVMODE=true (or 1 / yes) -> sandbox (default)
-    DEVMODE=false (or 0 / no) -> production
+    v4.7.31b: more permissive DEVMODE matching. Defense-in-depth in case
+    load_config didn't fully sanitize an inline-comment or stray quotes.
+
+    DEVMODE truthy values  -> sandbox  : true, 1, yes, y, on, t  (default)
+    DEVMODE falsy values   -> prod     : false, 0, no, n, off, f, ""
+    Anything else -> sandbox (safe default; production requires explicit opt-in).
     """
-    devmode = str(cfg.get("DEVMODE", "true")).strip().lower()
-    if devmode in ("true", "1", "yes"):
-        token = cfg.get("TRADIER_SANDBOX_TOKEN") or cfg.get("TRADIER_ACCESS_TOKEN") or ""
-        return token, "https://sandbox.tradier.com", "sandbox"
-    else:
+    raw = str(cfg.get("DEVMODE", "true"))
+    # Drop quotes and any trailing comment fragment, then lowercase + first token only.
+    cleaned = raw.strip().strip('"').strip("'").split("#", 1)[0].strip().split()[0:1]
+    devmode = (cleaned[0] if cleaned else "").lower()
+
+    SANDBOX_VALUES = {"true", "1", "yes", "y", "on", "t"}
+    PROD_VALUES    = {"false", "0", "no", "n", "off", "f"}
+
+    if devmode in PROD_VALUES:
         token = cfg.get("TRADIER_PROD_TOKEN") or ""
         return token, "https://api.tradier.com", "production"
+    # Default-sandbox: explicit truthy values, empty, typos, anything that
+    # isn't a recognized prod indicator. Silent — sandbox is the safe default.
+    token = cfg.get("TRADIER_SANDBOX_TOKEN") or cfg.get("TRADIER_ACCESS_TOKEN") or ""
+    return token, "https://sandbox.tradier.com", "sandbox"
 
 
 
@@ -296,8 +330,6 @@ OUTPUT JSON ONLY matching the provided schema. gex_wall_strike MUST be the numer
 class Stopwatch:
     """Works both inside and outside the `with` block. `sw.ms` returns live
     elapsed time during the block, frozen elapsed time after the block exits.
-    Fixes AttributeError: 'Stopwatch' object has no attribute 'elapsed' that
-    bit gemini_bias_bench.py when ms was read mid-block.
     """
     def __enter__(self):
         self.t0 = time.perf_counter()
@@ -307,7 +339,6 @@ class Stopwatch:
         self.elapsed = time.perf_counter() - self.t0
     @property
     def ms(self):
-        # If we're still inside the with block, compute live elapsed
         if self.elapsed is None:
             return (time.perf_counter() - self.t0) * 1000
         return self.elapsed * 1000

@@ -3,6 +3,11 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="assets/favicon-16.png">
+  <link rel="apple-touch-icon" sizes="192x192" href="assets/favicon-192.png">
+  <link rel="shortcut icon" href="assets/favicon.ico">
   <title>EdgeLane — Spread Optimizer</title>
 
   <!-- Tailwind via CDN, with the custom font tokens this JSX uses -->
@@ -28,8 +33,11 @@
   <style>
     body {
       margin: 0;
-      background: #f4ecd8;  /* parchment cream — matches the user palette (olive/tan/pale yellow) */
-      color: #4a3f33;       /* warm dark brown for default text */
+      /* v4.7.41: dark slate-charcoal palette (Option B) — replaces parchment theme.
+         Slate-blue tinted darks for the TradingView feel; emerald/amber/rose
+         accents from the JSX show through cleanly. */
+      background: #0f1419;
+      color: #cbd5e1;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
     }
     .glow-emerald { box-shadow: 0 0 60px -10px rgba(16, 185, 129, 0.30); }
@@ -95,62 +103,78 @@ __JSX_BODY__
   <!-- !important still set as belt-and-suspenders.                   -->
   <!-- ============================================================== -->
   <style id="brand-palette">
-    /* Warm-brown tier, all AA-readable (≥4.5:1) on the parchment #f4ecd8 bg.
-       Original UX spec values were designed for a dark theme — flipping them
-       wholesale to dark stops on light bg keeps the earth-tone feel readable. */
-    .text-stone-50  { --tw-text-opacity: 1 !important; color: #2d2419 !important; }  /* primary headlines/values  ~13:1 */
-    .text-stone-100 { --tw-text-opacity: 1 !important; color: #2d2419 !important; }  /* primary tier (spot, score) */
-    .text-stone-200 { --tw-text-opacity: 1 !important; color: rgb(82 82 74) !important; }  /* body prose       ~7:1 */
-    .text-stone-300 { --tw-text-opacity: 1 !important; color: #6e5537 !important; }  /* secondary labels         ~5.4:1 */
-    .text-stone-400 { --tw-text-opacity: 1 !important; color: #6e5537 !important; }  /* tertiary labels/hints     ~5.4:1 */
-    .text-stone-500 { --tw-text-opacity: 1 !important; color: #8b7050 !important; }  /* dim labels (was Tailwind default) */
-    .text-stone-600 { --tw-text-opacity: 1 !important; color: #a89880 !important; }  /* very dim / disabled */
-    .font-bold      { font-weight: 500 !important; }
-    .bg-black\/30      { background-color: rgb(134 130 130 / 30%) !important; }
-    .bg-rose-950\/40   { background-color: rgb(203 185 190 / 40%) !important; }
-    /* Colored card backgrounds — light pastel versions for parchment theme.   */
-    /* Emerald (healthy / good wall): light mint                                 */
-    .bg-emerald-950\/40 { background-color: rgb(220 245 220 / 70%) !important; }
-    .bg-emerald-950\/60 { background-color: rgb(210 240 215 / 85%) !important; }
-    .bg-emerald-950     { background-color: rgb(210 240 215) !important; }
-    .border-emerald-800\/50 { border-color: rgb(120 180 140 / 70%) !important; }
-    .border-emerald-700,
-    .border-emerald-700\/60 { border-color: rgb(100 160 120 / 80%) !important; }
-    /* Amber (warn / thin / directional / mid liq): light butter                 */
-    .bg-amber-950\/40   { background-color: rgb(248 235 195 / 70%) !important; }
-    .bg-amber-950\/60   { background-color: rgb(245 225 175 / 85%) !important; }
-    .border-amber-800\/50 { border-color: rgb(190 150  80 / 70%) !important; }
-    /* Rose (broken / capital trap / bad wall / low liq): /60 variant           */
-    .bg-rose-950\/60    { background-color: rgb(218 195 200 / 80%) !important; }
-    .border-rose-800\/50 { border-color: rgb(180 130 140 / 70%) !important; }
-    /* Text on colored cards — flip from Tailwind's bright -400/-300 stops      */
-    /* (designed for near-black bgs) to dark -800/-700 stops (readable on light  */
-    /* pastels). Same semantic ramp, different end of the scale.                 */
-    /* Emerald (healthy / good wall / recommended)                              */
-    .text-emerald-400 { --tw-text-opacity: 1 !important; color: #166534 !important; }
-    .text-emerald-300 { --tw-text-opacity: 1 !important; color: #15803d !important; }
-    .text-emerald-200 { --tw-text-opacity: 1 !important; color: #166534 !important; }
-    /* Amber (thin / directional / warn)                                         */
-    .text-amber-400   { --tw-text-opacity: 1 !important; color: #854d0e !important; }
-    .text-amber-300   { --tw-text-opacity: 1 !important; color: #a16207 !important; }
-    /* Rose (broken / capital trap / bad wall)                                   */
-    .text-rose-400    { --tw-text-opacity: 1 !important; color: #9f1239 !important; }
-    .text-rose-300    { --tw-text-opacity: 1 !important; color: #be123c !important; }
-    /* The JSX wraps everything in <div className="bg-[#0a0a0f] ..."> — flip
-       it to match the body parchment so the page reads as one surface. */
-    .bg-\[\#0a0a0f\]  { background-color: #f4ecd8 !important; }
-    /* Cards inside the app use bg-[#13131c] — give them a subtle warm white. */
-    .bg-\[\#13131c\]  { background-color: #faf3e0 !important; border-color: #d8cdb1 !important; }
-    /* Stone-900-ish backgrounds → warm light surfaces */
-    .bg-stone-900       { background-color: #ebe3c9 !important; }
-    .bg-stone-900\/40  { background-color: rgb(235 227 201 / 40%) !important; }
-    .bg-stone-900\/60  { background-color: rgb(235 227 201 / 60%) !important; }
-    .bg-stone-800\/40  { background-color: rgb(216 205 177 / 40%) !important; }
-    .bg-stone-800\/60  { background-color: rgb(216 205 177 / 60%) !important; }
-    .border-stone-800\/40,
-    .border-stone-800\/60 { border-color: #d8cdb1 !important; }
+    /* v4.7.41 — dark slate palette (Option B). Replaces the previous parchment
+       overrides. The JSX itself was designed for dark surfaces, so we mostly
+       SHIFT its stone-tinted neutrals to slate-tinted neutrals (cooler blue
+       cast). User-tuned label contrast: stone-500/400 bumped one stop brighter
+       so secondary captions like "Balanced · Iron Condor" and the small caps
+       row (CREDIT / POP / EV / COMPOSITE) read clearly without shouting. */
+
+    /* Page bg: JSX root uses bg-[#0a0a0f] — flip to slate */
+    .bg-\[\#0a0a0f\] { background-color: #0f1419 !important; }
+
+    /* Card bg: JSX cards use bg-[#13131c] — flip to slate-blue */
+    .bg-\[\#13131c\] { background-color: #1a1f2e !important; border-color: #1e293b !important; }
+
+    /* Stone text ramp → slate ramp (cooler). User bumped 500/400 brighter. */
+    .text-stone-50  { --tw-text-opacity: 1 !important; color: #f8fafc !important; }
+    .text-stone-100 { --tw-text-opacity: 1 !important; color: #f1f5f9 !important; }
+    .text-stone-200 { --tw-text-opacity: 1 !important; color: #e2e8f0 !important; }
+    .text-stone-300 { --tw-text-opacity: 1 !important; color: #cbd5e1 !important; }
+    .text-stone-400 { --tw-text-opacity: 1 !important; color: #cbd5e1 !important; }  /* bumped — was slate-400 */
+    .text-stone-500 { --tw-text-opacity: 1 !important; color: #94a3b8 !important; }  /* bumped — was slate-500 */
+    .text-stone-600 { --tw-text-opacity: 1 !important; color: #64748b !important; }
+    .text-stone-700 { --tw-text-opacity: 1 !important; color: #475569 !important; }
+
+    /* Stone borders → slate borders */
     .border-stone-700,
-    .border-stone-700\/60 { border-color: #c4b88f !important; }
+    .border-stone-700\/60 { border-color: #334155 !important; }
+    .border-stone-800\/40,
+    .border-stone-800\/60,
+    .border-stone-800\/80 { border-color: #1e293b !important; }
+
+    /* Stone bg fills → slate */
+    .bg-stone-900       { background-color: #0f1419 !important; }
+    .bg-stone-900\/40  { background-color: rgba(15, 20, 25, 0.4) !important; }
+    .bg-stone-900\/60  { background-color: rgba(15, 20, 25, 0.6) !important; }
+    .bg-stone-800\/40  { background-color: rgba(26, 31, 46, 0.4) !important; }
+    .bg-stone-800\/50  { background-color: rgba(26, 31, 46, 0.5) !important; }
+    .bg-stone-800\/60  { background-color: rgba(26, 31, 46, 0.6) !important; }
+
+    /* Accent text — restore the original Tailwind ramp values that work on dark */
+    .text-emerald-400 { --tw-text-opacity: 1 !important; color: #34d399 !important; }
+    .text-emerald-300 { --tw-text-opacity: 1 !important; color: #6ee7b7 !important; }
+    .text-emerald-200 { --tw-text-opacity: 1 !important; color: #a7f3d0 !important; }
+    .text-amber-400   { --tw-text-opacity: 1 !important; color: #fbbf24 !important; }
+    .text-amber-300   { --tw-text-opacity: 1 !important; color: #fcd34d !important; }
+    .text-amber-200   { --tw-text-opacity: 1 !important; color: #fde68a !important; }
+    .text-rose-400    { --tw-text-opacity: 1 !important; color: #fb7185 !important; }
+    .text-rose-300    { --tw-text-opacity: 1 !important; color: #fda4af !important; }
+    .text-rose-200    { --tw-text-opacity: 1 !important; color: #fecdd3 !important; }
+
+    /* v4.7.41: native HTML <input type="date"> integrates poorly on dark
+       bgs — the calendar picker icon defaults to near-black on near-black.
+       color-scheme:dark switches the entire native widget to the browser's
+       dark theme. The WebKit indicator filter brightens the icon explicitly
+       on Chrome/Safari/Edge. Firefox already respects color-scheme. */
+    input[type="date"] {
+      color-scheme: dark;
+    }
+    input[type="date"]::-webkit-calendar-picker-indicator {
+      filter: invert(0.85) brightness(1.6);
+      opacity: 0.85;
+      cursor: pointer;
+      padding: 4px;
+      border-radius: 4px;
+      transition: opacity 120ms;
+    }
+    input[type="date"]::-webkit-calendar-picker-indicator:hover {
+      opacity: 1;
+      background-color: rgba(52, 211, 153, 0.15);
+    }
+
+    /* font-bold normally renders heavy — keep the existing 500 weight */
+    .font-bold { font-weight: 500 !important; }
   </style>
 </body>
 </html>
