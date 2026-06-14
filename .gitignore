@@ -10,9 +10,22 @@ venv/
 # Claude Code agent config, local settings, and audit notes (may contain secrets/PII)
 .claude/
 
-# Secrets — never commit your real keys
+# Secrets — never commit your real keys (incl. ANY backup/variant of the configs)
 edge_lane_config.config
 edgelane_market.config
+edge_lane_config.config.*
+edgelane_market.config.*
+# ...but keep the sanitized templates
+!edge_lane_config.config.example
+!edgelane_market.config.example
+
+# Backup / scratch files that routinely capture live config (never commit)
+*.bak
+*.bak-*
+*.backup
+*.orig
+*.save
+*~
 
 # Operational notes (may contain account IDs / session notes)
 notes.txt
