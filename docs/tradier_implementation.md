@@ -1,6 +1,6 @@
 # Tradier Integration — Implementation Plan
 
-**Status:** Follows `tradier_design.md`. Phase 1 + Phase 2 scope.
+**Status:** Historical implementation plan — executed. EdgeLane originally used Atlas's API (mind-vest.io) as its data backbone; Atlas was fully retired ~May 2026 and Tradier is now the sole data provider. The dual-provider steps and Atlas-side edits below are the historical record of the migration, not current setup instructions — do not configure Atlas.
 **Audience:** The next agent (or human) actually making the edits.
 
 ---
@@ -418,10 +418,10 @@ the whole time. Every step before step 6 is invisible to end users.
 7. **Flip the flag.** Set `DATA_PROVIDER=tradier` in
    `edge_lane_config.config`, rebuild, hard-reload the page. Verify Tickets
    tab + Lookup tab on SPY, NVDA, MU. This is the user-visible cutover.
-8. **(Later, after a stable period) Retire Atlas.** Remove the `atlas`
-   namespace from JSX, drop `data_providers/atlas.py` (move `atlas_call` back
-   inline if any test still needs it), simplify the build-script fail-fast.
-   This is a separate PR; do not bundle it with the cutover.
+8. **Retire Atlas (done ~May 2026).** Removed the `atlas`
+   namespace from JSX, dropped `data_providers/atlas.py` (moving `atlas_call` back
+   inline where any test still needed it), and simplified the build-script
+   fail-fast. Tradier is now the sole provider.
 
 ---
 
@@ -537,26 +537,16 @@ $ ./edge_lane_build.sh
 $ # hard-reload edge_lane.html in browser
 ```
 
-**Switch BACK:** same operation, flip the value to `atlas`. Both namespaces
-remain present in the JSX bundle, so no rebuild-from-scratch needed beyond
-running the build script with the flag flipped.
+**Switch BACK:** during the gated-migration window this was possible by flipping
+the value back to `atlas` while both namespaces remained in the JSX bundle. Atlas
+was fully retired ~May 2026, so this rollback path no longer exists — Tradier is
+the only provider.
 
-**Per-symbol fallback (if the probe fails for a symbol class).** The hook is
-inside `tradier.greekExposures` in the JSX. Pseudocode:
-
-```javascript
-async greekExposures(symbol, num) {
-  const fallback = (window.ATLAS_FALLBACK_SYMBOLS || '').split(',').map(s => s.trim().toUpperCase());
-  if (fallback.includes(symbol.toUpperCase())) {
-    return atlas.analyzeGreekExposures(symbol, num);
-  }
-  // ...fan out N options_chain calls + _computeDealerExposures...
-}
-```
-
-The `ATLAS_FALLBACK_SYMBOLS` config key (CSV, e.g. `"MU,SMCI"`) and matching
-template/build placeholder follow the same wiring pattern as the three core
-keys. Add only when needed — Phase 1's default is empty.
+**Per-symbol fallback (during the migration window).** While Atlas was retained,
+the hook lived inside `tradier.greekExposures` in the JSX, routing the symbols in
+the `ATLAS_FALLBACK_SYMBOLS` config key (CSV, e.g. `"MU,SMCI"`) back to Atlas.
+That fallback and its config/template/build wiring were removed when Atlas was
+retired.
 
 ---
 

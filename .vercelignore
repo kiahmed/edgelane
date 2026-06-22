@@ -1,0 +1,38 @@
+# Vercel hosts the FRONTEND ONLY (the staged dist/ built from market/ui).
+# Everything below is excluded from the upload so the CLI never sees the
+# FastAPI backend, secrets, or the legacy single-file build.
+
+# Backend + tooling
+market/backend/
+market/extension/
+tools/
+tests/
+docs/
+deploy/
+archive/
+
+# Secrets / local config — NEVER upload these.
+# Match only the KEY=VALUE backend config files, NOT the browser
+# edgelane.config.js / edgelane.config.example.js that the UI MUST load. An
+# earlier `*.config.*` glob matched the ".config." in those .js names and
+# silently dropped them, so the deployed UI couldn't discover the backend URL.
+*.config
+*.config.example
+.env
+.env.*
+deploy/.env
+
+# Legacy single-file frontend (not deployed to Vercel)
+edge_lane.html
+edge_lane*.html
+spread_optimizer_v4_7_html.jsx
+edge_lane.template.html
+
+# Python / build noise
+**/__pycache__/
+*.pyc
+.venv/
+**/.venv/
+*.duckdb
+*.db
+*.log

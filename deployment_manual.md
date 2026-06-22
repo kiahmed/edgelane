@@ -21,8 +21,9 @@ This is the consolidated guide for getting EdgeLane running on a new workstation
 11. [Test scripts — what to run before committing](#test-scripts--what-to-run-before-committing)
 12. [Daily workflow](#daily-workflow)
 13. [Switching between sandbox and production](#switching-between-sandbox-and-production)
-14. [Troubleshooting](#troubleshooting)
-15. [Production deployment](#production-deployment) *(placeholder)*
+14. [Market backend & Torque](#market-backend--torque)
+15. [Troubleshooting](#troubleshooting)
+16. [Production deployment](#production-deployment) *(placeholder)*
 
 ---
 
@@ -30,7 +31,7 @@ This is the consolidated guide for getting EdgeLane running on a new workstation
 
 A single-file HTML web app that:
 
-- Pulls live options chain + Greeks from a data provider (Atlas or Tradier)
+- Pulls live options chain + Greeks from Tradier (EdgeLane originally used Atlas's API (mind-vest.io) as its data provider; Atlas was fully retired ~May 2026 and Tradier is now the sole provider)
 - Computes a deterministic market-bias signal in JavaScript (Gemini Flash only writes the prose summary, not the bias decision)
 - Scores candidate spreads (verticals, condors, butterflies, iron flies)
 - Lets the user sign in, attach a Tradier brokerage connection, copy a ticket to clipboard, or push an order straight to the broker
@@ -56,8 +57,7 @@ The whole front-end ships as one `edge_lane.html` produced by `edge_lane_build.s
         └────┬──────────┬─────┘   └─────────────────────┘
              │          │
              │          └──→ Gemini  (prose only)
-             └────────────→ Atlas    (chain, GEX, quote)  ── or ──
-                            Tradier   (chain, GEX, quote — operator-level)
+             └────────────→ Tradier  (chain, GEX, quote — operator-level)
 
 Python side (no browser involved):
     tradier_smoke.py            chain/quote sanity check
@@ -80,13 +80,12 @@ Bias decision is **always deterministic** — Gemini only writes the human-reada
 | `edge_lane_config.config` | Your real keys + DEVMODE. | ✗ (gitignored) |
 | `edge_lane.html` | Build artifact. Overwritten every build. | ✗ |
 | `.edge_lane_buildstate` | Version-bump state. | ✗ |
-| `tools/cors_proxy.py` | Local CORS proxy (browser → Atlas + Gemini). | ✓ |
+| `tools/cors_proxy.py` | Local CORS proxy (browser → Tradier + Gemini). | ✓ |
 | `tools/cors_proxy_service.sh` | Service manager: start/stop/status/install. | ✓ |
 | `tools/tradier_positions.py` | `tp` — Tradier position + order manager. | ✓ |
 | `tools/tp_operating_manual.html` | Operating manual for `tp` (HTML). | ✓ |
 | `tests/tradier_smoke.py` | Tradier API sanity check. | ✓ |
 | `tests/tradier_execute_ticket.py` | Parses EdgeLane copy-button ticket, posts via Tradier. | ✓ |
-| `tests/atlas_rest_smoke.py` | Atlas REST sanity check. | ✓ |
 | `tests/utils.py` | Shared test helpers (config loader, etc.). | ✓ |
 | `archive/` | Snapshots of prior JSX versions. | ✓ |
 | `docs/` | Implementation notes (tradier_implementation.md, etc.). | ✓ |
@@ -143,9 +142,8 @@ That's the whole loop. Everything below is detail and tooling around those six c
 
 | Key | What it's for |
 |---|---|
-| `ATLAS_KEY` | Operator-level Atlas account (chain + GEX provider when `DATA_PROVIDER=atlas`) |
 | `GEMINI_API_KEY` | Bias prose generation (deterministic JS does the math; Gemini just narrates) |
-| `TRADIER_TOKEN` | Operator-level Tradier token (chain + GEX + quote when `DATA_PROVIDER=tradier`) |
+| `TRADIER_TOKEN` | Operator-level Tradier token (chain + GEX + quote) |
 | `TRADIER_TOKEN_SANDBOX` | Sandbox-environment Tradier token (used when `DEVMODE=true`) |
 
 ### Environment toggles
@@ -153,16 +151,16 @@ That's the whole loop. Everything below is detail and tooling around those six c
 | Key | Values | Effect |
 |---|---|---|
 | `DEVMODE` | `true` / `false` | When `true`, Python CLI tools (`tp`, `tradier_smoke.py`, etc.) target Tradier sandbox; when `false`, they target production. The browser's data provider env is set by `TRADIER_ENV` below, independently. |
-| `DATA_PROVIDER` | `atlas` / `tradier` | Which provider EdgeLane uses for chain + GEX in the browser |
+| `DATA_PROVIDER` | `tradier` | Data provider EdgeLane uses for chain + GEX in the browser (Tradier is the only supported value) |
 | `TRADIER_ENV` | `production` / `sandbox` | Browser-side env when `DATA_PROVIDER=tradier` |
 | `EDGE_LANE_VERSION` | e.g. `4.7` | Major.minor base — build script auto-appends `.<patch>` per content change |
 
 ### Local-dev URLs
 
-When the CORS proxy is running locally, point both Atlas and Gemini at it so the browser doesn't hit CORS walls:
+When the CORS proxy is running locally, point both Tradier and Gemini at it so the browser doesn't hit CORS walls:
 
 ```
-ATLAS_BASE_URL="http://localhost:8787/atlas"
+TRADIER_BASE_URL="http://localhost:8787/tradier"
 GEMINI_BASE_URL="http://localhost:8787/gemini"
 ```
 
@@ -172,7 +170,6 @@ In production these point at server-side proxies/functions instead (see [Product
 
 ```bash
 # edge_lane_config.config
-ATLAS_KEY="atlas_xxxx"
 GEMINI_API_KEY="AIzaXXXX"
 GEMINI_MODEL=gemini-2.5-flash
 
@@ -182,7 +179,7 @@ DEVMODE=false                     # python CLI tools → production
 DATA_PROVIDER=tradier             # browser-side data provider
 TRADIER_ENV=production            # browser-side env
 
-ATLAS_BASE_URL="http://localhost:8787/atlas"
+TRADIER_BASE_URL="http://localhost:8787/tradier"
 GEMINI_BASE_URL="http://localhost:8787/gemini"
 
 EDGE_LANE_VERSION="4.7"
@@ -194,12 +191,12 @@ EDGE_LANE_VERSION="4.7"
 
 ## CORS proxy — what it does and how to manage it
 
-Atlas and Gemini don't return CORS headers, so the browser can't call them from a `file://` or `localhost` page directly. The proxy at `tools/cors_proxy.py` listens on `127.0.0.1:8787` and adds those headers while forwarding requests upstream. Keys are passed through from the browser's headers; the proxy never stores them.
+Tradier and Gemini don't return CORS headers, so the browser can't call them from a `file://` or `localhost` page directly. The proxy at `tools/cors_proxy.py` listens on `127.0.0.1:8787` and adds those headers while forwarding requests upstream. Keys are passed through from the browser's headers; the proxy never stores them.
 
 ### Routes
 
 ```
-/atlas/<tool>    →  https://atlasmcp.finmanagerai.com/api/v1/tools/<tool>
+/tradier/<rest>  →  https://api.tradier.com/<rest>
 /gemini/<rest>   →  https://generativelanguage.googleapis.com/v1beta/<rest>
 ```
 
@@ -223,6 +220,8 @@ State lives in `~/.edgelane/` (PID file + log). Port + bind are configurable:
 ```bash
 EDGELANE_CORS_PORT=9000 EDGELANE_CORS_BIND=0.0.0.0 ./tools/cors_proxy_service.sh start
 ```
+
+The script path is long — add the `coproxy` alias so you can type `coproxy start/status/install/...` instead. See [Tools: `tp` and `coproxy` shell aliases](#tools-tp-and-coproxy-shell-aliases).
 
 ### Auto-start on WSL boot
 
@@ -264,7 +263,7 @@ The build script does four things:
 
 1. Sources `edge_lane_config.config` for keys + URLs + version
 2. Reads `spread_optimizer_v4_7_html.jsx` and transforms it for browser use (strips ESM imports, drops `export default`)
-3. Wraps the transformed JSX inside `edge_lane.template.html`, substituting `__ATLAS_KEY__`, `__GEMINI_API_KEY__`, `__TRADIER_TOKEN__`, `__DATA_PROVIDER__`, `__VERSION__`, base URLs, etc.
+3. Wraps the transformed JSX inside `edge_lane.template.html`, substituting `__GEMINI_API_KEY__`, `__TRADIER_TOKEN__`, `__DATA_PROVIDER__`, `__VERSION__`, base URLs, etc.
 4. Writes the final `edge_lane.html` and updates `.edge_lane_buildstate` so the patch number auto-bumps on content change.
 
 ### Basic usage
@@ -379,13 +378,7 @@ python3 tests/tradier_smoke.py NDX 2026-06-20    # specific underlying + expirat
 
 Pings `markets/quotes`, `markets/options/expirations`, `markets/options/chains`. Strict pass criteria. Doesn't depend on the proxy.
 
-### 2. Atlas REST sanity (if you use the Atlas provider)
-
-```bash
-python3 tests/atlas_rest_smoke.py SPY
-```
-
-### 3. Chain pipeline (matches JSX filter logic)
+### 2. Chain pipeline (matches JSX filter logic)
 
 ```bash
 python3 tests/tradier_chain_pipeline_probe.py NVDA 2026-06-20
@@ -393,7 +386,7 @@ python3 tests/tradier_chain_pipeline_probe.py NVDA 2026-06-20
 
 Mirrors EdgeLane's client-side filter step (±30% band, bid>0 selection). Useful when the bottom panel goes empty for a specific ticker.
 
-### 4. Ticket parser round-trip
+### 3. Ticket parser round-trip
 
 ```bash
 python3 tests/tradier_execute_ticket.py \
@@ -401,14 +394,6 @@ python3 tests/tradier_execute_ticket.py \
 ```
 
 Parses the ticket, resolves canonical OCC root, posts a preview-only order. No `--execute` = dry run. Tells you if EdgeLane's copy-button output is valid for Tradier.
-
-### 5. End-to-end pipeline timing (Atlas path only, legacy)
-
-```bash
-python3 tests/e2e_pipeline.py SPY 2026-05-15
-```
-
-Target wall-clock total: **< 4 seconds**.
 
 ---
 
@@ -446,6 +431,34 @@ There are two independent env switches:
 
 ---
 
+## Market backend & Torque
+
+FastAPI service in `market/backend/` that polls Tradier, runs the bias/strategy
+math (parity-tested vs the JSX), and serves **Torque** (`/torque`), the
+standalone multi-leg order builder. Full detail: `docs/torque.md`.
+
+```bash
+cd market/backend
+make setup            # one-time: venv + deps
+make run-dev          # sandbox Tradier (paper) — forces DEVMODE=true, boots :8789
+make run-prod         # production Tradier (real money) — forces DEVMODE=false
+make run              # boot with whatever DEVMODE is in the config
+make test             # parity + torque tests (must be green before commit)
+# Torque page:  http://127.0.0.1:8789/torque
+```
+
+- **Config**: `edgelane_market.config` (KEY=VALUE). `DEVMODE=true` → sandbox token
+  + `sandbox.tradier.com` + sandbox DB; `false` → production, market-hours gated.
+  This flag is **separate** from the frontend's `edge_lane_config.config`.
+- **`run-dev`/`run-prod` rewrite `DEVMODE`** before booting; bare `run` respects it.
+- **Spot** = Yahoo live quote → Tradier put-call parity fallback. **Chain** keeps
+  only the live root (NDX→NDXP, SPX→SPXW, RUT→RUTW); UI shows the base ticker.
+- **Auto-close** is backgrounded: entry placed → watched until filled → close
+  placed then. Orders panel (`/torque/orders`) shows working orders + armed closes.
+- Restart to pick up Python changes; the page is `no-store` so a reload gets UI changes.
+
+---
+
 ## Troubleshooting
 
 ### Bias detection fails / "Failed to fetch" in console
@@ -464,7 +477,7 @@ Read the `[label]: HTTP <code> — <body>` message. Most common:
 ### "Undefined symbol" on order POST
 v4.7.56+ handles the NDX/NDXP/SPX/SPXW family. If you see this on a non-index ticker, the chain may have returned a ghost listing (rare but possible). Open the console, look for `[Tradier root probe]` and `[Tradier submit] live response:` lines — they tell you exactly what Tradier rejected.
 
-### "Atlas …: blocked by CORS"
+### "Tradier …: blocked by CORS"
 Same root cause as bias detection: proxy down. `coproxy start`.
 
 ### Babel error in browser console

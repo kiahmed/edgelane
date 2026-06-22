@@ -220,3 +220,37 @@ class MockTradierClient:
         else:
             order.update({"preview": False})
         return {"order": order}
+
+    async def quotes(self, symbols, greeks: bool = False) -> list[dict]:
+        """Synthetic quotes for Torque's live re-price poll. Deterministic
+        bid/ask per symbol so the demo net price is stable (not real data)."""
+        if isinstance(symbols, (list, tuple, set)):
+            syms = [str(s) for s in symbols]
+        else:
+            syms = [s for s in str(symbols).split(",") if s]
+        out = []
+        for s in syms:
+            # crude per-symbol value seeded by the strike digits, just so the
+            # spread nets to something believable in demo mode
+            digits = "".join(ch for ch in s[-8:] if ch.isdigit()) or "1000"
+            base = max(0.5, (int(digits) % 5000) / 100.0)
+            out.append({"symbol": s, "bid": round(base, 2), "ask": round(base + 0.20, 2),
+                        "last": round(base + 0.10, 2)})
+        return out
+
+    async def get_order(self, account_id: str, order_id) -> dict:
+        """Synthetic order lookup — always reports FILLED so the demo
+        confirm-then-close path completes end to end."""
+        return {"id": order_id, "status": "filled", "avg_fill_price": 1.0,
+                "exec_quantity": 1.0, "remaining_quantity": 0.0, "class": "multileg"}
+
+    async def get_orders(self, account_id: str) -> list[dict]:
+        """Synthetic order list (empty in demo)."""
+        return []
+
+    async def cancel_order(self, account_id: str, order_id) -> dict:
+        return {"order": {"id": order_id, "status": "ok"}}
+
+    async def modify_order(self, account_id: str, order_id, price=None,
+                           order_type=None, duration=None, stop=None) -> dict:
+        return {"order": {"id": order_id, "status": "ok", "price": price}}

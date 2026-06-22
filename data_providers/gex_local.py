@@ -2,8 +2,8 @@
 Local dealer-GEX aggregator.
 
 Takes a normalized options chain (per-contract: strike, side, gamma, delta,
-theta, open_interest, expiration) and a spot price, returns a structure that
-mirrors what Atlas's analyze_greek_exposures produces:
+theta, open_interest, expiration) and a spot price, returns a greek-exposures
+structure in the shape the engine expects:
 
     {
       "exposures_by_date": {
@@ -37,8 +37,8 @@ Convention (matches SpotGamma / SqueezeMetrics / public GEX literature):
     call_wall = strike above spot with most NEGATIVE dealer_GEX (largest forced-buy zone if pierced)
     put_wall  = strike below spot with most POSITIVE dealer_GEX (largest forced-sell zone if pierced)
 
-The validation probe in tests/tradier_vs_atlas_probe.py confirms these
-conventions produce numbers within tolerance of Atlas's output on real chains.
+These conventions mirror the dealer-GEX math the engine expects, matching
+the public GEX literature referenced above.
 """
 from collections import defaultdict
 from typing import Iterable

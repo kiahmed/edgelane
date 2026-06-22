@@ -178,7 +178,7 @@ def normalize_chain(tradier_options: list, expiration: str) -> list:
 
     - side is 'call' or 'put'
     - mid is computed as (bid + ask) / 2 when both present, else None
-    - iv is decimal (Tradier returns decimal already; Atlas returns percent)
+    - iv is decimal (Tradier returns decimal already)
     - open_interest and volume default to 0 (not None) — matches existing
       EdgeLane convention from _normalizeContract in the JSX
     """

@@ -1,6 +1,6 @@
 # EdgeLane — Deployment & Test Guide
 
-Single-file HTML deploy of the spread optimizer. Bias is synthesized hybrid (deterministic JS engine + Gemini Flash for prose only); chain fetch and quote pulls go straight to Atlas REST. No build pipeline, no Node runtime — Babel-standalone compiles the JSX in-browser.
+Single-file HTML deploy of the spread optimizer. Bias is synthesized hybrid (deterministic JS engine + Gemini Flash for prose only); chain fetch and quote pulls go straight to the Tradier REST API. No build pipeline, no Node runtime — Babel-standalone compiles the JSX in-browser. (EdgeLane originally pulled data from Atlas's API (mind-vest.io); that provider was fully retired ~May 2026 and Tradier is now the sole data backbone.)
 
 ---
 
@@ -16,8 +16,8 @@ Single-file HTML deploy of the spread optimizer. Bias is synthesized hybrid (det
 | `edge_lane.html` | Build artifact. Overwritten on every `./edge_lane_build.sh`. | ✗ (gitignored) |
 | `.edge_lane_buildstate` | Auto-managed version state (last hash, last patch). | ✗ (gitignored) |
 | `tools/cors_proxy.py` | Local-dev CORS proxy. Runs on `localhost:8787`. | ✓ |
-| `tests/utils.py` | Shared test helpers (config loader, Atlas/Gemini wrappers, schema). | ✓ |
-| `tests/atlas_rest_smoke.py` | Verifies Atlas REST endpoints respond with expected shapes. | ✓ |
+| `tests/utils.py` | Shared test helpers (config loader, Tradier/Gemini wrappers, schema). | ✓ |
+| `tests/tradier_smoke.py` | Verifies Tradier REST endpoints respond with expected shapes. | ✓ |
 | `tests/gemini_bias_bench.py` | Flash vs Pro on real data, side-by-side comparison. | ✓ |
 | `tests/e2e_pipeline.py` | Full pipeline simulation with stage-by-stage timings. | ✓ |
 | `operating_manual.md` | Badge / verdict / score / strategy reference. | ✓ |
@@ -30,13 +30,13 @@ Single-file HTML deploy of the spread optimizer. Bias is synthesized hybrid (det
 
 ```
 [detectBias click]
-    ├── Atlas /get_stock_quote          ─┐
-    │                                     ├── parallel ──→ JS engine ──→ structured bias fields
-    └── Atlas /analyze_greek_exposures  ─┘                              ──→ Gemini Flash (prose only)
-                                                                         ──→ bias card
+    ├── Tradier /v1/markets/quotes          ─┐
+    │                                          ├── parallel ──→ JS engine (local GEX) ──→ structured bias fields
+    └── Tradier /v1/markets/options/chains  ─┘                              ──→ Gemini Flash (prose only)
+                                                                            ──→ bias card
 
 [fetchChain click]
-    └── Atlas /get_options_chain ──→ flatten + ±30% strike filter (client-side) ──→ ready
+    └── Tradier /v1/markets/options/chains ──→ flatten + ±30% strike filter (client-side) ──→ ready
 
 [strategy / slider changes]
     └── pure JS over chainCache.contracts ──→ instant
@@ -58,8 +58,9 @@ cp edge_lane_config.config.example edge_lane_config.config
 Edit `edge_lane_config.config`:
 
 ```
-ATLAS_KEY="<your atlas key>"
-ANTHROPIC_KEY="sk-ant-..."   # only needed if you ever build with the legacy LLM/MCP path
+DATA_PROVIDER=tradier
+TRADIER_SANDBOX_TOKEN="<your sandbox token>"   # paper/dev
+TRADIER_PROD_TOKEN="<your production token>"   # live, only used when DEVMODE=false
 GEMINI_API_KEY="AIza..."
 GEMINI_MODEL=gemini-2.5-flash
 EDGE_LANE_VERSION="4.7"        # major.minor base — auto-patches via build script
@@ -79,18 +80,18 @@ The whole stack uses only Python stdlib (tests + CORS proxy) and bash (build scr
 cd C:\soljet_dev\EdgeLane
 python tools/cors_proxy.py
 # → listens on http://127.0.0.1:8787
-# → /atlas/<tool>   forwards to https://atlasmcp.finmanagerai.com/api/v1/tools/<tool>
+# → /tradier/<rest> forwards to the Tradier REST API
 # → /gemini/<rest>  forwards to https://generativelanguage.googleapis.com/v1beta/<rest>
 ```
 
-Leave this running. It adds CORS headers so the browser can hit Atlas/Gemini from `file://` or `localhost`.
+Leave this running. It adds CORS headers so the browser can hit Tradier/Gemini from `file://` or `localhost`.
 
 ### Terminal 2 — enable the proxy URLs in config
 
 Uncomment the two URL lines in `edge_lane_config.config`:
 
 ```
-ATLAS_BASE_URL="http://localhost:8787/atlas"
+TRADIER_BASE_URL="http://localhost:8787/tradier"
 GEMINI_BASE_URL="http://localhost:8787/gemini"
 ```
 
@@ -124,13 +125,13 @@ Hard reload (Ctrl+F5) when CSS or JSX changes — browsers cache HTML aggressive
 
 All tests load keys from `edge_lane_config.config`. Run from the project root.
 
-### Atlas REST smoke
+### Tradier REST smoke
 
 ```bash
-python tests/atlas_rest_smoke.py SPY
+python tests/tradier_smoke.py SPY
 ```
 
-Hits `get_stock_quote`, `analyze_greek_exposures`, `get_options_chain` directly (no proxy). Strict pass criteria — fails if any required field is missing. Shape dumps inline so you can see exactly what Atlas is returning today.
+Hits the quote, options expirations, and options chain endpoints directly (no proxy). Strict pass criteria — fails if any required field is missing. Shape dumps inline so you can see exactly what Tradier is returning today.
 
 ### Gemini bias bench (Flash vs Pro)
 
@@ -138,7 +139,7 @@ Hits `get_stock_quote`, `analyze_greek_exposures`, `get_options_chain` directly 
 python tests/gemini_bias_bench.py SPY 2026-05-15
 ```
 
-Pulls real Atlas data, runs the bias prompt through both `gemini-2.5-flash` and `gemini-2.5-pro`, prints latency, token usage, and a side-by-side field-by-field comparison. Use this to decide if Pro is worth the extra cost on your tickers. (For most options-bias work, Flash agrees on the structured fields and runs ~3× faster.)
+Pulls real Tradier data, runs the bias prompt through both `gemini-2.5-flash` and `gemini-2.5-pro`, prints latency, token usage, and a side-by-side field-by-field comparison. Use this to decide if Pro is worth the extra cost on your tickers. (For most options-bias work, Flash agrees on the structured fields and runs ~3× faster.)
 
 ### End-to-end pipeline timing
 
@@ -146,7 +147,7 @@ Pulls real Atlas data, runs the bias prompt through both `gemini-2.5-flash` and 
 python tests/e2e_pipeline.py SPY 2026-05-15
 ```
 
-Simulates a single user click: parallel Atlas pull → Gemini synthesis → chain fetch → local filter. Prints per-stage and total wall-clock latency. Target total: **< 4 seconds**.
+Simulates a single user click: parallel Tradier pull → local GEX + Gemini synthesis → chain fetch → local filter. Prints per-stage and total wall-clock latency. Target total: **< 4 seconds**.
 
 ---
 
@@ -174,7 +175,7 @@ Use this if anyone with the URL can reach the page. Keys must NOT be in the brow
 
 ```javascript
 // functions/api/[[path]].js
-// Cloudflare Pages Function — proxies /api/atlas/*  and /api/gemini/*  through
+// Cloudflare Pages Function — proxies /api/tradier/*  and /api/gemini/*  through
 // to the upstreams, attaching keys from environment variables. The browser
 // never sees the keys.
 export async function onRequest(context) {
@@ -182,9 +183,9 @@ export async function onRequest(context) {
   const path = params.path.join('/');
 
   let upstream, headers;
-  if (path.startsWith('atlas/')) {
-    upstream = 'https://atlasmcp.finmanagerai.com/api/v1/tools/' + path.slice(6);
-    headers = { 'Authorization': `Bearer ${env.ATLAS_KEY}`, 'Content-Type': 'application/json' };
+  if (path.startsWith('tradier/')) {
+    upstream = 'https://api.tradier.com/' + path.slice(8);
+    headers = { 'Authorization': `Bearer ${env.TRADIER_TOKEN}`, 'Accept': 'application/json' };
   } else if (path.startsWith('gemini/')) {
     upstream = 'https://generativelanguage.googleapis.com/v1beta/' + path.slice(7);
     headers = { 'x-goog-api-key': env.GEMINI_API_KEY, 'Content-Type': 'application/json' };
@@ -205,17 +206,17 @@ export async function onRequest(context) {
 ```
 
 **Step 2.** In Cloudflare Pages dashboard → your project → Settings → Environment variables, set:
-- `ATLAS_KEY` = your Atlas key (production)
+- `TRADIER_TOKEN` = your Tradier production access token
 - `GEMINI_API_KEY` = your Gemini key (production)
 
 **Step 3.** Build with proxy URLs pointing at the function, and EMPTY browser-side keys:
 
 ```bash
 # In edge_lane_config.config (production build only — keep separate file):
-ATLAS_KEY=""
+DATA_PROVIDER=tradier
+TRADIER_PROD_TOKEN=""
 GEMINI_API_KEY=""
-ANTHROPIC_KEY=""
-ATLAS_BASE_URL="/api/atlas"
+TRADIER_BASE_URL="/api/tradier"
 GEMINI_BASE_URL="/api/gemini"
 EDGE_LANE_VERSION="4.7"
 ```
@@ -225,33 +226,33 @@ EDGE_LANE_VERSION="4.7"
 wrangler pages deploy . --project-name=edgelane
 ```
 
-The browser now hits `/api/atlas/*` (same origin, no CORS), the Pages Function attaches the keys server-side, response gets returned. Keys never leave Cloudflare's servers.
+The browser now hits `/api/tradier/*` (same origin, no CORS), the Pages Function attaches the keys server-side, response gets returned. Keys never leave Cloudflare's servers.
 
 ---
 
 ## Troubleshooting
 
-### "Atlas …: blocked by CORS or network"
+### "Tradier …: blocked by CORS or network"
 
-Atlas doesn't return CORS headers for browser origins. Run the smoke test to confirm REST + auth work outside the browser:
+Tradier doesn't return CORS headers for browser origins. Run the smoke test to confirm REST + auth work outside the browser:
 
 ```bash
-python tests/atlas_rest_smoke.py SPY
+python tests/tradier_smoke.py SPY
 ```
 
 If that passes but the browser fails:
 - **Quick fix (dev)**: make sure `tools/cors_proxy.py` is running and the URLs in config are uncommented and pointing at it
 - **Real fix (production)**: use the Pages Function in Path B above
 
-### "Atlas …: rate_limit: free tier limit reached"
+### "Tradier …: rate limit reached"
 
-You've hit the 10/month free-tier cap on mind-vest.io. Upgrade or connect a broker at https://mind-vest.io/dashboard. Each Detect Bias click consumes 2 calls (quote + greeks); each Run Optimizer adds 1 (chain).
+You've hit Tradier's per-minute API rate limit. Back off and retry; the response headers report the remaining quota and reset window. Detect Bias and Run Optimizer each consume one chain call (quote is bundled).
 
 ### "Gemini …: HTTP 503"
 
 Gemini overloaded. The browser-side `_callGemini` retries with exponential backoff automatically (1s → 2s → 4s, ±20% jitter, max 3 retries). If it still fails after retries, wait or set `GEMINI_MODEL=gemini-2.5-flash-lite` for higher quota.
 
-### "GEMINI_API_KEY missing" / "ATLAS_KEY missing"
+### "GEMINI_API_KEY missing" / "TRADIER token missing"
 
 Build script's source step rejected the config. Most common cause: the config got truncated mid-string (any unmatched `"` makes bash refuse to source). Re-paste the keys with proper closing quotes.
 
@@ -295,11 +296,196 @@ python -m http.server 8080                 # serve
 # open http://localhost:8080/edge_lane.html, hard reload after CSS changes
 
 # ---- before commit ----
-python tests/atlas_rest_smoke.py SPY
+python tests/tradier_smoke.py SPY
 python tests/e2e_pipeline.py SPY 2026-05-15
 ./edge_lane_build.sh --dry-run             # confirm version + substitutions clean
 
 # ---- ship ----
 ./edge_lane_build.sh
 wrangler pages deploy . --project-name=edgelane
+
+# ---- market backend + Torque order builder ----
+cd market/backend
+make run-dev          # sandbox (paper) on :8789  — open /torque
+make run-prod         # production (real money)
+make test             # parity + torque tests
+# config: edgelane_market.config (DEVMODE); detail: docs/torque.md
 ```
+
+---
+
+## Production deployment (market backend + Vercel UI)
+
+The market service ships two deployables:
+
+- **Backend** (`market/backend` — FastAPI API + the Torque order builder at `/torque`)
+  runs as a **Docker container on a local PC**, exposed over HTTPS by a
+  **Cloudflare *quick* tunnel** sidecar — free, no domain, no token. The
+  cloudflared container gets a fresh `*.trycloudflare.com` URL on each start and
+  **publishes it to Supabase** (`app_config.api_base`); the frontend reads that
+  at load, so a rotated URL needs **no redeploy**. (A stable named tunnel is a
+  later option once you own a domain — see below.)
+- **Frontend** (`market/ui/index.html` — the market dashboard, *not* the legacy
+  `edge_lane.html`) deploys to **Vercel** (same pattern as the sibling `RelativeQs`).
+
+Torque is part of the **backend** container, not the Vercel deploy.
+
+### Targets (from repo root)
+
+```bash
+make doctor        # list ONLY missing build/deploy prerequisites (run this first)
+make vercel-setup  # install Vercel CLI on Ubuntu (+ Node) and log in (browser)
+make deploy-be     # backend → Docker container + Cloudflare tunnel (DEPLOY=local_container)
+make deploy-fe     # market UI → Vercel
+make deploy-prod   # both, backend first (+ db-push first)
+make deploy-dry    # dry-run everything (prints commands, runs nothing)
+
+# overrides
+make deploy-be DEPLOY=cloud      # reserved future target (errors for now)
+make deploy-prod ARGS=-n         # dry-run via ARGS passthrough
+make deploy-prod ARGS=-y         # skip confirmation prompts
+```
+
+All targets delegate to `./deploy.sh` (`-b` / `-f` / `--target` / `-n` / `-y`).
+
+> ⚠️ **Production flags — set these in `edgelane_market.config` before a public deploy:**
+> - **`AUTH_ENABLED=true`** — if left `false`, **every gate is off**: no Supabase-JWT
+>   enforcement, no anonymous-teaser redaction, no rate limiting → the API is wide
+>   open to the internet. Must be `true` for any public deploy. (`make doctor` warns
+>   if it isn't.)
+> - **`DEVMODE=false`** — production Tradier + **market-hours-only polling** (09:30–16:00
+>   ET). Off-hours you'll see no fresh snapshots; add `FORCE_POLL_WHEN_CLOSED=true`
+>   temporarily only if you need data outside market hours for testing.
+
+### Deploying from a new machine
+
+```bash
+make doctor          # lists what's missing (docker, node, vercel login, deploy/.env keys, …)
+make vercel-setup    # if doctor flags Vercel: installs the CLI on Ubuntu + browser login
+# copy the git-ignored secrets onto the machine: deploy/.env + edgelane_market.config
+make deploy-dry      # final sanity (prints every command, runs nothing)
+make deploy-prod     # go
+```
+
+`make doctor` prints only the **missing** items (silent on what's fine) and exits
+non-zero if any required dependency is absent — so it's safe to gate CI/scripts on
+it. Advisories like the `AUTH_ENABLED`/`DEVMODE` warnings don't fail it.
+
+### Database admin (data, not schema)
+
+`db-push` applies **schema** migrations. To inspect or edit **data**, use the
+standalone `tools/supabase_admin.py` utility — a no-SQL CRUD CLI over the same
+Supabase Management API query endpoint (no psql, stdlib only, reads `deploy/.env`).
+It runs with elevated rights (RLS bypassed) — operator-only.
+
+```bash
+python3 tools/supabase_admin.py tables                          # every table: row count + last-updated
+python3 tools/supabase_admin.py describe broker_configs         # columns, types, PK
+python3 tools/supabase_admin.py list profiles --where plan=pro --order created_at:desc
+python3 tools/supabase_admin.py update profiles --set plan=pro --where email~gmail -y
+python3 tools/supabase_admin.py delete user_settings --where user_id=<uuid> -y
+python3 tools/supabase_admin.py sql "select count(*) from auth.users"   # escape hatch
+python3 tools/supabase_admin.py --help                          # full help
+```
+
+Output: a bordered table that **wraps** long cell values to fit the terminal (never
+overflows). Tables with too many columns to fit a grid (e.g. `list auth.users`)
+auto-switch to a record view (psql `\x` style, one field per line); force it with
+`-x/--expanded`. `--wide` keeps full untrimmed widths; `--json` emits raw JSON.
+
+Safety: `--dry-run/-n` prints the SQL and runs nothing; `update`/`delete` **refuse**
+without a `--where` (override with `--all`); writes prompt unless `-y` (non-TTY
+shells must pass `-y`). Global flags work before or after the subcommand. Value
+syntax: `col=val` auto-types (numbers/bool/null/jsonb), `col=s:val` forces text,
+`col=r:expr` is raw SQL (e.g. `updated_at=r:now()`); `--where` ops are
+`= != > < >= <= ~` (`~` = ILIKE substring).
+
+**Cascade-impact preview.** Referential integrity is enforced by the DB, not the
+tool — every FK to `auth.users` is `ON DELETE CASCADE`, and nothing references the
+`public` tables (cascade depth 1). So deleting a user atomically removes its
+`profiles` / `broker_configs` / `user_settings` (plus Supabase's own `auth.*` rows)
+with no orphans, and you can't insert a child row for a non-existent user (FK
+rejects it). Before any `delete`, the tool prints a preview of exactly what
+cascades — recursively — e.g.:
+
+```
+$ python3 tools/supabase_admin.py --dry-run delete auth.users --where id=<uuid>
+cascade — will ALSO delete:
+  └─ auth.identities: delete 1
+  └─ auth.sessions: delete 2
+    └─ auth.refresh_tokens: delete 2
+  └─ public.profiles: delete 1
+  └─ public.user_settings: delete 1
+```
+
+It also flags `SET NULL`/`SET DEFAULT` refs (row kept, column nulled) and any
+`RESTRICT`/`NO ACTION` refs that would **block** the delete. `--no-cascade` skips
+the preview. To delete a user, delete the **parent** (`auth.users` — cascades
+clean), not the child rows piecemeal.
+
+### Files
+
+| File | Role | Commit? |
+|---|---|---|
+| `deploy.sh` | Orchestrator (frontend Vercel + backend Docker/tunnel). | ✓ |
+| `deploy/docker-compose.yml` | Backend + cloudflared quick-tunnel/publisher sidecar. | ✓ |
+| `market/backend/Dockerfile` | Backend image (editable install; serves API + Torque). | ✓ |
+| `market/backend/.dockerignore` | Keeps secrets/tests out of the build context. | ✓ |
+| `deploy/cloudflared/` | Quick-tunnel image: `Dockerfile` + `publish-url.sh` (publishes the rotating URL to Supabase). | ✓ |
+| `tools/db_push.py` | Applies `supabase/migrations/*.sql` (schema) via the Management API. | ✓ |
+| `tools/supabase_admin.py` | Standalone no-SQL data admin CLI: list tables + CRUD. | ✓ |
+| `deploy/.env.example` | Template: Supabase keys, image, Vercel project, optional tunnel token/API base. | ✓ |
+| `deploy/.env` | Real creds (Supabase service key, etc.). | ✗ (gitignored) |
+| `vercel.json` | Static deploy config (`outputDirectory: dist`). | ✓ |
+| `.vercelignore` | Hides backend/secrets/legacy from the Vercel upload. | ✓ |
+| `dist/` | Staged frontend output (built by `deploy.sh`). | ✗ (gitignored) |
+
+### One-time setup
+
+1. **Backend config** — `edgelane_market.config` with the **production** Tradier
+   token and `DEVMODE=false` (deploy.sh warns if it's `true`). Bind-mounted
+   read-only into the container at `/config/`; DuckDB persists in the
+   `edgelane-data` volume.
+2. **Cloudflare quick tunnel** — nothing to create. The `edgelane-cloudflared`
+   container (built from `deploy/cloudflared/`) starts a free quick tunnel and
+   publishes its URL to Supabase. It only needs `SUPABASE_URL` +
+   `SUPABASE_SERVICE_KEY` in `deploy/.env` (the service key writes
+   `app_config.api_base`). `CF_TUNNEL_TOKEN`/`EDGELANE_API_BASE` stay blank.
+3. **Vercel** — `npm i -g vercel && vercel login`. First `deploy-fe` links the
+   repo to the `edgelane` Vercel project. Leave `EDGELANE_API_BASE` blank — the
+   UI discovers the backend URL at runtime.
+
+**Backend URL wiring (runtime service discovery):** the cloudflared container
+publishes its current `*.trycloudflare.com` URL to Supabase `app_config.api_base`
+on every start (migration `0005`, anon-readable / service_role-write). At load,
+`market/ui/index.html` reads that pointer (`resolveApiBasePointer()`) and, on a
+failed call, re-reads it and retries once — so a tunnel rotation is invisible to
+users with **no Vercel redeploy**. Explicit `?api=` / `localStorage` overrides
+still win (dev); local dev falls back to `127.0.0.1:8789`.
+
+### Upgrading to a stable named tunnel (later, once you own a domain)
+
+The quick tunnel is best-effort and rate-limited — fine for launch/traffic-building,
+but when you outgrow it, move to a stable named tunnel on your own domain. This is
+**not** a single env flip; it's a one-time setup:
+
+1. **Register a domain** and add it to Cloudflare as a zone (Cloudflare Registrar
+   is at-cost; any registrar works if you point its nameservers at Cloudflare).
+2. **Create a named tunnel** (CF dashboard → Zero Trust → Networks → Tunnels, or
+   `cloudflared tunnel create edgelane-backend`) and add a **public hostname**
+   `api.<domain>` → service `http://edgelane-backend:8789`. Copy the connector token.
+3. **`deploy/.env`** — set `CF_TUNNEL_TOKEN=<connector token>` and
+   `EDGELANE_API_BASE=https://api.<domain>`.
+4. **`deploy/docker-compose.yml`** — replace the `edgelane-cloudflared` service's
+   `build:`/`image:`/`environment:` with the named-tunnel form (commented inline
+   in that service):
+   ```yaml
+   image: cloudflare/cloudflared:latest
+   command: tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN}
+   ```
+5. `make deploy-prod` (or `deploy-be` + `deploy-fe`).
+
+After the swap, the backend always answers at `https://api.<domain>` (no rotation),
+so `EDGELANE_API_BASE` is baked into the frontend as the primary URL. The Supabase
+`app_config.api_base` pointer is no longer written by the named-tunnel container —
+leave the row as-is or drop it; the frontend prefers the baked URL when present.

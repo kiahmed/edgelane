@@ -308,6 +308,51 @@ def fetch_gainloss(token: str, base: str, account_id: str,
     return rows
 
 
+def build_history_opens(token: str, base: str, account_id: str,
+                        start: str, end: str) -> dict[str, list[dict]]:
+    """Fetch /accounts/{id}/history trade events in [start,end] →
+    {option_symbol: [fill, ...]}.
+
+    This is the ONLY source for a prior-day OPEN's price when its position is
+    closed today: /orders is current-session-only, /positions is empty once
+    fully closed, and /gainloss doesn't list the close until it settles (next
+    day). /history keeps per-fill trades for prior days, each with a signed
+    quantity (+ = bought/long, − = sold/short), price, and signed cash amount.
+
+    Each fill: {date (YYYY-MM-DD), qty (signed float), price (float),
+    amount (signed float, includes fees)}.
+    """
+    try:
+        resp = tradier_get(
+            f"accounts/{account_id}/history",
+            {"limit": "5000", "page": "1", "type": "trade", "start": start, "end": end},
+            token, base,
+        )
+    except Exception:
+        return {}
+    hist = resp.get("history")
+    if not isinstance(hist, dict):
+        return {}
+    events = hist.get("event") or []
+    if isinstance(events, dict):
+        events = [events]
+    out: dict[str, list[dict]] = {}
+    for e in events:
+        if (e.get("type") or "").lower() != "trade":
+            continue
+        t = e.get("trade") or {}
+        sym = t.get("symbol")
+        if not sym:
+            continue
+        out.setdefault(sym, []).append({
+            "date": (e.get("date") or "")[:10],
+            "qty": _num(t.get("quantity")) or 0.0,
+            "price": _num(t.get("price")) or 0.0,
+            "amount": _num(e.get("amount")) or 0.0,
+        })
+    return out
+
+
 def _gainloss_group_by_close(rows: list[dict]) -> list[list[dict]]:
     """Group closure legs that share the same close_date (down to seconds).
     Multi-leg spread closes always share a timestamp; single-leg closes form
@@ -502,6 +547,8 @@ def gainloss_to_intraday_rows(gl_rows: list[dict]) -> list[dict]:
 
 def compute_intraday_realized(orders: list[dict], start_date: str, end_date: str,
                               positions: list[dict] | None = None,
+                              history_opens: dict[str, list[dict]] | None = None,
+                              history_days_back: int = 7,
                               verbose: bool = False) -> list[dict]:
     """Compute realized P&L for filled CLOSE orders in [start_date, end_date]
     by matching each one to its originating OPEN order via leg-symbol set.
@@ -645,6 +692,99 @@ def compute_intraday_realized(orders: list[dict], start_date: str, end_date: str
                 return v
         return None
 
+    # ── /history fallback: recover a prior-day open's cost basis ────────────
+    # When a position is closed TODAY but was opened on an EARLIER day, the open
+    # order is gone from /orders (current-session only) and the position is gone
+    # from /positions (fully closed), and /gainloss hasn't settled it yet. The
+    # opening fills still live in /history, so we reconstruct the cost basis from
+    # there: for each leg we take the qty-weighted average open price across all
+    # opening-direction fills within the look-back window (so partial entries
+    # average into one basis, per the "average price of the whole trade" rule).
+    def _realized_from_history(close_order: dict, close_leg_syms: list[str]) -> dict | None:
+        if not history_opens:
+            return None
+        try:
+            cutoff = (datetime.strptime(end_date, "%Y-%m-%d")
+                      - timedelta(days=history_days_back)).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+        legs = close_order.get("leg") or close_order.get("legs") or []
+        if isinstance(legs, dict):
+            legs = [legs]
+        if not legs:
+            legs = [close_order]   # single-leg order: side/symbol on the order itself
+        units = _spread_units(close_order)
+        if units <= 0:
+            return None
+        close_avg = _num(close_order.get("avg_fill_price")) or 0.0
+
+        total_open_cash = 0.0
+        open_dates: list[str] = []
+        any_partial = False
+        n_option_legs = 0
+        for l in legs:
+            sym = l.get("option_symbol") or l.get("symbol")
+            side = str(l.get("side") or close_order.get("side") or "").lower()
+            if not sym or "close" not in side:
+                return None
+            fills = history_opens.get(sym)
+            if not fills:
+                return None
+            # Closed by selling ⇒ opened by buying (qty>0); closed by buying ⇒
+            # opened by selling (qty<0). Restrict to prior days in the window.
+            want_buy = "sell" in side
+            ofills = [f for f in fills
+                      if cutoff <= f["date"] < end_date
+                      and f["qty"] != 0 and ((f["qty"] > 0) == want_buy)]
+            if not ofills:
+                return None
+            oqty = sum(abs(f["qty"]) for f in ofills)
+            if oqty <= 0:
+                return None
+            avg_price = sum(f["price"] * abs(f["qty"]) for f in ofills) / oqty
+            if oqty > units:
+                any_partial = True
+            mult = 100 if decode_occ(sym) else 1
+            if mult == 100:
+                n_option_legs += 1
+            open_sign = -1 if want_buy else +1
+            total_open_cash += open_sign * avg_price * units * mult
+            open_dates += [f["date"] for f in ofills]
+
+        mult = 100 if n_option_legs else 1
+        cls = (close_order.get("class") or "").lower()
+        if cls == "multileg":
+            ct = (close_order.get("type") or "").lower()
+            close_sign = +1 if ct == "credit" else (-1 if ct == "debit" else _cash_sign(close_order, +1))
+        else:
+            close_sign = _cash_sign(close_order, +1)
+        total_close_cash = close_sign * close_avg * units * mult
+
+        pnl = total_open_cash + total_close_cash
+        cost = -total_open_cash
+        proceeds = total_close_cash
+        close_date = close_order.get("transaction_date") or close_order.get("create_date") or ""
+        close_id = close_order.get("id")
+        return {
+            "_legs": sorted(set(close_leg_syms)),
+            "_underlying": (close_order.get("symbol") or "?"),
+            "_close_order_id": str(close_id) if close_id else None,
+            "_close_order_ids": [str(close_id)] if close_id else [],
+            "_open_order_id": None,
+            "_open_order_ids": [],
+            "_n_close_orders": 1,
+            "_is_partial": any_partial,
+            "_via_history": True,
+            "_open_qty_total": units,
+            "quantity": units,
+            "cost": cost,
+            "proceeds": proceeds,
+            "gain_loss": pnl,
+            "gain_loss_percent": (pnl / abs(cost) * 100) if cost else 0.0,
+            "open_date": (min(open_dates) if open_dates else None),
+            "close_date": close_date,
+        }
+
     for close_order, close_leg_syms, leg_key, _ in close_candidates:
         open_list = _find_opens(leg_key)
         if not open_list:
@@ -653,10 +793,16 @@ def compute_intraday_realized(orders: list[dict], start_date: str, end_date: str
                 fallback_rows.append(row)
                 if verbose:
                     print(f"  [verbose] matched {close_order.get('id')} via positions fallback (partial close)")
-            else:
-                unmatched.append((close_order, close_leg_syms))
+                continue
+            row = _realized_from_history(close_order, close_leg_syms)
+            if row:
+                fallback_rows.append(row)
                 if verbose:
-                    print(f"  [verbose] UNMATCHED close order {close_order.get('id')} — open not in /orders and position not in /positions")
+                    print(f"  [verbose] matched {close_order.get('id')} via /history fallback (prior-day open, basis from {row.get('open_date')})")
+                continue
+            unmatched.append((close_order, close_leg_syms))
+            if verbose:
+                print(f"  [verbose] UNMATCHED close order {close_order.get('id')} — open not in /orders, /positions, or /history (last {history_days_back}d)")
             continue
 
         close_qty_remaining = _spread_units(close_order)
@@ -2039,9 +2185,15 @@ def main():
                 # Positions are the fallback for partial closes whose open order
                 # isn't in today's /orders window.
                 positions = fetch_positions(token, base, account_id)
+                # /history recovers the cost basis of a TODAY close whose OPEN
+                # was on a prior day (gone from /orders, /positions, /gainloss).
+                hist_lookback = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+                history_opens = build_history_opens(token, base, account_id,
+                                                    start=hist_lookback, end=today_local)
                 merged_rows.extend(compute_intraday_realized(
                     orders, today_local, today_local,
                     positions=positions,
+                    history_opens=history_opens,
                     verbose=args["gainloss_verbose"],
                 ))
             # Newest close first across both sources.

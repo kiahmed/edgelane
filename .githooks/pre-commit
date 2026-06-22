@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Bump the market UI patch version whenever a commit touches
+# market/ui/index.html, and fold the bump into that same commit (no amend,
+# no force-push surprises). Enable once with:
+#
+#   git config core.hooksPath .githooks
+#
+# Skip for a one-off commit with: SKIP_UI_BUMP=1 git commit ...
+set -euo pipefail
+
+[ "${SKIP_UI_BUMP:-0}" = "1" ] && exit 0
+
+ROOT="$(git rev-parse --show-toplevel)"
+FILE="market/ui/index.html"
+
+# Only bump when the UI file is part of THIS commit — keeps unrelated commits
+# from churning the version.
+if git diff --cached --name-only | grep -qx "$FILE"; then
+  before="$("$ROOT/tools/bump_ui_version.sh" --print)"
+  "$ROOT/tools/bump_ui_version.sh" patch >/dev/null
+  after="$("$ROOT/tools/bump_ui_version.sh" --print)"
+  git add "$FILE"
+  echo "[pre-commit] bumped UI version $before -> $after (in this commit)"
+fi

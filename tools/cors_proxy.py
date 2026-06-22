@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tiny dev-only CORS proxy for EdgeLane.
 
-Forwards browser → Atlas + Gemini requests, adding CORS headers so the page
+Forwards browser → Gemini requests, adding CORS headers so the page
 served from file:// or localhost can actually reach them. Stdlib only — no
 pip install needed.
 
@@ -11,11 +11,10 @@ Usage:
     python3 tools/cors_proxy.py --bind 127.0.0.1   # localhost-only
 
 Routes:
-    /atlas/<tool>   →  https://atlasmcp.finmanagerai.com/api/v1/tools/<tool>
     /gemini/<rest>  →  https://generativelanguage.googleapis.com/v1beta/<rest>
 
-The browser sends its `Authorization` and `x-goog-api-key` headers normally;
-this proxy forwards them as-is. Keys never live on the proxy.
+The browser sends its `x-goog-api-key` header normally; this proxy forwards
+it as-is. Keys never live on the proxy.
 
 DO NOT EXPOSE THIS BEYOND LOCALHOST. It's a dev convenience, not a service.
 """
@@ -26,7 +25,6 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-ATLAS_UPSTREAM  = "https://atlasmcp.finmanagerai.com/api/v1/tools/"
 GEMINI_UPSTREAM = "https://generativelanguage.googleapis.com/v1beta/"
 
 CORS_HEADERS = {
@@ -56,14 +54,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         # Route
         path = self.path.lstrip("/")
-        if path.startswith("atlas/"):
-            upstream = ATLAS_UPSTREAM + path[len("atlas/"):]
-        elif path.startswith("gemini/"):
+        if path.startswith("gemini/"):
             upstream = GEMINI_UPSTREAM + path[len("gemini/"):]
         else:
             self.send_response(404)
             self.end_headers()
-            self.wfile.write(b"unknown route. expected /atlas/<tool> or /gemini/<rest>\n")
+            self.wfile.write(b"unknown route. expected /gemini/<rest>\n")
             return
 
         # Read body
@@ -113,7 +109,6 @@ def main():
 
     srv = ThreadingHTTPServer((args.bind, args.port), ProxyHandler)
     print(f"EdgeLane CORS proxy listening on http://{args.bind}:{args.port}")
-    print(f"  /atlas/<tool>   → {ATLAS_UPSTREAM}<tool>")
     print(f"  /gemini/<rest>  → {GEMINI_UPSTREAM}<rest>")
     print(f"\nKeep this terminal open. Ctrl+C to stop.")
     try:

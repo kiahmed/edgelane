@@ -5,11 +5,16 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from ..poller import state as poller_state
 from ..config import get_settings
+from ..auth import get_current_user
+from .. import supabase_admin
+from ..tradier_client import TradierClient
+from ..webull_client import WebullClient, WebullError
+from ..webull_order_builder import build_webull_option_order
 from ..order_builder import (
     Leg,
     build_legs_from_candidate,
@@ -126,9 +131,80 @@ def _tradier_client(request: Request):
     return client
 
 
-async def _submit_order(req: OrderRequest, tradier_client, preview: bool) -> dict:
+async def _resolve_broker(request: Request, user: dict) -> tuple[str, Any, str | None, bool]:
+    """Resolve the broker client + account for this order.
+
+    Prefer the authenticated user's OWN broker credentials (broker_configs in
+    Supabase) — Tradier or Webull, decrypted server-side via get_broker_secret.
+    Falls back to the system Tradier client + account when the user hasn't
+    connected a broker (and for dev/admin).
+    Returns (broker, client, account_override_or_None, is_per_user).
+    """
+    uid = user.get("id")
+    cfg = None
+    if uid and user.get("auth") == "supabase":
+        cfg = await supabase_admin.get_broker_config(uid)
+    if cfg:
+        broker = (cfg.get("broker") or "tradier").lower()
+        if broker == "webull" and cfg.get("webull_app_key") and cfg.get("webull_app_secret"):
+            client = WebullClient(
+                app_key=cfg["webull_app_key"], app_secret=cfg["webull_app_secret"],
+                region=cfg.get("webull_region") or "us", env=cfg.get("webull_env") or "production",
+            )
+            account = (cfg.get("webull_account_id") or "").strip() or None
+            return "webull", client, account, True
+        if cfg.get("tradier_token"):
+            env = (cfg.get("tradier_env") or "production").lower()
+            base = "https://sandbox.tradier.com" if env == "sandbox" else "https://api.tradier.com"
+            client = TradierClient(base_url=base, token=cfg["tradier_token"])
+            account = (cfg.get("tradier_account_id") or "").strip() or None
+            return "tradier", client, account, True
+    return "tradier", _tradier_client(request), None, False
+
+
+async def _submit_webull(req: OrderRequest, client: WebullClient, preview: bool,
+                         account_override: str | None = None) -> dict:
     snap, cand = _lookup_candidate(req.symbol, req.strategy, req.candidate_label)
-    account_id = _resolve_account_id(req)
+    expiration = snap.get("expiration")
+    if not expiration:
+        raise HTTPException(500, f"snapshot missing expiration for {req.symbol}")
+    try:
+        account_id = (account_override or "").strip() or await client.first_account_id()
+    except WebullError as e:
+        raise HTTPException(502, f"Webull account lookup failed: {e}")
+    if not account_id:
+        raise HTTPException(400, "no Webull account_id (set one in the broker config or ensure the account is reachable)")
+
+    order_type = _resolve_order_type(req, cand)
+    limit_price = _resolve_limit_price(req, cand, order_type)
+    try:
+        legs = build_legs_from_candidate(cand, base_quantity=int(req.quantity))
+        orders = build_webull_option_order(
+            strategy=req.strategy, legs=legs, expiration=expiration,
+            underlying=req.symbol.upper(), quantity=int(req.quantity),
+            order_type=order_type, limit_price=limit_price,
+        )
+    except ValueError as e:
+        raise HTTPException(400, f"could not build Webull order: {e}")
+
+    try:
+        resp = await (client.preview_option if preview else client.place_option)(account_id, orders)
+    except WebullError as e:
+        raise HTTPException(502, str(e))
+    return {
+        "preview": preview, "broker": "webull", "symbol": req.symbol.upper(),
+        "strategy": req.strategy, "label": req.candidate_label,
+        "account_id": account_id, "expiration": expiration,
+        "quantity": int(req.quantity), "order_type": order_type,
+        "limit_price": limit_price, "duration": req.duration,
+        "payload": orders, "webull_response": resp,
+    }
+
+
+async def _submit_order(req: OrderRequest, tradier_client, preview: bool,
+                        account_override: str | None = None) -> dict:
+    snap, cand = _lookup_candidate(req.symbol, req.strategy, req.candidate_label)
+    account_id = (account_override or "").strip() or _resolve_account_id(req)
     order_type = _resolve_order_type(req, cand)
     limit_price = _resolve_limit_price(req, cand, order_type)
     expiration = snap.get("expiration")
@@ -196,17 +272,44 @@ async def _post_to_tradier(tradier_client, account_id: str, payload: dict) -> di
 
 
 @router.post("/orders/preview")
-async def preview_order(req: OrderRequest, request: Request):
-    tradier_client = _tradier_client(request)
-    return await _submit_order(req, tradier_client, preview=True)
+async def preview_order(req: OrderRequest, request: Request,
+                        user: dict = Depends(get_current_user)):
+    broker, client, account_override, per_user = await _resolve_broker(request, user)
+    try:
+        if broker == "webull":
+            return await _submit_webull(req, client, preview=True,
+                                        account_override=account_override)
+        return await _submit_order(req, client, preview=True,
+                                   account_override=account_override)
+    finally:
+        if per_user:
+            await client.close()
 
 
 @router.post("/orders/submit")
-async def submit_order(req: OrderRequest, request: Request):
+async def submit_order(req: OrderRequest, request: Request,
+                       user: dict = Depends(get_current_user)):
     if not req.confirm:
         raise HTTPException(400, "submit requires confirm=true in the request body")
-    tradier_client = _tradier_client(request)
-    result = await _submit_order(req, tradier_client, preview=False)
+    broker, client, account_override, per_user = await _resolve_broker(request, user)
+    try:
+        if broker == "webull":
+            result = await _submit_webull(req, client, preview=False,
+                                          account_override=account_override)
+        else:
+            result = await _submit_order(req, client, preview=False,
+                                         account_override=account_override)
+    finally:
+        if per_user:
+            await client.close()
+    if result.get("broker") == "webull":
+        wb = result.get("webull_response") or {}
+        # Webull preview/place response shapes vary; surface what's present.
+        result["order_id"] = wb.get("order_id") or wb.get("client_order_id")
+        result["order_status"] = wb.get("order_status") or wb.get("status")
+        log.info("live webull order: symbol=%s strategy=%s label=%s qty=%s order_id=%s",
+                 req.symbol, req.strategy, req.candidate_label, req.quantity, result.get("order_id"))
+        return result
     tradier_resp = result.get("tradier_response") or {}
     order = tradier_resp.get("order") or {}
     result["order_id"] = order.get("id")

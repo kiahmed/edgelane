@@ -1,7 +1,7 @@
 """Shared utilities for EdgeLane test scripts.
 
 Loads keys from ../edge_lane_config.config (bash-sourceable KEY=value format),
-provides thin Atlas REST + Gemini API helpers, and a tiny stopwatch.
+provides a thin Gemini API helper, and a tiny stopwatch.
 """
 import json
 import os
@@ -12,7 +12,6 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-ATLAS_BASE = "https://atlasmcp.finmanagerai.com/api/v1/tools"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 # ---- config loader -----------------------------------------------------------
@@ -114,60 +113,6 @@ def _backoff_with_jitter(attempt: int, base: float = 1.0, cap: float = 8.0) -> f
     raw = min(cap, base * (2 ** attempt))
     jitter = raw * 0.2 * (2 * random.random() - 1)
     return max(0.3, raw + jitter)
-
-
-# ---- Atlas REST --------------------------------------------------------------
-
-class AtlasError(RuntimeError):
-    pass
-
-
-def atlas_call(tool: str, body: dict | None, atlas_key: str, timeout: int = 75,
-               max_retries: int = 3) -> dict:
-    """POST to /api/v1/tools/{tool}. Atlas wraps quota errors in 200 + {error,message}.
-    Retries on 429 / 5xx / network / mid-read timeout with exponential backoff + jitter.
-
-    Default timeout bumped from 30s → 75s because analyze_greek_exposures on
-    heavy-chain symbols (MU, AMD, SMCI) routinely takes 40-60s server-side.
-    """
-    last_err = None
-    for attempt in range(max_retries + 1):
-        req = urllib.request.Request(
-            f"{ATLAS_BASE}/{tool}",
-            data=json.dumps(body or {}).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {atlas_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            if isinstance(data, dict) and data.get("error"):
-                # Atlas's rate_limit envelope is non-retryable (quota exhausted, not transient)
-                raise AtlasError(f"Atlas {tool}: {data['error']}: {data.get('message', '')}")
-            return data
-        except urllib.error.HTTPError as e:
-            body_text = e.read().decode("utf-8", "replace")[:300]
-            last_err = AtlasError(f"Atlas {tool}: HTTP {e.code} — {body_text}")
-        except urllib.error.URLError as e:
-            last_err = AtlasError(f"Atlas {tool}: network error — {e.reason}")
-        except TimeoutError as e:
-            # Mid-read socket timeout. Raw TimeoutError escapes URLError on
-            # Python 3.10+ when the timeout fires AFTER connect — must catch
-            # explicitly or the retry loop is bypassed.
-            last_err = AtlasError(f"Atlas {tool}: read timed out after {timeout}s (server-side compute too slow)")
-        except AtlasError:
-            raise  # quota envelope — don't retry
-
-        if attempt < max_retries and _is_retryable(str(last_err)):
-            delay = _backoff_with_jitter(attempt)
-            sys.stderr.write(f"  \033[33m⚠ Atlas {tool} attempt {attempt+1}/{max_retries+1} failed: "
-                             f"{str(last_err)[:120]}\n    retrying in {delay:.1f}s...\033[0m\n")
-            time.sleep(delay)
-            continue
-        raise last_err
 
 
 # ---- Gemini ------------------------------------------------------------------
@@ -279,7 +224,7 @@ def build_bias_prompt(symbol: str, expiration: str, spot: float, greeks: dict) -
     """Build the bias-synthesis prompt. Trims `greeks` to target expiration to
     match what v4.6 detectBias does — keeps the prompt small and focused.
     """
-    # Atlas returns greeks under exposures_by_date keyed by date string.
+    # greeks are keyed under exposures_by_date by date string.
     # Trim to the chosen date (target if present, else closest).
     ebd = (greeks or {}).get("exposures_by_date") or {}
     dates = list(ebd.keys())
@@ -297,9 +242,9 @@ def build_bias_prompt(symbol: str, expiration: str, spot: float, greeks: dict) -
     }
     return f"""Analyze dealer hedging structure for {symbol} expiring {expiration} and output directional bias.
 
-DATA (live from Atlas — already trimmed to your target expiration):
+DATA (already trimmed to your target expiration):
 - Spot: {spot}
-- Atlas key_levels (pre-computed walls + flip points): {json.dumps(trimmed["key_levels"])}
+- key_levels (computed walls + flip points): {json.dumps(trimmed["key_levels"])}
 - Portfolio totals (sum across all expirations): {json.dumps(trimmed["portfolio_totals"])}
 - Per-strike exposures for {chosen}:
 {json.dumps(trimmed["exposures_for_chosen"], indent=2)}

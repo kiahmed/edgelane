@@ -1,0 +1,15 @@
+# Keep the build context tiny and secret-free. Config + tokens are mounted at
+# runtime, never copied into the image.
+.venv/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+tests/
+README.md
+*.duckdb
+*.db
+# never ship local config / secrets in the image
+*.config
+*.config.*
+.env

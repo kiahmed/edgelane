@@ -1,6 +1,6 @@
 # Tradier Integration — Design
 
-**Status:** Active design, follows approval of `tradier_integration_proposal.md`.
+**Status:** Historical design doc — implemented. EdgeLane originally used Atlas's API (mind-vest.io) as its data backbone; Atlas was fully retired ~May 2026 and Tradier is now the sole data provider. The Atlas-side details below describe the former system and the migration that replaced it.
 **Scope:** Phase 1 + Phase 2 from the proposal. Phase 4 (streaming, order placement) deferred.
 
 This document is the architectural contract for the migration. It does not repeat
@@ -15,7 +15,7 @@ first. This is the design the implementation document follows file-by-file.
 **zero observable change** to the UI, the bias engine output, the optimizer
 output, or the Lookup tab. From the user's perspective, the only difference is
 the quota pill semantics (now "rate-limit remaining this minute" instead of
-"calls remaining this month") and the absence of the symbols Atlas chokes on
+"calls remaining this month") and the absence of the symbols Atlas choked on
 (MU, AMD, SMCI — all instant under Tradier).
 
 **Goal.** Move dealer-GEX aggregation **out of the network path** and into a
@@ -25,9 +25,9 @@ architectural cleanup the proposal flagged as worth doing on its own merits.
 
 **Non-goals (Phase 1 + 2).** No multi-leg order placement via Tradier. No
 WebSocket streaming quotes. No account balances, positions, or transaction
-history. No first-party JS SDK adoption — we keep calling REST directly. The
-Atlas client stays present and selectable via `DATA_PROVIDER=atlas` for at
-least the first month post-cutover, per the gated-migration policy.
+history. No first-party JS SDK adoption — we keep calling REST directly. (At
+cutover the Atlas client was retained as a selectable fallback for the first
+month per the gated-migration policy; it has since been fully removed.)
 
 ---
 
@@ -83,7 +83,7 @@ signatures and return shapes. `_computeBiasSignals`, `_findGexWall`,
 by construction — they consume only the normalized contract shape and the
 `{exposures_by_date, portfolio_totals, key_levels}` triplet.
 
-The Atlas path continues to pull `exposures_by_date` from the
+The former Atlas path pulled `exposures_by_date` from the
 `analyze_greek_exposures` endpoint. The Tradier path computes it locally from
 the chain via `_computeDealerExposures` (Section 5). Both terminate at the same
 shape — see Section 4.
@@ -270,8 +270,8 @@ has one key in `exposures_by_date`; that's fine.
 ### Math
 
 Sign convention matches the standard public-GEX literature and the convention
-Atlas's `key_levels` agrees with on the validation symbols. Calibrated during
-Phase 1a if the probe (Section 7) disagrees.
+Atlas's `key_levels` agreed with on the validation symbols. Calibrated during
+Phase 1a if the probe (Section 7) disagreed.
 
 ```
 dealer_gamma_at_strike(K) = put_gamma(K) × put_OI(K)
@@ -315,7 +315,7 @@ put_wall  = argmax over candidates_below_spot of gex(K)
 **Portfolio-level `key_levels`** is computed by re-aggregating each strike across
 all expirations (sum gex per strike, then apply the wall-selection rules above
 to the portfolio-level series). This matches the multi-expiration semantics
-Atlas uses for its top-level `key_levels` block.
+Atlas used for its top-level `key_levels` block.
 
 ### Edge cases
 
@@ -462,7 +462,7 @@ Probe is rerun any time the aggregator's math changes. Output is a single CSV
 Additions to `edge_lane_config.config`:
 
 ```bash
-# Provider selection — 'atlas' or 'tradier'
+# Provider selection
 DATA_PROVIDER=tradier
 
 # Tradier — sandbox is 15-min delayed and free; production needs a funded
@@ -470,14 +470,6 @@ DATA_PROVIDER=tradier
 TRADIER_ACCESS_TOKEN="..."
 TRADIER_BASE_URL="https://api.tradier.com"        # production
 # TRADIER_BASE_URL="https://sandbox.tradier.com"  # sandbox
-
-# Atlas — retained as fallback per Phase 1 gating. Required when
-# DATA_PROVIDER=atlas OR when a symbol class falls back per Section 8.
-ATLAS_KEY="..."
-
-# Optional override list for per-symbol fallback when Tradier is primary.
-# Comma-separated; empty means full Tradier coverage.
-ATLAS_FALLBACK_SYMBOLS=""
 ```
 
 Build placeholders added to `edge_lane.template.html` and substituted by
@@ -487,10 +479,11 @@ Build placeholders added to `edge_lane.template.html` and substituted by
 __DATA_PROVIDER__         → window.DATA_PROVIDER
 __TRADIER_TOKEN__         → window.TRADIER_TOKEN
 __TRADIER_BASE_URL__      → window.TRADIER_BASE_URL
-__ATLAS_FALLBACK_SYMBOLS__→ window.ATLAS_FALLBACK_SYMBOLS  (CSV → JS array)
 ```
 
-Switching providers is a one-line edit + rebuild. No JSX edits to flip.
+(During the gated-migration window an `ATLAS_FALLBACK_SYMBOLS` key and matching
+`__ATLAS_FALLBACK_SYMBOLS__` placeholder existed for per-symbol Atlas fallback;
+both were removed when Atlas was retired ~May 2026.)
 
 ---
 

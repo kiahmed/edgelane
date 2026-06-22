@@ -37,7 +37,9 @@ def _empty_dealer_exposures() -> dict:
     }
 
 
-def compute_dealer_exposures(contracts: Iterable[dict], spot: float) -> dict:
+def compute_dealer_exposures(
+    contracts: Iterable[dict], spot: float, gex_weight: str = "oi"
+) -> dict:
     """Aggregate GEX/DEX/VEX/TEX per (expiration, strike).
 
     Sign convention (matches JSX):
@@ -47,7 +49,16 @@ def compute_dealer_exposures(contracts: Iterable[dict], spot: float) -> dict:
         net_tex = put_tex − call_tex
 
     These signs are what the bias engine and wall finder expect downstream.
+
+    gex_weight selects the contract-count term for the GEX leg ONLY:
+        "oi"     -> gamma × open_interest  (resting positioning; the default,
+                    and what the 56 parity tests lock — do not change)
+        "volume" -> gamma × volume         (today's traded gamma; lands closer
+                    to the flow-based provider walls for 0DTE)
+    DEX/VEX/TEX always stay on open_interest — only the magnet/wall layer
+    (which reads net_gex) is affected by the volume swap.
     """
+    use_volume = (gex_weight or "oi").lower() == "volume"
     contracts = list(contracts)
     if not contracts or not spot or spot <= 0:
         return _empty_dealer_exposures()
@@ -93,8 +104,15 @@ def compute_dealer_exposures(contracts: Iterable[dict], spot: float) -> dict:
             c_oi = int(_num(call.get("open_interest")) or 0)
             p_oi = int(_num(put.get("open_interest")) or 0)
 
-            call_gex = c_g * c_oi * DEALER_CONTRACT_MULT * spot_sq
-            put_gex  = p_g * p_oi * DEALER_CONTRACT_MULT * spot_sq
+            # GEX leg weights by OI (default) or today's traded volume.
+            if use_volume:
+                c_gw = int(_num(call.get("volume")) or 0)
+                p_gw = int(_num(put.get("volume")) or 0)
+            else:
+                c_gw, p_gw = c_oi, p_oi
+
+            call_gex = c_g * c_gw * DEALER_CONTRACT_MULT * spot_sq
+            put_gex  = p_g * p_gw * DEALER_CONTRACT_MULT * spot_sq
             net_gex  = put_gex - call_gex
 
             call_dex = c_d * c_oi * DEALER_CONTRACT_MULT * spot
@@ -116,6 +134,9 @@ def compute_dealer_exposures(contracts: Iterable[dict], spot: float) -> dict:
                 "call_vex": call_vex, "put_vex": put_vex, "net_vex": net_vex,
                 "call_tex": call_tex, "put_tex": put_tex, "net_tex": net_tex,
                 "call_oi": c_oi, "put_oi": p_oi,
+                "call_vol": int(_num(call.get("volume")) or 0),
+                "put_vol":  int(_num(put.get("volume")) or 0),
+                "gex_weight": "volume" if use_volume else "oi",
             })
 
             exp_net_gex += net_gex

@@ -93,7 +93,7 @@ const HEALTH_BADGES = {
 // we get a guaranteed-parseable JSON response. No prose-scraping, no greedy
 // regex. Reads model + key from window.GEMINI_API_KEY / window.GEMINI_MODEL
 // (build script injects from edge_lane_config.config).
-// Retry policy shared with _atlasCall — exp backoff with jitter on 429/5xx/network.
+// Retry policy — exp backoff with jitter on 429/5xx/network.
 const _RETRY_HTTP = new Set([429, 500, 502, 503, 504]);
 function _shouldRetry(err) {
   const m = String(err?.message || err);
@@ -156,197 +156,14 @@ async function _callGemini({ prompt, label, temperature = 0.1, responseSchema = 
   throw lastErr;
 }
 
-// ==============================================
-// ATLAS REST CLIENT (direct, no MCP, no LLM-in-the-loop)
-// ==============================================
-// Three tools we depend on:
-//   get_stock_quote          → spot price
-//   analyze_greek_exposures  → raw GEX/DEX/VEX/TEX arrays for bias synthesis
-//   get_options_chain        → full chain (filtered client-side to ±N% of spot)
-// Atlas wraps quota/rate-limit errors in 200 responses with {error, message}.
-async function _atlasCall(tool, body, { maxRetries = 3 } = {}) {
-  const key = (typeof window !== 'undefined' && window.ATLAS_KEY) || (typeof localStorage !== 'undefined' && localStorage.getItem('ATLAS_KEY'));
-  if (!key) throw new Error(`Provider ${tool}: API key missing.`);
-  // Use proxy if set (window.ATLAS_BASE_URL like 'http://localhost:8787/atlas'),
-  // otherwise direct (will hit CORS from browser unless Atlas allows your origin).
-  const _atlasBase = (typeof window !== 'undefined' && window.ATLAS_BASE_URL) || 'https://atlasmcp.finmanagerai.com/api/v1/tools';
-  const url = `${_atlasBase}/${tool}`;
-  const reqBody = JSON.stringify(body || {});
-
-  let lastErr = null;
-  // v4.7.22: explicit 75s timeout. analyze_greek_exposures on heavy symbols
-  // (MU, AMD, SMCI) regularly takes 40-60s server-side; without AbortController
-  // the browser default of ~5 min just leaves users staring at a spinner.
-  const REQUEST_TIMEOUT_MS = 75000;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    let r;
-    const abort = new AbortController();
-    const tid = setTimeout(() => abort.abort(), REQUEST_TIMEOUT_MS);
-    try {
-      r = await fetch(url, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
-        body: reqBody,
-        signal: abort.signal,
-      });
-      clearTimeout(tid);
-    } catch (e) {
-      clearTimeout(tid);
-      const msg = String(e?.message || e);
-      const isTimeout = e?.name === 'AbortError' || /aborted/i.test(msg);
-      if (isTimeout) {
-        const wrapped = new Error(`Provider ${tool}: request timed out after ${REQUEST_TIMEOUT_MS/1000}s. This endpoint is compute-heavy for some symbols; consider reducing num_expirations or retrying.`);
-        if (attempt < maxRetries) {
-          const delay = _backoff(attempt);
-          console.warn(`Provider ${tool} attempt ${attempt + 1}/${maxRetries + 1} timed out. Retrying in ${(delay/1000).toFixed(1)}s...`);
-          lastErr = wrapped; await _sleep(delay); continue;
-        }
-        throw wrapped;
-      }
-      if (/Failed to fetch|NetworkError/i.test(msg)) {
-        const wrapped = new Error(`Provider ${tool}: blocked by CORS or network. May need a proxy for browser-origin calls.`);
-        if (attempt < maxRetries) {
-          const delay = _backoff(attempt);
-          console.warn(`Provider ${tool} attempt ${attempt + 1}/${maxRetries + 1} network error. Retrying in ${(delay/1000).toFixed(1)}s...`);
-          lastErr = wrapped; await _sleep(delay); continue;
-        }
-        throw wrapped;
-      }
-      throw e;
-    }
-    if (!r.ok) {
-      const text = await r.text().catch(() => '');
-      const err = new Error(`Provider ${tool}: HTTP ${r.status}: ${text.slice(0, 200)}`);
-      if (attempt < maxRetries && _shouldRetry(err)) {
-        const delay = _backoff(attempt);
-        console.warn(`Provider ${tool} attempt ${attempt + 1}/${maxRetries + 1} failed (${r.status}). Retrying in ${(delay/1000).toFixed(1)}s...`);
-        lastErr = err; await _sleep(delay); continue;
-      }
-      throw err;
-    }
-    const data = await r.json();
-    // Provider wraps quota errors in 200 + {error,message} — non-retryable (not transient)
-    if (data?.error) throw new Error(`Provider ${tool}: ${data.error}: ${data.message || 'unknown error'}`);
-    return data;
-  }
-  throw lastErr;
-}
-
 const _num = (v) => (v == null || v === '' ? null : Number(v));
-
-function _normalizeContract(c, sideHint, expiration) {
-  const sideSrc = String(c.side || c.type || c.option_type || c.contract_type || sideHint || '').toLowerCase();
-  const side = sideSrc.includes('p') ? 'put' : 'call';
-  const bid = _num(c.bid ?? c.bidPrice);
-  const ask = _num(c.ask ?? c.askPrice);
-  const last = _num(c.last ?? c.last_price ?? c.lastPrice);
-  const mid = _num(c.mid) ?? (bid != null && ask != null ? (bid + ask) / 2 : last);
-  return {
-    // v4.7.31c: carry the provider's canonical option symbol so push-to-broker
-    // can use it as the OCC OptionSymbol directly. Avoids root-name guesswork
-    // for index options (NDX vs NDXP, SPX vs SPXW, etc.).
-    symbol: c.symbol ?? c.option_symbol ?? c.osi_symbol ?? null,
-    strike: _num(c.strike ?? c.strike_price ?? c.strikePrice),
-    side,
-    expiration: expiration ?? c.expiration ?? c.expiry ?? c.exp_date ?? null,
-    bid: bid ?? 0,
-    ask: ask ?? 0,
-    mid: mid ?? 0,
-    delta: _num(c.delta ?? c.greeks?.delta),
-    gamma: _num(c.gamma ?? c.greeks?.gamma),
-    theta: _num(c.theta ?? c.greeks?.theta),
-    vega:  _num(c.vega  ?? c.greeks?.vega),
-    iv:    _num(c.iv ?? c.implied_volatility ?? c.impliedVolatility ?? c.greeks?.iv),
-    open_interest: _num(c.open_interest ?? c.openInterest ?? c.oi) ?? 0,
-    volume:        _num(c.volume ?? c.vol) ?? 0,
-  };
-}
-
-// Walk Atlas's chain[] structure (or contracts[] if MCP-style). Handles flat
-// arrays, per-expiration grouping with calls/puts, and per-strike grouping.
-function _flattenChain(chainData, targetExpiration) {
-  const out = [];
-  const target = targetExpiration ? String(targetExpiration) : null;
-  const walk = (node, sideHint, currentExp) => {
-    if (node == null) return;
-    if (Array.isArray(node)) { node.forEach(n => walk(n, sideHint, currentExp)); return; }
-    if (typeof node !== 'object') return;
-    const exp = node.expiration || node.expiry || node.exp_date || currentExp;
-    if (target && exp && String(exp) !== target) return;
-    if (Array.isArray(node.calls)) node.calls.forEach(c => out.push(_normalizeContract(c, 'call', exp)));
-    if (Array.isArray(node.puts))  node.puts.forEach(c => out.push(_normalizeContract(c, 'put', exp)));
-    if (Array.isArray(node.contracts)) node.contracts.forEach(c => out.push(_normalizeContract(c, sideHint, exp)));
-    if (node.strike != null && (node.side || node.type || node.option_type)) out.push(_normalizeContract(node, sideHint, exp));
-    for (const k of Object.keys(node)) {
-      if (['calls','puts','contracts'].includes(k)) continue;
-      if (Array.isArray(node[k]) || (typeof node[k] === 'object' && node[k])) walk(node[k], sideHint, exp);
-    }
-  };
-  walk(chainData, undefined, target);
-  return out;
-}
-
-const atlas = {
-  async stockQuote(symbol) {
-    const d = await _atlasCall('get_stock_quote', { symbol });
-    return { symbol: d.symbol || symbol, price: _num(d.price), volume: _num(d.volume), timestamp: d.timestamp, raw: d };
-  },
-  async getSubscriptionStatus() {
-    return _atlasCall('get_subscription_status', {});
-  },
-    async analyzeGreekExposures(symbol, num_expirations = 5) {
-    return _atlasCall('analyze_greek_exposures', { symbol, num_expirations });
-  },
-  // One REST call. Filters to target expiration + ±strikeBandPct of spot client-side.
-  async getOptionsChain(symbol, expiration, { strikeBandPct = 30, maxExpirations = 12 } = {}) {
-    // Atlas REST requires `expiration` (or a range). max_expirations alone is
-    // rejected. We always know the target expiration here.
-    const [quote, resp] = await Promise.all([
-      atlas.stockQuote(symbol).catch(() => null),
-      _atlasCall('get_options_chain', { symbol, expiration }),
-    ]);
-    const spot = quote?.price ?? _num(resp?.current_price ?? resp?.spot ?? resp?.underlying_price);
-    if (!spot) throw new Error(`Could not determine spot price for ${symbol}.`);
-
-    let contracts = _flattenChain(resp.chain ?? resp.contracts ?? resp, expiration);
-    if (contracts.length === 0) contracts = _flattenChain(resp.chain ?? resp.contracts ?? resp, null);
-
-    const lo = spot * (1 - strikeBandPct / 100);
-    const hi = spot * (1 + strikeBandPct / 100);
-    contracts = contracts.filter(c => c.strike != null && c.strike >= lo && c.strike <= hi);
-
-    let atmStrike = null;
-    for (const c of contracts) if (atmStrike == null || Math.abs(c.strike - spot) < Math.abs(atmStrike - spot)) atmStrike = c.strike;
-    const atmCall = contracts.find(c => c.strike === atmStrike && c.side === 'call');
-    const atmPut  = contracts.find(c => c.strike === atmStrike && c.side === 'put');
-    const expectedMove = ((atmCall?.mid) || 0) + ((atmPut?.mid) || 0);
-    // Atlas IVs come back as percent already (e.g. 17.8 for 17.8%) — keep as-is
-    const atmIvPct = (((atmCall?.iv) || 0) + ((atmPut?.iv) || 0)) / 2;
-
-    // v4.7.32: keep DTE fractional so 0DTE intraday has proper sub-day precision.
-    const dte = Math.max(0, (new Date(`${expiration}T21:00:00Z`) - new Date()) / 86400000);
-    return {
-      spot, dte,
-      atm_iv_pct: atmIvPct, atmIV: atmIvPct,
-      expected_move: expectedMove, expectedMove,
-      expected_move_pct: spot ? (expectedMove / spot) * 100 : 0,
-      expectedMovePct:    spot ? (expectedMove / spot) * 100 : 0,
-      contracts,
-    };
-  },
-  // v4.7.25 interface aliases — keep snake_case existing methods AND expose
-  // provider-agnostic camelCase. dataProvider downstream uses the camelCase.
-  async optionsChain(symbol, expiration, opts) { return atlas.getOptionsChain(symbol, expiration, opts); },
-  async subscriptionStatus() { return atlas.getSubscriptionStatus(); },
-  async greekExposures(symbol, num_expirations = 3) { return _getGreekExposures(symbol, num_expirations); },
-};
 
 // ==============================================
 // DEALER GEX (LOCAL COMPUTATION, v4.7.25)
 // ==============================================
 // JS mirror of data_providers/gex_local.py. Aggregates per-contract gamma/delta
-// × open_interest into the same {exposures_by_date, portfolio_totals,
-// key_levels} shape Atlas\'s analyze_greek_exposures returns.
+// × open_interest into the {exposures_by_date, portfolio_totals, key_levels}
+// shape the bias engine consumes.
 //
 // Convention (matches SpotGamma / SqueezeMetrics):
 //   dealer_gamma_at_strike(K) = put_gamma(K) × put_OI(K) − call_gamma(K) × call_OI(K)
@@ -481,7 +298,7 @@ function _computeDealerExposures(contracts, spot) {
 // ==============================================
 // Brokerage REST: Bearer auth, hyphenated PascalCase paths via REST gateway,
 // decimal IV (we convert to percent in _normalizeTradierContract to match
-// Atlas downstream convention).
+// the engine's downstream percent-IV convention).
 
 const _tradierRateLimit = {};
 
@@ -539,7 +356,7 @@ function _normalizeTradierContract(c, expiration) {
     gamma: _num(g.gamma),
     theta: _num(g.theta),
     vega:  _num(g.vega),
-    iv: ivDecimal != null ? ivDecimal * 100 : null,    // decimal → percent (Atlas convention)
+    iv: ivDecimal != null ? ivDecimal * 100 : null,    // decimal → percent (engine convention)
     open_interest: _num(c.open_interest) ?? 0,
     volume:        _num(c.volume) ?? 0,
   };
@@ -1134,11 +951,9 @@ async function _submitOrderToActiveBroker(connection, candidate, symbol, expirat
 // ==============================================
 // PROVIDER SELECTOR (v4.7.25)
 // ==============================================
-const dataProvider = (typeof window !== 'undefined' && String(window.DATA_PROVIDER).toLowerCase() === 'tradier')
-  ? tradier
-  : atlas;
+const dataProvider = tradier;
 if (typeof window !== 'undefined') {
-  console.info(`[EdgeLane] data provider: ${dataProvider === tradier ? 'tradier' : 'atlas'}`);
+  console.info('[EdgeLane] data provider: tradier');
 }
 
 
@@ -1146,7 +961,7 @@ if (typeof window !== 'undefined') {
 // DETERMINISTIC BIAS ENGINE (v4.7 hybrid)
 // ==============================================
 // In v4.6, Flash and Pro produced different bias_label / score / confidence on
-// identical Atlas data because the prompt asked the LLM to do arithmetic
+// identical market data because the prompt asked the LLM to do arithmetic
 // (where's the wall? is spot above? what does net DEX imply?). Same data, same
 // prompt, opposite directional read — bad for trade selection.
 //
@@ -1155,7 +970,7 @@ if (typeof window !== 'undefined') {
 // summary paragraph and four short signal sentences. No more LLM arithmetic;
 // no more model-vs-model disagreement on structured fields.
 
-// Walk the per-strike rows from Atlas's exposures_by_date entry. The shape
+// Walk the per-strike rows from the exposures_by_date entry. The shape
 // isn't perfectly documented; try common keys.
 function _strikeRowsFrom(exposuresForChosen) {
   if (!exposuresForChosen || typeof exposuresForChosen !== 'object') return [];
@@ -1270,14 +1085,8 @@ function _computeEdgelaneProviderScore(spot, putWall, callWall) {
 
 
 // Find the dominant gamma wall + classify its strength relative to others.
-// Atlas often pre-computes call_wall / put_wall in key_levels — prefer those.
 function _findGexWall(greeksRaw, exposuresForChosen) {
-  // 1. Prefer Atlas's own key_levels if present
-  const kl = greeksRaw?.key_levels || {};
-  const atlasCallWall = Number(kl.call_wall ?? kl.callWall ?? kl.gex_call_wall ?? 0) || null;
-  const atlasPutWall  = Number(kl.put_wall  ?? kl.putWall  ?? kl.gex_put_wall  ?? 0) || null;
-
-  // 2. Compute from per-strike GEX (signed: + = puts dominate, - = calls dominate)
+  // Compute from per-strike GEX (signed: + = puts dominate, - = calls dominate)
   const rows = _strikeRowsFrom(exposuresForChosen);
   const gexByStrike = rows
     .map(r => ({
@@ -1328,14 +1137,9 @@ function _findGexWall(greeksRaw, exposuresForChosen) {
     }
   }
 
-  // Final wall: prefer computed best; fall back to atlas pre-computed levels
-  const wallStrike = best?.strike ?? atlasCallWall ?? atlasPutWall ?? null;
-  // If we fell back to an atlas wall, type comes from that:
-  if (best == null && wallStrike != null) {
-    wallType = (wallStrike === atlasCallWall) ? 'call' : (wallStrike === atlasPutWall) ? 'put' : null;
-  }
+  const wallStrike = best?.strike ?? null;
 
-  return { strike: wallStrike, strength, type: wallType, atlasCallWall, atlasPutWall, computedTopGex: best?.gex || 0 };
+  return { strike: wallStrike, strength, type: wallType, computedTopGex: best?.gex || 0 };
 }
 
 // Aggregate signed exposures for the chosen expiration.
@@ -1485,9 +1289,9 @@ function _recommendStrategies(biasLabel) {
 
 // One-pass bias computation. Returns the full structured fields the bias card
 // expects, minus the prose (summary + signals.* descriptions, filled by Gemini).
-// v4.7.29: also extract VEX/TEX walls. We accept whatever key_levels Atlas or
-// the local aggregator put on greeksRaw — defensive about field naming so this
-// works for both providers. Returns {strike, value} | null for each.
+// v4.7.29: also extract VEX/TEX walls. We accept whatever key_levels the local
+// aggregator put on greeksRaw — defensive about field naming. Returns
+// {strike, value} | null for each.
 function _extractGreekWall(greeksRaw, exposuresForChosen, keyName, fallbackRowField) {
   const kl = greeksRaw?.key_levels || exposuresForChosen?.key_levels || {};
   const direct = kl[keyName];
@@ -1714,22 +1518,11 @@ const WALL_STRENGTH_MULT = { high: 1.0, medium: 0.5, low: 0.25 };
 
 
 // ==============================================
-// ADAPTIVE GREEK EXPOSURES (v4.7.23 — denylist + chunked + cache)
+// GREEK EXPOSURES CACHE (v4.7.23)
 // ==============================================
-// analyze_greek_exposures is fast for liquid index/mega-cap symbols (5-15s)
-// but slow-to-failing for heavy single-name option chains. Workaround:
-//
-//   - Known-heavy symbols: skip the single call entirely, fan out parallel
-//     greek_exposure_single_expiration requests per expiration, aggregate.
-//   - Other symbols: try the single call with a tight 30s deadline; on
-//     timeout / 5xx / 'Internal server error', fall back to chunked.
-//   - Cache the aggregated result for 5 minutes per (symbol, num_exp).
-//
-// Add to HEAVY_CHAIN_SYMBOLS as new failures surface.
-
-const HEAVY_CHAIN_SYMBOLS = new Set([
-  'MU', 'AMD', 'SMCI', 'COIN', 'PLTR', 'ARM', 'AVGO', 'MARA', 'MSTR',
-]);
+// tradier.greekExposures aggregates N per-expiration chains locally (the
+// expensive part). Cache the aggregated result for 5 minutes per
+// (symbol, num_exp).
 
 const _GEX_CACHE = new Map();   // key: `${symbol}_${num}`, value: { data, fetchedAt }
 const _GEX_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -1747,125 +1540,6 @@ function _gexCacheGet(symbol, num) {
 
 function _gexCacheSet(symbol, num, data) {
   _GEX_CACHE.set(`${symbol}_${num}`, { data, fetchedAt: Date.now() });
-}
-
-// Heuristic for fallback trigger: timeout, 5xx, or 'Internal server error'
-function _shouldFallbackToChunked(err) {
-  const m = String(err?.message || err || '').toLowerCase();
-  return /timed out|http 5\d\d|internal server|gateway|service unavailable/.test(m);
-}
-
-// Aggregate N per-expiration responses into the shape downstream code expects
-// (matches analyze_greek_exposures: { exposures_by_date, portfolio_totals,
-// key_levels }). Defensive about which exact shape the single-expiration
-// endpoint returns — tries common envelope keys.
-function _aggregateChunkedExposures(perExpResults, expirations, symbol) {
-  const exposures_by_date = {};
-  const totals = { net_gex: 0, net_dex: 0, net_vex: 0, net_tex: 0 };
-  const wallCandidates = { call_wall: null, put_wall: null };
-  let bestCallWallGex = -Infinity;
-  let bestPutWallGex  = -Infinity;
-
-  for (let i = 0; i < perExpResults.length; i++) {
-    const exp = expirations[i];
-    const raw = perExpResults[i];
-    if (!raw) continue;
-
-    // Unwrap common envelopes — single-expiration may return either the bare
-    // per-strike object or wrap it under {exposures: ...} / {data: ...}.
-    const entry = raw.exposures_by_date && raw.exposures_by_date[exp]
-                  ? raw.exposures_by_date[exp]
-                  : (raw.exposures || raw.data || raw);
-    exposures_by_date[exp] = entry;
-
-    // Roll up portfolio totals (best-effort across naming conventions)
-    const t = entry?.totals || entry?.net_totals || entry;
-    if (t) {
-      totals.net_gex += Number(t.net_gex ?? t.gex ?? t.gamma_total ?? 0);
-      totals.net_dex += Number(t.net_dex ?? t.dex ?? t.delta_total ?? 0);
-      totals.net_vex += Number(t.net_vex ?? t.vex ?? t.vanna_total ?? 0);
-      totals.net_tex += Number(t.net_tex ?? t.tex ?? t.theta_total ?? 0);
-    }
-
-    // Surface per-expiration walls if provided; keep the strongest as overall
-    const kl = entry?.key_levels || raw?.key_levels;
-    if (kl) {
-      const cw = kl.call_wall;
-      const pw = kl.put_wall;
-      if (cw && (cw.gex ?? 0) > bestCallWallGex) {
-        bestCallWallGex = cw.gex ?? 0;
-        wallCandidates.call_wall = cw;
-      }
-      if (pw && (pw.gex ?? 0) > bestPutWallGex) {
-        bestPutWallGex = pw.gex ?? 0;
-        wallCandidates.put_wall = pw;
-      }
-    }
-  }
-
-  return {
-    symbol,
-    exposures_by_date,
-    portfolio_totals: totals,
-    key_levels: wallCandidates,
-    _chunked: true,           // marker for diagnostics
-  };
-}
-
-async function _chunkedGreekExposures(symbol, num_expirations) {
-  // 1) Fetch the expirations list (cheap call)
-  const expData = await _atlasCall('Option-Expiration-Dates', { symbol, filter: 'next_10' });
-  const all = expData.expirations || expData.dates || expData.expiration_dates
-              || (Array.isArray(expData) ? expData : []);
-  const expirations = all.slice(0, num_expirations).map(String);
-  if (expirations.length === 0) throw new Error(`Provider chunked greek_exposures: no expirations returned for ${symbol}`);
-
-  // 2) Parallel fan-out per expiration
-  const perExp = await Promise.all(
-    expirations.map(exp =>
-      _atlasCall('Greek-Exposure-Single-Expiration', { symbol, expiration: exp })
-        .catch(e => {
-          console.warn(`[Greek exposures] chunked ${symbol} ${exp} failed:`, e?.message || e);
-          return null;
-        })
-    )
-  );
-
-  if (perExp.every(r => r == null)) {
-    throw new Error(`Provider chunked greek_exposures: all ${expirations.length} per-expiration calls failed for ${symbol}`);
-  }
-
-  // 3) Aggregate to the analyze_greek_exposures shape
-  return _aggregateChunkedExposures(perExp, expirations, symbol);
-}
-
-async function _getGreekExposures(symbol, num_expirations = 3) {
-  const sym = String(symbol || '').toUpperCase();
-  const cached = _gexCacheGet(sym, num_expirations);
-  if (cached) {
-    console.info(`[Greek exposures] cache hit for ${sym} (num_exp=${num_expirations})`);
-    return cached;
-  }
-
-  let data;
-  if (HEAVY_CHAIN_SYMBOLS.has(sym)) {
-    console.info(`[Greek exposures] ${sym} on denylist → chunked path immediately`);
-    data = await _chunkedGreekExposures(sym, num_expirations);
-  } else {
-    try {
-      data = await _atlasCall('analyze_greek_exposures', { symbol: sym, num_expirations });
-    } catch (e) {
-      if (_shouldFallbackToChunked(e)) {
-        console.warn(`[Greek exposures] ${sym} fast path failed (${e.message}) → falling back to chunked`);
-        data = await _chunkedGreekExposures(sym, num_expirations);
-      } else {
-        throw e;
-      }
-    }
-  }
-
-  _gexCacheSet(sym, num_expirations, data);
-  return data;
 }
 
 
@@ -2848,93 +2522,6 @@ function generateCandidates(strategy, contracts, dte, expectedMove, targetDelta,
     candidates.push(enriched);
   }
   return candidates;
-}
-
-// ==============================================
-// PROVIDER QUOTA PARSER (v4.7+)
-// ==============================================
-// Provider docs list { plan, status, usage, limits } but the nested field
-// names drift across versions and account tiers. Walk the entire response
-// tree (up to a sane depth) and fuzzy-match keys by regex so we don't have
-// to keep extending a fragile allowlist of literal field names.
-//
-// One-shot raw dump is logged to console (info level) so the user can see
-// the actual shape in DevTools if the pill ever shows "unavailable".
-let _quotaRawLogged = false;
-function _parseAtlasQuota(resp) {
-  if (!resp || typeof resp !== 'object') return null;
-  if (!_quotaRawLogged) {
-    try { console.info('[Provider quota] raw response:', resp); } catch (_) {}
-    _quotaRawLogged = true;
-  }
-
-  // Recursive deep-walker: returns the first leaf value whose key matches `re`.
-  // Skips arrays of objects past depth 4 to avoid huge chain payloads.
-  const findByRe = (d, re, depth = 0) => {
-    if (depth > 6 || d == null) return null;
-    if (typeof d !== 'object') return null;
-    if (Array.isArray(d)) {
-      if (depth > 4) return null;
-      for (const item of d) {
-        const hit = findByRe(item, re, depth + 1);
-        if (hit != null) return hit;
-      }
-      return null;
-    }
-    // 1) Direct key match at this level (prefer scalar leaves)
-    for (const [k, v] of Object.entries(d)) {
-      if (re.test(k) && (v == null || typeof v !== 'object')) return v;
-    }
-    // 2) Direct key match where value is an object — pull a scalar leaf out
-    for (const [k, v] of Object.entries(d)) {
-      if (re.test(k) && v && typeof v === 'object' && !Array.isArray(v)) {
-        // Common shape: { usage: { count: 17 } } / { limits: { calls: 200 } }
-        for (const inner of Object.values(v)) {
-          if (inner != null && typeof inner !== 'object') return inner;
-        }
-      }
-    }
-    // 3) Recurse into nested objects
-    for (const v of Object.values(d)) {
-      const hit = findByRe(v, re, depth + 1);
-      if (hit != null) return hit;
-    }
-    return null;
-  };
-
-  const num = (v) => {
-    if (v == null) return null;
-    if (typeof v === 'number') return Number.isFinite(v) ? v : null;
-    const n = Number(String(v).replace(/[, ]/g, ''));
-    return Number.isFinite(n) ? n : null;
-  };
-
-  // Fuzzy regexes — match any reasonable spelling of the concept
-  const RE_PLAN     = /^(plan|tier|subscription_(plan|tier|name)|subscription|product|sku)$/i;
-  const RE_STATUS   = /^(status|state|subscription_status|account_status|is_active|active)$/i;
-  const RE_USED     = /(^|_)(calls?_?used|used_calls|usage_count|usage|consumed|calls_this_(month|period|cycle)|requests?_made|request_count|api_calls_used|current_usage|count|calls|made|spent)($|_)/i;
-  const RE_LIMIT    = /(^|_)(calls?_?limit|call_quota|limit|max_calls|max_requests|monthly_limit|quota|calls_per_(month|period|cycle)|total_calls|allowance|cap|allocation|max)($|_)/i;
-  const RE_PERIOD   = /^(period|billing_period|cycle|interval|window)$/i;
-  const RE_RESETS   = /^(reset_at|resets_at|renewal_date|next_reset|period_end|expires_at|valid_until|renews_at|end_date)$/i;
-
-  // Sometimes used > limit because the parser grabbed the wrong field
-  // (e.g. plan price). Sanity gate: limit must be ≥ used and ≤ a sane cap.
-  const usedRaw  = num(findByRe(resp, RE_USED));
-  let   limitRaw = num(findByRe(resp, RE_LIMIT));
-  if (limitRaw != null && limitRaw < 0)            limitRaw = null;
-  if (limitRaw != null && usedRaw != null && limitRaw < usedRaw && limitRaw < 5) {
-    // looks like we grabbed a price ($30) instead of the quota — drop it
-    limitRaw = null;
-  }
-
-  return {
-    plan:     findByRe(resp, RE_PLAN),
-    status:   findByRe(resp, RE_STATUS),
-    used:     usedRaw,
-    limit:    limitRaw,
-    period:   findByRe(resp, RE_PERIOD),
-    resetsAt: findByRe(resp, RE_RESETS),
-  };
 }
 
 // ==============================================
@@ -4583,8 +4170,6 @@ export default function SpreadOptimizer() {
   const [error, setError] = useState(null);
   const [lastBiasFetch, setLastBiasFetch] = useState(null);     // Date of last successful bias
   const [lastChainFetch, setLastChainFetch] = useState(null);    // Date of last successful chain
-  const [quota, setQuota] = useState(null);                      // Parsed Atlas subscription quota
-  const [quotaLoading, setQuotaLoading] = useState(false);
   // Live spot, updated on every quote/chain fetch. Decoupled from biasResult
   // (which only refreshes when detectBias completes end-to-end through Gemini)
   // so the displayed spot is always the freshest value we've seen, even if a
@@ -4621,33 +4206,6 @@ export default function SpreadOptimizer() {
     (typeof window !== 'undefined' && window.BIAS_NARRATIVE_OPEN_DEFAULT === true)
   );
 
-  // Refresh quota from Atlas (manual button click on the pill, or page load).
-  const refreshQuota = useCallback(async () => {
-    setQuotaLoading(true);
-    try {
-      const resp = await dataProvider.subscriptionStatus();
-      // tradier returns a pre-parsed shape (has scalar .limit/.used); atlas
-      // returns a raw envelope. Skip the recursive walker when already parsed.
-      const parsed = resp && resp.limit != null ? resp : _parseAtlasQuota(resp);
-      setQuota({ parsed, fetchedAt: new Date() });
-    } catch (e) {
-      setQuota({ parsed: null, error: e.message, fetchedAt: new Date() });
-    } finally {
-      setQuotaLoading(false);
-    }
-  }, []);
-
-  // Fetch on mount (so user sees current quota before doing anything).
-  // Skipped entirely when DATA_PROVIDER=tradier — Tradier exposes per-minute
-  // rate limits via X-Ratelimit-* response headers, not a monthly quota, so
-  // the quota pill concept doesn't apply. UI hides the pill in that case too.
-  useEffect(() => {
-    const isTradier = typeof window !== 'undefined' && String(window.DATA_PROVIDER).toLowerCase() === 'tradier';
-    if (isTradier) return;
-    const hasKey = (typeof window !== 'undefined' && window.ATLAS_KEY) ||
-                   (typeof localStorage !== 'undefined' && localStorage.getItem('ATLAS_KEY'));
-    if (hasKey) refreshQuota();
-  }, [refreshQuota]);
   const [logSteps, setLogSteps] = useState([]);
 
   const cacheKey = `${symbol}_${expiration}`;
@@ -4734,7 +4292,7 @@ export default function SpreadOptimizer() {
   const bestPick = useMemo(() => pickBestCandidate(candidates), [candidates]);
 
   // Bias detection — v4.7 hybrid: deterministic JS engine + Gemini prose only.
-  // 1) Parallel Atlas REST: spot + greek exposures
+  // 1) Parallel provider calls: spot + greek exposures
   // 2) JS rule table computes wall, score, confidence, bias_label, recommendations
   //    (every structured field that drives the optimizer is now reproducible)
   // 3) Gemini Flash writes a 1-paragraph summary + 4 short signal sentences
@@ -4882,8 +4440,8 @@ OUTPUT JSON only:
     finally { setBiasLoading(false); }
   }, [symbol, expiration, cacheKey, biasCache]);
 
-  // Chain fetch — pure Atlas REST, single call. No LLM, no MCP routing.
-  // atlas.getOptionsChain pulls chain + spot in parallel, filters to target
+  // Chain fetch — single provider call. No LLM, no MCP routing.
+  // dataProvider.optionsChain pulls chain + spot in parallel, filters to target
   // expiration + ±30% strike band, normalises contract shape, computes ATM
   // IV / expected move / DTE. Optimize then runs purely client-side over
   // chainCache.contracts. Rate-limit errors surface cleanly from REST.
@@ -5016,7 +4574,7 @@ OUTPUT JSON only:
           </header>
 
           {/* Cache status indicator + timestamps + Reload Data button (v4.7+) */}
-          {(biasResult || chainData || quota) && (
+          {(biasResult || chainData) && (
             <div className="mb-4 flex items-center gap-3 text-[10px] font-num uppercase tracking-widest text-stone-500 flex-wrap">
               <span className={biasResult ? 'text-emerald-400' : 'text-stone-600'}>
                 ● Bias {biasResult ? 'cached' : 'pending'}
@@ -5026,37 +4584,6 @@ OUTPUT JSON only:
                 ● Chain {chainData ? `cached (${chainData.contracts?.length || 0} contracts)` : 'pending'}
                 {lastChainFetch && <span className="normal-case text-stone-400 ml-1" title={lastChainFetch.toLocaleString()}>· {lastChainFetch.toLocaleTimeString()}</span>}
               </span>
-              {/* Atlas quota pill (v4.7+) — hidden when provider is tradier
-                  since Tradier uses per-minute rate-limit headers, not a
-                  monthly quota. */}
-              {(typeof window === 'undefined' || String(window.DATA_PROVIDER).toLowerCase() !== 'tradier') && quota && quota.parsed && quota.parsed.limit > 0 && (() => {
-                const q = quota.parsed;
-                const pct = (q.used / q.limit) * 100;
-                const color = pct < 75 ? 'emerald' : pct < 95 ? 'amber' : 'rose';
-                const cls = color === 'emerald' ? 'bg-emerald-100 border-emerald-700 text-emerald-900'
-                          : color === 'amber'   ? 'bg-amber-100 border-amber-700 text-amber-900'
-                                                : 'bg-rose-100 border-rose-700 text-rose-900';
-                return (
-                  <Tooltip content={`Plan: ${q.plan || 'unknown'}. ${q.used} of ${q.limit} calls used this period${q.resetsAt ? ` (resets ${q.resetsAt})` : ''}. 1 bias = 2 calls, 1 chain = 1 call.`}>
-                    <button onClick={refreshQuota} disabled={quotaLoading}
-                      className={`ml-auto border px-3 py-1.5 rounded-md text-[10px] font-num uppercase tracking-widest font-bold flex items-center gap-1.5 transition-colors ${cls} hover:opacity-80 disabled:opacity-50`}>
-                      <span className={quotaLoading ? 'spin inline-block' : 'inline-block'}>◎</span>
-                      <span>Quota: {Math.round(q.used)}/{Math.round(q.limit)} · {pct.toFixed(0)}%</span>
-                    </button>
-                  </Tooltip>
-                );
-              })()}
-              {(typeof window === 'undefined' || String(window.DATA_PROVIDER).toLowerCase() !== 'tradier') && quota && (!quota.parsed || !(quota.parsed.limit > 0)) && (
-                <Tooltip content={
-                  quota.error
-                    ? `Quota fetch failed: ${quota.error}`
-                    : `Quota response missing 'limit' field. Provider returned 200 but the parser couldn't find usage/limit in the JSON. Open DevTools console — '[Provider quota] raw response' shows the actual shape.`
-                }>
-                  <button onClick={refreshQuota} className="ml-auto bg-stone-200 border border-stone-500 px-3 py-1.5 rounded-md text-[10px] font-num uppercase tracking-widest text-stone-700 flex items-center gap-1.5">
-                    <span>◎</span><span>Quota: unavailable</span>
-                  </button>
-                </Tooltip>
-              )}
             </div>
           )}
 
@@ -5562,4 +5089,31 @@ OUTPUT JSON only:
           )}
 
           <footer className="mt-12 pt-6 border-t border-stone-800/60 text-xs text-stone-600 font-num text-center">
+            Not financial advice. Refresh to get the latest data.
+            <span className="mx-2 text-stone-700">·</span>
+            © {new Date().getFullYear()} EdgeLane. All rights reserved.
+          </footer>
+        </div>
+      </div>
+
+      {/* v4.7.30: settings + push-to-broker modals */}
+      {settingsOpen && (
+        <SettingsModal
+          session={auth.session}
+          broker={broker}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
+      {orderDialog && (
+        <OrderDialog
+          candidate={orderDialog.candidate}
+          symbol={symbol}
+          expiration={expiration}
+          connection={broker.active}
+          onClose={() => setOrderDialog(null)}
+        />
+      )}
+    </>
+  );
+}
       

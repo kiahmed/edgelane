@@ -47,20 +47,10 @@ def find_gex_wall(greeks_raw: dict | None, exposures_for_chosen: dict | None) ->
     """Return the single dominant wall (max-|GEX| strike) with type label.
 
     Mirrors JSX `_findGexWall` post-v4.7.65:
-      • Prefer Atlas-supplied key_levels if present.
-      • Otherwise pick max-|net_gex| strike from per-strike rows.
+      • Pick max-|net_gex| strike from per-strike rows.
       • Classify type = 'put'|'call'|'mixed' based on which side dominates GEX
         at that strike. Used by UI labeling.
     """
-    kl = (greeks_raw or {}).get("key_levels") or {}
-    atlas_call_wall = _num(kl.get("call_wall") or (kl.get("callWall") or {}).get("strike") if isinstance(kl.get("callWall"), dict) else kl.get("callWall")) or None
-    atlas_put_wall  = _num(kl.get("put_wall")  or (kl.get("putWall")  or {}).get("strike") if isinstance(kl.get("putWall"),  dict) else kl.get("putWall"))  or None
-    # If Atlas returns object form, extract strike
-    if isinstance(kl.get("call_wall"), dict):
-        atlas_call_wall = _num(kl["call_wall"].get("strike"))
-    if isinstance(kl.get("put_wall"), dict):
-        atlas_put_wall = _num(kl["put_wall"].get("strike"))
-
     rows = _strike_rows_from(exposures_for_chosen)
     enriched: list[dict] = []
     for r in rows:
@@ -101,16 +91,12 @@ def find_gex_wall(greeks_raw: dict | None, exposures_for_chosen: dict | None) ->
             else:
                 wall_type = "call"
 
-    wall_strike = best["strike"] if best else (atlas_call_wall or atlas_put_wall)
-    if best is None and wall_strike is not None:
-        wall_type = "call" if wall_strike == atlas_call_wall else "put" if wall_strike == atlas_put_wall else None
+    wall_strike = best["strike"] if best else None
 
     return {
         "strike": wall_strike,
         "strength": strength,
         "type": wall_type,
-        "atlas_call_wall": atlas_call_wall,
-        "atlas_put_wall": atlas_put_wall,
         "computed_top_gex": best["gex"] if best else 0.0,
     }
 

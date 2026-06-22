@@ -248,3 +248,116 @@ class TradierClient:
         if isinstance(options, dict):
             options = [options]
         return options
+
+    async def quotes(self, symbols: list[str] | str, greeks: bool = False) -> list[dict]:
+        """Batch quotes for equity and/or option (OCC) symbols. Returns a list
+        of inner quote dicts (always a list, even for one symbol)."""
+        if isinstance(symbols, (list, tuple, set)):
+            symbols = ",".join(str(s) for s in symbols)
+        if not symbols:
+            return []
+        d = await self._get("markets/quotes",
+                            {"symbols": symbols, "greeks": "true" if greeks else "false"})
+        q = (d.get("quotes") or {}).get("quote") or []
+        if isinstance(q, dict):
+            q = [q]
+        return q
+
+    async def _post(self, path: str, data: dict[str, Any]) -> dict:
+        """Form-urlencoded POST (orders, sessions). Single retry on transient
+        network/5xx; auth and rate-limit raise structured errors like _get."""
+        client = await self._get_client()
+        url = f"{self.base_url}/v1/{path.lstrip('/')}"
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        try:
+            resp = await client.post(url, data=data, headers=headers)
+        except httpx.TimeoutException as e:
+            raise TradierTimeoutError(f"Tradier POST {path}: timed out ({e!s})") from e
+        except httpx.RequestError as e:
+            raise TradierError(f"Tradier POST {path}: network — {e!s}") from e
+        _record_rate_limit(resp.headers)
+        if resp.status_code == 401:
+            raise TradierAuthError(f"Tradier POST {path}: invalid token (HTTP 401)")
+        if resp.status_code == 429:
+            raise TradierRateLimitError(
+                f"Tradier POST {path}: rate-limited (HTTP 429)",
+                retry_after_sec=_retry_after_from_headers(resp.headers),
+            )
+        if resp.status_code >= 400:
+            # Tradier returns a JSON {errors:{error:[...]}} body on validation
+            # failures — surface it rather than swallowing.
+            body = resp.text[:800]
+            raise TradierError(f"Tradier POST {path}: HTTP {resp.status_code} — {body}")
+        try:
+            return resp.json()
+        except Exception:
+            return {"raw": resp.text[:1000]}
+
+    async def place_order(self, account_id: str, payload: dict) -> dict:
+        """POST an order (any class) to /accounts/{id}/orders. Returns the raw
+        Tradier response ({order:{id,status,...}} or {errors:...})."""
+        return await self._post(f"accounts/{account_id}/orders", payload)
+
+    async def get_order(self, account_id: str, order_id: str | int) -> dict:
+        """GET a single order's current state (status, fills, leg[]).
+        Returns the inner `order` dict."""
+        d = await self._get(f"accounts/{account_id}/orders/{order_id}",
+                            {"includeTags": "true"})
+        return (d.get("order") or d) if isinstance(d, dict) else {}
+
+    async def modify_order(self, account_id: str, order_id: str | int,
+                           price: float | None = None, order_type: str | None = None,
+                           duration: str | None = None, stop: float | None = None) -> dict:
+        """Modify a working order: PUT /accounts/{id}/orders/{id} with the
+        fields to change (price, type, duration, stop)."""
+        client = await self._get_client()
+        url = f"{self.base_url}/v1/accounts/{account_id}/orders/{order_id}"
+        headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json",
+                   "Content-Type": "application/x-www-form-urlencoded"}
+        data: dict = {}
+        if order_type is not None: data["type"] = order_type
+        if duration is not None: data["duration"] = duration
+        if price is not None: data["price"] = f"{float(price):.2f}"
+        if stop is not None: data["stop"] = f"{float(stop):.2f}"
+        resp = await client.put(url, data=data, headers=headers)
+        _record_rate_limit(resp.headers)
+        if resp.status_code == 401:
+            raise TradierAuthError("Tradier PUT order: invalid token (HTTP 401)")
+        if resp.status_code >= 400:
+            raise TradierError(f"Tradier modify order {order_id}: HTTP {resp.status_code} — {resp.text[:400]}")
+        try:
+            return resp.json()
+        except Exception:
+            return {"raw": resp.text[:500]}
+
+    async def cancel_order(self, account_id: str, order_id: str | int) -> dict:
+        """Cancel a working order: DELETE /accounts/{id}/orders/{id}."""
+        client = await self._get_client()
+        url = f"{self.base_url}/v1/accounts/{account_id}/orders/{order_id}"
+        headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
+        resp = await client.delete(url, headers=headers)
+        _record_rate_limit(resp.headers)
+        if resp.status_code == 401:
+            raise TradierAuthError(f"Tradier DELETE order: invalid token (HTTP 401)")
+        if resp.status_code >= 400:
+            raise TradierError(f"Tradier cancel order {order_id}: HTTP {resp.status_code} — {resp.text[:400]}")
+        try:
+            return resp.json()
+        except Exception:
+            return {"raw": resp.text[:500]}
+
+    async def get_orders(self, account_id: str) -> list[dict]:
+        """GET all of today's orders for the account (open + filled + closed).
+        Returns a list of order dicts (empty if none)."""
+        d = await self._get(f"accounts/{account_id}/orders", {"includeTags": "true"})
+        orders = (d.get("orders") if isinstance(d, dict) else None) or None
+        if not orders or orders == "null":
+            return []
+        arr = orders.get("order") if isinstance(orders, dict) else orders
+        if arr is None:
+            return []
+        return arr if isinstance(arr, list) else [arr]

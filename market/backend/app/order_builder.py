@@ -153,18 +153,22 @@ def _normalize_legs_str(legs_str: str, verb: str) -> str:
             pieces = seg.split("/")
             triples = []
             for piece in pieces:
-                pm = re.match(r"^\s*(short|long)?\s*(\d+(?:\.\d+)?)\s*([pcPC])\s*$",
+                # Side char (P/C) is OPTIONAL per strike: a vertical/fly shares
+                # one side, so users often write it on only one leg, e.g.
+                # "Long 30130 / Short 30030P". We backfill the missing side below.
+                pm = re.match(r"^\s*(short|long)?\s*(\d+(?:\.\d+)?)\s*([pcPC])?\s*$",
                               piece, re.IGNORECASE)
                 if not pm:
                     return legs_str
                 kw = (pm.group(1) or "").lower()
                 k = float(pm.group(2))
-                side = pm.group(3).upper()
+                side = pm.group(3).upper() if pm.group(3) else None
                 triples.append((kw, k, side))
-            sides = {t[2] for t in triples}
-            if len(sides) != 1:
+            known_sides = {t[2] for t in triples if t[2]}
+            if len(known_sides) != 1:
+                # No side char anywhere, or conflicting sides → can't normalize.
                 return legs_str
-            side = triples[0][2]
+            side = next(iter(known_sides))
             strikes_sorted = sorted({t[1] for t in triples})
             strike_part = "/".join(str(int(k) if k == int(k) else k) for k in strikes_sorted)
             out_segments.append(f"{strike_part}{side}")

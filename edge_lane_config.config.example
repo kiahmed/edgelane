@@ -15,17 +15,13 @@
 # DO NOT commit your real edge_lane_config.config to git — add it to .gitignore.
 # -----------------------------------------------------------------------------
 
-# Atlas (mind-vest.io) — get one at https://mind-vest.io/dashboard
-ATLAS_KEY="sk_atlas_REPLACE_ME"
-
 # Anthropic — get one at https://console.anthropic.com/settings/keys
-# Used by detectBias to call the Messages API + atlas-mcp via mcp_servers.
+# Used by detectBias to call the Messages API.
 ANTHROPIC_KEY="sk-ant-REPLACE_ME"
 
 # ----- Optional: route through dev CORS proxy ---------------------------------
 # Run: python3 tools/cors_proxy.py
-# Then uncomment these so the browser hits the proxy instead of Atlas/Gemini direct.
-# ATLAS_BASE_URL="http://localhost:8787/atlas"
+# Then uncomment this so the browser hits the proxy instead of Gemini direct.
 # GEMINI_BASE_URL="http://localhost:8787/gemini"
 
 # Brand version base (major.minor) — the build script auto-appends a patch
@@ -34,11 +30,11 @@ ANTHROPIC_KEY="sk-ant-REPLACE_ME"
 # Bump to "4.8" → next build is v4.8.1.
 EDGE_LANE_VERSION="4.7"
 
-# ─── Data provider selection (v4.7.25) ─────────────────────────────────────
+# ─── Data provider selection ───────────────────────────────────────────────
 # Which backend supplies quotes + options chains + greek exposures.
-# 'atlas'   - mind-vest.io (current default, pre-computed dealer GEX rollups)
-# 'tradier' - brokerage.tradier.com (REST + chain raw, GEX computed locally)
-DATA_PROVIDER=atlas
+# 'tradier' - brokerage.tradier.com (REST + chain raw, GEX computed locally).
+#             Tradier is the sole supported data provider.
+DATA_PROVIDER=tradier
 
 # Tradier (https://web.tradier.com/user/api for tokens). Two tokens — one
 # per environment — so flipping DEVMODE switches both the credential and the

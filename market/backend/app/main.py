@@ -152,16 +152,27 @@ app = FastAPI(
 )
 
 _settings = get_settings()
+
+# Per-session rate limiting. Registered BEFORE CORS so CORS stays the outermost
+# middleware — that way even a 429 response carries CORS headers and the browser
+# can read it. No-op when AUTH_ENABLED=false (dev). Real DDoS shield is the
+# Cloudflare edge in front of the tunnel; this is app-level fairness.
+from . import ratelimit  # noqa: E402
+app.middleware("http")(ratelimit.rate_limit_middleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_settings.cors_allow_origins,
+    allow_origin_regex=_settings.cors_allow_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-from .routes import status, symbols, snapshot, accuracy, diag, orders, webhook  # noqa: E402
+from .routes import (  # noqa: E402
+    status, symbols, snapshot, accuracy, diag, orders, webhook, torque, session, broker, contact,
+)
 
 app.include_router(status.router)
 app.include_router(symbols.router)
@@ -170,6 +181,10 @@ app.include_router(accuracy.router)
 app.include_router(diag.router)
 app.include_router(orders.router)
 app.include_router(webhook.router)
+app.include_router(torque.router)
+app.include_router(session.router)
+app.include_router(broker.router)
+app.include_router(contact.router)
 
 
 @app.get("/")

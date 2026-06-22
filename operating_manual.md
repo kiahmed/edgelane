@@ -632,6 +632,32 @@ This is the rare disciplined options play: instead of taking what the market giv
 
 ---
 
+## Torque — fast order builder
+
+Separate page on the market backend (`:8789/torque`) for placing multi-leg
+orders fast — **no** bias logic. Run: `cd market/backend && make run-dev` (paper)
+or `make run-prod` (real). Full doc: `docs/torque.md`.
+
+1. Pick a **ticker** + one **strategy** (10, incl. single-leg). Legs auto-fill at
+   per-ticker offsets snapped to the live grid; −/+ nudges strikes.
+2. **Spot** is live (Yahoo, parity fallback); strikes + net bid/mid/ask re-anchor
+   every ~3s. Type a limit or **Send Market**. **DRY RUN** validates without placing.
+3. **Auto-close +N%** (default 30%): on confirmed fill it places the profit-target
+   close (single-leg limit → native OTO; spreads/market → background watch-then-close).
+4. **Orders panel** (bottom): working orders + armed closes — click a limit to
+   modify, or cancel. Env badge **SANDBOX** (gold) / **PRODUCTION** (red).
+
+## tp — positions & P&L CLI
+
+`tp` (`tools/tradier_positions.py`) shows positions and realized P&L. Full doc:
+`tools/tp_operating_manual.html`.
+
+- `tp` — open positions. `tp -G` — realized gain/loss (merges today's `/orders`
+  with prior-day opens via `/history`, back to 7 days; partials use the
+  whole-trade average as cost basis).
+
+---
+
 ## Troubleshooting
 
 | What you see | What's happening |

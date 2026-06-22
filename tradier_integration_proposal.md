@@ -1,16 +1,16 @@
 # Tradier Data Source — Integration Proposal
 
-**Status:** Proposal, awaiting approval. No production code changes until accepted.
+**Status:** Historical proposal — accepted and implemented. EdgeLane originally used Atlas's API (mind-vest.io) as its data backbone; Atlas was fully retired ~May 2026 and Tradier is now the sole data provider. This document is retained for the migration rationale; the Atlas-side details below describe the former system.
 **Author:** Research fleet (4 parallel agents) synthesized into this document.
 
 ---
 
 ## 1. Executive summary
 
-Tradier is a US brokerage that publishes its market-data and trading stack as a REST + WebSocket API. It is a strong technical fit for replacing Atlas (mind-vest.io) as EdgeLane's data backbone, with two structural differences:
+Tradier is a US brokerage that publishes its market-data and trading stack as a REST + WebSocket API. It was a strong technical fit for replacing Atlas (mind-vest.io) as EdgeLane's data backbone, with two structural differences:
 
 1. **Tradier is brokerage-first.** Authentication is tied to a Tradier brokerage account, not a data subscription. Real-time data requires a funded brokerage account; the free sandbox is 15-minute delayed.
-2. **Tradier has no dealer-positioning rollups.** Where Atlas exposes `analyze_greek_exposures` with pre-computed `key_levels.call_wall` / `put_wall` and `portfolio_totals.net_gex`, Tradier returns raw chain data only. We would compute GEX/DEX/walls **locally** from the chain we already fetch — the same architectural path I called out as "Path B" earlier in the session.
+2. **Tradier has no dealer-positioning rollups.** Where Atlas exposed `analyze_greek_exposures` with pre-computed `key_levels.call_wall` / `put_wall` and `portfolio_totals.net_gex`, Tradier returns raw chain data only. We would compute GEX/DEX/walls **locally** from the chain we already fetch — the same architectural path I called out as "Path B" earlier in the session.
 
 **Recommendation:** proceed. The migration is mostly a refactor toward a cleaner architecture (raw data in, analytics computed locally) that we'd have wanted anyway for Atlas resilience.
 
@@ -18,7 +18,7 @@ Tradier is a US brokerage that publishes its market-data and trading stack as a 
 
 ## 2. What Tradier brings
 
-| Property | Tradier | Atlas (current) |
+| Property | Tradier | Atlas (former) |
 |---|---|---|
 | Business model | Brokerage; API is a feature of the account | Pure data SaaS |
 | Auth | Bearer token (sandbox + production keys) | Bearer token |
@@ -50,7 +50,9 @@ Tradier is a US brokerage that publishes its market-data and trading stack as a 
 
 ## 3. Endpoint mapping — Atlas → Tradier
 
-| EdgeLane need | Atlas call (current) | Tradier equivalent | Notes |
+(Historical mapping from the former Atlas calls to their Tradier equivalents.)
+
+| EdgeLane need | Atlas call (former) | Tradier equivalent | Notes |
 |---|---|---|---|
 | Spot price | `get_stock_quote` | `GET /v1/markets/quotes?symbols=NVDA` | Direct map. Response: `quotes.quote.last`. |
 | Options chain for one expiration | `get_options_chain` | `GET /v1/markets/options/chains?symbol=NVDA&expiration=2026-05-23&greeks=true` | Direct map. Per-contract fields: `strike, option_type, bid, ask, last, volume, open_interest, greeks{delta, gamma, theta, vega, bid_iv, mid_iv, ask_iv, smv_vol}`. |
@@ -70,7 +72,7 @@ Tradier is a US brokerage that publishes its market-data and trading stack as a 
 
 ## 4. The dealer-GEX gap — solution sketch
 
-EdgeLane currently consumes from Atlas's `analyze_greek_exposures`:
+EdgeLane previously consumed from Atlas's `analyze_greek_exposures`:
 
 - `exposures_by_date[date].by_strike[].net_gex` / `net_dex`
 - `portfolio_totals.net_gex` / `net_dex`
@@ -90,9 +92,9 @@ net_gex   = Σ dealer_gamma_per_strike(K) for K in chain
 
 (The convention is that retail buys options → market makers are short options → MM gamma exposure flips sign by side.)
 
-This computation is fast (~milliseconds for 1,000 contracts), runs entirely client-side, and reuses the chain we already fetch for the optimizer. **Net effect: bias detection becomes 1 Tradier call (chain) instead of today's 2 Atlas calls (quote + greek_exposures). Heavy symbols like MU stop being a problem entirely** because we never call a slow aggregation endpoint — we just iterate the chain we already have.
+This computation is fast (~milliseconds for 1,000 contracts), runs entirely client-side, and reuses the chain we already fetch for the optimizer. **Net effect: bias detection became 1 Tradier call (chain) instead of the former 2 Atlas calls (quote + greek_exposures). Heavy symbols like MU stop being a problem entirely** because we never call a slow aggregation endpoint — we just iterate the chain we already have.
 
-**Trade-off:** Atlas's `key_levels` likely uses a more sophisticated wall-detection algorithm than naive max-magnitude. Our local version will be defensible but may differ from Atlas's output on edge cases (very flat exposure profiles, dispersed OI). For the symbols we typically trade (liquid index / mega-cap names), the difference should be small.
+**Trade-off:** Atlas's `key_levels` likely used a more sophisticated wall-detection algorithm than naive max-magnitude. Our local version is defensible but may have differed from Atlas's output on edge cases (very flat exposure profiles, dispersed OI). For the symbols we typically trade (liquid index / mega-cap names), the difference should be small.
 
 ---
 
@@ -172,16 +174,13 @@ EdgeLane/
 Additions to `edge_lane_config.config.example`:
 
 ```bash
-# Provider selection — 'atlas' or 'tradier'
+# Provider selection
 DATA_PROVIDER=tradier
 
 # Tradier — sandbox or production
 TRADIER_ACCESS_TOKEN="your-token-here"
 TRADIER_BASE_URL="https://api.tradier.com"   # production
 # TRADIER_BASE_URL="https://sandbox.tradier.com"   # sandbox
-
-# Atlas keys retained — easy to swap back via DATA_PROVIDER=atlas
-ATLAS_KEY="..."
 ```
 
 Build script (`edge_lane_build.sh`) adds three new placeholder substitutions:

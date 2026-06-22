@@ -10,6 +10,14 @@ dependencies = [
     "httpx>=0.27",
     "pydantic>=2.6",
     "python-dotenv>=1.0",
+    "pyjwt[crypto]>=2.8",
+    "python-multipart>=0.0.9",   # FastAPI multipart form parsing (POST /contact)
+    # Per-user Webull broker (signed OpenAPI SDK). It declares cryptography<42,
+    # but ONLY its unused RSA private-key signer imports cryptography — our
+    # app-key path uses stdlib HMAC. The Dockerfile upgrades cryptography>=43
+    # after install to override this dead-weight pin (so the auth backend keeps
+    # modern crypto for PyJWT). Verified: SDK + option preview + ES256 all work.
+    "webull-openapi-python-sdk>=2.0",
     "tzdata; sys_platform == 'win32'",
 ]
 
@@ -19,6 +27,13 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-cov>=4",
 ]
+
+# The container copies both app/ and ui/ into /srv (ui/torque.html is resolved
+# by filesystem path, not import), so setuptools' flat-layout auto-discovery
+# sees two top-level dirs and bails. Package only `app` (+ subpackages); ui/
+# stays on disk for the Torque route to read, just not as an installed package.
+[tool.setuptools.packages.find]
+include = ["app*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

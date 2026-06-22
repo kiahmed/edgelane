@@ -86,11 +86,10 @@ fi
 # shellcheck disable=SC1090
 source "$CONFIG"
 
-: "${ATLAS_KEY:?ATLAS_KEY not set in $CONFIG}"
 : "${ANTHROPIC_KEY:?ANTHROPIC_KEY not set in $CONFIG}"
 : "${GEMINI_API_KEY:?GEMINI_API_KEY not set in $CONFIG}"
-# Provider selection (v4.7.25). Defaults preserve existing behavior.
-DATA_PROVIDER="${DATA_PROVIDER:-atlas}"
+# Provider selection. Tradier is the sole data provider.
+DATA_PROVIDER="${DATA_PROVIDER:-tradier}"
 # DEVMODE selects between sandbox and production Tradier creds. Defaults to
 # true (sandbox) so you cannot accidentally hit live markets without flipping
 # the flag explicitly. Override per-build by exporting DEVMODE=false.
@@ -111,7 +110,6 @@ else
   TRADIER_ENV_LABEL="production"
 fi
 GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-flash}"  # default if not in config
-ATLAS_BASE_URL="${ATLAS_BASE_URL:-}"     # empty = direct (will CORS-fail from browser)
 GEMINI_BASE_URL="${GEMINI_BASE_URL:-}"   # empty = direct
 BIAS_NARRATIVE_OPEN_DEFAULT="${BIAS_NARRATIVE_OPEN_DEFAULT:-0}"  # 1 = open by default
 # ---- Version auto-bump ----------------------------------------------------
@@ -163,11 +161,9 @@ JSX_BODY="$(
 # ---- 4. Stitch template + jsx + keys via bash parameter expansion --------
 TEMPLATE_CONTENT="$(<"$TEMPLATE")"
 OUTPUT="${TEMPLATE_CONTENT//__JSX_BODY__/$JSX_BODY}"
-OUTPUT="${OUTPUT//__ATLAS_KEY__/$ATLAS_KEY}"
 OUTPUT="${OUTPUT//__ANTHROPIC_KEY__/$ANTHROPIC_KEY}"
 OUTPUT="${OUTPUT//__GEMINI_API_KEY__/$GEMINI_API_KEY}"
 OUTPUT="${OUTPUT//__GEMINI_MODEL__/$GEMINI_MODEL}"
-OUTPUT="${OUTPUT//__ATLAS_BASE_URL__/$ATLAS_BASE_URL}"
 OUTPUT="${OUTPUT//__GEMINI_BASE_URL__/$GEMINI_BASE_URL}"
 OUTPUT="${OUTPUT//__EDGE_LANE_VERSION__/$EDGE_LANE_VERSION}"
 OUTPUT="${OUTPUT//__BIAS_NARRATIVE_OPEN_DEFAULT__/$BIAS_NARRATIVE_OPEN_DEFAULT}"
@@ -184,7 +180,6 @@ if [[ $DRY_RUN -eq 1 ]]; then
   echo "  OUT       = $OUT  (would be overwritten if it exists)"
   echo
   echo "── substitutions ──────────────────────────────────────────────────"
-  printf "  %-20s = %s\n" "ATLAS_KEY"      "$(mask "$ATLAS_KEY")"
   printf "  %-20s = %s\n" "ANTHROPIC_KEY"  "$(mask "$ANTHROPIC_KEY")"
   printf "  %-20s = %s\n" "GEMINI_API_KEY" "$(mask "$GEMINI_API_KEY")"
   printf "  %-20s = %s\n" "GEMINI_MODEL"   "$GEMINI_MODEL"
@@ -199,7 +194,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
   WOULD_LINES=$(printf '%s\n' "$OUTPUT" | wc -l | tr -d ' ')
   WOULD_BYTES=${#OUTPUT}
   echo "  would write: $WOULD_LINES lines / ~$WOULD_BYTES bytes"
-  REMAINING=$(printf '%s' "$OUTPUT" | grep -cE '__(JSX_BODY|ATLAS_KEY|ANTHROPIC_KEY|GEMINI_API_KEY|GEMINI_MODEL)__' || true)
+  REMAINING=$(printf '%s' "$OUTPUT" | grep -cE '__(JSX_BODY|ANTHROPIC_KEY|GEMINI_API_KEY|GEMINI_MODEL)__' || true)
   echo "  remaining placeholders: $REMAINING (should be 0)"
   if [[ $REMAINING -gt 0 ]]; then
     echo "  ✗ would have unfilled placeholders! template/build mismatch?" >&2

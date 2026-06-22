@@ -3,12 +3,26 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>EdgeLane MARKET</title>
+  <title>EdgeLane Matrix — Spread Optimizer</title>
+  <meta name="description" content="Cut the noise. Trade the decided multi-leg options edge." />
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="assets/favicon-16.png">
+  <link rel="apple-touch-icon" sizes="192x192" href="assets/favicon-192.png">
+  <link rel="shortcut icon" href="assets/favicon.ico">
   <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Supabase JS (auth + RLS-scoped reads/writes to profiles / broker_configs /
+       user_settings). UMD build exposes window.supabase.createClient. -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <!-- Cloudflare Turnstile — anti-bot challenge gating the anonymous teaser
+       session. Loaded async; the explicit-render API is used from JS. -->
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
   <style>
     :root { color-scheme: dark; }
     html, body { background: #07090d; }
     body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    /* Global busy cursor for long-running async actions (contact send, broker connect/test, etc.) */
+    body.busy, body.busy * { cursor: progress !important; }
     .neon { text-shadow: 0 0 8px rgba(120,255,180,.45); }
     .pill { display:inline-flex; align-items:center; gap:.4rem; padding:.25rem .65rem; border-radius:9999px; font-size:.72rem; font-weight:600; letter-spacing:.04em; text-transform:uppercase; }
     .dot { width:.5rem; height:.5rem; border-radius:9999px; display:inline-block; }
@@ -141,73 +155,164 @@
     .lk-lvl--1 { background: rgba(190,18,60,.35); color:#fecaca; }
     .lk-lvl--2 { background: rgba(225,29,72,.5);  color:#fed7d7; }
     .lk-lvl--3 { background: rgba(244,63,94,.7);  color:#fff1f2; font-weight:700; }
+
+    /* ── Auth gate: blur locked content + signup/signin overlay ──────────── */
+    /* Everything below the 3 teaser chips is blurred until the user signs in. */
+    .locked-blur { filter: blur(7px); pointer-events:none; user-select:none;
+                   opacity:.55; transition: filter .2s, opacity .2s; }
+    /* True blocking modal: captures all pointer events so nothing in the
+       background (header, tabs, profile) is clickable until the user signs in.
+       The teaser chips stay visible behind a translucent scrim; gated content
+       below is blurred. */
+    .gate-mask { position: fixed; inset: 0; z-index: 70;
+                 display: none; align-items: flex-start; justify-content: center;
+                 background: linear-gradient(rgba(7,9,13,.55), rgba(7,9,13,.62)),
+                             radial-gradient(900px 500px at 50% 120%, rgba(16,185,129,.08), transparent 60%);
+                 padding: 1rem; overflow-y:auto; pointer-events: auto; }
+    .gate-mask.show { display: flex; }
+    .gate-card { width: min(440px, calc(100vw - 2rem)); position: relative;
+                 margin-top: 12vh; pointer-events: auto;
+                 background: linear-gradient(180deg, rgba(17,24,42,.97), rgba(7,11,20,.98));
+                 border: 1px solid rgba(34,197,94,.25); border-radius: 22px;
+                 padding: 2rem; box-shadow: 0 30px 90px rgba(0,0,0,.7),
+                 0 0 60px -20px rgba(16,185,129,.35); }
+    .gate-card .glow-orb { position:absolute; right:-3rem; top:-3rem; width:11rem; height:11rem;
+                           border-radius:9999px; background: rgba(16,185,129,.12); filter: blur(48px);
+                           pointer-events:none; }
+    .gate-logo { display:flex; align-items:center; gap:.6rem; }
+    .gate-logo .mark { width:2.5rem; height:2.5rem; border-radius:.7rem; display:grid; place-items:center;
+                       background: linear-gradient(135deg, #34d399, #0d9488); }
+    .gate-eyebrow { font-size:.65rem; font-weight:700; letter-spacing:.25em; text-transform:uppercase;
+                    color: rgba(110,231,183,.8); }
+    .gate-input { width:100%; margin-top:.5rem; border-radius:.9rem;
+                  border:1px solid rgba(71,85,105,.7); background:#040810;
+                  padding:.7rem .9rem; color:#e2e8f0; outline:none; font-size:.9rem;
+                  transition: border-color .15s; }
+    .gate-input:focus { border-color:#34d399; }
+    .gate-btn { width:100%; margin-top:.25rem; border-radius:.9rem; padding:.7rem 1rem;
+                font-size:.85rem; font-weight:700; color:#022c22; cursor:pointer;
+                background: linear-gradient(90deg, #34d399, #22d3ee); border:none;
+                transition: opacity .15s; }
+    .gate-btn:hover:not(:disabled) { opacity:.9; }
+    .gate-btn:disabled { opacity:.55; cursor:not-allowed; }
+    .gate-tab { flex:1; text-align:center; padding:.5rem; font-size:.78rem; font-weight:600;
+                color:#94a3b8; cursor:pointer; border-bottom:2px solid transparent; }
+    .gate-tab.active { color:#6ee7b7; border-bottom-color:#34d399; }
+    .gate-link { color:#6ee7b7; cursor:pointer; font-weight:600; }
+    .gate-link:hover { color:#a7f3d0; }
+    /* Broker connection cards in the settings panel */
+    .conn-card { border:1px solid rgba(60,80,110,.4); border-radius:10px; padding:.65rem .7rem;
+                 background: rgba(15,23,42,.55); margin-bottom:.5rem; }
+    .conn-card.active { border-color: rgba(34,197,94,.6); }
+    .conn-mini-btn { font-size:.62rem; text-transform:uppercase; letter-spacing:.06em;
+                     padding:.2rem .45rem; border-radius:5px; cursor:pointer;
+                     border:1px solid rgba(120,140,170,.3); background:#0f172a; color:#cbd5e1; }
+    .conn-mini-btn:hover { border-color: rgba(120,255,180,.4); }
+    .conn-mini-btn.danger { color:#fda4af; border-color: rgba(244,63,94,.4); background: rgba(244,63,94,.08); }
+    .toggle-row { display:flex; align-items:center; justify-content:space-between;
+                  font-size:.78rem; color:#cbd5e1; padding:.3rem 0; }
+    /* Social + share cluster (tab strip, right) — tuned to the app palette */
+    .social-btn { display:grid; place-items:center; height:2.1rem; width:2.1rem;
+                  border-radius:.7rem; border:1px solid rgba(60,80,110,.5);
+                  background: rgba(15,23,42,.6); color:#94a3b8; transition: all .15s; }
+    .social-btn:hover { border-color: rgba(34,197,94,.5); color:#e2e8f0; }
+    .share-btn { display:inline-flex; align-items:center; gap:.4rem; height:2.1rem;
+                 border-radius:.7rem; border:1px solid rgba(60,80,110,.5);
+                 background: rgba(15,23,42,.6); padding:0 .7rem; font-size:.72rem;
+                 font-weight:600; color:#cbd5e1; cursor:pointer; transition: all .15s; }
+    .share-btn:hover { border-color: rgba(34,197,94,.5); color:#fff; }
+    .footer-link { color:#64748b; cursor:pointer; background:none; border:none;
+                   font-size:inherit; padding:0; }
+    .footer-link:hover { color:#86efac; text-decoration: underline; }
+    /* About/Contact prose inside modal-card */
+    .doc-prose p { font-size:.82rem; line-height:1.6; color:#cbd5e1; margin:.5rem 0; }
+    .doc-prose h4 { font-size:.7rem; text-transform:uppercase; letter-spacing:.08em;
+                    color:#6ee7b7; font-weight:700; margin:1rem 0 .35rem; }
+    .doc-prose ul { margin:.25rem 0 .25rem; padding-left:1.1rem; }
+    .doc-prose li { font-size:.8rem; line-height:1.5; color:#cbd5e1; margin:.2rem 0;
+                    list-style:disc; }
+    .doc-prose li.dont { color:#fda4af; }
+    .doc-prose li.dont::marker { color:#fb7185; }
   </style>
 </head>
 <body class="text-slate-200">
 <div id="app" class="max-w-6xl mx-auto p-4 md:p-6 space-y-4">
 
-  <!-- Top bar -->
-  <header class="flex flex-wrap items-center justify-between gap-3 mb-2">
-    <div class="flex items-baseline gap-3">
-      <h1 class="text-2xl md:text-3xl font-black tracking-tight neon">EDGELANE <span class="text-emerald-400">MARKET</span></h1>
-      <span id="version" class="text-xs text-slate-500"></span>
+  <!-- Top bar — top-level row does NOT wrap; only the pills cluster wraps
+       internally, so the profile button can never get pushed to a new line. -->
+  <header class="flex items-start gap-3 mb-2">
+    <div class="flex items-baseline gap-3 flex-shrink-0">
+      <div>
+        <h1 class="text-2xl md:text-3xl font-black tracking-tight neon">EDGELANE <span class="text-emerald-400">MATRIX</span></h1>
+        <p class="text-[13px] italic text-slate-200 mt-0.5">Cut the noise. Trade the decided multi-leg options edge.</p>
+      </div>
+      <span id="version" class="text-xs text-slate-600"></span>
     </div>
-    <div class="flex items-center gap-2 flex-wrap">
+    <div class="flex items-center gap-2 flex-wrap justify-end ml-auto min-w-0">
       <span id="modePill" class="pill bg-slate-700 text-slate-200" title="Data source: MOCK = synthetic deterministic chain (no token); PRODUCTION/SANDBOX = live Tradier feed.">…</span>
       <span id="marketPill" class="pill bg-slate-700 text-slate-200" title="Regular-session market hours (NYSE Mon-Fri 9:30-16:00 ET). DEVMODE polls anytime.">…</span>
       <span id="statusPill" class="pill bg-slate-700 text-slate-200" title="Backend poller health. Live = polling on cadence; Down = poll loop failing or backend unreachable."><span class="dot bg-slate-400"></span>Connecting</span>
       <span id="accuracyPill" class="pill bg-slate-700 text-slate-300" title="Rolling win rate over last N decisions (config: EVAL_ROLLING_WINDOW). Green >=60%, amber middle, red <=40%.">Accuracy —</span>
       <label class="text-xs text-slate-400 ml-2">Symbol</label>
       <select id="symbolSel"><option>SPX</option></select>
-      <button class="btn" id="refreshBtn">Refresh</button>
+    </div>
 
-      <!-- Feature 3: profile circle + settings panel ---------------------- -->
-      <div class="relative" id="profileWrap">
-        <button id="profileBtn" class="avatar-btn" title="Profile &amp; settings">
-          <span id="profileInitial">O</span>
-        </button>
-        <div id="settingsPanel" class="settings-panel hidden">
-          <div class="flex items-baseline justify-between mb-2">
-            <div>
-              <div id="settingsUserName" class="text-sm font-bold text-slate-100">Operator</div>
-              <div class="text-[10px] text-slate-500 uppercase tracking-wider">local session</div>
-            </div>
-            <button id="settingsCloseBtn" class="text-slate-400 hover:text-slate-100 text-lg leading-none">&times;</button>
+    <!-- Profile circle pinned to the top-right margin; never shrinks or wraps. -->
+    <div class="relative flex-shrink-0 self-start ml-1 md:ml-2" id="profileWrap">
+      <button id="profileBtn" class="avatar-btn" title="Profile &amp; settings">
+        <span id="profileInitial">·</span>
+      </button>
+      <div id="settingsPanel" class="settings-panel hidden">
+        <div class="flex items-baseline justify-between mb-2">
+          <div class="min-w-0">
+            <div id="settingsUserName" class="text-sm font-bold text-slate-100 truncate">Account</div>
+            <div id="settingsUserEmail" class="text-[10px] text-slate-500 truncate">—</div>
           </div>
+          <button id="settingsCloseBtn" class="text-slate-400 hover:text-slate-100 text-lg leading-none">&times;</button>
+        </div>
 
-          <div class="settings-section">
-            <h3>Tradier Connection</h3>
-            <div id="brokerStatus" class="text-xs text-slate-300 mb-2">checking…</div>
-            <div class="radio-row mb-2">
-              <label><input type="radio" name="tradierEnv" value="production" /> Production</label>
-              <label><input type="radio" name="tradierEnv" value="sandbox" /> Sandbox</label>
-            </div>
-            <div class="text-[11px] text-slate-400 mb-2">
-              Account: <code id="brokerAccount" class="kv">—</code>
-            </div>
-            <div class="text-[10px] text-slate-500 italic mb-2 leading-snug">
-              Token is configured server-side in <code class="kv">edgelane_market.config</code> —
-              restart the backend after edits.
-            </div>
-            <div class="flex gap-2">
-              <button id="testConnBtn" class="btn">Test connection</button>
-              <span id="testConnResult" class="text-[11px] self-center text-slate-400"></span>
-            </div>
+        <!-- ── Broker connections (per-user, persisted to Supabase) ─────── -->
+        <div class="settings-section">
+          <div class="flex items-center justify-between mb-1">
+            <h3 class="!mb-0">Broker connections</h3>
+            <span id="brokerSyncState" class="text-[9px] text-slate-600 uppercase tracking-wider"></span>
           </div>
+          <p class="text-[10px] text-slate-500 leading-snug mb-2">
+            Connect your own broker so orders route to your account. One can be the default.
+          </p>
+          <div id="connList" class="space-y-1"></div>
+          <div id="connFormHost"></div>
+          <button id="addConnBtn" class="btn mt-2 w-full">+ Add broker connection</button>
+        </div>
 
-          <div class="settings-section">
-            <h3>Settings</h3>
-            <label class="text-xs text-slate-300 block mb-1">Auto-refresh interval (<span id="pollIntLabel">5</span>s)</label>
-            <input id="pollInt" type="range" min="5" max="30" step="5" value="5" class="w-full" />
-            <label class="text-xs text-slate-300 mt-2 flex items-center gap-2">
-              <input id="diagToggle" type="checkbox" /> Show diagnostics (placeholder)
-            </label>
-            <button id="resetUiBtn" class="btn mt-3 w-full">Reset UI state</button>
+        <!-- ── Notifications (per-user, persisted to Supabase) ──────────── -->
+        <div class="settings-section">
+          <h3>Notifications</h3>
+          <div class="toggle-row">
+            <span>Order fill confirmations</span>
+            <input type="checkbox" data-notif="email_fills" />
           </div>
+          <div class="toggle-row">
+            <span>Regime-shift alerts</span>
+            <input type="checkbox" data-notif="email_regime_shift" />
+          </div>
+          <div class="toggle-row">
+            <span>Daily summary email</span>
+            <input type="checkbox" data-notif="email_daily_summary" />
+          </div>
+          <div id="notifSaveState" class="text-[10px] text-slate-600 mt-1"></div>
+        </div>
 
-          <div class="settings-section">
-            <button id="signOutBtn" class="text-xs text-rose-300 hover:text-rose-200">Sign out (clear local session)</button>
-          </div>
+        <!-- ── App preferences ──────────────────────────────────────────── -->
+        <div class="settings-section">
+          <h3>Preferences</h3>
+          <label class="text-xs text-slate-300 block mb-1">Auto-refresh interval (<span id="pollIntLabel">5</span>s)</label>
+          <input id="pollInt" type="range" min="5" max="30" step="5" value="5" class="w-full" />
+          <button id="resetUiBtn" class="btn mt-3 w-full">Reset UI state</button>
+        </div>
+
+        <div class="settings-section">
+          <button id="signOutBtn" class="text-xs text-rose-300 hover:text-rose-200">Sign out</button>
         </div>
       </div>
     </div>
@@ -215,10 +320,26 @@
 
   <p id="lastUpdate" class="text-xs text-slate-500"></p>
 
-  <!-- Feature 4: Tab strip ------------------------------------------------- -->
-  <div class="flex items-center gap-1 border-b border-slate-800 mb-2">
-    <button class="tab-btn active" data-tab="engine" id="tabEngine">Engine pick</button>
-    <button class="tab-btn" data-tab="lookup" id="tabLookup">Lookup</button>
+  <!-- Feature 4: Tab strip (left) + social/share cluster (right) ----------- -->
+  <div class="flex items-center justify-between gap-2 border-b border-slate-800 mb-2 flex-wrap">
+    <div class="flex items-center gap-1">
+      <button class="tab-btn active" data-tab="engine" id="tabEngine">Engine pick</button>
+      <button class="tab-btn" data-tab="lookup" id="tabLookup">Lookup</button>
+    </div>
+    <div class="flex items-center gap-2 pb-1.5">
+      <a href="https://x.com/edgelanematrix" target="_blank" rel="noopener noreferrer"
+         aria-label="EdgeLane Matrix on X" class="social-btn">
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="h-4 w-4" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.66l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231 5.45-6.231Zm-1.161 17.52h1.833L7.084 4.126H5.117L17.083 19.77Z"></path></svg>
+      </a>
+      <a href="https://www.linkedin.com/company/edgelane-matrix" target="_blank" rel="noopener noreferrer"
+         aria-label="EdgeLane Matrix on LinkedIn" class="social-btn">
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="h-4 w-4" fill="currentColor"><path d="M20.45 20.45h-3.56v-5.57c0-1.33-.02-3.04-1.85-3.04-1.85 0-2.13 1.45-2.13 2.94v5.67H9.35V9h3.42v1.56h.05c.48-.9 1.64-1.85 3.37-1.85 3.6 0 4.27 2.37 4.27 5.46v6.28ZM5.34 7.43a2.07 2.07 0 1 1 0-4.14 2.07 2.07 0 0 1 0 4.14ZM7.12 20.45H3.55V9h3.57v11.45ZM22.22 0H1.77C.79 0 0 .77 0 1.73v20.54C0 23.23.79 24 1.77 24h20.45c.98 0 1.78-.77 1.78-1.73V1.73C24 .77 23.2 0 22.22 0Z"></path></svg>
+      </a>
+      <button id="shareBtn" class="share-btn" aria-label="Share EdgeLane Matrix">
+        <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><path d="M8.59 13.51l6.83 3.98M15.41 6.51l-6.82 3.98"></path></svg>
+        Share
+      </button>
+    </div>
   </div>
 
   <!-- ENGINE VIEW (existing UI) ----------------------------------------- -->
@@ -263,13 +384,13 @@
       </div>
       <div class="mt-2 grid grid-cols-2 gap-3 text-sm">
         <div>
-          <div class="text-xs text-emerald-400/80 tt" title="Put wall = strongest put-side gamma cluster. Intraday spot tends to drift toward this strike (dealer hedging is the magnet).">Put wall · MAGNET ↘</div>
-          <div id="putWall" class="font-bold text-emerald-300 text-lg">—</div>
+          <div class="text-xs text-rose-400/80 tt" title="Put wall = strongest put-side gamma cluster. Intraday spot tends to drift toward this strike (dealer hedging is the magnet).">Put wall · MAGNET ↘</div>
+          <div id="putWall" class="font-bold text-rose-300 text-lg">—</div>
           <div id="putWallStr" class="text-xs text-slate-500"></div>
         </div>
         <div>
-          <div class="text-xs text-rose-400/80 tt" title="Call wall = strongest call-side gamma cluster. Acts as resistance — rallies often stall here as dealers sell into upside.">Call wall · RESISTANCE ▲</div>
-          <div id="callWall" class="font-bold text-rose-300 text-lg">—</div>
+          <div class="text-xs text-emerald-400/80 tt" title="Call wall = strongest call-side gamma cluster. Acts as resistance — rallies often stall here as dealers sell into upside.">Call wall · RESISTANCE ▲</div>
+          <div id="callWall" class="font-bold text-emerald-300 text-lg">—</div>
           <div id="callWallStr" class="text-xs text-slate-500"></div>
         </div>
       </div>
@@ -282,7 +403,7 @@
   </section>
 
   <!-- Engine pick highlight -->
-  <section id="pickCard" class="card p-4 hidden">
+  <section id="pickCard" class="card p-4 hidden" data-gated>
     <div class="flex items-center justify-between flex-wrap gap-2">
       <div>
         <span class="text-xs uppercase tracking-wide text-emerald-400">Engine pick</span>
@@ -299,7 +420,7 @@
   </section>
 
   <!-- Strategy grid -->
-  <section>
+  <section data-gated>
     <div class="flex items-center justify-between mb-2">
       <h2 class="text-sm uppercase tracking-wide text-slate-400">Strategies (8)</h2>
       <div class="text-xs text-slate-500">★ recommended by bias</div>
@@ -313,7 +434,7 @@
   <section id="errBox" class="hidden card border-rose-500/40 bg-rose-900/20 p-3 text-rose-200 text-sm"></section>
 
   <!-- Recent outcomes — last 10 evaluations, populated by /accuracy poll -->
-  <section class="card p-4">
+  <section class="card p-4" data-gated>
     <div class="flex items-center justify-between mb-2">
       <h2 class="text-sm uppercase tracking-wide text-slate-400">Recent outcomes</h2>
       <span id="outcomeMeta" class="text-xs text-slate-500">—</span>
@@ -326,7 +447,7 @@
   </div><!-- /view-engine -->
 
   <!-- LOOKUP VIEW (Feature 4) ------------------------------------------- -->
-  <div id="view-lookup" class="hidden space-y-3">
+  <div id="view-lookup" class="hidden space-y-3" data-gated>
     <section class="card p-3 text-[12px] text-slate-300 leading-relaxed">
       <span class="font-bold uppercase tracking-widest text-slate-200 mr-2">Lookup:</span>
       Black-Scholes spread projection grid for the current
@@ -341,8 +462,13 @@
     </div>
   </div>
 
-  <footer class="text-center text-xs text-slate-600 pt-4">
-    Polls every 5s · backend cadence configurable via POLL_INTERVAL_SEC
+  <footer class="flex items-center justify-center gap-2 text-xs text-slate-600 pt-4">
+    <img src="assets/favicon.svg" alt="EdgeLane Matrix" class="h-4 w-4 opacity-80" />
+    <span>© EdgeLane Matrix <span id="footerYear">2026</span>. All rights reserved.</span>
+    <span class="mx-0.5 text-slate-700">·</span>
+    <button id="aboutLink" class="footer-link">About</button>
+    <span class="mx-0.5 text-slate-700">·</span>
+    <button id="contactLink" class="footer-link">Contact</button>
   </footer>
 </div>
 
@@ -392,7 +518,7 @@
 
     <div>
       <div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Tradier response</div>
-      <pre id="orderPreviewPane" class="preview-pane">No preview yet. Click "Preview" to validate against Tradier.</pre>
+      <pre id="orderPreviewPane" class="preview-pane">No preview yet. Click "Preview" to validate against your broker.</pre>
     </div>
 
     <div class="flex items-center justify-between flex-wrap gap-2 pt-1">
@@ -409,7 +535,153 @@
   </div>
 </div>
 
+<!-- About dialog --------------------------------------------------- -->
+<div id="aboutModal" class="modal-mask" role="dialog" aria-modal="true" aria-label="About EdgeLane Matrix">
+  <div class="modal-card space-y-2">
+    <div class="flex items-baseline justify-between gap-3">
+      <h3 class="text-slate-100">About EdgeLane <span class="text-emerald-400">Matrix</span></h3>
+      <button id="aboutCloseBtn" class="btn">Close</button>
+    </div>
+    <div class="doc-prose">
+      <p><strong>Cut the noise. Get to the trade — fast.</strong> No flipping through ten charts.
+         EdgeLane reads dealer GEX walls, bias, and live liquidity, then surfaces the
+         <strong>few</strong> spreads with real structural edge, each ranked on one composite
+         <strong>tradeability score</strong> (EV, health, liquidity, fill feasibility, PoP).
+         Fully deterministic math — AI only narrates, never decides.</p>
+      <h4>What makes it different</h4>
+      <ul>
+        <li><strong>Decision to execution in one click.</strong> Setup looks right → fire the full
+            multi-leg spread to a connected broker instantly. On SPX/NDX the level is gone in
+            30–60s — EdgeLane gives that time back to analysis and kills the fat-finger errors of
+            hand-keying four legs.</li>
+        <li><strong>No supported broker? Still instant.</strong> One click copies the ticket to paste
+            into your own broker's app — same speed, same accuracy edge.</li>
+        <li>Dealer-GEX walls with strength tiers — see where price pins and where it runs.</li>
+        <li>One honest score per spread, with fill feasibility built in — no wall of unranked chains.</li>
+        <li>Bias accuracy tracked over time, so the engine stays accountable to its own calls.</li>
+      </ul>
+      <h4>How <em>not</em> to use it</h4>
+      <ul>
+        <li class="dont">Not financial advice or a guaranteed outcome — it's a probabilistic edge.</li>
+        <li class="dont">Don't override liquidity flags and chase a spread you can't exit.</li>
+        <li class="dont">Don't oversize on a high score — it ranks edge, not position size.</li>
+      </ul>
+      <p class="text-[11px] text-slate-500">Options trading carries substantial risk. A research and
+         decision-support tool, not investment advice.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Contact dialog --------------------------------------------------- -->
+<div id="contactModal" class="modal-mask" role="dialog" aria-modal="true" aria-label="Contact EdgeLane Matrix">
+  <div class="modal-card space-y-3">
+    <div class="flex items-baseline justify-between gap-3">
+      <div>
+        <h3 class="text-slate-100">Contact us</h3>
+        <div class="text-xs text-slate-400 mt-0.5">Send a request — it opens a support ticket.</div>
+      </div>
+      <button id="contactCloseBtn" class="btn">Close</button>
+    </div>
+    <form id="contactForm" class="space-y-3">
+      <div>
+        <label for="contactName">Name</label>
+        <input id="contactName" type="text" autocomplete="name" maxlength="120" required />
+      </div>
+      <div>
+        <label for="contactEmail">Email</label>
+        <input id="contactEmail" type="email" autocomplete="email" maxlength="180" required />
+      </div>
+      <div>
+        <label for="contactMessage">Message</label>
+        <textarea id="contactMessage" rows="5" maxlength="5000" required
+                  style="background:#0f172a;border:1px solid rgba(120,140,170,.3);color:#e2e8f0;padding:.45rem .55rem;border-radius:6px;font-size:.85rem;width:100%;resize:vertical;"></textarea>
+      </div>
+      <div>
+        <label for="contactFile">Attachment <span class="text-slate-500 normal-case">(optional, max 5 MB)</span></label>
+        <input id="contactFile" type="file"
+               accept=".png,.jpg,.jpeg,.gif,.webp,.bmp,.svg,.pdf,.txt,.csv,.log,.json,.zip"
+               style="font-size:.78rem;color:#cbd5e1;" />
+      </div>
+      <div class="flex items-center justify-between flex-wrap gap-2 pt-1">
+        <span id="contactStatus" class="text-xs text-slate-400 min-h-[1rem]"></span>
+        <button id="contactSubmitBtn" type="submit" class="btn btn-primary">Submit ticket</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Auth gate — signup / signin overlay over the blurred dashboard ------- -->
+<div id="gateMask" class="gate-mask" role="dialog" aria-modal="true" aria-label="Sign in to EdgeLane">
+  <div class="gate-card">
+    <div class="glow-orb"></div>
+    <div class="gate-logo">
+      <span class="mark">
+        <svg width="22" height="22" viewBox="0 0 64 64" aria-hidden="true">
+          <rect x="8" y="18" width="34" height="4" fill="#022c22"/>
+          <rect x="8" y="30" width="34" height="4" fill="#022c22"/>
+          <rect x="8" y="42" width="34" height="4" fill="#022c22"/>
+          <rect x="48" y="18" width="4" height="28" fill="#022c22"/>
+          <rect x="48" y="30" width="9" height="4" fill="#022c22"/>
+        </svg>
+      </span>
+      <div>
+        <div class="text-lg font-black tracking-tight text-slate-50">EDGELANE <span class="text-emerald-400">MATRIX</span></div>
+        <div class="text-[10px] text-slate-500">Cut the noise. Trade the decided edge.</div>
+      </div>
+    </div>
+
+    <p id="gateEyebrow" class="gate-eyebrow mt-6">Welcome</p>
+    <h2 id="gateTitle" class="mt-1 text-xl font-bold text-white">Sign in to unlock the full dashboard</h2>
+    <p class="mt-1.5 text-sm text-slate-400">The top three signals are free. Sign in to reveal engine picks, all strategies, scoring, lookup &amp; live orders.</p>
+
+    <div class="flex mt-5 border-b border-slate-800">
+      <div id="gateTabSignIn" class="gate-tab active">Sign in</div>
+      <div id="gateTabSignUp" class="gate-tab">Create account</div>
+    </div>
+
+    <form id="gateForm" class="mt-5 space-y-3" autocomplete="on">
+      <div id="gateNameWrap" class="hidden">
+        <label class="text-xs font-medium text-slate-300" for="gateName">Full name</label>
+        <input id="gateName" type="text" class="gate-input" placeholder="Jane Trader" autocomplete="name" />
+      </div>
+      <div>
+        <label class="text-xs font-medium text-slate-300" for="gateEmail">Email address</label>
+        <input id="gateEmail" type="email" class="gate-input" placeholder="you@example.com" autocomplete="email" required />
+      </div>
+      <div>
+        <label class="text-xs font-medium text-slate-300" for="gatePassword">Password</label>
+        <input id="gatePassword" type="password" class="gate-input" placeholder="••••••••" autocomplete="current-password" required />
+      </div>
+
+      <!-- Cloudflare Turnstile renders here when a site key is configured. -->
+      <div id="gateTurnstile" class="mt-2 flex justify-center"></div>
+
+      <div id="gateError" class="text-sm text-rose-400 min-h-[1rem]"></div>
+      <div id="gateNotice" class="text-sm text-emerald-300 min-h-[1rem]"></div>
+      <div id="gateResendWrap" class="hidden text-sm text-slate-400">
+        Didn't get it? <span id="gateResend" class="gate-link">Resend confirmation</span>
+      </div>
+
+      <button id="gateSubmit" type="submit" class="gate-btn">Sign in</button>
+    </form>
+
+    <p class="mt-5 text-center text-sm text-slate-400">
+      <span id="gateSwitchPrompt">Don't have an account?</span>
+      <span id="gateSwitchLink" class="gate-link">Create one</span>
+    </p>
+
+    <div id="gateConfigWarn" class="hidden mt-4 text-[11px] text-amber-400/90 border border-amber-500/30 rounded-lg p-2 leading-snug">
+      Auth is not configured yet (no Supabase keys). Running in local dev-bypass mode — the full dashboard is open.
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="toast"></div>
+
+<!-- Deploy-time backend URL. Written by deploy.sh as window.__EDGELANE_API_BASE__
+     (the Cloudflare-tunnel URL). Absent/inert in local dev — the resolver below
+     falls back to same-origin / 127.0.0.1. Loaded before the resolver runs. -->
+<script src="edgelane.config.js"></script>
 
 <script>
 (() => {
@@ -417,12 +689,15 @@
   // API base URL resolver
   //   1. ?api=http://host:port query param (sticky — saved to localStorage)
   //   2. localStorage 'edgelane_api_base' (set by step 1 or manually)
-  //   3. Same origin as the UI if it's served over http(s) — common dev case
-  //   4. http://127.0.0.1:8789 (matches Makefile default PORT)
+  //   3. window.__EDGELANE_API_BASE__ (baked at deploy time — Vercel/prod)
+  //   4. Same origin as the UI if it's served over http(s) — common dev case
+  //   5. http://127.0.0.1:8789 (matches Makefile default PORT)
   // To override: open index.html?api=http://127.0.0.1:8788
   // To reset:    localStorage.removeItem('edgelane_api_base'); reload.
   // ───────────────────────────────────────────────────────────────────────
-  function _resolveApiBase() {
+  function _explicitOverride() {
+    // ?api and localStorage are sticky dev overrides — they win over everything,
+    // including the Supabase pointer. Returns the override URL or null.
     const url = new URL(location.href);
     const qp = url.searchParams.get('api');
     if (qp) {
@@ -433,12 +708,67 @@
       const stored = localStorage.getItem('edgelane_api_base');
       if (stored) return stored.replace(/\/+$/, '');
     } catch(e) {}
+    return null;
+  }
+  function _resolveApiBase() {
+    const ov = _explicitOverride();
+    if (ov) return ov;
+    // Deploy-baked backend URL (Vercel has no co-located backend, so prefer
+    // this over same-origin). null/absent when the backend URL is dynamic
+    // (Cloudflare quick tunnel) — then the Supabase pointer below supplies it.
+    if (typeof window.__EDGELANE_API_BASE__ === 'string' && window.__EDGELANE_API_BASE__) {
+      return window.__EDGELANE_API_BASE__.replace(/\/+$/, '');
+    }
     if ((location.protocol === 'http:' || location.protocol === 'https:') && location.host) {
       return `${location.protocol}//${location.host}`;
     }
     return 'http://127.0.0.1:8789';
   }
-  const API_BASE = _resolveApiBase();
+  let API_BASE = _resolveApiBase();
+
+  // ── Runtime service discovery ───────────────────────────────────────────
+  // The backend runs behind a Cloudflare *quick* tunnel whose hostname rotates
+  // on every cloudflared restart. The backend publishes its current URL to a
+  // public, anon-readable Supabase row (app_config.api_base) on each start; we
+  // read it here at load so rotations need no frontend redeploy. Explicit
+  // ?api/localStorage overrides always win (dev). Self-heals: getJSON re-reads
+  // the pointer and retries once on a network error (mid-session rotation).
+  async function _fetchApiBasePointer() {
+    const sUrl = window.__EDGELANE_SUPABASE_URL__, sKey = window.__EDGELANE_SUPABASE_ANON_KEY__;
+    if (!sUrl || !sKey) return null;   // dev-bypass (no Supabase) → keep sync fallback
+    try {
+      const r = await fetch(`${sUrl.replace(/\/+$/, '')}/rest/v1/app_config?select=value&key=eq.api_base`,
+        { headers: { apikey: sKey, Authorization: `Bearer ${sKey}` } });
+      if (!r.ok) return null;
+      const rows = await r.json();
+      const v = rows && rows[0] && rows[0].value;
+      return (typeof v === 'string' && v) ? v.replace(/\/+$/, '') : null;
+    } catch (e) { return null; }
+  }
+  async function resolveApiBasePointer() {
+    // Precedence: a CURRENT ?api= query param  >  baked __EDGELANE_API_BASE__
+    // (stable named tunnel / custom domain)  >  live Supabase pointer
+    // (quick-tunnel mode)  >  stale localStorage.
+    //
+    // NOTE: a persisted localStorage `edgelane_api_base` must NOT outrank the
+    // pointer here — otherwise a dev who once used ?api= (which stickies it to
+    // localStorage) can never reach the rotating tunnel: discovery would be
+    // skipped forever and the UI would hit a dead URL. localStorage still wins
+    // in dev-bypass (no Supabase → pointer is null → the sync fallback keeps it).
+    const qp = new URL(location.href).searchParams.get('api');
+    if (qp) return;   // explicit, current-session override wins
+    if (typeof window.__EDGELANE_API_BASE__ === 'string' && window.__EDGELANE_API_BASE__) return;
+    const ptr = await _fetchApiBasePointer();
+    if (ptr && ptr !== API_BASE) {
+      API_BASE = ptr;
+      // Refresh the sticky value so the next load's sync resolve starts correct.
+      try { localStorage.setItem('edgelane_api_base', ptr); } catch (e) {}
+      console.info('[edgelane] API_BASE (pointer) =', API_BASE);
+    }
+  }
+  // UI-owned version, auto-bumped by .githooks/pre-commit on any commit that
+  // touches this file (manual: tools/bump_ui_version.sh).
+  const UI_VERSION = '2.0.1';
   console.info('[edgelane] API_BASE =', API_BASE,
     '  (override with ?api=http://host:port; clear with localStorage.removeItem("edgelane_api_base"))');
 
@@ -473,6 +803,14 @@
   const TT_WALL_STR = "Tiered by |net_gex| magnitude relative to chain-wide max. high = dominant, medium = significant, low = present but weak.";
   const TT_LIQ = "Composite of bid-ask spread + per-leg open interest. high = tight spread + deep OI on every leg; low = wide spread or thin OI somewhere.";
   const TT_COMPOSITE = "Composite 0-100: EV cap +40, healthy badge +15, high liquidity +10, limit feasibility +10 to +30, POP tiebreaker. Centered at 50.";
+  // Engine-pick metric tooltips (per-contract, x100 = dollars per spread).
+  const TT_METRIC = {
+    net_premium: "Net premium — net cost (debit) or credit of the spread per share. Positive = you pay to open; negative = you collect. Multiply by 100 for dollars per contract.",
+    max_profit:  "Max profit — the most this spread can make at expiry, per share, if it lands in the ideal zone. Caps your upside on a defined-risk spread.",
+    max_loss:    "Max loss — the worst case at expiry, per share. Your defined risk: the most you can lose no matter how far the underlying moves against you.",
+    pop_pct:     "POP — probability of profit: model-estimated chance the spread expires at or above breakeven, from strike distance and implied vol. Higher = more likely to win, not bigger wins.",
+    ev:          "EV — expected value per share: POP-weighted blend of the win and loss outcomes. Positive EV = the math favors the trade over many repeats; it's the core edge signal.",
+  };
   const TT_HEALTH = {
     healthy:      "Healthy — strikes outside the wall, balanced delta, premium worth the capital. Default state for a tradeable spread.",
     thin:         "Thin — premium is small relative to max loss. Risk/reward is unfavorable; consider passing or widening strikes.",
@@ -499,6 +837,15 @@
     clearTimeout(t._tt); t._tt = setTimeout(() => t.classList.remove('show'), 1800);
   }
 
+  // Show a busy (progress) mouse cursor while an async action runs. Nestable —
+  // a counter keeps the cursor up until the last concurrent task finishes.
+  let _busyDepth = 0;
+  async function withBusy(fn) {
+    _busyDepth++; document.body.classList.add('busy');
+    try { return await fn(); }
+    finally { if (--_busyDepth <= 0) { _busyDepth = 0; document.body.classList.remove('busy'); } }
+  }
+
   function showError(msg) {
     const box = $('errBox');
     box.textContent = String(msg);
@@ -508,7 +855,15 @@
 
   // ── fetch helpers ──
   async function getJSON(path) {
-    const r = await fetch(`${API_BASE}${path}`, { mode:'cors' });
+    let r;
+    try {
+      r = await fetch(`${API_BASE}${path}`, { mode:'cors', headers: _authHeaders() });
+    } catch (netErr) {
+      // Network-level failure (tunnel rotated / backend unreachable): re-read
+      // the Supabase pointer for a fresh URL and retry once before giving up.
+      await resolveApiBasePointer();
+      r = await fetch(`${API_BASE}${path}`, { mode:'cors', headers: _authHeaders() });
+    }
     if (r.status === 404) return { __404: true };
     if (!r.ok) throw new Error(`${path} → HTTP ${r.status}`);
     return r.json();
@@ -518,7 +873,8 @@
   function renderStatus(st) {
     state.status = st;
     if (!st) return;
-    $('version').textContent = `v${st.version || ''}`;
+    $('version').textContent = `v${UI_VERSION}`;
+    $('version').title = `UI v${UI_VERSION} · backend v${st.version || '?'}`;
     const polling = !!st.polling;
     const mock = !!st.using_mock;
     // Mode pill
@@ -654,10 +1010,11 @@
 
     // Walls
     $('putWall').textContent  = fmt.strike(bias.put_wall_strike);
-    $('putWallStr').textContent  = bias.put_wall_strength ? `${bias.put_wall_strength} · gex ${fmt.sigInt(bias.put_wall_net_gex)}` : '';
+    // Provider (Tradytics) sign: display = −(internal net_gex) so put → negative, call → positive.
+    $('putWallStr').textContent  = bias.put_wall_strength ? `${bias.put_wall_strength} · gex ${fmt.sigInt(bias.put_wall_net_gex == null ? null : -bias.put_wall_net_gex)}` : '';
     $('putWallStr').title = TT_WALL_STR;
     $('callWall').textContent = fmt.strike(bias.call_wall_strike);
-    $('callWallStr').textContent = bias.call_wall_strength ? `${bias.call_wall_strength} · gex ${fmt.sigInt(bias.call_wall_net_gex)}` : '';
+    $('callWallStr').textContent = bias.call_wall_strength ? `${bias.call_wall_strength} · gex ${fmt.sigInt(bias.call_wall_net_gex == null ? null : -bias.call_wall_net_gex)}` : '';
     $('callWallStr').title = TT_WALL_STR;
     $('gexWall').textContent  = fmt.strike(bias.gex_wall_strike);
     $('gexWallStr').textContent  = bias.gex_wall_strength ? `${bias.gex_wall_strength} · ${bias.gex_wall_type||''}` : '';
@@ -676,11 +1033,11 @@
       $('pickVerdict').title = TT_VERDICT[(v.label||'').toLowerCase()] || '';
       $('pickStructure').textContent = pick.structure_text || '';
       $('pickMetrics').innerHTML = `
-        <div><div class="text-slate-500">Net prem</div><div>${fmt.money(pick.net_premium)}</div></div>
-        <div><div class="text-slate-500">Max P</div><div class="text-emerald-300">${fmt.money(pick.max_profit)}</div></div>
-        <div><div class="text-slate-500">Max L</div><div class="text-rose-300">${fmt.money(pick.max_loss)}</div></div>
-        <div><div class="text-slate-500">POP</div><div>${fmt.pct(pick.pop_pct,1)}</div></div>
-        <div><div class="text-slate-500">EV</div><div>${fmt.money(pick.ev,2)}</div></div>
+        <div><div class="text-slate-500 tt" title="${TT_METRIC.net_premium}">Net prem</div><div>${fmt.money(pick.net_premium)}</div></div>
+        <div><div class="text-slate-500 tt" title="${TT_METRIC.max_profit}">Max P</div><div class="text-emerald-300">${fmt.money(pick.max_profit)}</div></div>
+        <div><div class="text-slate-500 tt" title="${TT_METRIC.max_loss}">Max L</div><div class="text-rose-300">${fmt.money(pick.max_loss)}</div></div>
+        <div><div class="text-slate-500 tt" title="${TT_METRIC.pop_pct}">POP</div><div>${fmt.pct(pick.pop_pct,1)}</div></div>
+        <div><div class="text-slate-500 tt" title="${TT_METRIC.ev}">EV</div><div>${fmt.money(pick.ev,2)}</div></div>
       `;
     } else {
       $('pickCard').classList.add('hidden');
@@ -870,9 +1227,12 @@
   }
 
   function _readBrokerAccountId() {
-    // sessionStorage holds per-user broker connections keyed by
-    // `edgelane_broker_connections_v1_{userId}`. We don't know the userId
-    // here, so scan all matching keys for an active tradier connection.
+    // Prefer the active per-user broker connection synced from Supabase.
+    try {
+      const active = (_connCache || []).find(c => c.is_active) || (_connCache || [])[0];
+      if (active && active.tradier_account_id) return active.tradier_account_id;
+    } catch (_) {}
+    // Legacy fallback: sessionStorage broker connections from the single-file app.
     try {
       for (let i = 0; i < sessionStorage.length; i++) {
         const k = sessionStorage.key(i);
@@ -936,7 +1296,7 @@
     // via /status); fall back to sessionStorage broker connection.
     const cfgAcc = (state.status && state.status.tradier_account_id) || '';
     $('orderAccount').value = cfgAcc || _readBrokerAccountId() || '';
-    $('orderPreviewPane').textContent = 'No preview yet. Click "Preview" to validate against Tradier.';
+    $('orderPreviewPane').textContent = 'No preview yet. Click "Preview" to validate against your broker.';
     $('orderStatus').textContent = '';
     $('orderSubmitBtn').disabled = true;
 
@@ -968,7 +1328,7 @@
     const r = await fetch(`${API_BASE}${path}`, {
       method: 'POST',
       mode: 'cors',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ..._authHeaders() },
       body: JSON.stringify(body),
     });
     let payload = null;
@@ -983,9 +1343,17 @@
     $('orderPreviewPane').textContent = '';
     $('orderSubmitBtn').disabled = true;
     orderModal.previewOk = false;
-    const { ok, status, payload } = await _postOrder('/orders/preview', body);
+    const { ok, status, payload } = await withBusy(() => _postOrder('/orders/preview', body));
     $('orderPreviewPane').textContent = JSON.stringify(payload, null, 2);
-    if (ok) {
+    if (ok && payload && payload.broker === 'webull') {
+      // Webull preview: success = HTTP 200 with an estimate (no Tradier-style
+      // order.status / rejection field).
+      const est = payload.webull_response || {};
+      const cost = (est.estimated_cost != null) ? ` · est cost ${est.estimated_cost}` : '';
+      $('orderStatus').innerHTML = `<span class="text-emerald-300">Preview OK${cost}</span>`;
+      orderModal.previewOk = true;
+      $('orderSubmitBtn').disabled = false;
+    } else if (ok) {
       const order = (payload && payload.tradier_response && payload.tradier_response.order) || {};
       const st = (order.status || 'ok').toLowerCase();
       const rejected = order.result === false || st === 'rejected';
@@ -1007,7 +1375,7 @@
     const body = _buildOrderReq();
     body.confirm = true;
     $('orderStatus').textContent = 'Submitting live…';
-    const { ok, status, payload } = await _postOrder('/orders/submit', body);
+    const { ok, status, payload } = await withBusy(() => _postOrder('/orders/submit', body));
     $('orderPreviewPane').textContent = JSON.stringify(payload, null, 2);
     if (ok) {
       const oid = payload.order_id || '?';
@@ -1176,74 +1544,492 @@
     }
   }
   $('symbolSel').addEventListener('change', (e) => { state.symbol = e.target.value; poll(); pollAccuracy(); renderLookup(); });
-  $('refreshBtn').addEventListener('click', () => { poll(); pollAccuracy(); });
 
   // ═══════════════════════════════════════════════════════════════════════
-  // Feature 3 — Profile circle + Settings panel
+  // Auth + gating (Supabase) · per-user broker connections · notifications
   // ═══════════════════════════════════════════════════════════════════════
-  const USER_KEY = 'edgelane_user_v1';
+  // The Vercel frontend talks to Supabase directly for signup/login and for
+  // RLS-scoped reads/writes (broker_configs, user_settings). The backend only
+  // verifies the JWT it receives. Until Supabase keys are configured we run in
+  // dev-bypass: gates open, full dashboard, no login (matches AUTH_ENABLED=false).
   const POLL_INTERVAL_KEY = 'edgelane_poll_interval_v1';
 
-  function _loadUser() {
-    try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null'); } catch { return null; }
-  }
-  function _saveUser(u) {
-    try { localStorage.setItem(USER_KEY, JSON.stringify(u)); } catch {}
+  const AUTH = {
+    configured: false, devBypass: false, ready: false,
+    session: null, user: null, anonToken: null, mode: 'signin', turnstileId: null,
+  };
+  let supa = null;
+  let authChannel = null;   // BroadcastChannel for cross-tab sign-out (same origin)
+
+  // Cross-tab sign-out: with per-tab sessionStorage sessions, Supabase's
+  // localStorage-based multi-tab sync doesn't fire. So we broadcast our own
+  // signout, SCOPED to the user id — signing out user A's tab must not log out
+  // a different user B signed in elsewhere. Duplicated tabs share the same
+  // user id, so they follow each other out.
+  function _initAuthChannel(ref) {
+    if (typeof window.BroadcastChannel === 'undefined') return;
+    try {
+      authChannel = new window.BroadcastChannel(`edgelane-auth-bc-${ref}`);
+      authChannel.onmessage = (ev) => {
+        const m = (ev && ev.data) || {};
+        if (m.type === 'signout' && AUTH.user && AUTH.user.id === m.userId) {
+          _localSignOut();            // do NOT re-broadcast — avoids a loop
+          toast('Signed out in another tab');
+        }
+      };
+    } catch (_) { authChannel = null; }
   }
 
-  function _renderSettings() {
-    const u = _loadUser() || { displayName: 'Operator' };
-    $('settingsUserName').textContent = u.displayName || 'Operator';
-    $('profileInitial').textContent = (u.displayName || 'O').trim()[0].toUpperCase();
-    // Tradier env from /status
-    const st = state.status || {};
-    const env = (st.tradier_env || 'production').toLowerCase();
-    document.querySelectorAll('input[name="tradierEnv"]').forEach(el => {
-      el.checked = (el.value === env);
-    });
-    if (st.using_mock) {
-      $('brokerStatus').innerHTML = '<span class="text-amber-300">● MOCK mode</span> — no live Tradier token configured';
-    } else {
-      $('brokerStatus').innerHTML = `<span class="text-emerald-300">● Connected</span> · ${env.toUpperCase()}`;
+  // Clear this tab's auth state + stored token (no broadcast).
+  function _localSignOut() {
+    if (supa) { try { supa.auth.signOut(); } catch (_) {} }
+    AUTH.session = null; AUTH.user = null; _connCache = [];
+    applyGate();
+  }
+
+  function _authConfig() {
+    const s = (v) => (typeof v === 'string' && v) ? v : '';
+    return {
+      url:       s(window.__EDGELANE_SUPABASE_URL__),
+      anon:      s(window.__EDGELANE_SUPABASE_ANON_KEY__),
+      turnstile: s(window.__EDGELANE_TURNSTILE_SITE_KEY__),
+    };
+  }
+  function isFull() { return AUTH.devBypass || !!AUTH.session; }
+  function _authHeaders() {
+    if (AUTH.session && AUTH.session.access_token) return { Authorization: `Bearer ${AUTH.session.access_token}` };
+    if (AUTH.anonToken) return { 'X-EdgeLane-Session': AUTH.anonToken };
+    return {};
+  }
+
+  async function initAuth() {
+    const cfg = _authConfig();
+    AUTH.configured = !!(cfg.url && cfg.anon && window.supabase);
+    if (!AUTH.configured) {
+      AUTH.devBypass = true; AUTH.ready = true;
+      $('gateConfigWarn').classList.remove('hidden');
+      applyGate();
+      return;
     }
-    $('brokerAccount').textContent = st.tradier_account_id || '(auto-resolving…)';
-    const ival = parseInt(localStorage.getItem(POLL_INTERVAL_KEY) || '5', 10);
-    $('pollInt').value = ival;
-    $('pollIntLabel').textContent = ival;
+    try {
+      // Per-TAB session isolation: persist the Supabase session in
+      // sessionStorage, not the default localStorage. Consequences (all wanted):
+      //   • two different users in two tabs of the SAME origin never overwrite
+      //     each other's token (localStorage is shared per-origin; sessionStorage
+      //     is per-tab);
+      //   • duplicating a signed-in tab carries the session — browsers copy
+      //     sessionStorage into the duplicate, so it auto-signs-in;
+      //   • a brand-new tab starts signed-out (the per-tab model).
+      // Local (localhost) vs prod (deployed domain) are already isolated because
+      // they are different origins. The storageKey is scoped by Supabase URL so
+      // two EdgeLane deployments sharing one origin still don't collide.
+      let store;
+      try { window.sessionStorage.setItem('__el_probe', '1'); window.sessionStorage.removeItem('__el_probe'); store = window.sessionStorage; }
+      catch (_) { store = undefined; }   // sandboxed context → let Supabase default to localStorage
+      const ref = (cfg.url.match(/https?:\/\/([^.]+)\./) || [])[1] || 'edgelane';
+      supa = window.supabase.createClient(cfg.url, cfg.anon, {
+        auth: {
+          storage: store,
+          storageKey: `edgelane-auth-${ref}`,
+          persistSession: true,
+          autoRefreshToken: true,
+          detectSessionInUrl: true,
+        },
+      });
+      _initAuthChannel(ref);
+    }
+    catch (e) {
+      console.error('[auth] supabase init failed — falling back to dev-bypass', e);
+      AUTH.devBypass = true; AUTH.ready = true; applyGate(); return;
+    }
+    try {
+      const { data } = await supa.auth.getSession();
+      AUTH.session = (data && data.session) || null;
+      AUTH.user = AUTH.session ? AUTH.session.user : null;
+    } catch (e) { console.warn('[auth] getSession failed', e); }
+    AUTH.ready = true;
+
+    supa.auth.onAuthStateChange((_evt, session) => {
+      AUTH.session = session || null;
+      AUTH.user = session ? session.user : null;
+      applyGate();
+      if (isFull()) { poll(); pollAccuracy(); }
+    });
+
+    // Show the gate first so the Turnstile widget renders into a visible
+    // container, then mint the anonymous teaser session.
+    applyGate();
+    if (!AUTH.session) await _ensureAnonSession();
   }
 
+  // Anonymous teaser session: Turnstile → POST /session/anon → X-EdgeLane-Session.
+  async function _ensureAnonSession() {
+    const cfg = _authConfig();
+    if (!cfg.turnstile) { await _mintAnon(null); return; }   // dev backends mint without a token
+    if (!window.turnstile) { setTimeout(_ensureAnonSession, 400); return; }
+    if (AUTH.turnstileId != null) return;
+    try {
+      AUTH.turnstileId = window.turnstile.render('#gateTurnstile', {
+        sitekey: cfg.turnstile, theme: 'dark', size: 'flexible',
+        callback: (tok) => _mintAnon(tok),
+        // Don't let a Turnstile failure (e.g. error 110200 = the widget's
+        // allowed-domains list doesn't include this hostname) throw uncaught or
+        // hard-block the page. Signed-in users never need the teaser session.
+        'error-callback': (code) => {
+          console.warn('[auth] Turnstile error', code, '— teaser disabled; sign in for full access');
+          return true;   // swallow so the SDK doesn't rethrow
+        },
+        'timeout-callback': () => console.warn('[auth] Turnstile timed out'),
+      });
+    } catch (e) { console.warn('[auth] turnstile render failed', e); }
+  }
+  async function _mintAnon(token) {
+    try {
+      const r = await fetch(`${API_BASE}/session/anon`, {
+        method: 'POST', mode: 'cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ turnstile_token: token }),
+      });
+      if (r.ok) { const j = await r.json(); AUTH.anonToken = j.session_token || null; poll(); }
+    } catch (_) { /* teaser stays in placeholder until a token lands */ }
+  }
+
+  function applyGate() {
+    const full = isFull();
+    const showGate = !full && !AUTH.devBypass;
+    document.querySelectorAll('[data-gated]').forEach(el => el.classList.toggle('locked-blur', !full));
+    $('gateMask').classList.toggle('show', showGate);
+    // While gated there's no user, so hide the profile avatar + settings panel
+    // (a "Sign out" there is bogus) and lock background scroll — true modal.
+    $('profileWrap').classList.toggle('hidden', showGate);
+    if (showGate) toggleSettings(false);
+    document.body.style.overflow = showGate ? 'hidden' : '';
+    renderProfile();
+    if (full && supa && AUTH.user) { loadBrokerConnections(); loadNotifications(); }
+  }
+
+  function renderProfile() {
+    const initEl = $('profileInitial');
+    if (AUTH.devBypass) {
+      initEl.textContent = 'O';
+      $('settingsUserName').textContent = 'Operator';
+      $('settingsUserEmail').textContent = 'local dev session';
+      return;
+    }
+    const u = AUTH.user;
+    if (!u) { initEl.textContent = '·'; $('settingsUserName').textContent = 'Guest'; $('settingsUserEmail').textContent = 'not signed in'; return; }
+    const name = (u.user_metadata && u.user_metadata.full_name) || u.email || 'Account';
+    initEl.textContent = ((name || '?').trim()[0] || '?').toUpperCase();
+    $('settingsUserName').textContent = name;
+    $('settingsUserEmail').textContent = u.email || '';
+  }
+
+  // ── Gate form: sign in / sign up tabs ──────────────────────────────────
+  function _setGateMode(mode) {
+    AUTH.mode = mode;
+    const signup = mode === 'signup';
+    $('gateTabSignIn').classList.toggle('active', !signup);
+    $('gateTabSignUp').classList.toggle('active', signup);
+    $('gateNameWrap').classList.toggle('hidden', !signup);
+    $('gateTitle').textContent = signup ? 'Create your EdgeLane account' : 'Sign in to unlock the full dashboard';
+    $('gateEyebrow').textContent = signup ? 'Get started' : 'Welcome';
+    $('gateSubmit').textContent = signup ? 'Create account' : 'Sign in';
+    $('gateSwitchPrompt').textContent = signup ? 'Already have an account?' : "Don't have an account?";
+    $('gateSwitchLink').textContent = signup ? 'Sign in' : 'Create one';
+    $('gatePassword').setAttribute('autocomplete', signup ? 'new-password' : 'current-password');
+    $('gateError').textContent = ''; $('gateNotice').textContent = '';
+    $('gateResendWrap').classList.add('hidden');
+  }
+  $('gateTabSignIn').addEventListener('click', () => _setGateMode('signin'));
+  $('gateTabSignUp').addEventListener('click', () => _setGateMode('signup'));
+  $('gateSwitchLink').addEventListener('click', () => _setGateMode(AUTH.mode === 'signup' ? 'signin' : 'signup'));
+
+  const _emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  $('gateForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!supa) { $('gateError').textContent = 'Auth is not configured.'; return; }
+    const email = $('gateEmail').value.trim();
+    const password = $('gatePassword').value;
+    const name = $('gateName').value.trim();
+    $('gateError').textContent = ''; $('gateNotice').textContent = '';
+    if (!_emailRe.test(email)) { $('gateError').textContent = 'Enter a valid email address.'; return; }
+    if (!password) { $('gateError').textContent = 'Enter your password.'; return; }
+    const btn = $('gateSubmit'); const prev = btn.textContent;
+    btn.disabled = true; btn.textContent = AUTH.mode === 'signup' ? 'Creating…' : 'Signing in…';
+    try {
+      await withBusy(async () => {
+        if (AUTH.mode === 'signup') {
+          const { data, error } = await supa.auth.signUp({ email, password, options: { data: { full_name: name }, emailRedirectTo: location.origin + location.pathname } });
+          if (error) { $('gateError').textContent = error.message; }
+          else if (!data.session) {
+            AUTH._pendingEmail = email;
+            _setGateMode('signin');
+            $('gateNotice').textContent = 'Account created. Check your email to confirm (link expires in 24 hours), then sign in.';
+            $('gateResendWrap').classList.remove('hidden');
+          }
+          // a returned session triggers onAuthStateChange → gate closes
+        } else {
+          const { error } = await supa.auth.signInWithPassword({ email, password });
+          if (error) {
+            $('gateError').textContent = error.message;
+            if (/confirm/i.test(error.message)) {   // "Email not confirmed" → offer resend
+              AUTH._pendingEmail = email;
+              $('gateResendWrap').classList.remove('hidden');
+            }
+          }
+        }
+      });
+    } catch (err) { $('gateError').textContent = err.message || 'Unexpected error.'; }
+    finally { btn.disabled = false; btn.textContent = prev; }
+  });
+
+  $('gateResend').addEventListener('click', async () => {
+    const email = AUTH._pendingEmail || $('gateEmail').value.trim();
+    if (!supa || !_emailRe.test(email)) { $('gateError').textContent = 'Enter the email you signed up with first.'; return; }
+    const link = $('gateResend'); link.textContent = 'Sending…'; link.style.pointerEvents = 'none';
+    $('gateError').textContent = ''; $('gateNotice').textContent = '';
+    try {
+      await withBusy(async () => {
+        const { error } = await supa.auth.resend({ type: 'signup', email, options: { emailRedirectTo: location.origin + location.pathname } });
+        if (error) $('gateError').textContent = error.message;
+        else $('gateNotice').textContent = 'Confirmation email resent (link expires in 24 hours). Check your inbox.';
+      });
+    } catch (err) { $('gateError').textContent = err.message || 'Could not resend.'; }
+    finally { link.textContent = 'Resend confirmation'; link.style.pointerEvents = ''; }
+  });
+
+  // ── Broker connections (per-user, persisted to Supabase broker_configs) ─
+  let _connCache = [];
+
+  async function loadBrokerConnections() {
+    if (!supa || !AUTH.user) return;
+    $('brokerSyncState').textContent = 'syncing…';
+    const { data, error } = await supa.from('broker_configs')
+      .select('*').eq('user_id', AUTH.user.id).order('created_at', { ascending: true });
+    if (error) { $('brokerSyncState').textContent = 'sync error'; console.error('[broker]', error); return; }
+    _connCache = data || [];
+    $('brokerSyncState').textContent = `${_connCache.length} saved`;
+    renderConnList();
+  }
+
+  function renderConnList() {
+    const host = $('connList');
+    if (!_connCache.length) {
+      host.innerHTML = '<div class="text-[11px] text-slate-500 italic">No broker connected yet.</div>';
+      return;
+    }
+    host.innerHTML = _connCache.map(c => {
+      const active = !!c.is_active;
+      const nm = (c.broker || 'tradier'); const Nm = nm.charAt(0).toUpperCase() + nm.slice(1);
+      const isWb = nm === 'webull';
+      const env = isWb ? (c.webull_env || '') : (c.tradier_env || '');
+      const acct = (isWb ? c.webull_account_id : c.tradier_account_id) || '—';
+      const last4 = isWb ? (c.webull_app_key_last4 || '') : (c.token_last4 || (c.tradier_token || '').slice(-4));
+      const credLabel = isWb ? 'app key' : 'token';
+      return `<div class="conn-card ${active ? 'active' : ''}">
+        <div class="flex items-center justify-between">
+          <div class="text-sm font-semibold text-slate-100">${Nm}
+            ${active ? '<span class="text-[8px] uppercase bg-emerald-700 text-emerald-50 px-1 py-0.5 rounded ml-1">Default</span>' : ''}</div>
+          <span class="text-[10px] text-slate-500">${env}</span>
+        </div>
+        <div class="text-[10px] text-slate-500 font-mono mt-0.5">acct ${acct} · ${credLabel} ••••${last4}</div>
+        <div id="connTest_${c.id}" class="text-[10px] mt-1"></div>
+        <div class="flex flex-wrap gap-1 mt-2">
+          ${active ? '' : `<button class="conn-mini-btn" data-conn-act="default" data-id="${c.id}">Set default</button>`}
+          <button class="conn-mini-btn" data-conn-act="test" data-id="${c.id}">Test</button>
+          <button class="conn-mini-btn" data-conn-act="edit" data-id="${c.id}">Edit</button>
+          <button class="conn-mini-btn danger ml-auto" data-conn-act="remove" data-id="${c.id}">Remove</button>
+        </div>
+      </div>`;
+    }).join('');
+    host.querySelectorAll('[data-conn-act]').forEach(b =>
+      b.addEventListener('click', () => _connAction(b.dataset.connAct, b.dataset.id)));
+  }
+
+  // Short setup warning for Webull (matches the backend's WEBULL_AUTH_HINT).
+  const WEBULL_SETUP_HINT = 'Webull production requires the account owner to authorize the app for trading before its token activates.';
+
+  function _tradierFields(c, existing, esc) {
+    return `
+      <div><label class="text-[10px] text-slate-400">Access token</label>
+        <input id="cfToken" type="password" class="w-full font-mono" value="" placeholder="${existing ? 'Leave blank to keep current token' : 'Tradier bearer token'}" autocomplete="off" spellcheck="false" />
+        ${existing && c.token_last4 ? `<div class="text-[9px] text-slate-500 font-mono mt-0.5">current ••••${c.token_last4}</div>` : ''}</div>
+      <div><label class="text-[10px] text-slate-400">Account id</label>
+        <input id="cfAccount" type="text" class="w-full font-mono" value="${esc(c.tradier_account_id)}" placeholder="VA00000000" autocomplete="off" spellcheck="false" /></div>
+      <div><label class="text-[10px] text-slate-400">Environment</label>
+        <select id="cfEnv" class="w-full">
+          <option value="sandbox" ${c.tradier_env === 'sandbox' ? 'selected' : ''}>Sandbox (paper trading)</option>
+          <option value="production" ${c.tradier_env === 'production' ? 'selected' : ''}>Production (real money)</option>
+        </select></div>`;
+  }
+  function _webullFields(c, existing, esc) {
+    return `
+      <div class="text-[9px] text-amber-300/80 leading-snug">${WEBULL_SETUP_HINT}</div>
+      <div><label class="text-[10px] text-slate-400">App key</label>
+        <input id="cfWbKey" type="password" class="w-full font-mono" value="" placeholder="${existing ? 'Leave blank to keep' : 'Webull OpenAPI app key'}" autocomplete="off" spellcheck="false" />
+        ${existing && c.webull_app_key_last4 ? `<div class="text-[9px] text-slate-500 font-mono mt-0.5">current ••••${c.webull_app_key_last4}</div>` : ''}</div>
+      <div><label class="text-[10px] text-slate-400">App secret</label>
+        <input id="cfWbSecret" type="password" class="w-full font-mono" value="" placeholder="${existing ? 'Leave blank to keep' : 'Webull OpenAPI app secret'}" autocomplete="off" spellcheck="false" /></div>
+      <div><label class="text-[10px] text-slate-400">Account id <span class="text-slate-600">(optional)</span></label>
+        <input id="cfWbAccount" type="text" class="w-full font-mono" value="${esc(c.webull_account_id)}" placeholder="auto-resolved if blank" autocomplete="off" spellcheck="false" /></div>
+      <div><label class="text-[10px] text-slate-400">Environment</label>
+        <select id="cfWbEnv" class="w-full">
+          <option value="uat" ${c.webull_env === 'uat' ? 'selected' : ''}>Paper (UAT)</option>
+          <option value="production" ${(c.webull_env === 'production' || !c.webull_env) ? 'selected' : ''}>Production (real money)</option>
+        </select></div>`;
+  }
+
+  function showConnForm(existing) {
+    const c = existing || { broker: 'tradier', tradier_env: 'sandbox' };
+    const esc = (v) => String(v || '').replace(/"/g, '&quot;');
+    const fields = (broker) => broker === 'webull' ? _webullFields(c, existing, esc) : _tradierFields(c, existing, esc);
+    $('connFormHost').innerHTML = `
+      <form id="connForm" class="conn-card active space-y-2 mt-2">
+        <div class="text-[9px] uppercase tracking-wider text-slate-500">${existing ? 'Edit' : 'New'} connection</div>
+        <div><label class="text-[10px] text-slate-400">Broker</label>
+          <select id="cfBroker" class="w-full" ${existing ? 'disabled' : ''}>
+            <option value="tradier" ${c.broker === 'tradier' ? 'selected' : ''}>Tradier</option>
+            <option value="webull" ${c.broker === 'webull' ? 'selected' : ''}>Webull</option>
+          </select></div>
+        <div id="cfFields" class="space-y-2">${fields(c.broker || 'tradier')}</div>
+        <div class="flex gap-2 justify-end pt-1">
+          <button type="button" id="cfCancel" class="conn-mini-btn">Cancel</button>
+          <button type="submit" class="conn-mini-btn" style="background:rgba(34,197,94,.18);border-color:rgba(34,197,94,.45);color:#bbf7d0;">${existing ? 'Save' : 'Save & add'}</button>
+        </div>
+      </form>`;
+    $('addConnBtn').classList.add('hidden');
+    $('cfCancel').addEventListener('click', _closeConnForm);
+    // Switching broker re-renders the field set (only when adding — broker is fixed on edit).
+    const sel = $('cfBroker');
+    if (sel && !existing) sel.addEventListener('change', () => { $('cfFields').innerHTML = fields(sel.value); });
+    $('connForm').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const broker = existing ? existing.broker : $('cfBroker').value;
+      let row;
+      if (broker === 'webull') {
+        row = { broker: 'webull', webull_region: 'us',
+                webull_env: $('cfWbEnv').value,
+                webull_account_id: $('cfWbAccount').value.trim() || null };
+        const k = $('cfWbKey').value.trim(), s = $('cfWbSecret').value.trim();
+        if (k) row.webull_app_key = k;          // omit on edit → backend keeps existing (encrypted) value
+        if (s) row.webull_app_secret = s;
+        if (!existing && (!k || !s)) { toast('App key and secret required'); return; }
+      } else {
+        row = { broker: 'tradier',
+                tradier_account_id: $('cfAccount').value.trim() || null,
+                tradier_env: $('cfEnv').value };
+        const t = $('cfToken').value.trim();
+        if (t) row.tradier_token = t;
+        if (!existing && !t) { toast('Access token required'); return; }
+      }
+      await withBusy(() => existing ? _updateConn(existing.id, row) : _insertConn(row));
+      _closeConnForm();
+    });
+  }
+  function _closeConnForm() { $('connFormHost').innerHTML = ''; $('addConnBtn').classList.remove('hidden'); }
+  $('addConnBtn').addEventListener('click', () => showConnForm(null));
+
+  async function _deactivateAll() {
+    await supa.from('broker_configs').update({ is_active: false }).eq('user_id', AUTH.user.id);
+  }
+  async function _insertConn(row) {
+    if (!supa || !AUTH.user) return;
+    // Auto-default when the user has no active connection yet (first one, or none
+    // currently marked default) — so a lone broker works without "Set default".
+    const makeActive = !_connCache.some(c => c.is_active);
+    if (makeActive) await _deactivateAll();
+    const { error } = await supa.from('broker_configs').insert({ ...row, user_id: AUTH.user.id, is_active: makeActive });
+    if (error) { toast('Save failed: ' + error.message); return; }
+    toast('Broker connection saved'); await loadBrokerConnections();
+  }
+  async function _updateConn(id, row) {
+    const { error } = await supa.from('broker_configs').update(row).eq('id', id).eq('user_id', AUTH.user.id);
+    if (error) { toast('Update failed: ' + error.message); return; }
+    toast('Connection updated'); await loadBrokerConnections();
+  }
+  async function _setDefault(id) {
+    await _deactivateAll();
+    const { error } = await supa.from('broker_configs').update({ is_active: true }).eq('id', id).eq('user_id', AUTH.user.id);
+    if (error) { toast('Failed to set default'); return; }
+    toast('Default broker set'); await loadBrokerConnections();
+  }
+  async function _removeConn(id) {
+    if (!confirm('Remove this broker connection?')) return;
+    const wasActive = (_connCache.find(c => c.id === id) || {}).is_active;
+    await supa.from('broker_configs').delete().eq('id', id).eq('user_id', AUTH.user.id);
+    if (wasActive) {
+      const next = _connCache.find(c => c.id !== id);
+      if (next) { await _deactivateAll(); await supa.from('broker_configs').update({ is_active: true }).eq('id', next.id).eq('user_id', AUTH.user.id); }
+    }
+    toast('Connection removed'); await loadBrokerConnections();
+  }
+  async function _testConn(id) {
+    const c = _connCache.find(x => x.id === id); if (!c) return;
+    const out = $(`connTest_${c.id}`); if (!out) return;
+    out.textContent = 'testing…'; out.className = 'text-[10px] mt-1 text-slate-400';
+    // Token is encrypted at rest and never returned to the browser, so the
+    // backend decrypts it server-side and probes Tradier on our behalf.
+    try {
+      await withBusy(async () => {
+        const r = await fetch(`${API_BASE}/broker/test`, {
+          method: 'POST', mode: 'cors',
+          headers: { 'Content-Type': 'application/json', ..._authHeaders() },
+          body: JSON.stringify({ id: c.id }),
+        });
+        const j = await r.json().catch(() => ({}));
+        // Webull (and any broker) may return a short setup `hint` to show inline.
+        const hint = j.hint ? `<div class="text-[9px] text-amber-300/80 mt-0.5">${j.hint}</div>` : '';
+        if (!r.ok || !j.ok) {
+          out.innerHTML = `<span class="text-rose-300">✗ ${j.status ? 'HTTP ' + j.status : (j.error || j.detail || 'failed')}</span>${hint}`;
+          return;
+        }
+        out.innerHTML = `<span class="text-emerald-300">✓ connected${j.account_id ? ' · ' + j.account_id : ''}</span>${hint}`;
+      });
+    } catch (e) {
+      out.innerHTML = `<span class="text-rose-300">✗ ${e.message || 'unreachable'}</span>`;
+    }
+  }
+  function _connAction(act, id) {
+    if (act === 'default') return _setDefault(id);
+    if (act === 'test')    return _testConn(id);
+    if (act === 'edit')    return showConnForm(_connCache.find(c => c.id === id));
+    if (act === 'remove')  return _removeConn(id);
+  }
+
+  // ── Notification settings (per-user, persisted to Supabase user_settings) ─
+  const NOTIF_KEYS = ['email_fills', 'email_regime_shift', 'email_daily_summary'];
+  const NOTIF_DEFAULTS = { email_fills: true, email_regime_shift: true, email_daily_summary: false };
+  async function loadNotifications() {
+    if (!supa || !AUTH.user) return;
+    const { data } = await supa.from('user_settings').select('notifications').eq('user_id', AUTH.user.id).maybeSingle();
+    const n = (data && data.notifications) || NOTIF_DEFAULTS;
+    NOTIF_KEYS.forEach(k => { const el = document.querySelector(`[data-notif="${k}"]`); if (el) el.checked = !!n[k]; });
+  }
+  async function _saveNotifications() {
+    if (!supa || !AUTH.user) return;
+    const n = {}; NOTIF_KEYS.forEach(k => { const el = document.querySelector(`[data-notif="${k}"]`); n[k] = el ? el.checked : false; });
+    $('notifSaveState').textContent = 'saving…';
+    const { error } = await supa.from('user_settings').upsert({ user_id: AUTH.user.id, notifications: n }, { onConflict: 'user_id' });
+    $('notifSaveState').textContent = error ? 'save failed' : 'saved ✓';
+    setTimeout(() => { $('notifSaveState').textContent = ''; }, 1500);
+  }
+  document.querySelectorAll('[data-notif]').forEach(el => el.addEventListener('change', _saveNotifications));
+
+  // ── Profile panel toggle ───────────────────────────────────────────────
   function toggleSettings(force) {
     const p = $('settingsPanel');
     const open = force !== undefined ? force : p.classList.contains('hidden');
-    if (open) { _renderSettings(); p.classList.remove('hidden'); }
-    else      { p.classList.add('hidden'); }
+    if (open) {
+      renderProfile();
+      if (isFull() && supa && AUTH.user) { loadBrokerConnections(); loadNotifications(); }
+      p.classList.remove('hidden');
+    } else { p.classList.add('hidden'); }
   }
-
   $('profileBtn').addEventListener('click', () => toggleSettings());
   $('settingsCloseBtn').addEventListener('click', () => toggleSettings(false));
-  // Click-outside-to-close
   document.addEventListener('click', (e) => {
     const wrap = $('profileWrap');
-    if (!wrap.contains(e.target) && !$('settingsPanel').classList.contains('hidden')) {
-      toggleSettings(false);
-    }
-  });
-
-  $('testConnBtn').addEventListener('click', async () => {
-    const out = $('testConnResult');
-    out.textContent = 'testing…';
-    out.className = 'text-[11px] self-center text-slate-400';
-    try {
-      const r = await fetch(`${API_BASE}/diag/tradier`, { mode:'cors' });
-      const j = await r.json();
-      if (j.ok) {
-        out.innerHTML = `<span class="text-emerald-300">OK · ${j.latency_ms || '?'}ms</span>`;
-      } else {
-        out.innerHTML = `<span class="text-rose-300">${j.error || 'failed'}</span>`;
-      }
-    } catch (e) {
-      out.innerHTML = `<span class="text-rose-300">${e.message || 'unreachable'}</span>`;
-    }
+    if (!wrap.contains(e.target) && !$('settingsPanel').classList.contains('hidden')) toggleSettings(false);
   });
 
   $('pollInt').addEventListener('input', (e) => {
@@ -1256,32 +2042,101 @@
   $('resetUiBtn').addEventListener('click', () => {
     if (!confirm('Clear all local UI state and reload?')) return;
     try {
-      Object.keys(localStorage)
-        .filter(k => k.startsWith('edgelane_'))
-        .forEach(k => localStorage.removeItem(k));
+      Object.keys(localStorage).filter(k => k.startsWith('edgelane_')).forEach(k => localStorage.removeItem(k));
     } catch {}
     location.reload();
   });
 
-  $('signOutBtn').addEventListener('click', () => {
-    try { localStorage.removeItem(USER_KEY); } catch {}
-    _renderSettings();
-    toast('Local session cleared');
+  $('signOutBtn').addEventListener('click', async () => {
     toggleSettings(false);
+    const uid = AUTH.user && AUTH.user.id;   // capture before signOut clears it
+    if (supa) { try { await supa.auth.signOut(); } catch {} }
+    if (AUTH.devBypass) { toast('Dev session — no auth configured'); return; }
+    AUTH.session = null; AUTH.user = null; _connCache = [];
+    applyGate();
+    toast('Signed out');
+    // Tell this user's other tabs (e.g. duplicates) to sign out too.
+    if (authChannel && uid) { try { authChannel.postMessage({ type: 'signout', userId: uid }); } catch {} }
   });
 
   let _pollTimer = setInterval(poll, 5000);
   function _applyPollInterval(secs) {
     clearInterval(_pollTimer);
-    _pollTimer = setInterval(poll, Math.max(5, Number(secs)||5) * 1000);
+    _pollTimer = setInterval(poll, Math.max(5, Number(secs) || 5) * 1000);
   }
-
-  // Initial profile circle
-  (function _initProfile() {
-    const u = _loadUser() || { displayName: 'Operator', createdAt: new Date().toISOString() };
-    _saveUser(u);
-    $('profileInitial').textContent = (u.displayName || 'O').trim()[0].toUpperCase();
+  (function _initPollInterval() {
+    let stored = '5';
+    try { stored = localStorage.getItem(POLL_INTERVAL_KEY) || '5'; } catch (_) {}
+    const v = parseInt(stored, 10) || 5;
+    $('pollInt').value = v; $('pollIntLabel').textContent = v; _applyPollInterval(v);
   })();
+  _setGateMode('signin');
+
+  // ── Footer year + About/Contact dialogs + social share ─────────────────
+  try { $('footerYear').textContent = String(new Date().getFullYear()); } catch (_) {}
+
+  function _openModal(id) { $(id).classList.add('show'); }
+  function _closeModal(id) { $(id).classList.remove('show'); }
+  // backdrop-click + Close button + Esc
+  ['aboutModal', 'contactModal'].forEach(id => {
+    $(id).addEventListener('click', (e) => { if (e.target.id === id) _closeModal(id); });
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { _closeModal('aboutModal'); _closeModal('contactModal'); }
+  });
+  $('aboutLink').addEventListener('click', () => _openModal('aboutModal'));
+  $('aboutCloseBtn').addEventListener('click', () => _closeModal('aboutModal'));
+  $('contactLink').addEventListener('click', () => { $('contactStatus').textContent = ''; _openModal('contactModal'); });
+  $('contactCloseBtn').addEventListener('click', () => _closeModal('contactModal'));
+
+  // Share — native share sheet where available, clipboard fallback.
+  $('shareBtn').addEventListener('click', async () => {
+    const share = { title: 'EdgeLane Matrix', text: 'Cut the noise. Trade the decided multi-leg options edge.', url: location.origin + location.pathname };
+    try {
+      if (navigator.share) { await navigator.share(share); return; }
+      await navigator.clipboard.writeText(share.url);
+      toast('Link copied to clipboard');
+    } catch (_) { /* user cancelled share — ignore */ }
+  });
+
+  // Contact form → POST multipart to backend (endpoint built by another session).
+  const CONTACT_MAX_BYTES = 5 * 1024 * 1024;   // 5 MB attachment cap
+  $('contactForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const name = $('contactName').value.trim();
+    const email = $('contactEmail').value.trim();
+    const message = $('contactMessage').value.trim();
+    const file = $('contactFile').files[0] || null;
+    const status = $('contactStatus');
+    status.className = 'text-xs text-slate-400 min-h-[1rem]';
+    if (!name || !_emailRe.test(email) || !message) { status.textContent = 'Fill in name, a valid email, and a message.'; return; }
+    if (file && file.size > CONTACT_MAX_BYTES) { status.textContent = 'Attachment exceeds the 5 MB limit.'; return; }
+    const btn = $('contactSubmitBtn'); const prev = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Submitting…'; status.textContent = '';
+    try {
+      await withBusy(async () => {
+        const fd = new FormData();
+        fd.append('name', name); fd.append('email', email); fd.append('message', message);
+        if (file) fd.append('attachment', file, file.name);
+        // Backend contract (to be built): POST {API_BASE}/contact, multipart/form-data
+        //   fields: name, email, message, attachment(optional ≤5MB) → inserts a support ticket row.
+        const r = await fetch(`${API_BASE}/contact`, { method: 'POST', mode: 'cors', headers: _authHeaders(), body: fd });
+        if (r.ok) {
+          status.className = 'text-xs text-emerald-300 min-h-[1rem]';
+          status.textContent = 'Thanks — your ticket was submitted. We’ll be in touch.';
+          $('contactForm').reset();
+          setTimeout(() => _closeModal('contactModal'), 1800);
+        } else {
+          const j = await r.json().catch(() => ({}));
+          status.className = 'text-xs text-rose-400 min-h-[1rem]';
+          status.textContent = j.detail || j.error || `Submission failed (HTTP ${r.status}).`;
+        }
+      });
+    } catch (err) {
+      status.className = 'text-xs text-rose-400 min-h-[1rem]';
+      status.textContent = err.message || 'Could not reach the server.';
+    } finally { btn.disabled = false; btn.textContent = prev; }
+  });
 
   // ═══════════════════════════════════════════════════════════════════════
   // Feature 4 — Tab strip + Lookup tab (Black-Scholes projection grid)
@@ -1566,9 +2421,13 @@
   // (Already wrapped via state.snapshot updates — call renderLookup after each poll)
   setInterval(() => { if (activeTab === 'lookup') renderLookup(); }, 5000);
 
-  poll();
-  pollAccuracy();
-  setInterval(pollAccuracy, 10000);
+  (async () => {
+    await resolveApiBasePointer();   // overlay the current backend URL before first call
+    initAuth();
+    poll();
+    pollAccuracy();
+    setInterval(pollAccuracy, 10000);
+  })();
 })();
 </script>
 </body>

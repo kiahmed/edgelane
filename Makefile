@@ -13,15 +13,22 @@ PY           = python3
 PORT         ?= 8789
 HOST         ?= 127.0.0.1
 CORS_PORT    ?= 8787
-SERVE_PORT   ?= 8080
+COPROXY      = ./tools/cors_proxy_service.sh
+DEPLOY       ?= local_container     # backend target: local_container | cloud
+DEPLOY_SH    = ./deploy.sh
+ARGS         ?=                     # extra flags, e.g. make deploy-prod ARGS=-n
+COMPOSE      = docker compose -f deploy/docker-compose.yml --env-file deploy/.env
 
 .PHONY: help \
-        build build-dry serve cors \
+        build build-dry cors cors-start cors-stop cors-restart cors-delete \
         setup run run-dev run-prod run-bg stop logs \
         diag status snapshot accuracy \
         test test-e2e test-all \
         webhook-debug webhook-post ext-version ext-policy \
-        ui clean
+        ui clean \
+        deploy-be deploy-fe deploy-prod deploy-dry db-push db-push-dry \
+        deploy-down deploy-be-down deploy-be-restart deploy-prune \
+        doctor vercel-setup check-tunnel
 
 help:
 	@echo "EdgeLane — all targets"
@@ -29,8 +36,11 @@ help:
 	@echo "  Frontend (build + serve the HTML app):"
 	@echo "    make build         run edge_lane_build.sh → produces edge_lane.html"
 	@echo "    make build-dry     dry-run build (preview substitutions, no write)"
-	@echo "    make serve         python http.server on port $(SERVE_PORT)"
 	@echo "    make cors          start CORS proxy on port $(CORS_PORT) (background)"
+	@echo "    make cors-start    start CORS proxy via service manager (coproxy)"
+	@echo "    make cors-stop     stop the CORS proxy service"
+	@echo "    make cors-restart  restart the CORS proxy service"
+	@echo "    make cors-delete   uninstall the CORS proxy auto-start hook"
 	@echo ""
 	@echo "  Backend — setup:"
 	@echo "    make setup         one-time venv + pip install"
@@ -64,7 +74,22 @@ help:
 	@echo "  UI:"
 	@echo "    make ui            open market/ui/index.html in browser"
 	@echo ""
-	@echo "Override defaults:  make run PORT=8788  |  make serve SERVE_PORT=3000"
+	@echo "  Deploy (production):"
+	@echo "    make deploy-be     backend → Docker container + Cloudflare tunnel (DEPLOY=$(DEPLOY))"
+	@echo "    make deploy-fe     market UI → Vercel"
+	@echo "    make deploy-prod   both backend + frontend together (+ db-push first)"
+	@echo "    make deploy-dry    dry-run the full deploy (prints commands, runs nothing)"
+	@echo "    make deploy-down   stop+remove the stack (keeps DB volume; ARGS=-v drops it)"
+	@echo "    make deploy-be-down    remove ONLY the backend (cloudflared keeps running)"
+	@echo "    make deploy-be-restart rebuild+recreate ONLY the backend (latest code)"
+	@echo "    make deploy-prune  delete dangling images from rebuilds (ARGS=-a = all unused)"
+	@echo "    make db-push       apply Supabase migrations (idempotent)"
+	@echo "    make db-push-dry   list migrations that would be applied"
+	@echo "    make doctor        list missing build/deploy prerequisites (run on a new machine)"
+	@echo "    make vercel-setup  install Vercel CLI on Ubuntu (+ Node) and log in"
+	@echo "    make check-tunnel  verify the prod backend is reachable end-to-end (tunnel+CORS+auth)"
+	@echo ""
+	@echo "Override defaults:  make run PORT=8788  |  make deploy-be DEPLOY=cloud  |  make deploy-prod ARGS=-n"
 
 # ---- Frontend ----------------------------------------------------------------
 
@@ -74,13 +99,21 @@ build:
 build-dry:
 	@./edge_lane_build.sh --dry-run
 
-serve:
-	@echo ">>> serving on http://localhost:$(SERVE_PORT)/edge_lane.html"
-	@$(PY) -m http.server $(SERVE_PORT)
-
 cors:
 	@echo ">>> CORS proxy on port $(CORS_PORT) (background)"
 	@$(PY) tools/cors_proxy.py &
+
+cors-start:
+	@EDGELANE_CORS_PORT=$(CORS_PORT) $(COPROXY) start
+
+cors-stop:
+	@$(COPROXY) stop
+
+cors-restart:
+	@EDGELANE_CORS_PORT=$(CORS_PORT) $(COPROXY) restart
+
+cors-delete:
+	@$(COPROXY) uninstall
 
 # ---- Backend (delegate to market/backend/Makefile) ---------------------------
 
@@ -151,3 +184,57 @@ test-all:
 
 ui:
 	@$(MAKE) -C $(BACKEND) ui
+
+# ---- Deploy ------------------------------------------------------------------
+# Frontend (market UI) → Vercel; backend (FastAPI + Torque) → Docker container
+# behind a Cloudflare tunnel. See deploy.sh + deploy/ for config.
+
+deploy-be:
+	@$(DEPLOY_SH) -b --target $(DEPLOY) $(ARGS)
+
+deploy-fe:
+	@$(DEPLOY_SH) -f $(ARGS)
+
+deploy-prod:
+	@$(DEPLOY_SH) --target $(DEPLOY) $(ARGS)
+
+deploy-dry:
+	@$(DEPLOY_SH) --target $(DEPLOY) -n $(ARGS)
+
+# Teardown the whole stack (backend + cloudflared + network). The named
+# edgelane-data volume (DuckDB) is KEPT; add ARGS=-v to also drop it.
+deploy-down:
+	@$(COMPOSE) down $(ARGS)
+
+# Remove ONLY the backend container; leaves cloudflared (and the tunnel) running.
+deploy-be-down:
+	@$(COMPOSE) rm -sf edgelane-backend
+
+# Rebuild + recreate ONLY the backend (latest code), without touching cloudflared.
+deploy-be-restart:
+	@$(COMPOSE) up -d --no-deps --build edgelane-backend
+
+# Reclaim disk: delete dangling (untagged) images left by repeated rebuilds.
+# ARGS=-a prunes all unused images (more aggressive).
+deploy-prune:
+	@docker image prune -f $(ARGS)
+
+# Supabase schema — idempotent push of supabase/migrations/*.sql.
+db-push:
+	@$(PY) tools/db_push.py $(ARGS)
+
+db-push-dry:
+	@$(PY) tools/db_push.py --dry-run
+
+# Preflight: list ONLY the missing build/deploy prerequisites (run on a new machine).
+doctor:
+	@./tools/doctor.sh
+
+# One-shot: install the Vercel CLI on Ubuntu/Debian (+ Node if needed) and log in.
+vercel-setup:
+	@./tools/install_vercel.sh
+
+# Health: probe the prod backend the way the deployed frontend does
+# (Supabase api_base pointer -> tunnel /status -> CORS -> /session/anon).
+check-tunnel:
+	@./tools/check_tunnel.sh $(ARGS)

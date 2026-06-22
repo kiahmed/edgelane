@@ -95,8 +95,10 @@ def compute_engine_output(
     expected_move: float | None = None,
 ) -> dict:
     """Full pipeline.  See module docstring for return shape."""
-    # 1. Dealer exposures (per-strike net_gex/net_dex/net_vex/net_tex)
-    de = compute_dealer_exposures(chain_contracts, spot)
+    settings = get_settings()
+    # 1. Dealer exposures (per-strike net_gex/net_dex/net_vex/net_tex).
+    # GEX leg weights by OI (default) or today's traded volume per GEX_SOURCE.
+    de = compute_dealer_exposures(chain_contracts, spot, gex_weight=settings.gex_source)
     exposures_for_chosen = de.get("exposures_by_date", {}).get(chosen_expiration)
     # Some chains may not include the chosen expiration in the bucket map
     # (e.g. if all contracts had no expiration field). Fall back to first.
@@ -109,14 +111,12 @@ def compute_engine_output(
             exposures_for_chosen = {"by_strike": [], "totals": {}}
 
     # --- External GEX overlay (EdgelaneProvider browser-extension webhook) -------
-    # When fresh external data exists for this symbol, inject it into
-    # greeks_raw["key_levels"] so the bias engine's Atlas-style override
-    # path (find_gex_wall / _extract_greek_wall) consults it. We DO NOT
-    # touch the math layer — the bias engine already prefers key_levels
-    # overrides. After compute_bias_signals(), we additionally overlay the
-    # bilateral put_wall/call_wall fields on the returned bias dict (since
-    # find_gex_walls_bilateral does not consult key_levels by design).
-    settings = get_settings()
+    # When fresh external data exists for this symbol, prefer it. If the payload
+    # carries the full signed net-GEX-by-strike book, we replace the per-strike
+    # rows the wall/bias layer reads (below). The explicit put_wall/call_wall
+    # points are surfaced on the returned bias dict by the post-compute overlay
+    # (find_gex_wall / find_gex_walls_bilateral scan per-strike rows only, not
+    # key_levels). We DO NOT touch the math layer.
     external = None
     if settings.use_external_gex:
         external = ext_state.get_if_fresh(symbol, settings.external_gex_timeout_sec)
@@ -255,7 +255,7 @@ def compute_engine_output(
         if ext_profile:
             bias["_profile_by_strike"] = exposures_for_chosen.get("by_strike")
     else:
-        bias["_data_source"] = "tradier_oi"
+        bias["_data_source"] = "tradier_volume" if settings.gex_source == "volume" else "tradier_oi"
         bias["_score_method"] = "single_wall_magnet"
 
     # 3. Expected move (ATM straddle, or fallback 0.5% of spot)

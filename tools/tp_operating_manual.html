@@ -331,6 +331,8 @@ Just remember the EXPIRATION must be in <code>YYYY-MM-DD</code> form — otherwi
 
 <p>The ticket's own verb (Buy/Sell at the start) determines the order direction. Use <code>--buy</code> for debit (long) spreads and <code>--sell</code> for credit (short) spreads.</p>
 
+<p>Leg side letter (<code>P</code>/<code>C</code>) may appear on just one strike — it's inferred for the rest, since a vertical/fly shares one side. So <code>Long 30130 / Short 30030P</code>, <code>Long 30130P / Short 30030P</code>, and <code>30130/30030P</code> are all equivalent.</p>
+
 <h3>Syntax</h3>
 <pre><span class="cmd">tp</span> <span class="flag">--buy</span> <span class="arg">'&lt;ticket-string&gt;'</span> [<span class="flag">--execute</span>]
 <span class="cmd">tp</span> <span class="flag">--sell</span> <span class="arg">'&lt;ticket-string&gt;'</span> [<span class="flag">--execute</span>]</pre>
@@ -343,11 +345,14 @@ Just remember the EXPIRATION must be in <code>YYYY-MM-DD</code> form — otherwi
 <span class="cmd">tp</span> <span class="flag">--sell</span> <span class="arg">'Sell Range · NDX · 2026-05-19 · 7300/7350P + 7450/7500C · LIMIT credit $4.00 DAY · 1 contract'</span> <span class="flag">--execute</span>
 
 <span class="comment"># Debit spread (long call spread)</span>
-<span class="cmd">tp</span> <span class="flag">--buy</span> <span class="arg">'Buy Aggressive · NVDA · 2026-06-30 · 220/225C · LIMIT debit $1.80 GTC · 1 contract'</span> <span class="flag">--execute</span></pre>
+<span class="cmd">tp</span> <span class="flag">--buy</span> <span class="arg">'Buy Aggressive · NVDA · 2026-06-30 · 220/225C · LIMIT debit $1.80 GTC · 1 contract'</span> <span class="flag">--execute</span>
 
-<div class="card warn"><span class="icon">bash quoting</span>
-Always <strong>single-quote</strong> the ticket string. Inside double quotes, bash treats
-<code>$6.00</code> as positional <code>$6</code> + <code>.00</code> and the dollar amount silently disappears.
+<span class="comment"># Bear put debit spread — DOUBLE quotes OK because the price has no $</span>
+<span class="cmd">tp</span> <span class="flag">-B</span> <span class="arg">"Buy Conservative · NDX · 2026-06-16 · Long 30130 / Short 30030P · LIMIT debit 15 GTC · 1 contract"</span> <span class="flag">--execute</span></pre>
+
+<div class="card warn"><span class="icon">bash quoting · the price</span>
+The limit price accepts a bare number — <code>LIMIT debit 15 GTC</code> — so it works in plain double quotes.<br>
+A <code>$</code> only works inside <strong>single quotes</strong>: in double quotes bash expands <code>$15</code> → <code>5</code> (positional <code>$1</code> + <code>5</code>) <em>before</em> the tool runs, so the amount is wrong and unrecoverable. Either drop the <code>$</code>, or single-quote the whole ticket (required when pasting the "Copy ticket" string, which includes the <code>$</code>).
 </div>
 
 <div class="card tip"><span class="icon">tip</span>
@@ -402,7 +407,16 @@ NDX / SPX / RUT / XSP tickets auto-route to their canonical OCC root (NDXP, SPXW
 
 <!-- ─── 10 Gainloss ─────────────────────────────────────────────────── -->
 <h2 id="gainloss"><span class="num">10</span>Closed-position P&amp;L (daily)</h2>
-<p>Pulls Tradier's <code>/accounts/{id}/gainloss</code> endpoint — realized P&amp;L on closures within a date range. Multi-leg spread closes are aggregated by close-timestamp so a 4-leg iron condor close shows as one row, not four. The bottom of the table sums total cost, proceeds, and P&amp;L for the range.</p>
+<p>Realized P&amp;L on closures within a date range. Multi-leg spread closes are aggregated so a 4-leg iron condor close shows as one row, not four. The bottom of the table sums total cost, proceeds, and P&amp;L for the range.</p>
+
+<div class="card"><span class="icon">info</span>
+<strong>Where the numbers come from.</strong> Tradier's <code>/orders</code> endpoint only returns the <em>current trading day</em>, and <code>/gainloss</code> only lists <em>fully-settled</em> closes (a position closed today doesn't appear there until it settles, next day). So <code>tp -G</code> merges sources, partitioned by date:
+<ul>
+  <li><strong>Prior days</strong> → <code>/gainloss</code> (settled, fully-closed history).</li>
+  <li><strong>Today</strong> → live filled close orders, matched to their open to compute P&amp;L (includes partial closes, which <code>/gainloss</code> never shows).</li>
+</ul>
+<strong>Prior-day opens closed today.</strong> If you close a position today that you opened on an earlier day, its open order is already gone from <code>/orders</code>, the position is gone from <code>/positions</code>, and it hasn't settled into <code>/gainloss</code> yet. <code>tp</code> recovers the cost basis from <code>/accounts/{id}/history</code>, looking back up to <strong>7 days</strong> for the opening fills. Partial entries are averaged (qty-weighted) into one cost basis. These rows show the true open date in the <em>Opened</em> column. Use <code>-V</code> to see which source matched each close.
+</div>
 
 <h3>Syntax</h3>
 <pre><span class="cmd">tp</span> <span class="flag">-G</span> [<span class="arg">&lt;YYYY-MM-DD&gt;</span>] [<span class="flag">--since</span> <span class="arg">&lt;N&gt;</span>]</pre>

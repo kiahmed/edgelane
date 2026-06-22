@@ -241,7 +241,7 @@ install_systemd() {
   local unit="$unit_dir/${SERVICE_NAME}.service"
   cat > "$unit" <<EOF
 [Unit]
-Description=EdgeLane CORS proxy for browser to Atlas and Gemini
+Description=EdgeLane CORS proxy for browser to Gemini
 After=network-online.target
 
 [Service]

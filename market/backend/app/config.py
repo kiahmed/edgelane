@@ -12,8 +12,13 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
-# Default config path — repo root, two levels up from this file
-_DEFAULT_CONFIG = Path(__file__).resolve().parents[3] / "edgelane_market.config"
+# Default config path — repo root (app/ -> backend/ -> market/ -> repo).
+# In the container the source lives at /srv/app, which is shallower than the
+# repo layout, so parents[3] doesn't exist; the container sets
+# EDGELANE_MARKET_CONFIG (read in load_settings) and this default is unused.
+# Guard the index so import never crashes regardless of where the file sits.
+_PARENTS = Path(__file__).resolve().parents
+_DEFAULT_CONFIG = (_PARENTS[3] if len(_PARENTS) > 3 else _PARENTS[-1]) / "edgelane_market.config"
 
 
 def _strip_inline_comment(value: str) -> str:
@@ -106,9 +111,61 @@ class Settings(BaseModel):
         # The private GEX provider's page origin (where the extension direct-POSTs
         # from) is added via the local config file, not hardcoded here.
     ])
+    # Regex fallback so the deployed Vercel frontend works across renamed projects
+    # and rotating preview URLs (edgelane-hazel, edgelane-matrix, *-git-* previews)
+    # without re-listing each one. Matched in addition to cors_allow_origins.
+    # Override/disable via CORS_ALLOW_ORIGIN_REGEX in the config (blank = off).
+    cors_allow_origin_regex: str | None = Field(
+        default=r"^https://edgelane[a-z0-9-]*\.vercel\.app$")
 
     # WebSocket
     ws_heartbeat_sec: int = Field(default=30)
+
+    # --- Auth (Supabase) + abuse protection ---
+    # Master switch. When False (default — local dev / parity tests), all auth
+    # dependencies pass through anonymously and rate limiting is off, so the
+    # existing local flow is unchanged. Set AUTH_ENABLED=true in production.
+    auth_enabled: bool = Field(default=False)
+    # Supabase project (frontend handles signup/login; backend only verifies the
+    # JWT the frontend attaches). service_key is server-only — bypasses RLS.
+    supabase_url: str = Field(default="")
+    supabase_jwt_secret: str = Field(default="")     # legacy HS256 projects only
+    supabase_service_key: str = Field(default="")    # server-only; never shipped
+    # Cloudflare Turnstile — verifies a real browser before minting an anon
+    # teaser session token. Empty + auth_enabled=False → teaser open in dev.
+    turnstile_secret: str = Field(default="")
+    # Signs the short-lived anonymous teaser session tokens (spot/bias/walls).
+    anon_session_secret: str = Field(default="")
+    anon_session_ttl_sec: int = Field(default=1800)  # 30 min
+    # Server-side secret for curl/testing — bypasses Turnstile + JWT. NEVER
+    # shipped to a browser (kept in the gitignored config only).
+    admin_api_token: str = Field(default="")
+    # Per-session (authed user / anon session / IP) request budget.
+    rate_limit_per_min: int = Field(default=120)
+    rate_limit_window_sec: int = Field(default=60)
+
+    # --- Support / contact form (Resend email) ---
+    # POST /contact stores the ticket (+ private-bucket attachment) then emails
+    # support via Resend. support_email is the destination; from_email must be a
+    # Resend-verified sender (or onboarding@resend.dev in test mode). If
+    # resend_api_key/support_email are blank the ticket is still saved — the email
+    # is just logged, not sent (non-fatal).
+    support_email: str = Field(default="")
+    contact_from_email: str = Field(default="EdgeLane <onboarding@resend.dev>")
+    contact_attachment_max_bytes: int = Field(default=5 * 1024 * 1024)   # 5 MB
+    contact_bucket: str = Field(default="contact-attachments")
+    # Transport: auto (SMTP if SMTP_HOST set, else Resend), or force smtp|resend.
+    email_provider: str = Field(default="auto")
+    # SMTP (e.g. Google Workspace: smtp.gmail.com:587 + App Password, or the
+    # smtp-relay.gmail.com relay). Leave SMTP_HOST blank to use Resend instead.
+    smtp_host: str = Field(default="")
+    smtp_port: int = Field(default=587)
+    smtp_user: str = Field(default="")
+    smtp_password: str = Field(default="")
+    smtp_starttls: bool = Field(default=True)   # 587 STARTTLS (set false only with SSL)
+    smtp_use_ssl: bool = Field(default=False)   # implicit TLS on 465
+    # Resend (HTTP API) — used when SMTP isn't configured.
+    resend_api_key: str = Field(default="")
 
     # Dev override: keep polling even when market is closed (mock-mode dev)
     force_poll_when_closed: bool = Field(default=False)
@@ -123,6 +180,11 @@ class Settings(BaseModel):
     # External GEX override (private GEX provider extension webhook)
     use_external_gex: bool = Field(default=True)         # prefer extension data over Tradier-OI walls when fresh
     external_gex_timeout_sec: int = Field(default=30)    # how stale before falling back
+    # GEX weighting for the Tradier fallback walls (no external feed):
+    #   "oi"     -> gamma × open_interest  (resting positioning; default)
+    #   "volume" -> gamma × volume         (today's traded gamma; closer to the
+    #               flow-based provider levels for 0DTE)
+    gex_source: str = Field(default="oi")
     extension_policy_version: int = Field(default=1)     # bump to force extension hot-reload
     # The provider page the extension attaches to. Real value set in the local
     # config file; left blank in the public default.
@@ -243,7 +305,38 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
     if "HTTP_PORT" in raw:                   out["http_port"] = int(raw["HTTP_PORT"])
     if "CORS_ALLOW_ORIGINS" in raw:
         out["cors_allow_origins"] = [s.strip() for s in raw["CORS_ALLOW_ORIGINS"].split(",") if s.strip()]
+    if "CORS_ALLOW_ORIGIN_REGEX" in raw:
+        # Blank value explicitly disables the regex fallback.
+        out["cors_allow_origin_regex"] = raw["CORS_ALLOW_ORIGIN_REGEX"].strip() or None
     if "WS_HEARTBEAT_SEC" in raw:            out["ws_heartbeat_sec"] = int(raw["WS_HEARTBEAT_SEC"])
+
+    if "AUTH_ENABLED" in raw:
+        out["auth_enabled"] = raw["AUTH_ENABLED"].strip().lower() in ("true", "1", "yes", "on")
+    if "SUPABASE_URL" in raw:                out["supabase_url"] = raw["SUPABASE_URL"].strip()
+    if "SUPABASE_JWT_SECRET" in raw:         out["supabase_jwt_secret"] = raw["SUPABASE_JWT_SECRET"].strip()
+    if "SUPABASE_SERVICE_KEY" in raw:        out["supabase_service_key"] = raw["SUPABASE_SERVICE_KEY"].strip()
+    if "TURNSTILE_SECRET" in raw:            out["turnstile_secret"] = raw["TURNSTILE_SECRET"].strip()
+    if "ANON_SESSION_SECRET" in raw:         out["anon_session_secret"] = raw["ANON_SESSION_SECRET"].strip()
+    if "ANON_SESSION_TTL_SEC" in raw:        out["anon_session_ttl_sec"] = int(raw["ANON_SESSION_TTL_SEC"])
+    if "ADMIN_API_TOKEN" in raw:             out["admin_api_token"] = raw["ADMIN_API_TOKEN"].strip()
+    if "RATE_LIMIT_PER_MIN" in raw:          out["rate_limit_per_min"] = int(raw["RATE_LIMIT_PER_MIN"])
+    if "RATE_LIMIT_WINDOW_SEC" in raw:       out["rate_limit_window_sec"] = int(raw["RATE_LIMIT_WINDOW_SEC"])
+
+    if "SUPPORT_EMAIL" in raw:               out["support_email"] = raw["SUPPORT_EMAIL"].strip()
+    if "CONTACT_FROM_EMAIL" in raw:          out["contact_from_email"] = raw["CONTACT_FROM_EMAIL"].strip()
+    if "CONTACT_ATTACHMENT_MAX_BYTES" in raw:
+        out["contact_attachment_max_bytes"] = int(raw["CONTACT_ATTACHMENT_MAX_BYTES"])
+    if "CONTACT_BUCKET" in raw:              out["contact_bucket"] = raw["CONTACT_BUCKET"].strip()
+    if "EMAIL_PROVIDER" in raw:              out["email_provider"] = raw["EMAIL_PROVIDER"].strip().lower()
+    if "SMTP_HOST" in raw:                   out["smtp_host"] = raw["SMTP_HOST"].strip()
+    if "SMTP_PORT" in raw:                   out["smtp_port"] = int(raw["SMTP_PORT"])
+    if "SMTP_USER" in raw:                   out["smtp_user"] = raw["SMTP_USER"].strip()
+    if "SMTP_PASSWORD" in raw:               out["smtp_password"] = raw["SMTP_PASSWORD"]
+    if "SMTP_STARTTLS" in raw:
+        out["smtp_starttls"] = raw["SMTP_STARTTLS"].strip().lower() in ("true", "1", "yes", "on")
+    if "SMTP_USE_SSL" in raw:
+        out["smtp_use_ssl"] = raw["SMTP_USE_SSL"].strip().lower() in ("true", "1", "yes", "on")
+    if "RESEND_API_KEY" in raw:              out["resend_api_key"] = raw["RESEND_API_KEY"].strip()
 
     if "FORCE_POLL_WHEN_CLOSED" in raw:
         out["force_poll_when_closed"] = raw["FORCE_POLL_WHEN_CLOSED"].strip().lower() in ("true", "1", "yes", "on")
@@ -258,6 +351,9 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
         out["external_gex_timeout_sec"] = int(raw["EXTERNAL_GEX_TIMEOUT_SEC"])
     if "EXTENSION_POLICY_VERSION" in raw:
         out["extension_policy_version"] = int(raw["EXTENSION_POLICY_VERSION"])
+    if "GEX_SOURCE" in raw:
+        v = raw["GEX_SOURCE"].strip().lower()
+        out["gex_source"] = "volume" if v == "volume" else "oi"
 
     return out
 

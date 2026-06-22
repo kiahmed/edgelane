@@ -43,10 +43,78 @@ DB_PATH=~/.edgelane/market.duckdb
 # ── HTTP server ──
 HTTP_HOST=127.0.0.1
 HTTP_PORT=8788
-CORS_ALLOW_ORIGINS=http://localhost:5173
+# Comma-separated allowed origins. Includes the Vercel-hosted market UI
+# (production) so the deployed frontend can call this API cross-origin.
+CORS_ALLOW_ORIGINS=http://localhost:5173,https://edgelane-matrix.vercel.app
+# Regex fallback (in ADDITION to the list above) so renamed Vercel projects and
+# rotating preview URLs (edgelane-hazel, edgelane-matrix, *-git-* previews) all
+# work without re-listing each. Blank disables it. Default matches edgelane*.vercel.app.
+CORS_ALLOW_ORIGIN_REGEX=^https://edgelane[a-z0-9-]*\.vercel\.app$
 
 # ── WebSocket ──
 WS_HEARTBEAT_SEC=30
+
+# ── Auth (Supabase) + abuse protection ──
+# Master switch. false (default) = local dev: all gates pass through, no rate
+# limiting (existing flow unchanged + parity/e2e tests unaffected).
+# true = production: enforce Supabase JWT, Turnstile teaser sessions, rate limit.
+AUTH_ENABLED=false
+# Supabase project (Dashboard → Settings → API). Frontend does signup/login;
+# backend only verifies the JWT it attaches. SERVICE_KEY is server-only — it
+# bypasses Row Level Security, so it must NEVER reach the browser.
+SUPABASE_URL=
+SUPABASE_JWT_SECRET=           # only for legacy HS256 projects; blank for asymmetric (JWKS)
+SUPABASE_SERVICE_KEY=
+# Cloudflare Turnstile SECRET key (Dashboard → Turnstile → your widget).
+# Backend-only — verifies a real browser before minting a short-lived anon
+# teaser session. The widget's *public* SITE key is a frontend value and lives
+# in deploy/.env as EDGELANE_TURNSTILE_SITE_KEY (baked into edgelane.config.js),
+# NOT here. Never put the SITE key here or the SECRET in deploy/.env.
+TURNSTILE_SECRET=
+# Signs the short-lived anonymous teaser session tokens (spot/bias/walls chips).
+# Generate: python -c "import secrets;print(secrets.token_urlsafe(48))"
+ANON_SESSION_SECRET=
+ANON_SESSION_TTL_SEC=1800
+# Server-side secret for curl/testing — bypasses Turnstile + JWT via the
+# X-Admin-Token header. NEVER shipped to a browser (lives only in the real,
+# gitignored config). Generate the same way as ANON_SESSION_SECRET.
+ADMIN_API_TOKEN=
+# Per-session (authed user / anon session / IP) request budget.
+RATE_LIMIT_PER_MIN=120
+RATE_LIMIT_WINDOW_SEC=60
+
+# ── Support / contact form (POST /contact → email) ──
+# A new ticket is saved to public.contact_tickets (+ private Storage bucket for
+# any attachment), then emailed to SUPPORT_EMAIL. Email is best-effort: if the
+# transport is unset/errors, the ticket is still saved (the send is just logged).
+# Attachment cap + Storage use the backend's SUPABASE_SERVICE_KEY (set above).
+SUPPORT_EMAIL=
+# From address. For SMTP it must be the authenticated mailbox or a send-as alias.
+CONTACT_FROM_EMAIL=EdgeLane <support@yourdomain.com>
+CONTACT_ATTACHMENT_MAX_BYTES=5242880
+CONTACT_BUCKET=contact-attachments
+
+# Transport: auto = SMTP if SMTP_HOST set, else Resend. Force with smtp|resend.
+EMAIL_PROVIDER=auto
+
+# -- Option A: SMTP (e.g. Google Workspace) --
+# Gmail SMTP: host=smtp.gmail.com, port=587, SMTP_USER=a Workspace mailbox,
+#   SMTP_PASSWORD=a 16-char App Password (Google Account → Security → 2-Step
+#   Verification → App passwords; enter it WITHOUT spaces). ~2,000 sends/day.
+# Workspace SMTP relay (Admin console → Apps → Gmail → Routing → SMTP relay):
+#   host=smtp-relay.gmail.com, port=587; can send as any address in your domain,
+#   ~10,000/day. CONTACT_FROM_EMAIL must be an address you're allowed to send as.
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASSWORD=
+SMTP_STARTTLS=true          # true for port 587 (STARTTLS)
+SMTP_USE_SSL=false          # true (and STARTTLS=false) for implicit TLS on port 465
+
+# -- Option B: Resend (HTTP API) — used only when SMTP_HOST is blank --
+# API key (re_…) from resend.com. With onboarding@resend.dev it only delivers to
+# the Resend account owner; use a verified domain for prod.
+RESEND_API_KEY=
 
 # ── Off-hours polling policy ──
 # Auto-derived: poller skips off-hours when DEVMODE=false AND a real Tradier
@@ -69,6 +137,11 @@ WS_HEARTBEAT_SEC=30
 USE_EXTERNAL_GEX=true
 EXTERNAL_GEX_TIMEOUT_SEC=30
 EXTENSION_POLICY_VERSION=1
+# Tradier-fallback GEX weighting (used only when no fresh external feed):
+#   oi     = gamma × open_interest  (resting positioning; default)
+#   volume = gamma × volume         (today's traded gamma; lands closer to the
+#            flow-based provider walls for 0DTE). Shows as _data_source=tradier_volume.
+GEX_SOURCE=oi
 # The provider page the extension attaches to (served back via /extension/policy.json).
 # Also add this origin to CORS_ALLOW_ORIGINS so the extension can direct-POST.
 PROVIDER_TARGET_URL=

@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TORQUE · fast order builder</title>
+<link rel="icon" type="image/svg+xml" href="/torque/assets/favicon.svg" />
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#111721; --panel2:#0d131c; --line:#1d2733; --line2:#2a3744;
+    --txt:#d6e0ea; --dim:#aab7c5; --dim2:#8d9bab;
+    --call:#36d399; --put:#f87272; --debit:#fbbf24; --credit:#36d399;
+    --accent:#4aa3ff; --accentdim:#1a3a5c; --warn:#fbbf24; --bad:#f87272; --good:#36d399;
+    --mono:'SFMono-Regular',ui-monospace,'JetBrains Mono',Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--txt);font:13px/1.45 var(--mono);
+    -webkit-font-smoothing:antialiased;overflow:hidden}
+  button{font-family:inherit;cursor:pointer}
+  input,select{font-family:inherit}
+  /* SPA: fill the viewport, center horizontally, never scroll the page —
+     the orders panel takes the remaining height and scrolls internally. */
+  .wrap{max-width:1320px;margin:0 auto;padding:12px 16px;height:100vh;
+    box-sizing:border-box;display:flex;flex-direction:column;overflow:hidden}
+  .grid{flex:0 0 auto}
+  .panel.orders{flex:1 1 auto;min-height:120px;display:flex;flex-direction:column}
+  .panel.orders .oscroll{flex:1 1 auto;min-height:0;overflow-y:auto;margin-top:6px}
+  header{display:flex;align-items:center;gap:14px;padding:6px 2px 16px;border-bottom:1px solid var(--line)}
+  .logomark{width:38px;height:38px;display:block}
+  .brand{display:flex;flex-direction:column;line-height:1}
+  .logo{font-weight:800;letter-spacing:3px;font-size:20px;color:#fff}
+  .logo small{color:var(--accent);font-weight:800}
+  /* EdgeLane brand byline — emerald, italic, default EdgeLane accent */
+  .byline{font-style:italic;font-size:10.5px;letter-spacing:1.5px;color:#36d399;font-weight:600;margin-top:3px}
+  .tag{font-size:11px;padding:2px 8px;border-radius:4px;border:1px solid var(--line2);color:var(--dim);letter-spacing:1px}
+  .tag.sandbox{color:var(--debit);border-color:#5a4a1a;background:#1c1606}
+  .tag.production{color:var(--put);border-color:#5a1a1a;background:#1c0606}
+  .grow{flex:1}
+  .clock{color:var(--dim);font-size:12px}
+  .grid{display:grid;grid-template-columns:1fr 360px;gap:14px;margin-top:14px}
+  @media(max-width:980px){.grid{grid-template-columns:1fr}}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .panel h3{margin:0 0 10px;font-size:11px;letter-spacing:1.5px;color:var(--dim);text-transform:uppercase;font-weight:700}
+  .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .ctrls{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+  label.fld{display:flex;flex-direction:column;gap:4px;font-size:11.5px;letter-spacing:1px;color:var(--dim);text-transform:uppercase}
+  select,input[type=number]{background:var(--panel2);border:1px solid var(--line2);color:var(--txt);
+    border-radius:6px;padding:8px 10px;font-size:14px;outline:none}
+  select:focus,input:focus{border-color:var(--accent)}
+  select.big{font-size:15px;font-weight:700;min-width:120px}
+  .strat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(108px,1fr));gap:6px;margin-top:4px}
+  .strat{padding:8px 6px;border:1px solid var(--line2);border-radius:7px;background:var(--panel2);
+    color:var(--dim);text-align:center;font-size:12px;font-weight:600;transition:.12s}
+  .strat:hover{border-color:var(--accent);color:var(--txt)}
+  .strat.on{background:var(--accentdim);border-color:var(--accent);color:#fff}
+  .strat .k{font-size:10px;letter-spacing:.5px;opacity:.85;display:block;margin-top:2px;text-transform:uppercase}
+  .strat.on .k{color:var(--debit)}
+  .strat.credit.on .k{color:var(--credit)}
+  .spotline{display:flex;gap:18px;align-items:baseline;margin:14px 0 8px}
+  .spot{font-size:26px;font-weight:800;color:#fff}
+  .spot .sym{color:var(--accent);margin-right:8px}
+  .exp{color:var(--dim);font-size:12px}
+  table.legs{width:100%;border-collapse:collapse;margin-top:6px}
+  table.legs th{font-size:11px;letter-spacing:1px;color:var(--dim2);text-transform:uppercase;text-align:right;padding:4px 8px;font-weight:600}
+  table.legs th:first-child,table.legs td:first-child{text-align:left}
+  table.legs td{padding:7px 8px;border-top:1px solid var(--line);text-align:right;font-size:14px}
+  .side{font-weight:700;font-size:10px;padding:2px 6px;border-radius:4px;letter-spacing:.5px}
+  .side.call{color:var(--call);background:#0c2018}
+  .side.put{color:var(--put);background:#200c0c}
+  .act{font-size:12px;color:var(--dim)}
+  .act.buy{color:var(--good)}
+  .act.sell{color:var(--put)}
+  .stepper{display:inline-flex;align-items:center;gap:2px}
+  .stepper button{width:22px;height:22px;border-radius:5px;border:1px solid var(--line2);
+    background:var(--panel2);color:var(--txt);font-size:14px;line-height:1;padding:0}
+  .stepper button:hover{border-color:var(--accent);color:#fff}
+  .strike{display:inline-block;min-width:74px;font-weight:700;font-size:14px}
+  .netcard{display:flex;gap:0;margin-top:14px;border:1px solid var(--line2);border-radius:9px;overflow:hidden}
+  .netcard .cell{flex:1;padding:11px 8px;text-align:center;border-right:1px solid var(--line)}
+  .netcard .cell:last-child{border-right:0}
+  .netcard .cell .lab{font-size:11px;letter-spacing:1px;color:var(--dim2);text-transform:uppercase}
+  .netcard .cell .val{font-size:20px;font-weight:800;margin-top:3px}
+  .netcard .cell.mid{background:#0d1620}
+  .netcard .cell.mid .val{color:#fff}
+  .ptype{font-size:11px;font-weight:700;letter-spacing:1px;padding:2px 8px;border-radius:4px}
+  .ptype.debit{color:var(--debit);background:#1c1606}
+  .ptype.credit{color:var(--credit);background:#06160e}
+  .sendrow{display:flex;gap:10px;align-items:flex-end;margin-top:16px;flex-wrap:wrap}
+  .toggle{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--dim);cursor:pointer;user-select:none}
+  .toggle .sw{width:36px;height:20px;border-radius:11px;background:var(--line2);position:relative;transition:.15s}
+  .toggle .sw::after{content:'';position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:2px;left:2px;transition:.15s}
+  .toggle.on .sw{background:var(--accent)}
+  .toggle.on .sw::after{left:18px}
+  .btn{padding:11px 18px;border-radius:8px;border:1px solid var(--line2);background:var(--panel2);
+    color:var(--txt);font-weight:700;font-size:13px;letter-spacing:.5px}
+  .btn:hover{border-color:var(--accent)}
+  .btn.limit{background:var(--accent);border-color:var(--accent);color:#04121f}
+  .btn.market{background:#2a1c06;border-color:#5a4a1a;color:var(--debit)}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .confirm{margin-top:14px;padding:12px;border:1px dashed var(--accent);border-radius:8px;background:#0c1824}
+  .confirm .summary{font-size:13px;color:#fff;margin-bottom:10px;line-height:1.6}
+  .muted{color:var(--dim)}
+  .result{margin-top:14px;padding:12px;border-radius:8px;border:1px solid var(--line2);font-size:12px;white-space:pre-wrap}
+  .result.good{border-color:#1c4a32;background:#08160e}
+  .result.bad{border-color:#4a1c1c;background:#160808}
+  .result .hl{font-weight:800;font-size:13px}
+  /* analysis */
+  .lean-wrap{margin:2px 0 14px}
+  .lean-bar{height:14px;border-radius:7px;background:linear-gradient(90deg,#3a1414,#1d2733 50%,#0c2a1c);position:relative;border:1px solid var(--line2)}
+  .lean-bar .mid{position:absolute;left:50%;top:-3px;bottom:-3px;width:1px;background:var(--dim2)}
+  .lean-bar .dot{position:absolute;top:50%;width:16px;height:16px;border-radius:50%;transform:translate(-50%,-50%);border:2px solid #fff;box-shadow:0 0 8px rgba(0,0,0,.6)}
+  .lean-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px}
+  .lean-val{font-size:22px;font-weight:800}
+  .lean-lab{font-size:11px;letter-spacing:1px;text-transform:uppercase;font-weight:700;padding:2px 8px;border-radius:4px}
+  .lean-lab.bullish{color:var(--call);background:#0c2018}
+  .lean-lab.bearish{color:var(--put);background:#200c0c}
+  .lean-lab.neutral{color:var(--dim);background:#151c25}
+  .sugg{margin:8px 0 4px;font-size:12px;color:var(--dim)}
+  .sugg b{color:var(--txt)}
+  .sugg .pill{padding:2px 8px;border-radius:4px;font-weight:700;margin-left:4px}
+  .metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+  .metric{background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:8px}
+  .metric .l{font-size:11px;letter-spacing:1px;color:var(--dim2);text-transform:uppercase}
+  .metric .v{font-size:15px;font-weight:700;margin-top:2px}
+  .bar{height:4px;border-radius:2px;background:var(--line2);margin-top:5px;overflow:hidden}
+  .bar i{display:block;height:100%}
+  .levels{margin-top:12px;font-size:12px}
+  .levels .lv{display:flex;justify-content:space-between;padding:5px 0;border-top:1px solid var(--line)}
+  .disc{margin-top:12px;font-size:12px;color:var(--dim);line-height:1.55;border-top:1px solid var(--line);padding-top:10px}
+  .err{color:var(--bad);font-size:12px;margin-top:8px}
+  .panel.orders{margin-top:14px}
+  .watchers{margin:6px 0 10px}
+  .watch{font-size:12px;color:var(--accent);padding:6px 10px;background:#10202b;border:1px solid var(--line2);border-radius:7px;margin-bottom:6px}
+  .dotpulse{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent);margin-right:7px;animation:pulse 1.2s infinite}
+  @keyframes pulse{0%,100%{opacity:.35}50%{opacity:1}}
+  table.otable{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}
+  table.otable th{text-align:left;color:var(--dim2);font-size:11px;letter-spacing:1px;text-transform:uppercase;padding:4px 8px;border-bottom:1px solid var(--line)}
+  table.otable td{padding:5px 8px;border-bottom:1px solid var(--line)}
+  table.otable tr.working td{background:#15202b}
+  .ostat{font-size:11px;font-weight:700;padding:2px 7px;border-radius:4px;text-transform:uppercase}
+  .ostat.open,.ostat.pending,.ostat.partially_filled{color:var(--accent);background:#10202b}
+  .ostat.filled{color:var(--call);background:#0c2018}
+  .ostat.canceled,.ostat.rejected,.ostat.expired{color:var(--put);background:#200c0c}
+  .btn.xcancel{padding:2px 8px;font-size:10px;background:#2a1414;color:#f0a0a0;border:1px solid #5a2828}
+  .pxedit{cursor:pointer;border-bottom:1px dotted var(--dim2)}
+  .pxedit:hover{color:var(--accent)}
+  .pxrow{display:inline-flex;gap:3px;align-items:center}
+  .pxrow input{width:70px;background:var(--panel2);border:1px solid var(--accent);color:var(--txt);border-radius:4px;padding:2px 5px;font-size:11px}
+  .btn.xsave{padding:2px 7px;font-size:11px;background:#0c2018;color:var(--call);border:1px solid #1c4a30}
+  .btn.xx{padding:2px 6px;font-size:11px;background:var(--panel2);color:var(--dim);border:1px solid var(--line2)}
+  .spin{color:var(--dim);font-size:12px}
+  .flash{animation:fl .6s}
+  @keyframes fl{0%{background:#13202c}100%{background:transparent}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const {useState,useEffect,useRef,useCallback}=React;
+const API='';
+const j=(u,o)=>fetch(API+u,o).then(async r=>{const t=await r.text();let d;try{d=JSON.parse(t)}catch{d={detail:t}}if(!r.ok)throw new Error(d.detail||r.statusText);return d});
+const fmt=(n,d=2)=>n==null||isNaN(n)?'—':Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
+const fmt0=n=>n==null?'—':Number(n).toLocaleString('en-US');
+
+function App(){
+  const [cfg,setCfg]=useState(null);
+  const [ticker,setTicker]=useState(null);
+  const [strategy,setStrategy]=useState(null);
+  const [adj,setAdj]=useState({});
+  const [build,setBuild]=useState(null);
+  const [price,setPrice]=useState(null);      // live reprice
+  const [analysis,setAnalysis]=useState(null);
+  const [limit,setLimit]=useState('');
+  const [userLimit,setUserLimit]=useState(false);
+  const [qty,setQty]=useState(1);
+  const [duration,setDuration]=useState('day');
+  const [autoClose,setAutoClose]=useState(true);
+  const [targetPct,setTargetPct]=useState(30);
+  const [confirm,setConfirm]=useState(null);    // {order_type}
+  const [placing,setPlacing]=useState(false);
+  const [result,setResult]=useState(null);
+  const [err,setErr]=useState(null);
+  const [now,setNow]=useState('');
+
+  useEffect(()=>{const t=setInterval(()=>setNow(new Date().toLocaleTimeString()),1000);return()=>clearInterval(t)},[]);
+
+  // config
+  useEffect(()=>{j('/torque/config').then(c=>{
+    setCfg(c);setTicker(c.tickers[0]);setStrategy(c.default_strategy);setTargetPct(c.close_target_pct);
+  }).catch(e=>setErr('config: '+e.message))},[]);
+
+  const sdef=cfg&&strategy?cfg.strategies.find(s=>s.key===strategy):null;
+
+  // build (on ticker/strategy/adj change)
+  const doBuild=useCallback(()=>{
+    if(!ticker||!strategy)return;
+    setErr(null);
+    j('/torque/build',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbol:ticker,strategy,adjustments:adj})})
+      .then(b=>{setBuild(b);
+        // only accept a COMPLETE net price; keep the last good one otherwise so
+        // a momentary missing leg never flickers a partial single-leg number.
+        if(b.price&&b.price.complete){setPrice(b.price);if(!userLimit)setLimit(String(b.suggested_limit));}})
+      .catch(e=>{setErr('build: '+e.message);setBuild(null)});
+  },[ticker,strategy,adj,userLimit]);
+  useEffect(()=>{doBuild()},[ticker,strategy,adj]);
+
+  // reset on ticker/strategy change
+  useEffect(()=>{setAdj({});setUserLimit(false);setResult(null);},[ticker,strategy]);
+
+  // analysis poll 5s
+  useEffect(()=>{
+    if(!ticker)return;let live=true;
+    const run=()=>j('/torque/analyze/'+ticker).then(a=>{if(live)setAnalysis(a)}).catch(()=>{});
+    run();const t=setInterval(run,5000);return()=>{live=false;clearInterval(t)};
+  },[ticker]);
+
+  // live re-anchor + reprice every 3s: rebuild re-derives strikes from the
+  // current spot (keeping any manual ±steps in adj) and returns fresh net
+  // bid/mid/ask, so spot, strikes, and prices all move together and stay in
+  // sync with the chain. Paused while confirming or placing so strikes don't
+  // shift under the user. The chain itself is cached 2s server-side, so this
+  // is at most one fetch per tick.
+  useEffect(()=>{
+    if(!ticker||!strategy||confirm||placing)return;let live=true;
+    const t=setInterval(()=>{if(live)doBuild()},3000);
+    return()=>{live=false;clearInterval(t)};
+  },[ticker,strategy,confirm,placing,doBuild]);
+
+  const step=(role,n)=>setAdj(a=>({...a,[role]:(a[role]||0)+n}));
+
+  // busy cursor for any in-flight request (place is the slow one)
+  useEffect(()=>{document.body.style.cursor=placing?'progress':'';return()=>{document.body.style.cursor='';};},[placing]);
+
+  // orders panel: poll working + filled orders + auto-close watchers every 4s
+  const [orders,setOrders]=useState(null);
+  useEffect(()=>{let live=true;
+    const run=()=>j('/torque/orders').then(o=>{if(live)setOrders(o)}).catch(()=>{});
+    run();const t=setInterval(run,4000);return()=>{live=false;clearInterval(t)};
+  },[]);
+  const refreshOrders=()=>j('/torque/orders').then(setOrders).catch(()=>{});
+  const cancelOrder=(id)=>{setPlacing(true);
+    j('/torque/cancel/'+id,{method:'POST'}).catch(e=>setErr('cancel: '+e.message))
+      .finally(()=>{setPlacing(false);refreshOrders();});};
+  const modifyOrder=(id,price)=>{setPlacing(true);
+    j('/torque/modify/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({price:Number(price)})})
+      .catch(e=>setErr('modify: '+e.message)).finally(()=>{setPlacing(false);refreshOrders();});};
+
+  const place=(order_type,dry=false)=>{
+    setPlacing(true);setResult(null);setErr(null);
+    const legs=build.legs.map(l=>({symbol:l.symbol,action:l.action,quantity:l.quantity,side:l.side,strike:l.strike,role:l.role}));
+    const body={symbol:ticker,strategy,legs,order_type,
+      limit_price:order_type==='limit'?Number(limit):null,duration,quantity:Number(qty),
+      auto_close:autoClose,close_target_pct:Number(targetPct),
+      spread_type:build.type,confirm:!dry,dry_run:dry};
+    j('/torque/place',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(r=>setResult(r)).catch(e=>setErr('place: '+e.message))
+      .finally(()=>{setPlacing(false);setConfirm(null)});
+  };
+
+  if(!cfg)return <div className="wrap"><div className="spin">loading…{err&&<div className="err">{err}</div>}</div></div>;
+  // last KNOWN-complete net price (sticky). build.price is only used as the
+  // initial value and only if itself complete — never a partial.
+  const bp=build&&build.price;
+  const p=price||((bp&&bp.complete)?bp:null);
+
+  return <div className="wrap">
+    <header>
+      <img className="logomark" src="/torque/assets/torque-logo.svg" alt="Torque"/>
+      <div className="brand">
+        <div className="logo">TORQUE<small>·</small></div>
+        <div className="byline">by EDGELANE</div>
+      </div>
+      <span className={"tag "+(cfg.env==='sandbox'||cfg.devmode?'sandbox':'production')}>
+        {cfg.devmode||cfg.env==='sandbox'?'SANDBOX':'PRODUCTION'} · {cfg.mode}</span>
+      <div className="grow"></div>
+      <div className="clock">{now}</div>
+    </header>
+
+    <div className="row" style={{marginTop:14,gap:14,alignItems:'flex-start'}}>
+      <label className="fld">Ticker
+        <select className="big" value={ticker||''} onChange={e=>setTicker(e.target.value)}>
+          {cfg.tickers.map(t=><option key={t} value={t}>{t}</option>)}
+        </select>
+      </label>
+      <div style={{flex:1}}>
+        <label className="fld" style={{marginBottom:4}}>Strategy</label>
+        <div className="strat-grid">
+          {cfg.strategies.map(s=>
+            <div key={s.key} className={"strat "+(s.type)+(strategy===s.key?' on':'')}
+                 onClick={()=>setStrategy(s.key)}>
+              {s.short}<span className="k">{s.type}{s.legs>1?' · '+s.legs+'L':''}</span>
+            </div>)}
+        </div>
+      </div>
+    </div>
+
+    <div className="grid">
+      {/* ── order builder ── */}
+      <div className="panel">
+        <div className="spotline">
+          <div className="spot"><span className="sym">{ticker}</span>{(()=>{const s=(build&&build.symbol===ticker?build.spot:null)??(analysis&&analysis.symbol===ticker?analysis.spot:null);return s!=null?fmt(s,2):'—';})()}</div>
+          <div className="exp">exp {build?build.expiration:'—'} · 0DTE</div>
+          {sdef&&<span className={"ptype "+sdef.type} style={{alignSelf:'center'}}>{sdef.name} · {sdef.type}</span>}
+        </div>
+
+        {build&&build.missing_legs&&build.missing_legs.length>0&&
+          <div className="err">⚠ no listed strike for legs: {build.missing_legs.join(', ')} — step them into the grid.</div>}
+
+        <table className="legs">
+          <thead><tr><th>Leg</th><th>Side</th><th>Action</th><th>Strike</th><th>Mid</th></tr></thead>
+          <tbody>
+            {build&&build.legs.map((l,i)=>{
+              const lp=p&&p.legs&&p.legs.find(x=>x.role===l.role);
+              return <tr key={l.role+i}>
+                <td className="muted">{l.role.replace('_',' ')}</td>
+                <td><span className={"side "+l.side}>{l.side.toUpperCase()}</span></td>
+                <td><span className={"act "+(l.action.startsWith('buy')?'buy':'sell')}>
+                  {l.action.startsWith('buy')?'BUY':'SELL'}{l.quantity>1?' ×'+l.quantity:''}</span></td>
+                <td>
+                  <span className="stepper">
+                    <button onClick={()=>step(l.role,-1)}>−</button>
+                    <span className="strike">{fmt(l.strike,0)}</span>
+                    <button onClick={()=>step(l.role,1)}>+</button>
+                  </span>
+                </td>
+                <td>{lp?fmt(lp.mid):'—'}</td>
+              </tr>;
+            })}
+            {!build&&<tr><td colSpan="5" className="spin">building…</td></tr>}
+          </tbody>
+        </table>
+
+        {/* net price */}
+        {p?<div className="netcard">
+          <div className="cell"><div className="lab">Bid</div><div className="val" style={{color:'var(--dim)'}}>{fmt(p.abs_bid)}</div></div>
+          <div className="cell mid"><div className="lab">Mid ({p.type})</div>
+            <div className="val" style={{color:p.type==='debit'?'var(--debit)':'var(--credit)'}}>{fmt(p.abs_mid)}</div></div>
+          <div className="cell"><div className="lab">Ask</div><div className="val" style={{color:'var(--dim)'}}>{fmt(p.abs_ask)}</div></div>
+        </div>:<div className="netcard"><div className="cell"><div className="lab">Net</div><div className="val" style={{color:'var(--dim)'}}>pricing…</div></div></div>}
+
+        {/* order controls */}
+        <div className="sendrow">
+          <label className="fld">Limit Price
+            <input type="number" step="0.05" value={limit}
+              onChange={e=>{setLimit(e.target.value);setUserLimit(true)}} style={{width:110}}/>
+          </label>
+          <label className="fld">Qty
+            <input type="number" min="1" max="50" value={qty} onChange={e=>setQty(e.target.value)} style={{width:70}}/>
+          </label>
+          <label className="fld">TIF
+            <select value={duration} onChange={e=>setDuration(e.target.value)}>
+              <option value="day">DAY</option><option value="gtc">GTC</option></select>
+          </label>
+          <div className={"toggle"+(autoClose?' on':'')} onClick={()=>setAutoClose(v=>!v)} style={{alignSelf:'center',marginBottom:4}}>
+            <span className="sw"></span> auto-close +
+            <input type="number" min="1" max="500" value={targetPct} onClick={e=>e.stopPropagation()}
+              onChange={e=>setTargetPct(e.target.value)} style={{width:54,padding:'4px 6px',fontSize:12}}/>%
+          </div>
+        </div>
+
+        <div className="sendrow">
+          <button className="btn limit" disabled={!build||placing||!limit} onClick={()=>setConfirm({t:'limit'})}>
+            SEND LIMIT ${limit||'—'}</button>
+          <button className="btn market" disabled={!build||placing} onClick={()=>setConfirm({t:'market'})}>
+            SEND MARKET</button>
+          <button className="btn" disabled={!build||placing||!limit} title="Validate format against the broker — places nothing"
+            onClick={()=>place('limit',true)}>DRY RUN</button>
+          {placing&&<span className="spin" style={{alignSelf:'center'}}>working…</span>}
+        </div>
+
+        {confirm&&<div className="confirm">
+          <div className="summary">
+            <b>{confirm.t==='market'?'MARKET':'LIMIT $'+limit}</b> · {sdef.name} · {ticker} · {qty} contract{qty>1?'s':''} · {duration.toUpperCase()}
+            {autoClose&&<><br/><span className="muted">↳ auto-close at +{targetPct}% once the entry confirms FILLED
+              {sdef.legs===1&&confirm.t==='limit'?' (native OTO bracket)':' (place→confirm→close)'}</span></>}
+            <br/><span className="muted">{build.legs.map(l=>(l.action.startsWith('buy')?'+':'-')+(l.quantity>1?l.quantity:'')+l.side[0].toUpperCase()+fmt(l.strike,0)).join('  ')}</span>
+          </div>
+          <button className="btn limit" disabled={placing} onClick={()=>place(confirm.t)}>CONFIRM & SEND</button>
+          <button className="btn" style={{marginLeft:8}} onClick={()=>setConfirm(null)}>cancel</button>
+        </div>}
+
+        {err&&<div className="err">{err}</div>}
+        {result&&<ResultView r={result}/>}
+      </div>
+
+      {/* ── analysis ── */}
+      <div className="panel">
+        <h3>Directional Lean <span className="muted" style={{textTransform:'none',letterSpacing:0}}>(heuristic)</span></h3>
+        {!analysis&&<div className="spin">analyzing…</div>}
+        {analysis&&<>
+          <div className="lean-head">
+            <div className="lean-val" style={{color:leanColor(analysis.lean)}}>{analysis.lean>0?'+':''}{analysis.lean}</div>
+            <div className={"lean-lab "+analysis.label}>{analysis.label}</div>
+          </div>
+          <div className="lean-wrap"><div className="lean-bar"><div className="mid"></div>
+            <div className="dot" style={{left:(50+analysis.lean/2)+'%',background:leanColor(analysis.lean)}}></div></div></div>
+          <div className="sugg">suggested single-leg side:
+            {analysis.suggested_side
+              ? <span className={"pill side "+analysis.suggested_side}>{analysis.suggested_side.toUpperCase()}</span>
+              : <span className="pill" style={{color:'var(--dim)'}}>NO EDGE</span>}
+            {analysis.suggested_side&&sdef&&sdef.legs===1&&<button className="btn" style={{marginLeft:8,padding:'3px 8px',fontSize:11}}
+              onClick={()=>setStrategy(analysis.suggested_side==='call'?'long_call':'long_put')}>use →</button>}
+          </div>
+          <div className="metrics">
+            <Metric l="Volume P/C" v={analysis.components.volume.pcr} sig={analysis.components.volume.signal}/>
+            <Metric l="Premium skew" v={null} sig={analysis.components.premium_skew.signal} txt={sigTxt(analysis.components.premium_skew.signal)}/>
+            <Metric l="OI P/C" v={analysis.components.oi.pcr} sig={-(analysis.components.oi.signal||0)}/>
+            <Metric l="Magnet" v={null} txt={fmt0(analysis.components.magnet.strike)} sub={analysis.components.magnet.dist_pct+'%'} sig={analysis.components.magnet.signal}/>
+          </div>
+          <div className="levels">
+            <Lvl l="top call OI" x={analysis.levels.top_call_oi}/>
+            <Lvl l="top put OI" x={analysis.levels.top_put_oi}/>
+            <Lvl l="top volume" x={analysis.levels.top_volume}/>
+          </div>
+          <div className="disc">{analysis.disclaimer}</div>
+        </>}
+      </div>
+    </div>
+
+    <OrdersPanel data={orders} onCancel={cancelOrder} onModify={modifyOrder} busy={placing}/>
+  </div>;
+}
+
+function PriceEdit({o,onModify,busy}){
+  const [v,setV]=useState('');
+  const [edit,setEdit]=useState(false);
+  useEffect(()=>{if(!edit)setV(o.price!=null?String(o.price):'')},[o.price,edit]);
+  if(o.price==null)return <span className="muted">{o.avg_fill_price!=null?'@$'+fmt(o.avg_fill_price):'mkt'}</span>;
+  if(!edit)return <span className="pxedit" onClick={()=>setEdit(true)} title="click to modify">${fmt(o.price)} ✎</span>;
+  return <span className="pxrow">
+    <input type="number" step="0.05" value={v} autoFocus onChange={e=>setV(e.target.value)}
+      onKeyDown={e=>{if(e.key==='Enter'){onModify(o.id,v);setEdit(false)}if(e.key==='Escape')setEdit(false)}}/>
+    <button className="btn xsave" disabled={busy} onClick={()=>{onModify(o.id,v);setEdit(false)}}>✓</button>
+    <button className="btn xx" onClick={()=>setEdit(false)}>✕</button>
+  </span>;
+}
+
+function OrdersPanel({data,onCancel,onModify,busy}){
+  const orders=(data&&data.orders)||[];      // backend returns ONLY working orders
+  const watchers=(data&&data.watchers)||[];
+  const empty=orders.length===0&&watchers.length===0;
+  return <div className="panel orders">
+    <h3>Working Orders {data?<span className="muted" style={{textTransform:'none',letterSpacing:0}}>· {orders.length} live{watchers.length?' · '+watchers.length+' arming':''}</span>:null}</h3>
+    <div className="oscroll">
+    {watchers.length>0&&<div className="watchers">
+      {watchers.map(w=><div key={w.entry_order_id} className="watch">
+        <span className="dotpulse"></span> auto-close armed — {w.symbol} {w.strategy} · waiting for entry {w.entry_order_id} to fill
+        {w.close_target_price?(' → will sell/buy-to-close ~$'+fmt(w.close_target_price)+' GTC'):''}
+        {w.close_reason?<span className="err"> ({w.close_reason})</span>:''}
+      </div>)}
+    </div>}
+    {!data&&<div className="spin">loading…</div>}
+    {data&&empty&&<div className="muted">no working orders.</div>}
+    {orders.length>0&&<table className="otable">
+      <thead><tr><th>id</th><th>sym</th><th>class</th><th>type</th><th>fill</th><th>limit</th><th>status</th><th>tag</th><th></th></tr></thead>
+      <tbody>{orders.map(o=><tr key={o.id} className="working">
+        <td className="muted">{o.id}</td>
+        <td>{o.symbol}</td>
+        <td>{o.class}</td>
+        <td><span className={"side "+(/credit|sell/i.test((o.type||'')+(o.side||''))?'put':'call')}>{(o.type||o.side||'').toUpperCase()}</span></td>
+        <td>{o.exec_quantity||0}/{o.quantity||0}</td>
+        <td><PriceEdit o={o} onModify={onModify} busy={busy}/></td>
+        <td><span className={"ostat "+o.status}>{o.status}</span></td>
+        <td className="muted" style={{fontSize:10}}>{o.tag}</td>
+        <td><button className="btn xcancel" disabled={busy} onClick={()=>onCancel(o.id)}>cancel</button></td>
+      </tr>)}</tbody>
+    </table>}
+    </div>
+  </div>;
+}
+
+function Metric({l,v,sig,txt,sub}){
+  const c=sig>0.05?'var(--call)':sig<-0.05?'var(--put)':'var(--dim)';
+  const w=Math.min(100,Math.abs((sig||0)*100));
+  return <div className="metric">
+    <div className="l">{l}</div>
+    <div className="v">{txt!=null?txt:(v!=null?fmt(v,2):'—')}{sub&&<span className="muted" style={{fontSize:11}}> {sub}</span>}</div>
+    <div className="bar"><i style={{width:w+'%',background:c,marginLeft:sig<0?(100-w)+'%':0}}></i></div>
+  </div>;
+}
+function Lvl({l,x}){
+  if(!x)return <div className="lv"><span className="muted">{l}</span><span>—</span></div>;
+  return <div className="lv"><span className="muted">{l}</span>
+    <span><span className={"side "+x.side} style={{marginRight:6}}>{x.side.toUpperCase()}</span>
+    {fmt0(x.strike)} · OI {fmt0(x.open_interest)} · V {fmt0(x.volume)}</span></div>;
+}
+function ResultView({r}){
+  if(r.mode==='dry_run'){
+    const ok=r.entry_ok&&r.close_ok;
+    return <div className={"result "+(ok?'good':'bad')}>
+      <div className="hl">{ok?'✓ DRY RUN — format valid (nothing placed)':'✗ DRY RUN — issue found'}</div>
+      <div>entry: {r.entry_ok?<span style={{color:'var(--good)'}}>✓ accepted</span>:<span className="err">✗ {r.entry_reason}</span>}</div>
+      <div>close: {r.close_needs_position
+        ? <span className="muted">✓ format valid (full check needs the position open — validates live after fill)</span>
+        : (r.close_ok?<span style={{color:'var(--good)'}}>✓ accepted</span>:<span className="err">✗ {r.close_reason}</span>)}
+        {' '}<span className="muted">@ ${fmt(r.close_target_price)}</span></div>
+    </div>;
+  }
+  const rej=r.rejected;
+  const good=!rej;
+  return <div className={"result "+(rej?'bad':good?'good':'')}>
+    <div className="hl">{rej?'✗ ENTRY REJECTED':r.mode==='oto_bracket'?'✓ OTO BRACKET SENT':'✓ ENTRY SENT'}</div>
+    {rej&&<div className="err">{r.reason}</div>}
+    {!rej&&<>
+      <div>entry id: {r.entry&&r.entry.id} · status: {r.entry&&r.entry.status}</div>
+      {r.mode==='oto_bracket'&&<div>close target: ${fmt(r.close_target_price)} (broker-held OCO)</div>}
+      {r.mode==='watching_fill'&&<div className="hl" style={{color:'var(--accent)'}}>
+        ⏳ auto-close armed — watching for fill, places the profit-target close once filled
+        {r.close_target_price?(' (~$'+fmt(r.close_target_price)+' GTC)'):''}
+        <div className="muted">track it in the Orders panel below.</div></div>}
+      {!r.auto_close&&r.mode!=='oto_bracket'&&<div className="muted">auto-close off — single order only</div>}
+    </>}
+  </div>;
+}
+const leanColor=v=>v>=25?'#36d399':v<=-25?'#f87272':'#7d8b9a';
+const sigTxt=s=>s>0.05?'calls rich':s<-0.05?'puts rich':'balanced';
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>

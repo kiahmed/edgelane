@@ -274,10 +274,6 @@ function _computeEdgelaneProviderScore(spot, putWall, callWall) {
 }
 
 function _findGexWall(greeksRaw, exposuresForChosen) {
-  const kl = greeksRaw?.key_levels || {};
-  const atlasCallWall = Number(kl.call_wall ?? kl.callWall ?? kl.gex_call_wall ?? 0) || null;
-  const atlasPutWall  = Number(kl.put_wall  ?? kl.putWall  ?? kl.gex_put_wall  ?? 0) || null;
-
   const rows = _strikeRowsFrom(exposuresForChosen);
   const gexByStrike = rows
     .map(r => ({
@@ -318,12 +314,9 @@ function _findGexWall(greeksRaw, exposuresForChosen) {
     }
   }
 
-  const wallStrike = best?.strike ?? atlasCallWall ?? atlasPutWall ?? null;
-  if (best == null && wallStrike != null) {
-    wallType = (wallStrike === atlasCallWall) ? 'call' : (wallStrike === atlasPutWall) ? 'put' : null;
-  }
+  const wallStrike = best?.strike ?? null;
 
-  return { strike: wallStrike, strength, type: wallType, atlasCallWall, atlasPutWall, computedTopGex: best?.gex || 0 };
+  return { strike: wallStrike, strength, type: wallType, computedTopGex: best?.gex || 0 };
 }
 
 function _aggregateExposures(exposuresForChosen, portfolioTotals) {

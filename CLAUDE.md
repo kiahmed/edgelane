@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-EdgeLane is a hybrid (single-file frontend + optional FastAPI backend) options spread optimizer. It finds and ranks multi-leg options spreads by a composite tradeability score (EV, structural health, liquidity, limit-order feasibility, probability of profit). Data comes from Atlas (mind-vest.io) or Tradier, with Gemini Flash providing prose narrative synthesis.
+EdgeLane is a hybrid (single-file frontend + optional FastAPI backend) options spread optimizer. It finds and ranks multi-leg options spreads by a composite tradeability score (EV, structural health, liquidity, limit-order feasibility, probability of profit). Data comes from Tradier, with Gemini Flash providing prose narrative synthesis.
 
 ## Build & Run Commands
 
@@ -49,16 +49,14 @@ make test
 # or: python -m pytest tests/parity/ -q --no-header
 
 # Integration/smoke tests (from repo root, require live API keys)
-python tests/atlas_rest_smoke.py
 python tests/tradier_smoke.py
-python tests/e2e_pipeline.py
 ```
 
 ## Architecture
 
 ### Frontend: `spread_optimizer_v4_7_html.jsx`
 
-This single JSX file (~5,500 lines) is the **source of truth** for the frontend. The build script (`edge_lane_build.sh`) strips ESM syntax, inlines it into `edge_lane.template.html`, substitutes config values (`__ATLAS_KEY__`, `__GEMINI_API_KEY__`, `__EDGE_LANE_VERSION__`, etc.), and emits `edge_lane.html`. No Node.js build step — Babel-standalone transpiles in-browser.
+This single JSX file (~5,500 lines) is the **source of truth** for the frontend. The build script (`edge_lane_build.sh`) strips ESM syntax, inlines it into `edge_lane.template.html`, substitutes config values (`__TRADIER_TOKEN__`, `__GEMINI_API_KEY__`, `__EDGE_LANE_VERSION__`, etc.), and emits `edge_lane.html`. No Node.js build step — Babel-standalone transpiles in-browser.
 
 Key subsystems within the JSX:
 - **Bias engine** — deterministic dealer GEX wall detection + confidence scoring (JS math, not LLM)
@@ -84,22 +82,48 @@ FastAPI + DuckDB service that continuously polls Tradier, runs the same math as 
 | `walls.py` | Bilateral wall finder + strength + penalty |
 | `tradier_client.py` | Async httpx Tradier client (structured errors, rate-limit capture) |
 | `mock_tradier.py` | Synthetic SPX chain for dev/demo (no credentials needed) |
-| `routes/` | HTTP endpoints: /status, /snapshot/{symbol}, /accuracy/{symbol}, /orders, /diag/tradier, /webhook/edgelane_provider_gex |
+| `routes/` | HTTP endpoints: /status, /snapshot/{symbol}, /accuracy/{symbol}, /orders, /diag/tradier, /webhook/edgelane_provider_gex, /torque/* |
+| `torque_engine.py` / `torque_config.py` | Torque order-builder: pure strike auto-fill + pricing + lean math; per-ticker offset config |
+| `ui/torque.html` | Torque standalone page (served at `GET /torque`) |
+
+### Torque (standalone order builder)
+
+A separate page (`/torque`) served from this same backend — the place-order
+dialog as its own fast, auto-filling advanced order menu (ticker + one of 10
+strategies, no bias logic). Auto-close is hybrid: single-leg limit entries use a
+native Tradier OTO bracket, spreads/market entries place→confirm-fill→close (so a
+rejected/unfilled entry never leaves a naked close). Strike offsets are
+backend-configured (`torque_config.py` / `torque_tickers.json`), never hardcoded
+in the page. Run via `make run-dev` (sandbox) and open `:8789/torque`. Full doc:
+`docs/torque.md`.
 
 ### Data Providers
 
-Switchable via `DATA_PROVIDER` config (frontend) or token presence (backend):
-- **Atlas** (mind-vest.io) — pre-computed dealer GEX rollups, default for frontend
-- **Tradier** — raw chains + local GEX aggregation, primary for backend
+Tradier is the sole live data provider (EdgeLane was originally built on Atlas (mind-vest.io), which was fully retired ~May 2026):
+- **Tradier** — raw chains + local GEX aggregation, for both frontend and backend
 - **Mock** — deterministic synthetic chain when no Tradier token configured
 
 ## Configuration
 
 Two config files (both KEY=VALUE format, `#` comments):
 - `edge_lane_config.config` — frontend: API keys, model, data provider, proxy URLs, version
-- `edgelane_market.config` — backend: Tradier tokens, symbols, poll interval, scoring params, DB path, CORS origins
+- `edgelane_market.config` — backend (FastAPI service + **Torque**): Tradier tokens, symbols, poll interval, scoring params, DB path, CORS origins
 
-DEVMODE controls sandbox vs production Tradier and market-hours gating.
+**DEVMODE** controls sandbox vs production Tradier and market-hours gating. Each
+config file has its **own** `DEVMODE`, read by a **separate** code path — the
+frontend file's flag is consumed only by the browser JSX build; the backend file's
+flag is consumed only by the market service / Torque. They are independent; setting
+one does not affect the other.
+
+For the backend (`edgelane_market.config`), the `make` targets manage `DEVMODE` for you:
+- `make run-dev` **rewrites** `DEVMODE=true` (sandbox token + `sandbox.tradier.com` + sandbox DB), then boots.
+- `make run-prod` **rewrites** `DEVMODE=false` (production token + `api.tradier.com`, market-hours gated), then boots.
+- `make run` does **not** flip it — it boots with whatever `DEVMODE` is currently in the file.
+
+So `run-dev`/`run-prod` force the environment regardless of the file's prior value;
+only bare `make run` respects the current setting. `DEVMODE=true` flips token,
+account id, base URL, and DB path to sandbox in one switch (derived properties in
+`config.py`).
 
 ## Key Conventions
 

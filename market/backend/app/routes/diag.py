@@ -17,11 +17,16 @@ router = APIRouter()
 
 
 @router.get("/diag/walls/{symbol}")
-async def diag_walls(symbol: str, request: Request, window: float = 0.015):
-    """Per-strike OI GEX (gamma x open_interest) for a symbol, shown in the
-    provider sign convention (negative = PUT, positive = CALL), plus the
-    dominant put/call walls. Lets the operator compare Tradier-OI walls against
-    what the provider displays without running tools/wall_compare.py by hand."""
+async def diag_walls(symbol: str, request: Request, window: float = 0.015,
+                     source: str = "oi"):
+    """Per-strike GEX for a symbol, shown in the provider sign convention
+    (negative = PUT, positive = CALL), plus the dominant put/call walls. Lets
+    the operator compare Tradier walls against what the provider displays
+    without running tools/wall_compare.py by hand.
+
+    ?source=oi (gamma x open_interest, default) or ?source=volume (gamma x
+    today's traded volume) — call both to diff resting vs flow walls live."""
+    gex_weight = "volume" if (source or "oi").lower() == "volume" else "oi"
     from ..poller import _normalize_tradier_contract
     from ..dealer_exposures import compute_dealer_exposures
 
@@ -46,7 +51,7 @@ async def diag_walls(symbol: str, request: Request, window: float = 0.015):
         return {"error": f"no expirations for {sym}"}
     raw = await client.options_chain(sym, exp)
     contracts = [_normalize_tradier_contract(o) for o in raw if o.get("strike") is not None]
-    rows = (compute_dealer_exposures(contracts, spot).get("exposures_by_date", {}).get(exp) or {}).get("by_strike", [])
+    rows = (compute_dealer_exposures(contracts, spot, gex_weight=gex_weight).get("exposures_by_date", {}).get(exp) or {}).get("by_strike", [])
 
     lo, hi = spot * (1 - window), spot * (1 + window)
     # provider convention: gex_tt = call_gex - put_gex (negative = PUT, positive = CALL)
@@ -70,7 +75,8 @@ async def diag_walls(symbol: str, request: Request, window: float = 0.015):
         "spot": spot,
         "expiration": exp,
         "convention": "edgelane_provider: negative=PUT, positive=CALL",
-        "source": "tradier_oi (gamma x open_interest)",
+        "source": ("tradier_volume (gamma x volume)" if gex_weight == "volume"
+                   else "tradier_oi (gamma x open_interest)"),
         "put_wall": {"strike": put_wall[0], "gex_tt": put_wall[1],
                      "pos": "above" if (put_wall[0] or 0) > spot else "below"},
         "call_wall": {"strike": call_wall[0], "gex_tt": call_wall[1],
