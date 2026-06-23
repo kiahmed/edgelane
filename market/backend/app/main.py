@@ -172,6 +172,7 @@ app.add_middleware(
 
 from .routes import (  # noqa: E402
     status, symbols, snapshot, accuracy, diag, orders, webhook, torque, session, broker, contact,
+    strike_profiles,
 )
 
 app.include_router(status.router)
@@ -185,6 +186,10 @@ app.include_router(torque.router)
 app.include_router(session.router)
 app.include_router(broker.router)
 app.include_router(contact.router)
+# page route first so /strike-profiles/admin matches the HTML page (no JSON gate)
+# before the API router's /strike-profiles/{symbol} parameterized route.
+app.include_router(strike_profiles.page_router)
+app.include_router(strike_profiles.router)
 
 
 @app.get("/")

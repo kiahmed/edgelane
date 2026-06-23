@@ -162,7 +162,12 @@
 <script type="text/babel" data-presets="react">
 const {useState,useEffect,useRef,useCallback}=React;
 const API='';
-const j=(u,o)=>fetch(API+u,o).then(async r=>{const t=await r.text();let d;try{d=JSON.parse(t)}catch{d={detail:t}}if(!r.ok)throw new Error(d.detail||r.statusText);return d});
+// Torque is an admin/owner tool — the page is opened with ?token=<ADMIN_API_TOKEN>;
+// we stash it (sessionStorage, per-tab) and attach it as X-Admin-Token on every
+// fetch. Auth is a no-op when the backend runs with AUTH_ENABLED=false (dev).
+const TOK=(new URLSearchParams(location.search).get('token'))||sessionStorage.getItem('tq_tok')||'';
+if(TOK)sessionStorage.setItem('tq_tok',TOK);
+const j=(u,o={})=>fetch(API+u,{...o,headers:{...(o.headers||{}),...(TOK?{'X-Admin-Token':TOK}:{})}}).then(async r=>{const t=await r.text();let d;try{d=JSON.parse(t)}catch{d={detail:t}}if(!r.ok)throw new Error(d.detail||r.statusText);return d});
 const fmt=(n,d=2)=>n==null||isNaN(n)?'—':Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const fmt0=n=>n==null?'—':Number(n).toLocaleString('en-US');
 
@@ -390,19 +395,19 @@ function App(){
 
       {/* ── analysis ── */}
       <div className="panel">
-        <h3>Directional Lean <span className="muted" style={{textTransform:'none',letterSpacing:0}}>(heuristic)</span></h3>
+        <h3>Positioning <span className="muted" style={{textTransform:'none',letterSpacing:0}}>(snapshot — not a forecast)</span></h3>
         {!analysis&&<div className="spin">analyzing…</div>}
         {analysis&&<>
           <div className="lean-head">
             <div className="lean-val" style={{color:leanColor(analysis.lean)}}>{analysis.lean>0?'+':''}{analysis.lean}</div>
-            <div className={"lean-lab "+analysis.label}>{analysis.label}</div>
+            <div className={"lean-lab "+analysis.label}>{LEAN_LAB[analysis.label]||analysis.label}</div>
           </div>
           <div className="lean-wrap"><div className="lean-bar"><div className="mid"></div>
             <div className="dot" style={{left:(50+analysis.lean/2)+'%',background:leanColor(analysis.lean)}}></div></div></div>
-          <div className="sugg">suggested single-leg side:
+          <div className="sugg">premium / OI clusters:
             {analysis.suggested_side
-              ? <span className={"pill side "+analysis.suggested_side}>{analysis.suggested_side.toUpperCase()}</span>
-              : <span className="pill" style={{color:'var(--dim)'}}>NO EDGE</span>}
+              ? <span className={"pill side "+analysis.suggested_side}>{analysis.suggested_side==='call'?'CALL-SIDE':'PUT-SIDE'}</span>
+              : <span className="pill" style={{color:'var(--dim)'}}>BALANCED</span>}
             {analysis.suggested_side&&sdef&&sdef.legs===1&&<button className="btn" style={{marginLeft:8,padding:'3px 8px',fontSize:11}}
               onClick={()=>setStrategy(analysis.suggested_side==='call'?'long_call':'long_put')}>use →</button>}
           </div>
@@ -518,6 +523,9 @@ function ResultView({r}){
   </div>;
 }
 const leanColor=v=>v>=25?'#36d399':v<=-25?'#f87272':'#7d8b9a';
+// Positioning is a snapshot of where premium/OI/volume cluster — NOT a price
+// forecast. Label reads as call-/put-leaning, never bullish/bearish.
+const LEAN_LAB={bullish:'call-leaning',bearish:'put-leaning',neutral:'balanced'};
 const sigTxt=s=>s>0.05?'calls rich':s<-0.05?'puts rich':'balanced';
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App/>);

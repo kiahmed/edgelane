@@ -768,7 +768,7 @@
   }
   // UI-owned version, auto-bumped by .githooks/pre-commit on any commit that
   // touches this file (manual: tools/bump_ui_version.sh).
-  const UI_VERSION = '2.0.1';
+  const UI_VERSION = '2.0.2';
   console.info('[edgelane] API_BASE =', API_BASE,
     '  (override with ?api=http://host:port; clear with localStorage.removeItem("edgelane_api_base"))');
 
@@ -2289,7 +2289,12 @@
     const liveSigned = credit ? -Math.abs(candidate.net_premium) : Math.abs(candidate.net_premium);
     const offset = liveSigned - anchor.total;
 
-    const STEP = currentSpot > 1000 ? 1 : 0.5;
+    // Spot-axis granularity scales with price so the visible range stays a
+    // comparable % band across underlyings. SPX (~6k) keeps STEP=1 (≈±0.25%);
+    // NDX (~24k) trades ~4x the points with 25-wide strikes, so ±15 single
+    // points would be a uselessly tight ~0.06% band — bump STEP for high-priced
+    // names to keep the projection meaningful.
+    const STEP = currentSpot > 10000 ? 5 : currentSpot > 1000 ? 1 : 0.5;
     const HALF = 15;
     const centerSnap = Math.round(currentSpot / STEP) * STEP;
     const spotAxis = [];

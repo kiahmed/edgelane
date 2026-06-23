@@ -90,7 +90,31 @@ CREATE TABLE IF NOT EXISTS edgelane_provider_display (
 );
 CREATE INDEX IF NOT EXISTS idx_edgelane_provider_display_lookup
     ON edgelane_provider_display (symbol, ts);
+
+-- Per-ticker debit-spread strike-selection config (see strike_profiles.py).
+-- NULL width bounds / offset mean "derive from the expected move".
+CREATE TABLE IF NOT EXISTS strike_profiles (
+    symbol          VARCHAR PRIMARY KEY,
+    enabled         BOOLEAN,
+    long_delta_lo   DOUBLE,
+    long_delta_hi   DOUBLE,
+    long_offset_pts DOUBLE,
+    short_min_delta DOUBLE,
+    min_width_pts   DOUBLE,
+    max_width_pts   DOUBLE,
+    target_source   VARCHAR,
+    round_snap      DOUBLE,
+    min_oi          INTEGER,
+    min_vol         INTEGER,
+    updated_at      TIMESTAMP
+);
 """
+
+_STRIKE_PROFILE_COLS = (
+    "symbol", "enabled", "long_delta_lo", "long_delta_hi", "long_offset_pts",
+    "short_min_delta", "min_width_pts", "max_width_pts", "target_source",
+    "round_snap", "min_oi", "min_vol",
+)
 
 
 class Database:
@@ -114,6 +138,50 @@ class Database:
             self._conn = duckdb.connect(str(self.path))
         with self._lock:
             self._conn.execute(_SCHEMA)
+        self._seed_strike_profiles()
+
+    # ── Strike profiles (debit smart-picker config) ──────────────────────────
+    def _seed_strike_profiles(self) -> None:
+        """Insert the built-in DEFAULT + SPX profiles on first run. Uses
+        INSERT OR IGNORE so a user's later edits are never clobbered."""
+        from .strike_profiles import SEED_PROFILES
+        cols = ", ".join(_STRIKE_PROFILE_COLS)
+        ph = ", ".join("?" for _ in _STRIKE_PROFILE_COLS)
+        with self._lock:
+            for p in SEED_PROFILES:
+                row = p.to_row()
+                self.connect().execute(
+                    f"INSERT OR IGNORE INTO strike_profiles ({cols}, updated_at) "
+                    f"VALUES ({ph}, now())",
+                    [row.get(c) for c in _STRIKE_PROFILE_COLS],
+                )
+
+    def get_strike_profile(self, symbol: str) -> dict | None:
+        with self._lock:
+            cur = self.connect().execute(
+                f"SELECT {', '.join(_STRIKE_PROFILE_COLS)} FROM strike_profiles WHERE symbol = ?",
+                [symbol.upper()],
+            )
+            r = cur.fetchone()
+        return dict(zip(_STRIKE_PROFILE_COLS, r)) if r else None
+
+    def list_strike_profiles(self) -> list[dict]:
+        with self._lock:
+            cur = self.connect().execute(
+                f"SELECT {', '.join(_STRIKE_PROFILE_COLS)} FROM strike_profiles ORDER BY symbol"
+            )
+            rows = cur.fetchall()
+        return [dict(zip(_STRIKE_PROFILE_COLS, r)) for r in rows]
+
+    def upsert_strike_profile(self, profile: dict) -> None:
+        cols = ", ".join(_STRIKE_PROFILE_COLS)
+        ph = ", ".join("?" for _ in _STRIKE_PROFILE_COLS)
+        with self._lock:
+            self.connect().execute(
+                f"INSERT OR REPLACE INTO strike_profiles ({cols}, updated_at) "
+                f"VALUES ({ph}, now())",
+                [profile.get(c) for c in _STRIKE_PROFILE_COLS],
+            )
 
     def close(self) -> None:
         with self._lock:

@@ -1092,8 +1092,14 @@ def aggregate_positions(positions: list[dict], orders: list[dict]) -> list[Posit
     used_symbols: set[str] = set()
     rows: list[PositionRow] = []
 
-    # Pass 1 — match filled multi-leg orders to their surviving positions
-    for o in orders:
+    # Pass 1 — match filled multi-leg orders to their surviving positions.
+    # Newest-first so a re-opened spread is represented by its LATEST open
+    # order; each position symbol is consumed once so the same legs reused
+    # across multiple orders (open → close → re-open of the same 0DTE strikes)
+    # don't each spawn a duplicate row.
+    def _ts(o: dict) -> str:
+        return o.get("create_date") or o.get("transaction_date") or ""
+    for o in sorted(orders, key=_ts, reverse=True):
         if (o.get("class") or "").lower() != "multileg":
             continue
         if (o.get("status") or "").lower() not in ("filled", "partially_filled"):
@@ -1103,16 +1109,21 @@ def aggregate_positions(positions: list[dict], orders: list[dict]) -> list[Posit
             legs = [legs]
         if len(legs) < 2:
             continue
+        # A pure closing order (every leg is *_to_close) never represents a held
+        # position — skip it so it can't match the legs of a still-open spread.
+        sides = [(lg.get("side") or "").lower() for lg in legs]
+        if sides and all(s.endswith("_to_close") for s in sides):
+            continue
         matched_positions = []
         for leg in legs:
             sym = leg.get("option_symbol") or leg.get("symbol")
-            if not sym or sym not in pos_by_sym:
+            if not sym or sym not in pos_by_sym or sym in used_symbols:
                 matched_positions = []
                 break
             matched_positions.append((leg, pos_by_sym[sym]))
         if not matched_positions:
             continue
-        # All legs of this order still exist in positions — aggregate them
+        # All legs of this order still exist (and are unclaimed) — aggregate them
         row = _build_multileg_row(o, matched_positions)
         if row:
             rows.append(row)

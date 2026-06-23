@@ -123,8 +123,12 @@ def _load_overrides_file() -> dict[str, Any]:
        {"tickers":[...], "default_strategy":"...", "overrides":{"NDX":{...}}}"""
     path = os.environ.get("TORQUE_TICKERS_CONFIG")
     candidates = [Path(path)] if path else []
-    # repo root = .../EdgeLane (this file is market/backend/app/torque_config.py)
-    candidates.append(Path(__file__).resolve().parents[3] / "torque_tickers.json")
+    # repo root = .../EdgeLane (dev: this file is market/backend/app/torque_config.py).
+    # Walk up looking for torque_tickers.json so it works regardless of how deep
+    # the package is mounted (e.g. /srv/app in the Docker image has no parents[3]).
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidates.append(parent / "torque_tickers.json")
     for p in candidates:
         try:
             if p and p.is_file():

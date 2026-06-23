@@ -18,6 +18,9 @@ DEPLOY       ?= local_container     # backend target: local_container | cloud
 DEPLOY_SH    = ./deploy.sh
 ARGS         ?=                     # extra flags, e.g. make deploy-prod ARGS=-n
 COMPOSE      = docker compose -f deploy/docker-compose.yml --env-file deploy/.env
+# DuckDB store (compose-prefixed volume name) + gitignored migration tarball
+DATA_VOLUME  = edgelane_edgelane-data
+DATA_DUMP    = deploy/edgelane-data.tar.gz
 
 .PHONY: help \
         build build-dry cors cors-start cors-stop cors-restart cors-delete \
@@ -28,6 +31,7 @@ COMPOSE      = docker compose -f deploy/docker-compose.yml --env-file deploy/.en
         ui clean \
         deploy-be deploy-fe deploy-prod deploy-dry db-push db-push-dry \
         deploy-down deploy-be-down deploy-be-restart deploy-prune \
+        deploy-data-dump deploy-data-restore \
         doctor vercel-setup check-tunnel
 
 help:
@@ -83,6 +87,8 @@ help:
 	@echo "    make deploy-be-down    remove ONLY the backend (cloudflared keeps running)"
 	@echo "    make deploy-be-restart rebuild+recreate ONLY the backend (latest code)"
 	@echo "    make deploy-prune  delete dangling images from rebuilds (ARGS=-a = all unused)"
+	@echo "    make deploy-data-dump     tar the DuckDB volume -> deploy/edgelane-data.tar.gz (migration)"
+	@echo "    make deploy-data-restore  restore that tarball into the volume on a new host"
 	@echo "    make db-push       apply Supabase migrations (idempotent)"
 	@echo "    make db-push-dry   list migrations that would be applied"
 	@echo "    make doctor        list missing build/deploy prerequisites (run on a new machine)"
@@ -218,6 +224,21 @@ deploy-be-restart:
 # ARGS=-a prunes all unused images (more aggressive).
 deploy-prune:
 	@docker image prune -f $(ARGS)
+
+# Machine migration — DuckDB volume in/out. Dump tars the volume into
+# $(DATA_DUMP) (gitignored); copy that file to the new host and run restore
+# there BEFORE `make deploy-be` so the fresh stack picks up the history.
+deploy-data-dump:
+	@docker run --rm -v $(DATA_VOLUME):/data:ro -v "$(CURDIR)/deploy":/backup \
+		alpine tar czf /backup/$(notdir $(DATA_DUMP)) -C /data .
+	@echo ">>> wrote $(DATA_DUMP) ($$(du -h $(DATA_DUMP) | cut -f1))"
+
+deploy-data-restore:
+	@test -f $(DATA_DUMP) || { echo "missing $(DATA_DUMP) — copy it here first"; exit 1; }
+	@docker volume create $(DATA_VOLUME) >/dev/null
+	@docker run --rm -v $(DATA_VOLUME):/data -v "$(CURDIR)/deploy":/backup \
+		alpine sh -c "rm -rf /data/* && tar xzf /backup/$(notdir $(DATA_DUMP)) -C /data"
+	@echo ">>> restored $(DATA_VOLUME) from $(DATA_DUMP)"
 
 # Supabase schema — idempotent push of supabase/migrations/*.sql.
 db-push:

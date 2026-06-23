@@ -93,8 +93,13 @@ def compute_engine_output(
     chosen_expiration: str,
     chosen_dte: float,
     expected_move: float | None = None,
+    strike_profile=None,
 ) -> dict:
-    """Full pipeline.  See module docstring for return shape."""
+    """Full pipeline.  See module docstring for return shape.
+
+    `strike_profile` (StrikeProfile | None): when supplied + enabled, debit
+    verticals use the OTM-OTM smart picker instead of the legacy deep-ITM mirror.
+    None keeps legacy behavior (used by parity/unit callers)."""
     settings = get_settings()
     # 1. Dealer exposures (per-strike net_gex/net_dex/net_vex/net_tex).
     # GEX leg weights by OI (default) or today's traded volume per GEX_SOURCE.
@@ -296,6 +301,8 @@ def compute_engine_output(
                     target_delta=target_delta,
                     width_factor=wf,
                     walls=walls,
+                    spot=spot,
+                    profile=strike_profile,
                 )
             except Exception:
                 variants = []

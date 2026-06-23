@@ -37,6 +37,26 @@ environment regardless of the current value). Only bare **`make run`** respects 
 existing value. Note: Tradier's **sandbox serves fake/stale prices** (no real index
 quote), so use `run-prod` when you need realistic spot/strikes — and DRY RUN first.
 
+### Access (auth)
+
+Torque trades the **server's single broker account**, so it's an admin/owner
+tool — not a per-user feature. When the backend runs with `AUTH_ENABLED=true`
+(production), every data/action endpoint requires the **admin token** (or a
+Supabase JWT); the page is locked until you open it with the token in the URL:
+
+```
+https://<backend-host>/torque?token=<ADMIN_API_TOKEN>
+```
+
+The page stashes the token (per-tab `sessionStorage`) and sends it as
+`X-Admin-Token` on every fetch. No token → the page shows a "locked" notice and
+the endpoints 401. Being logged into the main EdgeLane app in another tab does
+**not** carry over — that session lives on the Vercel origin; Torque is served
+from the backend origin and browsers isolate storage per-origin.
+
+`ADMIN_API_TOKEN` lives in `edgelane_market.config`. With `AUTH_ENABLED=false`
+(dev / `make run-dev`) the gate is a no-op — open `:8789/torque` directly.
+
 ## Using it
 
 - **Ticker** dropdown (left). First entry (NDX) is selected on load.
@@ -102,10 +122,14 @@ stayed NDXP, build and `/torque/price` agreed every sample, zero single-digit
 dips).
 - **Auto-close +N%** toggle (default 30%) places a profit-target close — see
   below.
-- **Right panel** — a real-time directional **lean** score (−100…+100 from
-  volume skew + premium skew + OI magnet). ≥+25 → bullish/CALL, ≤−25 →
-  bearish/PUT, in between → **neutral / NO EDGE** (no side suggested — it does
-  *not* default to CALL). It is an **honest heuristic, not a prediction**.
+- **Right panel — Positioning** — a real-time **snapshot** score (−100…+100 from
+  volume skew + premium skew + OI magnet), shown as where premium/OI/volume
+  *cluster*: ≥+25 → **call-leaning**, ≤−25 → **put-leaning**, in between →
+  **balanced** (no side). It is **NOT a price forecast** — static OI/premium
+  can't tell direction (OI has a long *and* a short side; index put OI is mostly
+  hedging). Same-index products legitimately diverge (e.g. thin institutional NDX
+  vs liquid retail-hedged QQQ), which is exactly why it isn't a directional call.
+  Read it as positioning context only.
 
 ## Auto-close (hybrid, +30% target)
 
@@ -205,7 +229,7 @@ Anchoring model (points from spot, snapped to the chain grid):
 |---|---|
 | `GET /torque` | the page |
 | `GET /torque/config` | tickers + strategy registry + env/mode |
-| `GET /torque/analyze/{sym}` | spot + directional lean (poll ~5s) |
+| `GET /torque/analyze/{sym}` | spot + positioning snapshot (poll ~5s) |
 | `POST /torque/build` | auto-filled legs for (ticker, strategy, step adjustments) |
 | `POST /torque/price` | live net bid/mid/ask for a set of legs (poll ~2.5s) |
 | `POST /torque/place` | submit entry; arm background fill-watch + auto-close (`confirm:true`) |

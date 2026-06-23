@@ -6,6 +6,8 @@ edge_lane.html
 deploy/.env
 deploy/.env.*
 !deploy/.env.example
+# DuckDB volume backups produced by `make deploy-data-dump` (machine migration)
+deploy/*.tar.gz
 dist/
 .vercel/
 
@@ -61,6 +63,8 @@ market/backend/README.md
 # Database files
 *.duckdb
 *.db
+# DB / data exports (e.g. deploy/edgelane-data.tar.gz — may hold real trading data)
+*.tar.gz
 
 # Runtime logs (SDK logs capture request headers incl. app keys / signatures)
 *.log

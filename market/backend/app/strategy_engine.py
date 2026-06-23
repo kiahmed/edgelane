@@ -36,6 +36,7 @@ from typing import Any, Callable, Iterable
 
 from .lookup_tables import STRATEGIES
 from .walls import compute_wall_penalty
+from .strike_profiles import pick_debit_strikes, DEBIT_STRATEGIES, StrikeProfile
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -608,10 +609,34 @@ def build_vertical(
     expected_move: float,
     target_delta: float,
     width_factor: float,
+    *,
+    spot: float | None = None,
+    walls: dict | None = None,
+    profile: StrikeProfile | None = None,
+    aggressiveness: int = 0,
 ) -> dict | None:
-    """Port of `buildVertical` at JSX line 2718."""
+    """Port of `buildVertical` at JSX line 2718.
+
+    Debit verticals (bull_call/bear_put): when a `profile` + `spot` are supplied
+    and the profile is enabled, the OTM-OTM smart picker (strike_profiles.py)
+    selects the strikes instead of the legacy `1 - target_delta` deep-ITM mirror.
+    Falls back to the legacy path if the picker can't build. Credit spreads are
+    unaffected. Defaults keep the legacy behavior so JSX-parity callers are
+    unchanged."""
     base_w = width_base_for_dte(dte, expected_move)
     desired_w = base_w * width_factor
+
+    if strategy in DEBIT_STRATEGIES and profile is not None and getattr(profile, "enabled", False) and spot:
+        picked = pick_debit_strikes(
+            strategy, contracts, float(spot), expected_move, walls, profile, aggressiveness
+        )
+        if picked:
+            v = score_vertical(picked["short"], picked["long"], "debit", dte)
+            if v is not None:
+                v["strike_logic"] = picked["logic"]
+                v["strike_source"] = "smart_picker"
+            return v
+        # picker couldn't build (illiquid/thin chain) -> legacy path below
 
     if strategy == "bull_put":
         s = find_strike_by_delta(contracts, "put", target_delta)
@@ -757,6 +782,8 @@ def generate_candidates(
     target_delta: float,
     width_factor: float,
     walls: dict | None,
+    spot: float | None = None,
+    profile: StrikeProfile | None = None,
 ) -> list[dict]:
     """Port of `generateCandidates` at JSX line 2800.
 
@@ -772,11 +799,16 @@ def generate_candidates(
     Calls compute_wall_penalty() with the v4.7.59 signature including net_gex
     and dte.
     """
+    # Debit verticals route through the smart picker when a profile+spot are
+    # present; `aggr` (set per-variant below) shifts the OTM-OTM structure so the
+    # Conservative/Balanced/Aggressive fan stays distinct. Credit/fly builders
+    # ignore the extra kwargs.
+    _aggr = 0  # rebound per-variant in the loop below (Conservative -1 .. Aggressive +1)
     builders: dict[str, Callable[[float, float], dict | None]] = {
         "bull_put":       lambda d, w: build_vertical("bull_put",  contracts, dte, expected_move, d, w),
         "bear_call":      lambda d, w: build_vertical("bear_call", contracts, dte, expected_move, d, w),
-        "bull_call":      lambda d, w: build_vertical("bull_call", contracts, dte, expected_move, d, w),
-        "bear_put":       lambda d, w: build_vertical("bear_put",  contracts, dte, expected_move, d, w),
+        "bull_call":      lambda d, w: build_vertical("bull_call", contracts, dte, expected_move, d, w, spot=spot, walls=walls, profile=profile, aggressiveness=_aggr),
+        "bear_put":       lambda d, w: build_vertical("bear_put",  contracts, dte, expected_move, d, w, spot=spot, walls=walls, profile=profile, aggressiveness=_aggr),
         "iron_condor":    lambda d, w: build_iron_condor(contracts, dte, expected_move, d, w),
         "iron_butterfly": lambda d, w: build_iron_butterfly(contracts, dte, expected_move, w),
         "call_butterfly": lambda d, w: build_butterfly("call_butterfly", contracts, dte, expected_move, w),
@@ -812,8 +844,10 @@ def generate_candidates(
         w_net_gex = 0
         w_dte = None
 
+    _aggr_by_label = {"Conservative": -1, "Balanced": 0, "Aggressive": 1}
     candidates: list[dict] = []
     for cfg in configs:
+        _aggr = _aggr_by_label.get(cfg["label"], 0)  # consumed by debit picker lambdas
         c = builder(cfg["delta"], cfg["width"])
         if not c:
             continue

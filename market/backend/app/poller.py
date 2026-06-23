@@ -176,8 +176,12 @@ async def poll_symbol(symbol: str, tradier_client, db, settings, persist: bool =
     # 4. dte
     dte = _compute_dte_fraction(chosen_exp)
 
-    # 5. engine
-    output = compute_engine_output(symbol, spot, contracts, chosen_exp, dte)
+    # 5. engine — resolve this symbol's debit strike profile (DB-backed, hot:
+    # edits via /strike-profiles take effect next poll cycle).
+    from .strike_profiles import resolve_profile
+    strike_profile = resolve_profile(db, symbol)
+    output = compute_engine_output(symbol, spot, contracts, chosen_exp, dte,
+                                   strike_profile=strike_profile)
 
     # 6. persist — DuckDB ops are sync; run in default executor so we don't
     # block the asyncio loop on disk I/O. Skipped for display-only polls.

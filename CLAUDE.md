@@ -79,10 +79,11 @@ FastAPI + DuckDB service that continuously polls Tradier, runs the same math as 
 | `engine.py` | Main orchestrator (calls bias_engine + strategy_engine) |
 | `bias_engine.py` | Dealer GEX aggregation, wall detection, confidence (ported from JSX) |
 | `strategy_engine.py` | Candidate generation + composite scoring (ported from JSX) |
+| `strike_profiles.py` | Per-ticker OTM-OTM debit strike picker + DB-backed profiles (backend-only; see `docs/strike_profiles.md`) |
 | `walls.py` | Bilateral wall finder + strength + penalty |
 | `tradier_client.py` | Async httpx Tradier client (structured errors, rate-limit capture) |
 | `mock_tradier.py` | Synthetic SPX chain for dev/demo (no credentials needed) |
-| `routes/` | HTTP endpoints: /status, /snapshot/{symbol}, /accuracy/{symbol}, /orders, /diag/tradier, /webhook/edgelane_provider_gex, /torque/* |
+| `routes/` | HTTP endpoints: /status, /snapshot/{symbol}, /accuracy/{symbol}, /orders, /diag/tradier, /webhook/edgelane_provider_gex, /strike-profiles, /torque/* |
 | `torque_engine.py` / `torque_config.py` | Torque order-builder: pure strike auto-fill + pricing + lean math; per-ticker offset config |
 | `ui/torque.html` | Torque standalone page (served at `GET /torque`) |
 

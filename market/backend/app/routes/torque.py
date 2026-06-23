@@ -23,10 +23,12 @@ import time
 from pathlib import Path
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
+from .. import auth
+from ..auth import get_current_user
 from ..config import get_settings
 from ..order_builder import build_tradier_order_payload
 from .. import torque_config as tcfg
@@ -34,6 +36,28 @@ from .. import torque_engine as teng
 
 log = logging.getLogger("edgelane.market.torque")
 router = APIRouter()
+
+# Torque trades the SERVER's single broker account, so it's an admin/owner tool —
+# NOT a per-user product feature. Every data/action endpoint requires the admin
+# token (X-Admin-Token, sent by the page on each fetch) or a valid Supabase JWT;
+# get_current_user 401s otherwise, and is a no-op when AUTH_ENABLED=false (dev).
+_GATE = [Depends(get_current_user)]
+
+
+def _page_authorized(request: Request) -> bool:
+    """Authorize the initial page navigation. Browsers can't attach a custom
+    header on a top-level GET, so the shell accepts ?token=<ADMIN_API_TOKEN> in
+    the URL (the page then stores it and sends it as X-Admin-Token on fetches).
+    A header/Bearer is also honored if present."""
+    settings = get_settings()
+    if not settings.auth_enabled:
+        return True
+    if auth._admin_token_ok(request):
+        return True
+    tok = (request.query_params.get("token") or "").strip()
+    if settings.admin_api_token and tok == settings.admin_api_token:
+        return True
+    return False
 
 _HTML_PATH = Path(__file__).resolve().parents[2] / "ui" / "torque.html"
 _ASSETS_DIR = Path(__file__).resolve().parents[2] / "ui" / "assets"
@@ -145,7 +169,15 @@ def _grid_neighbors(contracts: list[dict], side: str, strike: float, span: int =
 
 # ── page + config ──────────────────────────────────────────────────────────
 @router.get("/torque")
-async def torque_page():
+async def torque_page(request: Request):
+    if not _page_authorized(request):
+        return HTMLResponse(
+            "<!doctype html><meta charset=utf-8><title>Torque — locked</title>"
+            "<body style='background:#0b0f14;color:#aab7c5;font:15px system-ui;"
+            "display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>"
+            "<div style='text-align:center'><h2 style='color:#36d399'>Torque is locked</h2>"
+            "<p>Append <code>?token=YOUR_ADMIN_TOKEN</code> to the URL to access.</p></div>",
+            status_code=401, headers={"Cache-Control": "no-store, max-age=0"})
     if not _HTML_PATH.is_file():
         raise HTTPException(404, f"torque.html not found at {_HTML_PATH}")
     # never cache the page — so UI fixes land on a normal reload, not only a
@@ -165,7 +197,7 @@ async def torque_asset(name: str):
     return FileResponse(str(f), media_type=media, headers={"Cache-Control": "max-age=3600"})
 
 
-@router.get("/torque/config")
+@router.get("/torque/config", dependencies=_GATE)
 async def torque_cfg():
     settings = get_settings()
     return {
@@ -180,7 +212,7 @@ async def torque_cfg():
 
 
 # ── analysis ───────────────────────────────────────────────────────────────
-@router.get("/torque/analyze/{symbol}")
+@router.get("/torque/analyze/{symbol}", dependencies=_GATE)
 async def torque_analyze(symbol: str, request: Request):
     client = _client(request)
     spot, exp, contracts = await _get_chain(client, symbol)
@@ -197,7 +229,7 @@ class BuildRequest(BaseModel):
     adjustments: dict[str, int] = Field(default_factory=dict)
 
 
-@router.post("/torque/build")
+@router.post("/torque/build", dependencies=_GATE)
 async def torque_build(req: BuildRequest, request: Request):
     if req.strategy not in tcfg.STRATEGY_DEFS:
         raise HTTPException(400, f"unknown strategy {req.strategy!r}")
@@ -226,7 +258,7 @@ class PriceRequest(BaseModel):
     symbol: str | None = None   # underlying (optional; recovered from legs if absent)
 
 
-@router.post("/torque/price")
+@router.post("/torque/price", dependencies=_GATE)
 async def torque_price(req: PriceRequest, request: Request):
     client = _client(request)
     syms = [l.get("symbol") for l in req.legs if l.get("symbol")]
@@ -340,7 +372,7 @@ async def _submit(client, account_id, payload) -> dict:
     return resp.get("order") or resp
 
 
-@router.post("/torque/place")
+@router.post("/torque/place", dependencies=_GATE)
 async def torque_place(req: PlaceRequest, request: Request):
     if not req.confirm and not req.dry_run:
         raise HTTPException(400, "place requires confirm=true (or dry_run=true to preview only)")
@@ -555,7 +587,7 @@ async def _watch_and_close(client, account_id, entry_id, w, *, is_single, legs,
 _WORKING_STATES = {"open", "pending", "partially_filled", "calculated", "accepted", "queued", "received"}
 
 
-@router.get("/torque/orders")
+@router.get("/torque/orders", dependencies=_GATE)
 async def torque_orders(request: Request, account_id: str | None = None):
     """ONLY the live/working orders (no filled/closed history) plus active
     auto-close watchers still waiting for their entry to fill — feeds the
@@ -590,7 +622,7 @@ async def torque_orders(request: Request, account_id: str | None = None):
     return {"account_id": aid, "orders": orders, "watchers": watchers}
 
 
-@router.post("/torque/cancel/{order_id}")
+@router.post("/torque/cancel/{order_id}", dependencies=_GATE)
 async def torque_cancel(order_id: str, request: Request, account_id: str | None = None):
     """Cancel a working order (entry or close) from the orders panel."""
     client = _client(request)
@@ -608,7 +640,7 @@ class ModifyRequest(BaseModel):
     account_id: str | None = None
 
 
-@router.post("/torque/modify/{order_id}")
+@router.post("/torque/modify/{order_id}", dependencies=_GATE)
 async def torque_modify(order_id: str, req: ModifyRequest, request: Request):
     """Change a working order's limit price (and optionally duration)."""
     client = _client(request)
@@ -620,7 +652,7 @@ async def torque_modify(order_id: str, req: ModifyRequest, request: Request):
     return {"order_id": order_id, "result": resp}
 
 
-@router.get("/torque/order/{order_id}")
+@router.get("/torque/order/{order_id}", dependencies=_GATE)
 async def torque_order(order_id: str, request: Request, account_id: str | None = None):
     client = _client(request)
     aid = _account_id(account_id)

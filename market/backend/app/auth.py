@@ -82,7 +82,12 @@ def _user_from_payload(payload: dict) -> dict:
 
 def _admin_token_ok(request: Request) -> bool:
     settings = get_settings()
-    tok = request.headers.get("x-admin-token") or ""
+    # Accept the admin secret via the X-Admin-Token header (curl/API) OR a
+    # ?token= query param (browser navigation — same convenience the Torque page
+    # already grants, now shared by every admin-gated route).
+    tok = (request.headers.get("x-admin-token")
+           or request.query_params.get("token")
+           or "")
     return bool(settings.admin_api_token) and tok == settings.admin_api_token
 
 
@@ -113,6 +118,23 @@ def get_current_user(request: Request,
         raise
     except Exception:
         raise HTTPException(401, "Invalid or expired session")
+
+
+def require_admin(request: Request,
+                  user: dict = Depends(get_current_user)) -> dict:
+    """Admin-ONLY gate (stricter than get_current_user, which lets any signed-in
+    Supabase user through). Grants access only to the server admin token
+    (`X-Admin-Token` / `?token=`), so server-owner tools — strike profiles,
+    etc. — are invisible to regular users.
+
+    When AUTH_ENABLED=false it's a no-op (dev convenience), matching the rest of
+    the auth layer."""
+    settings = get_settings()
+    if not settings.auth_enabled:
+        return user
+    if user.get("auth") == "admin":
+        return user
+    raise HTTPException(403, "Admin only")
 
 
 def get_optional_user(request: Request,
