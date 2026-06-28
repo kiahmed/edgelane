@@ -176,7 +176,7 @@ Modifier flags — <code>-L</code> (limit price), <code>-Q</code> (quantity), <c
     <tr><td>Ticker</td><td>Underlying + structure shorthand (e.g. <code>NVDA VE 220/225C</code>, <code>SPX IC 7300/7350P + 7450/7500C</code>).</td></tr>
     <tr><td>Acquired</td><td>Date/time the originating order filled, rendered in local timezone.</td></tr>
     <tr><td>Cost</td><td>Signed net cash: <span class="pill ok">+</span> debit (you paid) or <span class="pill danger">−</span> credit (you collected).</td></tr>
-    <tr><td>Bid / Ask</td><td>Current absolute spread mark — what the spread is worth right now, always positive.</td></tr>
+    <tr><td>Bid / Mid / Ask</td><td>Current absolute spread mark — what the spread is worth right now, always positive. <strong>Mid</strong> is the single net mark <code>(bid+ask)/2</code>, matching the one price Tradier's web UI shows; it's the basis for the P&amp;L below.</td></tr>
     <tr><td>P&amp;L $</td><td>Unrealized P&amp;L = current market value − cost basis. Green positive / red negative.</td></tr>
     <tr><td>P&amp;L %</td><td>P&amp;L as percentage of |cost basis|.</td></tr>
     <tr><td>Qty</td><td>Open quantity (contracts for options, shares for equities).</td></tr>
@@ -187,11 +187,11 @@ Modifier flags — <code>-L</code> (limit price), <code>-Q</code> (quantity), <c
 <pre><span class="comment">$ tp</span>
 Tradier positions  <span class="out-dim">env: production  account: 6YB79610</span>
 
-  #  Ticker                                Acquired         Cost           Bid     Ask    P&amp;L $        P&amp;L %    Qty
-  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  1  SPX VE 7365/7385P 2026-05-21          2026-05-21 11:06   −$600.00   $3.80   $4.00     <span class="out-pos">+$210.00</span>      <span class="out-pos">+35.0%</span>      1
-  2  NVDA VE 220/225C 2026-05-23           2026-05-19 14:22   +$245.00   $3.10   $3.20     <span class="out-pos">+$72.00</span>       <span class="out-pos">+29.4%</span>      2
-  3  QQQ 746C 2026-06-04                   2026-06-01 11:30   +$375.00   $3.13   $3.14     <span class="out-pos">−$60.00</span>       <span class="out-neg">−16.0%</span>      1</pre>
+  #  Ticker                                Acquired         Cost           Bid     Mid     Ask    P&amp;L $        P&amp;L %    Qty
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  1  SPX VE 7365/7385P 2026-05-21          2026-05-21 11:06   −$600.00   $3.80   $3.90   $4.00     <span class="out-pos">+$210.00</span>      <span class="out-pos">+35.0%</span>      1
+  2  NVDA VE 220/225C 2026-05-23           2026-05-19 14:22   +$245.00   $3.10   $3.15   $3.20     <span class="out-pos">+$72.00</span>       <span class="out-pos">+29.4%</span>      2
+  3  QQQ 746C 2026-06-04                   2026-06-01 11:30   +$375.00   $3.13   $3.14   $3.14     <span class="out-pos">−$60.00</span>       <span class="out-neg">−16.0%</span>      1</pre>
 
 <!-- ─── 3 List working orders ───────────────────────────────────────── -->
 <h2 id="orders-list"><span class="num">3</span>List working orders</h2>
@@ -288,7 +288,7 @@ The original sides are inferred from the position's source order. For a bull-put
   <tbody>
     <tr><td>SYMBOL</td><td>Underlying ticker. Indices auto-route to their settlement-variant root.</td><td><code>QQQ</code>, <code>SPY</code>, <code>NVDA</code>, <code>NDX</code></td></tr>
     <tr><td>STRIKE+side</td><td>Numeric strike immediately followed by <code>C</code> (call) or <code>P</code> (put).</td><td><code>746C</code>, <code>540P</code>, <code>220.5C</code></td></tr>
-    <tr><td>EXPIRATION</td><td>ISO date <code>YYYY-MM-DD</code>.</td><td><code>2026-06-04</code></td></tr>
+    <tr><td>EXPIRATION</td><td><strong>Optional</strong> (defaults to today). An explicit date — lenient: <code>YYYY-MM-DD</code>, <code>MM-DD</code>, <code>MM/DD/YYYY</code>, <code>YYYYMMDD</code> — <em>or</em> <code>+N</code> for "N trading days out".</td><td><code>2026-06-04</code>, <code>06-04</code>, <code>+1</code></td></tr>
   </tbody>
 </table>
 
@@ -317,12 +317,21 @@ The original sides are inferred from the position's source order. For a bull-put
 <span class="cmd">tp</span> <span class="flag">--buy</span> <span class="arg">NVDA</span> <span class="arg">220C</span> <span class="arg">2026-06-30</span> <span class="flag">-L</span> <span class="arg">4.50</span> <span class="flag">-D</span> <span class="arg">day</span> <span class="flag">--execute</span>
 
 <span class="comment"># Index option — canonical root auto-resolved (NDX → NDXP for PM-settled)</span>
-<span class="cmd">tp</span> <span class="flag">--buy</span> <span class="arg">NDX</span> <span class="arg">30000C</span> <span class="arg">2026-06-04</span> <span class="flag">-L</span> <span class="arg">50.00</span></pre>
+<span class="cmd">tp</span> <span class="flag">--buy</span> <span class="arg">NDX</span> <span class="arg">30000C</span> <span class="arg">2026-06-04</span> <span class="flag">-L</span> <span class="arg">50.00</span>
+
+<span class="comment"># +N DTE: 1 trading day out — the Nth REAL expiration (skips weekends/holidays)</span>
+<span class="cmd">tp</span> <span class="flag">--buy</span> <span class="arg">SPY</span> <span class="arg">738C+1</span> <span class="flag">--execute</span>
+
+<span class="comment"># +N as its own token works too (738C +2)</span>
+<span class="cmd">tp</span> <span class="flag">--buy</span> <span class="arg">SPY</span> <span class="arg">738C</span> <span class="arg">+2</span> <span class="flag">-L</span> <span class="arg">1.20</span></pre>
 
 <div class="card warn"><span class="icon">bash quoting</span>
 Strike+side is a single bareword token (no space between the digits and the
-<code>C</code> / <code>P</code>). Bash won't expand it; no quoting needed.
-Just remember the EXPIRATION must be in <code>YYYY-MM-DD</code> form — otherwise the parser rejects it.
+<code>C</code> / <code>P</code>). Bash won't expand it; no quoting needed — and
+<code>738C+1</code> (DTE attached) is still one bareword. <code>+N</code> counts
+<em>live chain expirations</em>, not raw calendar days: the target date always
+has a tradeable chain and weekends/market holidays are skipped automatically
+(<code>+1</code> on a Thursday with a closed Friday lands on Monday).
 </div>
 
 <!-- ─── 7 New multi-leg ────────────────────────────────────────────── -->

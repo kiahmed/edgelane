@@ -340,6 +340,16 @@ make deploy-fe     # market UI → Vercel
 make deploy-prod   # both, backend first (+ db-push first)
 make deploy-dry    # dry-run everything (prints commands, runs nothing)
 
+# lifecycle / teardown (Docker on this host only — never touches Vercel)
+make deploy-be-restart  # rebuild + recreate ONLY the backend (latest code), leaves cloudflared up
+make deploy-be-down     # remove ONLY the backend container (tunnel stays; public URL 502s until back)
+make deploy-down        # stop+remove the whole stack; KEEPS the DuckDB volume (ARGS=-v drops it)
+make deploy-prune       # delete dangling images from rebuilds (ARGS=-a = all unused; machine-wide!)
+
+# data migration (DuckDB volume → gitignored tarball)
+make deploy-data-dump     # tar the volume → deploy/edgelane-data.tar.gz
+make deploy-data-restore  # restore that tarball into the volume on a new host
+
 # overrides
 make deploy-be DEPLOY=cloud      # reserved future target (errors for now)
 make deploy-prod ARGS=-n         # dry-run via ARGS passthrough
@@ -370,6 +380,45 @@ make deploy-prod     # go
 `make doctor` prints only the **missing** items (silent on what's fine) and exits
 non-zero if any required dependency is absent — so it's safe to gate CI/scripts on
 it. Advisories like the `AUTH_ENABLED`/`DEVMODE` warnings don't fail it.
+
+### Migrating the backend to another machine
+
+The Vercel frontend has **no baked-in backend URL** — the cloudflared container
+publishes its `*.trycloudflare.com` URL to Supabase `app_config.api_base` on every
+start, and the UI reads that pointer at runtime. So moving the backend host needs
+**no Vercel redeploy**: the new tunnel publishes a new URL and the frontend follows.
+
+`make setup` is **not** needed on the new host — that builds a native Python venv
+for `make run`. The container deploy builds its own deps inside the image, so the
+new host needs only Docker + the two git-ignored config files.
+
+```bash
+# ── on the OLD machine ──
+make deploy-data-dump                      # → deploy/edgelane-data.tar.gz (DuckDB history)
+scp deploy/edgelane-data.tar.gz \
+    deploy/.env edgelane_market.config \
+    user@newhost:/path/to/EdgeLane/<dest>  # carry the gitignored secrets + data
+
+# ── on the NEW machine (repo cloned, Docker installed) ──
+# place deploy/.env + edgelane_market.config + deploy/edgelane-data.tar.gz
+make deploy-data-restore   # load history into the volume BEFORE first boot
+make deploy-be             # build + start; tunnel publishes the new api_base
+
+# ── back on the OLD machine, once the new one is serving ──
+make deploy-down           # stop backend + cloudflared here
+```
+
+> ⚠️ **Don't leave both machines' cloudflared running.** Each tunnel writes
+> `app_config.api_base`; two publishers race, and the old one (pointing at the host
+> you're abandoning) can overwrite the pointer and send the frontend to a dead
+> backend. Exactly **one** stack should be up. `make deploy-down` only touches Docker
+> on that host — the Vercel site is untouched and stays live throughout.
+
+> **DuckDB history doesn't move on its own.** It lives in the `edgelane_edgelane-data`
+> named volume, local to each host; `make deploy-down` keeps it *on that host*. Skip
+> `deploy-data-dump`/`restore` and the new machine simply starts with a fresh DB
+> (the app works; only bias-accuracy history resets). The tarball is git-ignored
+> (`deploy/*.tar.gz`).
 
 ### Database admin (data, not schema)
 

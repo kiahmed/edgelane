@@ -3,21 +3,19 @@
 Started by main.py lifespan as a background asyncio task. Every 30s it sweeps
 `bias_decisions` looking for rows that:
   - Are older than `eval_window_min` (default 3 minutes)
+  - Carry a saved engine pick (pick_legs IS NOT NULL)
   - Have no matching `outcomes` row yet
 
-For each pending decision:
-  1. Read current spot from PollerState (in-memory cache, refreshed every
-     POLL_INTERVAL_SEC by the poll loop).
-  2. Compute actual_move_pct = (spot_at_eval - spot_at_decision) / spot_at_decision * 100.
-  3. Derive predicted_direction from bias_decision.label:
-        bullish, mild_bullish   → 'up'
-        bearish, mild_bearish   → 'down'
-        neutral                 → 'neutral'
-  4. Resolve win/loss using `neutral_band_pct` as the dead-zone:
-        up:      win if move >  +band, loss if move <  -band, else neutral
-        down:    win if move <  -band, loss if move >  +band, else neutral
-        neutral: win if |move| <= band, else loss
-  5. Insert outcomes row.
+Grading is spread-outcome based (see docs/spread_outcome_eval.md), NOT spot
+direction. For each pending decision:
+  1. Re-price the SAME saved pick legs against the current cached snapshot
+     (poller_state.latest_by_symbol[symbol]["_quote_by_symbol"]).
+  2. favorable delta = premium change in the spread's profit direction
+        (debit wins as it expands; credit wins as it decays toward 0).
+  3. friction band = ½ × the spread's current bid/ask package width (noise floor).
+  4. result: fav > +friction → win; fav < −friction → loss; else neutral.
+     (Spot move is still computed as context metadata only.)
+  5. Insert outcomes row (with the premium-delta columns).
   6. Update per-symbol regime counters:
         - On 'loss': consec_losses++, consec_wins=0
         - On 'win':  consec_wins++,   consec_losses=0
@@ -31,6 +29,7 @@ State is exposed via module-level `state` (an EvaluatorState) for the
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -70,25 +69,81 @@ def _predict_direction(label: str | None) -> str:
     return _LABEL_TO_DIRECTION.get(label.lower(), "neutral")
 
 
-def _resolve_result(direction: str, move_pct: float, band: float) -> str:
-    """Tiered win/loss/neutral classifier.
+# Tiny non-zero friction floor used when the live bid/ask width can't be
+# recovered, so a clear mid move still scores instead of silently neutralizing.
+_FRICTION_EPSILON = 1e-6
 
-    `band` is the symmetric dead-zone in percent (e.g. 0.05 = ±5bps).
+
+def _reprice_spread(legs: list[dict], quote_map: dict) -> tuple[float, float] | None:
+    """Re-mark the saved pick legs against a current quote map.
+
+    Returns `(signed_open, friction_band)` or None if any leg lacks a usable
+    mid (caller skips → retried next sweep).
+
+    `signed_open` = Σ long_short_i · mid_i — the signed cost to OPEN the spread:
+    positive = net debit paid, negative = net credit collected. This matches the
+    builders' net-premium math (debit verticals/flies: +long −short = debit;
+    credit verticals/condors: stored net_premium = −signed_open).
+
+    `friction_band` = ½ · Σ |long_short_i| · (ask_i − bid_i) — half the package's
+    summed per-leg bid/ask width (the 2× butterfly body counts twice via
+    |long_short|). Falls back to a tiny epsilon when no width is recoverable.
     """
-    if direction == "up":
-        if move_pct > band:
-            return "win"
-        if move_pct < -band:
-            return "loss"
-        return "neutral"
-    if direction == "down":
-        if move_pct < -band:
-            return "win"
-        if move_pct > band:
-            return "loss"
-        return "neutral"
-    # neutral prediction: win if price barely moved
-    return "win" if abs(move_pct) <= band else "loss"
+    if not legs:
+        return None
+    signed = 0.0
+    width = 0.0
+    have_width = False
+    for leg in legs:
+        sym = leg.get("symbol")
+        q = quote_map.get(sym) if sym else None
+        if not q:
+            return None
+        mid = q.get("mid")
+        if mid is None:
+            return None
+        ls = float(leg.get("long_short") or 0)
+        signed += ls * float(mid)
+        try:
+            spread_w = float(q.get("ask") or 0.0) - float(q.get("bid") or 0.0)
+        except (TypeError, ValueError):
+            spread_w = 0.0
+        if spread_w > 0:
+            width += abs(ls) * spread_w
+            have_width = True
+    friction = 0.5 * width if have_width else _FRICTION_EPSILON
+    return signed, friction
+
+
+def _grade_spread(spread_type: str, entry_mid: float, legs: list[dict],
+                  quote_map: dict) -> tuple[float, float, float, str] | None:
+    """Grade the saved pick by its own net premium moving in its favor.
+
+    Returns `(net_now, favorable_delta, friction_band, result)` or None when the
+    legs can't be re-priced from this snapshot.
+
+    favorable delta = premium change in the spread's PROFIT direction:
+      - debit  (paid to open): wins as the spread expands → fav = net_now − entry
+      - credit (collected):    wins as it decays toward 0 → fav = entry − net_now
+    result: fav > +friction → win; fav < −friction → loss; else neutral.
+    """
+    rp = _reprice_spread(legs, quote_map)
+    if rp is None:
+        return None
+    signed, friction = rp
+    if (spread_type or "").lower() == "credit":
+        net_now = -signed
+        fav = entry_mid - net_now
+    else:  # debit (default)
+        net_now = signed
+        fav = net_now - entry_mid
+    if fav > friction:
+        result = "win"
+    elif fav < -friction:
+        result = "loss"
+    else:
+        result = "neutral"
+    return net_now, fav, friction, result
 
 
 def _update_regime(symbol: str, result: str, settings) -> None:
@@ -121,34 +176,58 @@ def _update_regime(symbol: str, result: str, settings) -> None:
 
 
 async def evaluate_pending(db, poller_state, settings) -> int:
-    """Single sweep over pending decisions. Returns count evaluated."""
+    """Single sweep over pending decisions. Returns count evaluated.
+
+    Grades each ripe decision that carries a saved engine pick by re-pricing the
+    SAME legs against the current cached snapshot (spread-outcome eval — see
+    docs/spread_outcome_eval.md). Decisions with no pick never reach here
+    (filtered out by fetch_pending_evaluations). Spot move is kept only as
+    context metadata; it no longer decides win/loss.
+    """
     pending = await asyncio.to_thread(
         db.fetch_pending_evaluations, settings.eval_window_min
     )
     if not pending:
         return 0
 
-    band = float(getattr(settings, "neutral_band_pct", 0.05))
     n = 0
     for row in pending:
-        # tuple shape: (id, ts, symbol, spot_at_decision, label, score)
-        decision_id, ts_decision, symbol, spot_at_decision, label, _score = row
+        # tuple shape: (id, ts, symbol, spot_at_decision, label, score,
+        #               pick_legs, pick_entry_mid, pick_spread_type, pick_strategy)
+        (decision_id, ts_decision, symbol, spot_at_decision, label, _score,
+         pick_legs_json, pick_entry_mid, pick_spread_type, _pick_strategy) = row
+
         snap = poller_state.latest_by_symbol.get(symbol)
         if not snap:
-            # Poller hasn't produced a snapshot for this symbol yet — skip,
-            # we'll retry on the next sweep.
+            # Poller hasn't produced a snapshot for this symbol yet — retry next sweep.
             continue
-        try:
-            spot_at_eval = float(snap.get("spot") or 0)
-        except (TypeError, ValueError):
-            spot_at_eval = 0.0
-        if not spot_at_eval or not spot_at_decision:
+        if pick_legs_json is None or pick_entry_mid is None:
+            # Should not happen (SQL filters NULL picks) — skip defensively.
             continue
 
-        spot_at_decision = float(spot_at_decision)
-        move_pct = (spot_at_eval - spot_at_decision) / spot_at_decision * 100.0
+        try:
+            legs = json.loads(pick_legs_json)
+        except (TypeError, ValueError):
+            log.warning("bad pick_legs JSON for decision_id=%s", decision_id)
+            continue
+
+        quote_map = snap.get("_quote_by_symbol") or {}
+        graded = _grade_spread(pick_spread_type, float(pick_entry_mid), legs, quote_map)
+        if graded is None:
+            # Couldn't re-price the exact legs from this snapshot (rotated
+            # expiration / missing quotes) — leave un-evaluated, retry next sweep.
+            continue
+        net_now, fav, friction, result = graded
+
+        # Spot move retained as context only (not the scoring basis).
+        try:
+            spot_at_eval = float(snap.get("spot") or 0) or float(spot_at_decision or 0)
+        except (TypeError, ValueError):
+            spot_at_eval = float(spot_at_decision or 0)
         direction = _predict_direction(label)
-        result = _resolve_result(direction, move_pct, band)
+        move_pct = None
+        if spot_at_decision and spot_at_eval:
+            move_pct = round((spot_at_eval - float(spot_at_decision)) / float(spot_at_decision) * 100.0, 4)
 
         evaluated_at = datetime.now(timezone.utc)
         # ts_decision may be a datetime (DuckDB) — guard either way.
@@ -164,8 +243,13 @@ async def evaluate_pending(db, poller_state, settings) -> int:
                 "spot_at_eval": spot_at_eval,
                 "elapsed_minutes": round(elapsed, 3),
                 "predicted_direction": direction,
-                "actual_move_pct": round(move_pct, 4),
+                "actual_move_pct": move_pct,
                 "result": result,
+                "entry_net_premium": round(float(pick_entry_mid), 4),
+                "eval_net_premium": round(net_now, 4),
+                "favorable_delta": round(fav, 4),
+                "friction_band": round(friction, 4),
+                "spread_type": pick_spread_type,
             })
         except Exception:
             log.exception("insert_outcome failed for decision_id=%s", decision_id)
@@ -174,8 +258,10 @@ async def evaluate_pending(db, poller_state, settings) -> int:
         _update_regime(symbol, result, settings)
         n += 1
         log.info(
-            "outcome decision_id=%s sym=%s label=%s dir=%s move=%.4f%% result=%s",
-            decision_id, symbol, label, direction, move_pct, result,
+            "outcome decision_id=%s sym=%s strat=%s type=%s entry=%.3f now=%.3f "
+            "fav=%.3f friction=%.3f result=%s",
+            decision_id, symbol, _pick_strategy, pick_spread_type,
+            float(pick_entry_mid), net_now, fav, friction, result,
         )
     return n
 

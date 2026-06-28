@@ -19,6 +19,7 @@ errors are all swallowed per-symbol with a retry on the next interval.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import date, datetime, time, timezone
 from typing import Any
@@ -111,6 +112,41 @@ def _normalize_tradier_contract(o: dict) -> dict:
     }
 
 
+def _contract_mid(c: dict) -> float | None:
+    """Mid of a contract from bid/ask (averaged) or an explicit mid; None if
+    neither is usable. Mirrors strategy_engine._get_mid semantics."""
+    m = c.get("mid")
+    if m not in (None, ""):
+        try:
+            return float(m)
+        except (TypeError, ValueError):
+            pass
+    try:
+        bid = float(c.get("bid") or 0.0)
+        ask = float(c.get("ask") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if bid <= 0 and ask <= 0:
+        return None
+    return (bid + ask) / 2.0
+
+
+def _quote_map(contracts: list[dict]) -> dict[str, dict]:
+    """Map OCC option symbol → {bid, ask, mid} for evaluator re-pricing."""
+    out: dict[str, dict] = {}
+    for c in contracts:
+        sym = c.get("symbol")
+        if not sym:
+            continue
+        try:
+            bid = float(c.get("bid") or 0.0)
+            ask = float(c.get("ask") or 0.0)
+        except (TypeError, ValueError):
+            bid = ask = 0.0
+        out[sym] = {"bid": bid, "ask": ask, "mid": _contract_mid(c)}
+    return out
+
+
 def _compute_dte_fraction(exp_iso: str) -> float:
     """DTE in days. Same-day expiration -> 0.5 (intraday gate).
     Future expirations -> integer days + 0.5 (mid-day execution assumption)."""
@@ -183,6 +219,11 @@ async def poll_symbol(symbol: str, tradier_client, db, settings, persist: bool =
     output = compute_engine_output(symbol, spot, contracts, chosen_exp, dte,
                                    strike_profile=strike_profile)
 
+    # Attach a per-OCC-symbol quote map so the evaluator can re-price the saved
+    # pick legs against THIS (later) snapshot without re-fetching the chain.
+    # Engine output itself is left math-pure (parity); this is a poller add-on.
+    output["_quote_by_symbol"] = _quote_map(contracts)
+
     # 6. persist — DuckDB ops are sync; run in default executor so we don't
     # block the asyncio loop on disk I/O. Skipped for display-only polls.
     output["market_open"] = state.market_open
@@ -231,6 +272,11 @@ def _persist_snapshot(db, symbol: str, expiration: str, spot: float, output: dic
         except Exception as e:
             log.warning("gex_snapshot insert failed: %s", e)
 
+    # Engine-pick capture (spread-outcome eval). Null when no pick → not graded.
+    pick = output.get("engine_pick") or {}
+    pick_legs = pick.get("legs")
+    pick_legs_json = json.dumps(pick_legs) if pick_legs else None
+
     # Bias decision row
     try:
         decision_id = db.insert_bias_decision({
@@ -248,6 +294,10 @@ def _persist_snapshot(db, symbol: str, expiration: str, spot: float, output: dic
             "call_wall_strength": bias.get("call_wall_strength"),
             "call_wall_net_gex": bias.get("call_wall_net_gex"),
             "recommended_strategies": ",".join(bias.get("recommended_strategies") or []),
+            "pick_legs": pick_legs_json,
+            "pick_entry_mid": pick.get("net_premium") if pick_legs_json else None,
+            "pick_spread_type": pick.get("spread_type") if pick_legs_json else None,
+            "pick_strategy": pick.get("strategy") if pick_legs_json else None,
         })
         # attach decision_id back into the engine output so the UI can reference it
         if output.get("engine_pick"):

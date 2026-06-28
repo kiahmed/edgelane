@@ -341,6 +341,7 @@ def compute_engine_output(
             "strategy": winner["strategy"],
             "name": winner["name"],
             "short": winner["short"],
+            "spread_type": b.get("type"),   # 'credit' | 'debit' — drives outcome eval
             "label": b.get("label"),
             "width_preset": b.get("width_preset"),
             "composite_score": b.get("composite_score"),

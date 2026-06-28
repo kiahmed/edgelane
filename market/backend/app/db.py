@@ -47,7 +47,13 @@ CREATE TABLE IF NOT EXISTS bias_decisions (
     call_wall_strike      DOUBLE,
     call_wall_strength    VARCHAR,
     call_wall_net_gex     DOUBLE,
-    recommended_strategies VARCHAR
+    recommended_strategies VARCHAR,
+    -- Engine-pick capture for spread-outcome eval (see docs/spread_outcome_eval.md).
+    -- NULL when the poll produced no pick → the row is never graded.
+    pick_legs             VARCHAR,    -- JSON: the pick's legs (strike/side/long_short/symbol)
+    pick_entry_mid        DOUBLE,     -- the pick's mid net premium at decision
+    pick_spread_type      VARCHAR,    -- 'credit' | 'debit'
+    pick_strategy         VARCHAR     -- strategy key (bull_put, bear_call, …)
 );
 CREATE INDEX IF NOT EXISTS idx_bias_lookup
     ON bias_decisions (symbol, ts);
@@ -59,8 +65,26 @@ CREATE TABLE IF NOT EXISTS outcomes (
     elapsed_minutes    DOUBLE       NOT NULL,
     predicted_direction VARCHAR,
     actual_move_pct    DOUBLE,
-    result             VARCHAR
+    result             VARCHAR,
+    -- Spread-outcome eval columns (additive; legacy spot fields above are kept
+    -- as context). favorable_delta = premium move in the pick's profit direction.
+    entry_net_premium  DOUBLE,
+    eval_net_premium   DOUBLE,
+    favorable_delta    DOUBLE,
+    friction_band      DOUBLE,
+    spread_type        VARCHAR
 );
+
+-- Additive migrations for DuckDB files created before the spread-outcome eval.
+ALTER TABLE bias_decisions ADD COLUMN IF NOT EXISTS pick_legs VARCHAR;
+ALTER TABLE bias_decisions ADD COLUMN IF NOT EXISTS pick_entry_mid DOUBLE;
+ALTER TABLE bias_decisions ADD COLUMN IF NOT EXISTS pick_spread_type VARCHAR;
+ALTER TABLE bias_decisions ADD COLUMN IF NOT EXISTS pick_strategy VARCHAR;
+ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS entry_net_premium DOUBLE;
+ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS eval_net_premium DOUBLE;
+ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS favorable_delta DOUBLE;
+ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS friction_band DOUBLE;
+ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS spread_type VARCHAR;
 
 CREATE SEQUENCE IF NOT EXISTS seq_gex_profile_snapshots;
 CREATE TABLE IF NOT EXISTS gex_profile_snapshots (
@@ -228,8 +252,9 @@ class Database:
                   (ts, symbol, expiration, spot_at_decision, score, label, confidence,
                    put_wall_strike, put_wall_strength, put_wall_net_gex,
                    call_wall_strike, call_wall_strength, call_wall_net_gex,
-                   recommended_strategies)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   recommended_strategies,
+                   pick_legs, pick_entry_mid, pick_spread_type, pick_strategy)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 RETURNING id
                 """,
                 [
@@ -238,6 +263,8 @@ class Database:
                     row.get("put_wall_strike"), row.get("put_wall_strength"), row.get("put_wall_net_gex"),
                     row.get("call_wall_strike"), row.get("call_wall_strength"), row.get("call_wall_net_gex"),
                     row.get("recommended_strategies"),
+                    row.get("pick_legs"), row.get("pick_entry_mid"),
+                    row.get("pick_spread_type"), row.get("pick_strategy"),
                 ],
             )
             (new_id,) = cur.fetchone()
@@ -249,12 +276,16 @@ class Database:
                 """
                 INSERT INTO outcomes
                   (decision_id, evaluated_at, spot_at_eval, elapsed_minutes,
-                   predicted_direction, actual_move_pct, result)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                   predicted_direction, actual_move_pct, result,
+                   entry_net_premium, eval_net_premium, favorable_delta,
+                   friction_band, spread_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     row["decision_id"], row["evaluated_at"], row["spot_at_eval"], row["elapsed_minutes"],
                     row.get("predicted_direction"), row.get("actual_move_pct"), row.get("result"),
+                    row.get("entry_net_premium"), row.get("eval_net_premium"),
+                    row.get("favorable_delta"), row.get("friction_band"), row.get("spread_type"),
                 ],
             )
 
@@ -262,10 +293,12 @@ class Database:
         with self._lock:
             cur = self.connect().execute(
                 """
-                SELECT bd.id, bd.ts, bd.symbol, bd.spot_at_decision, bd.label, bd.score
+                SELECT bd.id, bd.ts, bd.symbol, bd.spot_at_decision, bd.label, bd.score,
+                       bd.pick_legs, bd.pick_entry_mid, bd.pick_spread_type, bd.pick_strategy
                 FROM bias_decisions bd
                 LEFT JOIN outcomes o ON o.decision_id = bd.id
                 WHERE o.decision_id IS NULL
+                  AND bd.pick_legs IS NOT NULL
                   AND bd.ts <= CURRENT_TIMESTAMP - INTERVAL (?) MINUTE
                 ORDER BY bd.ts ASC
                 """,
@@ -281,7 +314,11 @@ class Database:
                     SELECT bd.id, bd.label, o.result, bd.recommended_strategies
                     FROM bias_decisions bd
                     JOIN outcomes o ON o.decision_id = bd.id
-                    WHERE bd.symbol = ?
+                    -- Count ONLY spread-outcome grades. Legacy spot-diff rows
+                    -- (graded before the premium-based eval) have a NULL
+                    -- favorable_delta; excluding them gives a clean start on the
+                    -- new metric without deleting the historical rows.
+                    WHERE bd.symbol = ? AND o.favorable_delta IS NOT NULL
                     ORDER BY bd.ts DESC
                     LIMIT ?
                 )
@@ -315,10 +352,14 @@ class Database:
                 """
                 SELECT bd.id, bd.ts, bd.label, bd.spot_at_decision,
                        o.evaluated_at, o.spot_at_eval, o.actual_move_pct,
-                       o.predicted_direction, o.result
+                       o.predicted_direction, o.result,
+                       bd.pick_strategy, o.spread_type,
+                       o.entry_net_premium, o.eval_net_premium,
+                       o.favorable_delta, o.friction_band
                 FROM bias_decisions bd
                 JOIN outcomes o ON o.decision_id = bd.id
-                WHERE bd.symbol = ?
+                -- Spread-outcome grades only (NULL favorable_delta = legacy spot-diff row).
+                WHERE bd.symbol = ? AND o.favorable_delta IS NOT NULL
                 ORDER BY o.evaluated_at DESC
                 LIMIT ?
                 """,
@@ -326,5 +367,8 @@ class Database:
             )
             cols = ['id', 'ts', 'label', 'spot_at_decision',
                     'evaluated_at', 'spot_at_eval', 'actual_move_pct',
-                    'predicted_direction', 'result']
+                    'predicted_direction', 'result',
+                    'pick_strategy', 'spread_type',
+                    'entry_net_premium', 'eval_net_premium',
+                    'favorable_delta', 'friction_band']
             return [dict(zip(cols, row)) for row in cur.fetchall()]

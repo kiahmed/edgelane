@@ -34,6 +34,7 @@ COMPOSITE_PICK_TOP=3                   # candidates surfaced to UI
 # ── Self-evaluation ──
 EVAL_WINDOW_MIN=3                       # minutes after decision to evaluate
 EVAL_ROLLING_WINDOW=20                  # accuracy = last N decisions
+EVAL_MIN_GRADED=10                      # graded outcomes before a win-rate is published (else "calibrating")
 PILL_GREEN_PCT=60                       # >= this → green pill
 PILL_RED_PCT=40                         # <= this → red pill
 

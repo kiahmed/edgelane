@@ -647,6 +647,35 @@ or `make run-prod` (real). Full doc: `docs/torque.md`.
 4. **Orders panel** (bottom): working orders + armed closes — click a limit to
    modify, or cancel. Env badge **SANDBOX** (gold) / **PRODUCTION** (red).
 
+## Strike Profiles — debit strike picker config (admin)
+
+Admin-only page on the market backend for tuning **how the engine builds debit
+verticals** (`bull_call` / `bear_put`) per ticker — the OTM-OTM "buy the move,
+sell the wall" strike picker. Config only; **no** orders are placed here. Standalone
+page (not linked from the dashboard). Full doc: `docs/strike_profiles.md`.
+
+**How to access:** open `…/strike-profiles/admin?token=<ADMIN_API_TOKEN>` on the
+backend host — local `http://127.0.0.1:8789/strike-profiles/admin?token=…`, or prod
+the Cloudflare tunnel URL + the same path. Auth (same admin secret as Torque):
+- Browser nav → append `?token=<ADMIN_API_TOKEN>` (the page then sends it as the
+  `X-Admin-Token` header on every API call).
+- API/curl → send `X-Admin-Token: <ADMIN_API_TOKEN>`.
+- When `AUTH_ENABLED=true`: anonymous → **401**, signed-in non-admin user → **403**,
+  admin token → **200**. When `AUTH_ENABLED=false` (dev) the gate is a no-op.
+
+1. **List** — every saved profile (one row/symbol; `DEFAULT` is the fallback for any
+   unconfigured ticker). Shows enabled, long Δ-band, target source, width window,
+   snap, min OI.
+2. **Edit** — click a row → form prefilled from the current values. Save is a
+   **full-object replace** (the page loads then re-sends the whole object). Blank
+   nullable fields (`long_offset_pts`, `min/max_width_pts`) mean **auto / derive
+   from expected move**, not `0`.
+3. **Add symbol** — type a ticker → a `DEFAULT`-seeded form → save creates the
+   override. Also add it to `SYMBOLS=` in `edgelane_market.config` so the poller
+   fetches it.
+4. **Applies on the next poll cycle (~15s)** — no restart needed. SPX + NDX ship
+   seeded; unconfigured symbols inherit `DEFAULT`. (No delete endpoint yet.)
+
 ## tp — positions & P&L CLI
 
 `tp` (`tools/tradier_positions.py`) shows positions and realized P&L. Full doc:
@@ -655,6 +684,12 @@ or `make run-prod` (real). Full doc: `docs/torque.md`.
 - `tp` — open positions. `tp -G` — realized gain/loss (merges today's `/orders`
   with prior-day opens via `/history`, back to 7 days; partials use the
   whole-trade average as cost basis).
+- `tp -B SYM STRIKE [DATE]` — open a single-leg position. The date is optional
+  (defaults to today) and can be an explicit date **or** `+N` for "N trading
+  days out": `tp -B spy 738c+1 -x` (or `tp -B spy 738c +2`). `+N` resolves to
+  the Nth real expiration in the live chain, so weekends/holidays are skipped
+  automatically and the target date is guaranteed tradeable — `+1` on a Thursday
+  whose Friday is a market holiday lands on Monday.
 
 ---
 

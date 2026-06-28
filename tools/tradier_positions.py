@@ -27,6 +27,10 @@ CLI summary
         tp --buy  QQQ 746C 06-04 -L 2.90                    # MM-DD → current year auto-filled
         tp --sell SPY 540p 06/04 -L 1.50 --execute          # US slash style + lowercase 'p'
         tp --sell SPY 540P 2026-06-30 -L 1.50 --execute     # full ISO, live
+        tp --buy  SPY 738C+1 -x                             # +N DTE: Nth REAL expiration out
+        tp --buy  SPY 738C +2 -L 1.20                       #   (own token form; weekends/holidays skipped)
+            # +N counts live chain expirations, not calendar days — the target
+            # is guaranteed tradeable. +1 on Thu skips a closed Fri to Mon, etc.
 
     Open NEW multi-leg (EdgeLane copy-button ticket; '·' separator detected)
         tp --buy  "Buy Aggressive · NVDA · 2026-06-30 · 220/225C · LIMIT debit $1.80 GTC · 1 contract"
@@ -1303,6 +1307,49 @@ def _normalize_date(s: str | None) -> str | None:
     return None
 
 
+def resolve_dte_expiration(token: str, base: str, symbol: str, n: int) -> str:
+    """Map a +N "trading days out" request to a concrete expiration (YYYY-MM-DD).
+
+    N is counted over expirations that ACTUALLY exist in Tradier's option chain,
+    not raw calendar days — so weekends, holidays, and any non-trading day are
+    skipped automatically and the target date is guaranteed to have a tradeable
+    chain. +1 = the nearest expiration strictly after today, +2 = the next one,
+    etc. Unions across index-root variants (NDX → NDXP/NDXW…) so weekly roots
+    are included. Exits with a clear message if N exceeds what's listed.
+    """
+    if n < 1:
+        sys.exit(f"{R}+N DTE must be >= 1 (got +{n}){N}")
+    try:
+        from tradier_execute_ticket import tradier_get
+        from app.order_builder import INDEX_ROOT_VARIANTS
+    except ImportError as e:
+        sys.exit(f"{R}Cannot resolve +{n} DTE — import failed: {e}{N}")
+    today = datetime.now().strftime("%Y-%m-%d")
+    dates: set[str] = set()
+    for suffix in INDEX_ROOT_VARIANTS:
+        root = symbol.upper() + suffix
+        try:
+            resp = tradier_get("markets/options/expirations",
+                               {"symbol": root, "includeAllRoots": "true"},
+                               token, base, timeout=20)
+        except Exception:
+            continue
+        d = (resp.get("expirations") or {}).get("date") or []
+        if isinstance(d, str):
+            d = [d]
+        for x in d:
+            if x and x > today:
+                dates.add(x)
+    future = sorted(dates)
+    if not future:
+        sys.exit(f"{R}✗ No future expirations found for {symbol.upper()} — can't resolve +{n} DTE.{N}")
+    if n > len(future):
+        avail = ", ".join(future[:8])
+        sys.exit(f"{R}✗ +{n} DTE requested but only {len(future)} future expiration(s) listed for "
+                 f"{symbol.upper()}: {avail}{'…' if len(future) > 8 else ''}{N}")
+    return future[n - 1]
+
+
 def _format_date(s):
     if not s:
         return "—"
@@ -1389,6 +1436,7 @@ def render_table(rows: list[PositionRow]) -> None:
         ("Entry",     8,  "right"),   # per-unit avg entry price (signed: −credit, +debit)
         ("Cost",      11, "right"),
         ("Bid",       7,  "right"),
+        ("Mid",       7,  "right"),   # net mark — matches Tradier web's single price
         ("Ask",       7,  "right"),
         ("P&L $",     11, "right"),
         ("P&L %",     8,  "right"),
@@ -1418,6 +1466,7 @@ def render_table(rows: list[PositionRow]) -> None:
         cost_str = _sign_dollars(r.cost_basis)
         bid_str = f"${r.bid:.2f}" if r.bid is not None else "—"
         ask_str = f"${r.ask:.2f}" if r.ask is not None else "—"
+        mid_str = f"${(r.bid + r.ask) / 2:.2f}" if (r.bid is not None and r.ask is not None) else "—"
         pnl_color = G if r.pnl_dollar >= 0 else R
         pnl_dollar_str = f"{pnl_color}{_sign_dollars(r.pnl_dollar)}{N}"
         pnl_pct_str = f"{pnl_color}{r.pnl_pct:+.1f}%{N}"
@@ -1428,10 +1477,11 @@ def render_table(rows: list[PositionRow]) -> None:
             _pad(entry_str, cols[3][1], cols[3][2]),
             _pad(cost_str, cols[4][1], cols[4][2]),
             _pad(bid_str, cols[5][1], cols[5][2]),
-            _pad(ask_str, cols[6][1], cols[6][2]),
-            _pad_ansi(pnl_dollar_str, cols[7][1], cols[7][2]),
-            _pad_ansi(pnl_pct_str, cols[8][1], cols[8][2]),
-            _pad(str(r.quantity), cols[9][1], cols[9][2]),
+            _pad(mid_str, cols[6][1], cols[6][2]),
+            _pad(ask_str, cols[7][1], cols[7][2]),
+            _pad_ansi(pnl_dollar_str, cols[8][1], cols[8][2]),
+            _pad_ansi(pnl_pct_str, cols[9][1], cols[9][2]),
+            _pad(str(r.quantity), cols[10][1], cols[10][2]),
         ])
         print(row_str)
 
@@ -1832,6 +1882,7 @@ def parse_args(argv):
         "new_symbol": None,
         "new_strike_side": None,
         "new_expiration": None,
+        "new_dte": None,                  # +N trading-days-out (resolved to a real expiration later)
         "ticket": None,                   # set when --buy/--sell got a multi-leg ticket
         # -G closed-P&L params
         "gainloss_date": None,            # YYYY-MM-DD, default today
@@ -1934,28 +1985,45 @@ def parse_args(argv):
                 args["ticket"] = first
                 args["mode"] = "open"
             else:
-                # Single-leg: SYMBOL  STRIKE_SIDE  [EXPIRATION]
+                # Single-leg: SYMBOL  STRIKE_SIDE  [EXPIRATION | +N]
                 # EXPIRATION is OPTIONAL — defaults to today when omitted.
                 # Date input is lenient: accepts 2026-06-4, 06-04, 06/04/2026, etc.
+                # +N means "N trading days out" — resolved to the Nth real
+                # expiration in the live chain (skips weekends/holidays, and
+                # guarantees a tradeable chain exists). May be attached to the
+                # strike ("738C+2") or given as its own token ("738C +2").
                 try:
                     args["new_symbol"] = first.upper()
-                    args["new_strike_side"] = next(it).upper()
-                    args["mode"] = "new_leg"
+                    strike_tok = next(it).upper()
                 except StopIteration:
                     sys.exit(f"{R}{a} single-leg form needs at least SYMBOL STRIKE_SIDE (e.g., {a} QQQ 746C){N}")
-                # Peek for optional expiration
+                args["mode"] = "new_leg"
+                mdte = re.match(r"^(.+?)\+(\d+)$", strike_tok)
+                if mdte:
+                    strike_tok = mdte.group(1)
+                    args["new_dte"] = int(mdte.group(2))
+                args["new_strike_side"] = strike_tok
+                # Peek for optional expiration / +N DTE
                 peek = next(it, None)
-                if peek is None:
+                if args["new_dte"] is not None:
+                    # DTE already supplied via the strike suffix — no date token expected.
+                    if peek is not None:
+                        it = iter([peek] + list(it))
+                elif peek is None:
                     args["new_expiration"] = datetime.now().strftime("%Y-%m-%d")
                 elif peek.startswith("-"):
                     # It's the next flag — push back and default to today
                     args["new_expiration"] = datetime.now().strftime("%Y-%m-%d")
                     it = iter([peek] + list(it))
                 else:
-                    normalized = _normalize_date(peek)
-                    if not normalized:
-                        sys.exit(f"{R}Bad expiration: {peek!r}. Try YYYY-MM-DD, MM-DD, MM/DD/YYYY, or 20260604.{N}")
-                    args["new_expiration"] = normalized
+                    mpd = re.match(r"^\+(\d+)$", peek)
+                    if mpd:
+                        args["new_dte"] = int(mpd.group(1))
+                    else:
+                        normalized = _normalize_date(peek)
+                        if not normalized:
+                            sys.exit(f"{R}Bad expiration: {peek!r}. Try YYYY-MM-DD, MM-DD, MM/DD/YYYY, 20260604, or +N (DTE).{N}")
+                        args["new_expiration"] = normalized
 
         # ── Modifier flags (apply to whichever operation is active) ──
         elif a in ("-L", "--limit"):
@@ -2008,6 +2076,10 @@ def main():
             sys.exit(f"{R}Bad strike+side: {args['new_strike_side']!r}. Expected like '746C' or '540P'.{N}")
         strike = float(m.group(1))
         side = "call" if m.group(2).upper() == "C" else "put"
+        if args.get("new_dte") is not None:
+            args["new_expiration"] = resolve_dte_expiration(
+                token, base, args["new_symbol"], args["new_dte"])
+            print(f"  {D}+{args['new_dte']} DTE → {args['new_expiration']}{N}")
         try:
             datetime.strptime(args["new_expiration"], "%Y-%m-%d")
         except ValueError:

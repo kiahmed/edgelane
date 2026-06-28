@@ -417,6 +417,8 @@
     </div>
     <div id="pickStructure" class="mt-2 text-sm text-slate-300"></div>
     <div id="pickMetrics" class="mt-2 grid grid-cols-2 md:grid-cols-5 gap-2 text-xs"></div>
+    <!-- Bias-trust hint (confidence framing) — shown when /accuracy show_hint=true -->
+    <div id="pickHint" class="hidden mt-2 text-xs text-slate-500 italic"></div>
   </section>
 
   <!-- Strategy grid -->
@@ -436,7 +438,7 @@
   <!-- Recent outcomes — last 10 evaluations, populated by /accuracy poll -->
   <section class="card p-4" data-gated>
     <div class="flex items-center justify-between mb-2">
-      <h2 class="text-sm uppercase tracking-wide text-slate-400">Recent outcomes</h2>
+      <h2 id="outcomeHeader" class="text-sm uppercase tracking-wide text-slate-400">Recent outcomes</h2>
       <span id="outcomeMeta" class="text-xs text-slate-500">—</span>
     </div>
     <div id="outcomeList" class="space-y-1 text-xs font-mono text-slate-300">
@@ -768,7 +770,7 @@
   }
   // UI-owned version, auto-bumped by .githooks/pre-commit on any commit that
   // touches this file (manual: tools/bump_ui_version.sh).
-  const UI_VERSION = '2.0.2';
+  const UI_VERSION = '2.0.3';
   console.info('[edgelane] API_BASE =', API_BASE,
     '  (override with ?api=http://host:port; clear with localStorage.removeItem("edgelane_api_base"))');
 
@@ -1469,6 +1471,18 @@
     neutral: 'text-slate-400',
   };
 
+  // Color for the bias-trust header: in_sync earns green; paused/low_conf are
+  // amber (caution, not failure); calibrating is muted.
+  function trustHeaderClass(stt) {
+    switch (stt) {
+      case 'in_sync':  return 'text-emerald-300';
+      case 'paused':   return 'text-amber-300';
+      case 'low_conf': return 'text-amber-200/90';
+      case 'calibrating':
+      default:         return 'text-slate-400';
+    }
+  }
+
   function tierClass(tier) {
     switch (tier) {
       case 'green':  return 'bg-emerald-500/20 text-emerald-200';
@@ -1490,12 +1504,28 @@
       pill.title = 'Outcome evaluation resumes at market open';
       banner.classList.add('hidden');
     } else {
-      pill.className = `pill ${tierClass(acc.tier)}`;
+      // When the backend exposes a trust state, only publish a win-rate % when
+      // it's earned (in_sync / low_conf). Paused/calibrating show counts only —
+      // no naked %. Older backends (no `state`) keep the legacy % display.
+      const earned = acc.state == null || acc.state === 'in_sync' || acc.state === 'low_conf';
       if (acc.tier === 'unknown' || (acc.n || 0) === 0) {
+        pill.className = `pill ${tierClass(acc.tier)}`;
         pill.textContent = 'Accuracy collecting…';
         pill.title = 'No outcomes evaluated yet';
+      } else if (!earned) {
+        const tally = `(${acc.wins}W / ${acc.losses}L / ${acc.neutrals}N)`;
+        if (acc.state === 'paused') {
+          pill.className = 'pill bg-amber-500/20 text-amber-200';
+          pill.textContent = `Recalibrating ${tally}`;
+          pill.title = 'Win-rate paused while the bias re-syncs — grading continues silently';
+        } else {
+          pill.className = 'pill bg-slate-600/40 text-slate-300';
+          pill.textContent = `Calibrating ${tally}`;
+          pill.title = 'Collecting graded outcomes before publishing a win-rate';
+        }
       } else {
-        const a = Number(acc.accuracy_pct || 0).toFixed(0);
+        const a = Number(acc.win_rate != null ? acc.win_rate : (acc.accuracy_pct || 0)).toFixed(0);
+        pill.className = `pill ${tierClass(acc.tier)}`;
         pill.textContent = `Accuracy ${a}% (${acc.wins}W / ${acc.losses}L / ${acc.neutrals}N)`;
         pill.title = `rolling window of ${acc.window} · ${acc.n} outcomes counted`;
       }
@@ -1510,6 +1540,30 @@
         banner.classList.add('hidden');
       }
     }
+    // Bias-trust state → "Recent outcomes" header + pick-card hint.
+    // Render display_text / hint_text verbatim from the API; fall back to the
+    // legacy static header when an older backend omits these fields.
+    const header = $('outcomeHeader');
+    if (header) {
+      if (acc.display_text) {
+        header.textContent = acc.display_text;
+        header.className = `text-sm tracking-wide font-semibold ${trustHeaderClass(acc.state)}`;
+      } else {
+        header.textContent = 'Recent outcomes';
+        header.className = 'text-sm uppercase tracking-wide text-slate-400';
+      }
+    }
+    const hint = $('pickHint');
+    if (hint) {
+      if (acc.show_hint && acc.hint_text) {
+        hint.textContent = acc.hint_text;
+        hint.classList.remove('hidden');
+      } else {
+        hint.textContent = '';
+        hint.classList.add('hidden');
+      }
+    }
+
     // Recent outcomes list
     const list = $('outcomeList');
     const rows = acc.recent_outcomes || [];
@@ -1523,13 +1577,25 @@
     }
     list.innerHTML = rows.map(r => {
       const t = r.evaluated_at ? new Date(r.evaluated_at).toLocaleString() : '—';
-      const mv = (r.actual_move_pct >= 0 ? '+' : '') + Number(r.actual_move_pct || 0).toFixed(3) + '%';
       const cls = RESULT_CLASS[r.result] || 'text-slate-400';
+      // Premium-movement rows (new eval) show the spread's own favorable delta;
+      // fall back to the legacy spot-move display for older outcome rows.
+      let detail;
+      if (r.favorable_delta != null) {
+        const fav = Number(r.favorable_delta);
+        const favStr = (fav >= 0 ? '+' : '') + fav.toFixed(2);
+        const favCls = fav > 0 ? 'text-emerald-300' : (fav < 0 ? 'text-rose-300' : 'text-slate-300');
+        const typ = r.spread_type ? `<span class="text-slate-500">${r.spread_type}</span>` : '';
+        detail = `${typ}<span class="text-slate-400">premium <span class="${favCls}">${favStr}</span></span>`;
+      } else {
+        const mv = (r.actual_move_pct >= 0 ? '+' : '') + Number(r.actual_move_pct || 0).toFixed(3) + '%';
+        detail = `<span class="text-slate-400">predicted <span class="text-slate-200">${r.predicted_direction || '—'}</span></span>
+        <span class="text-slate-400">actual <span class="text-slate-200">${mv}</span></span>`;
+      }
       return `<div class="flex flex-wrap gap-x-3 gap-y-0 items-baseline">
         <span class="text-slate-500">${t}</span>
         <span class="text-slate-300">${r.label || '—'}</span>
-        <span class="text-slate-400">predicted <span class="text-slate-200">${r.predicted_direction || '—'}</span></span>
-        <span class="text-slate-400">actual <span class="text-slate-200">${mv}</span></span>
+        ${detail}
         <span class="${cls} font-bold uppercase ml-auto">${r.result || '—'}</span>
       </div>`;
     }).join('');
