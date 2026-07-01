@@ -116,8 +116,12 @@ class FakeRequest:
 @pytest.fixture(autouse=True)
 def _clear_chain_cache():
     troute._CHAIN_CACHE.clear()
+    troute._CHAIN_FAIL.clear()      # negative cache — also reset so failures don't leak between tests
+    troute._MKT_CACHE.update(t=0.0, state=None, open=None)
     yield
     troute._CHAIN_CACHE.clear()
+    troute._CHAIN_FAIL.clear()
+    troute._MKT_CACHE.update(t=0.0, state=None, open=None)
 
 
 @pytest.fixture(autouse=True)

@@ -271,6 +271,13 @@ async def test_orders_endpoint_returns_only_working():
     r = await torque_orders(FakeRequest(client), account_id="T", user=DEV)
     assert len(r["orders"]) == 1                # only the OPEN one (no filled/canceled)
     assert r["orders"][0]["id"] == "2" and r["orders"][0]["working"] is True
+    # Past Orders (account-wide): every Torque-TAGGED order, ANY status — but not
+    # the untagged SPY order (id 3), which some other tool/app placed.
+    hist_ids = [h["id"] for h in r["history"]]
+    assert set(hist_ids) == {"1", "2"}          # torque-tagged filled + open, no id 3
+    assert "3" not in hist_ids
+    # newest first (id 2 created after id 1)
+    assert hist_ids == ["2", "1"]
 
 
 async def test_orders_endpoint_shows_pending_watcher():

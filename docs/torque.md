@@ -152,11 +152,15 @@ moving this minute**, then leaves the trade to you. Two layers:
 The big signed number (−100 … +100) is a deterministic heuristic blend of three
 things in the current chain (±3% around spot):
 
-| Component (shown as a metric tile) | What it measures | Weight |
+| Component | What it measures | Weight |
 |---|---|---|
-| **Volume P/C** | call vs put **contracts traded today** | 40% |
-| **Premium skew** | call vs put **$ resting in open interest** (mid × OI) | 30% |
-| **Magnet** | pull toward the most **OI-concentrated strike** near spot | 30% |
+| Volume P/C | call vs put **contracts traded today** | 40% |
+| **Premium skew** *(tile)* | call vs put **$ resting in open interest** (mid × OI) | 30% |
+| **Magnet** *(tile)* | pull toward the most **OI-concentrated strike** near spot | 30% |
+
+(These are the Lean's *inputs*; only **Premium skew** and **Magnet** still show as
+tiles — the `Volume P/C` and `OI P/C` tiles were replaced by the **Session flow**
+block, see Layer 3.)
 
 Thresholds: **≥ +25 → call-leaning**, **≤ −25 → put-leaning**, in between →
 **balanced** (deliberately no side — a small score isn't an edge). The bar under
@@ -168,16 +172,26 @@ yesterday, not because of now).
 
 ### Layer 2 — the Flow (momentum: where money is moving *now*)
 
-The **flow** block tracks **premium dollars actually traded** — `mid × volume`
-per side — and reports how much hit **calls vs puts over the last 3 minutes**
-(`calls +$1.2M · puts +$0.4M · net +$0.8M call`). It's kept in **browser memory
-for this tab only** (cleared on refresh), sampled every 5s.
+The **flow** block reports the **premium $ of *new* contracts traded** on calls
+vs puts over the last 3 minutes (`calls +$1.2M · puts +$0.4M · net +$0.8M call`).
+It's kept in **browser memory for this tab only** (cleared on refresh), sampled
+every 5s.
 
 Why volume, not the premium-skew $? Because **open interest only settles
 overnight** — intraday the premium-skew number moves mostly because price moved,
 so its "rate of change" would just echo the chart. **Volume is intraday and
-cumulative**, so its delta is real, fresh order flow. That's the whole reason
-flow adds something the Lean doesn't.
+cumulative**, so its delta is real, fresh order flow.
+
+**How it's measured (and why `$0` is meaningful):** each side's figure is
+`Δvolume × current $-per-contract` — the *new contracts* in the window, valued at
+the side's current average premium. It deliberately does **not** diff
+`mid × cumulative-volume`, because a mid tick would then revalue the *whole day's*
+volume and leak the price move into the "flow" (e.g. price drops → put mids rise →
+a fake `+$1.5M` put flow that's really just repricing). Because cumulative volume
+only rises, each side is monotonic, so **`+$0` on a side means exactly one thing:
+zero new contracts traded there in the window** — not "mids fell." A one-sided
+read like `calls +$0 / puts +$1.5M` is then a genuine *"all the fresh flow is
+hitting puts"* — which, under a call-leaning Lean, is a real **diverging** signal.
 
 ### The tag that ties them together: confirms / diverging
 
@@ -192,6 +206,14 @@ layers:
 - On a **balanced** lean there's nothing to confirm, so it just names the side
   the money is hitting (`call flow` / `put flow`) — an early tell before the
   Lean itself tips.
+
+**`call flow`/`put flow` and `confirms`/`diverging` are different states, but the
+first often *matures* into the second.** On a **balanced** lean, persistent
+`put flow` is usually the **precursor**: as that flow keeps up it drags the Lean
+itself down into **put-leaning**, and then the *same* flow reads as **confirms**.
+So `put flow → confirms` (and `call flow → confirms`) is frequently **one move
+maturing**, not two unrelated signals — watching that hand-off is an early read on
+a lean that's about to establish.
 
 **The key idea:** *the Lean tells you where the crowd is; the Flow tells you
 whether the crowd is still right.* A **small lean that flow confirms** is often
@@ -215,11 +237,66 @@ None of these is a "buy/sell" instruction — they're context for the structure
 *you* already had in mind. Torque's job is to make that read fast and then
 execute cleanly.
 
+### Layer 3 — Session flow (trend vs chop over the day)
+
+The 3m flow is the tape; a single reading is noisy and swings side to side. The
+**Session flow** block integrates it over a **trailing 60 minutes** — a
+**cumulative delta (CVD)** in premium dollars — to answer the mid-day question:
+*is there a persistent direction, or is this just chop?* It shows:
+
+- **Net $** — `Σ(call$ − put$)` over the hour. Steadily one way = sustained
+  pressure. A lone opposite print (your `+$1M` call against `−$42M` puts) barely
+  dents it — **the noise filters itself.**
+- **Trend-strength bar + regime** — judged by **persistence**, i.e. how many of
+  the 3-min windows in the hour agree on a side (`X/Y windows put-side`):
+  - **mostly one side** (≳70%) → **`trending put` / `trending call`** → a
+    directional debit spread is in play, and a small counter-print is a
+    pullback/entry, not a reversal.
+  - **~50/50, sign flipping** → **`chop / range`** → two-sided, rangebound →
+    **Iron Condor / Fly** territory.
+  - in between → **`mixed`** (building or transitioning).
+  - *Why persistence, not `|net|/gross`?* A **mild but relentless** drift (every
+    window slightly call-side) is a *trend* even though its net/gross is low —
+    counting windows catches that; a raw lopsidedness ratio would miscall it chop.
+- **`% one-sided flow`** — the `|net|/gross` ratio, shown as a secondary stat:
+  how lopsided the raw flow is (size of the edge), distinct from how *persistent*
+  it is (the bar).
+
+Regime turnover — e.g. a `chop → trending put` shift, or the trend-strength bar
+climbing off a flat base — is your **early mid-day regime-change** cue. As always:
+this is *pressure*, not a forecast; dealers can absorb sustained flow.
+
+**Browser-only, this tab** — the 60m series (and the 3m flow) live in memory and
+clear on refresh; they're per-tab, so two tabs on different tickers each keep their
+own. (Past Orders, by contrast, is account-wide — see the Orders panel.)
+
+**Market-hours pause.** Torque only ever trades **same-day (0DTE)** premiums, which
+stop at 16:00 ET — so in **production** *all* polling (positioning, flow, live
+reprice, **and** the orders panel) **pauses whenever the market isn't in its regular
+session**, and resumes automatically when it reopens. Nothing fills outside RTH, so
+there's nothing to poll for. The header shows `MARKET <state> · PAUSED`, the session
+flow **freezes** (rather than resetting), and the orders panel is fetched **once** at
+the pause (so resting GTC orders still show) then held — **cancel/modify still work**
+(broker actions, not polls).
+
+The open/closed signal is **Yahoo's live `marketState`** (`GET /torque/clock`,
+cached ~30 s, polled slowly and always so a reopen is noticed) — which reflects the
+real exchange session, so **holidays and early closes are handled automatically with
+no hardcoded calendar**. On the rare Yahoo failure it **falls back** to a local
+weekday + 09:30–16:00 ET check. In **sandbox/dev** (`make run-dev`) nothing pauses,
+so the tool stays testable off-hours (mirrors the backend's DEVMODE gating). Note:
+Torque is **stateless** — none of this is persisted; it holds no DuckDB, unlike the
+market poller/evaluator.
+
 ### The other tiles & levels
 
-- **OI P/C** — put/call **open interest** ratio (standing positioning, not today's
-  flow). High put OI on an index is often *hedging*, not bearish conviction.
-- **Magnet** — the near-spot strike with the most concentrated OI, and its
+- **Session flow replaced the `Volume P/C` + `OI P/C` tiles.** `OI P/C` was
+  overnight-static (near-useless intraday) and `Volume P/C` was just an unweighted,
+  windowless cumulative-flow proxy — the CVD net + trend-strength strictly
+  dominate both.
+- **Premium skew** *(tile)* — call vs put **$ resting in OI**; the standing dollar
+  balance (a Lean input).
+- **Magnet** *(tile)* — the near-spot strike with the most concentrated OI, and its
   distance from spot; a tight near-spot magnet is what flips the balanced
   auto-pick from **Iron Condor** to **Iron Fly** (sell the pin).
 - **premium / OI clusters** pill — the side OI/premium leans; for single-leg
@@ -331,12 +408,13 @@ Anchoring model (points from spot, snapped to the chain grid):
 |---|---|
 | `GET /torque` | the page |
 | `GET /torque/config` | tickers + strategy registry + env/mode |
+| `GET /torque/clock` | `{market_state, open}` from Yahoo `marketState` (holiday/early-close aware; cached ~30s success / ~8s failure so an outage doesn't re-hit each poll) — gates the pause |
 | `GET /torque/analyze/{sym}` | spot + positioning snapshot (poll ~5s) |
 | `POST /torque/build` | auto-filled legs for (ticker, strategy, step adjustments) |
 | `POST /torque/price` | live net bid/mid/ask for a set of legs (poll ~2.5s) |
 | `POST /torque/place` | submit entry; arm background fill-watch + auto-close (`confirm:true`) |
 | `GET /torque/order/{id}` | single order status |
-| `GET /torque/orders` | **only the live/working** orders (no filled/closed history) + active auto-close watchers — feeds the bottom **Orders panel** (polled ~4s) |
+| `GET /torque/orders` | `orders` (live/working) + `watchers` (active auto-close) + `history` (all Torque-tagged orders today, any status — the account-wide **Past Orders**) — feeds the bottom panel (polled ~4s) |
 | `POST /torque/cancel/{id}` | cancel a working order from the panel |
 | `POST /torque/modify/{id}` | change a working order's limit price (Tradier PUT) |
 
@@ -353,14 +431,17 @@ close order is actually placed it becomes a working order in the table. Polls
 `/torque/orders` every ~4s; a **busy cursor** shows during any place/modify/
 cancel.
 
-**Past Orders** — an **in-memory log of every order Torque sent this session**
-(whatever the outcome: pending, filled, rejected, canceled, expired), newest
-first. Each send appends a row; as the working poll runs it updates that row's
-status/fills, and once an order drops off the working list a one-time
-`GET /torque/order/{id}` fetches its **final** status. It's purely for
-operational transparency — **browser memory only, capped at 50, lost on refresh
-or tab close** (no server record). This is just so you can see what you fired and
-how it resolved, without hunting in the broker UI.
+**Past Orders** — **account-wide**, newest first: every **Torque-tagged** order on
+the broker account today at **any status** (pending → filled / canceled / rejected
+/ expired). Because it's derived from the account's own orders (Torque tags all of
+them `torque…` / `torqueClose…`), it is **identical from every tab**, shows the
+**broker's own live status** (so it always reflects fills/cancels — no per-tab
+tracking to drift), and needs no extra API call (the `/torque/orders` poll returns
+it as `history`, filtered from the same fetch). Not persisted server-side — it's
+just today's account orders, so it naturally clears with the broker's daily order
+history. *(Caveat: an order **rejected at submission** never becomes a broker order,
+so it won't appear here — the red `✗ ENTRY REJECTED` result panel is your record of
+that.)*
 
 **Order-status panel** — the "✓ ENTRY SENT · entry id N" confirmation that
 appears under the order builder after you place **auto-dismisses after 10s** (the

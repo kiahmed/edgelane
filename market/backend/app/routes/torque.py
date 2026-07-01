@@ -128,6 +128,10 @@ _WATCHERS: dict[str, dict] = {}
 # tiny TTL cache so analyze + build hitting within one tick share a chain fetch
 _CHAIN_CACHE: dict[str, tuple[float, float, str, list[dict]]] = {}
 _CHAIN_TTL = 2.0
+_CHAIN_FAIL: dict[str, tuple[float, int, str]] = {}   # sym -> (t, status, detail)
+_CHAIN_FAIL_TTL = 4.0   # brief negative cache: analyze/build/price all call _get_chain,
+                        # so during a Tradier blip serve the last error for this long
+                        # instead of each poll re-hitting — recovers within ~4s.
 
 # Yahoo live-spot source (primary; Tradier parity is the fallback).
 _YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
@@ -151,6 +155,29 @@ async def _yahoo_spot(ticker: str) -> float | None:
             return float(px) if px is not None else None
     except Exception as e:                       # network, parse, http — all soft
         log.warning("yahoo spot failed for %s (%s): %s", ticker, ysym, e)
+        return None
+
+
+_MKT_CACHE: dict = {"t": 0.0, "state": None, "open": None}
+_MKT_OK_TTL = 30.0     # serve a good read this long
+_MKT_FAIL_TTL = 8.0    # serve a FAILED read briefly too, so a Yahoo outage doesn't
+                       # re-hit every poll — still recovers within seconds
+
+async def _yahoo_market_state() -> str | None:
+    """Yahoo `marketState` for a US reference symbol
+    (PREPRE/PRE/REGULAR/POST/POSTPOST/CLOSED). This reflects the REAL exchange
+    session — including holidays and early closes — so it's an authoritative
+    open/closed signal with no hardcoded calendar. None on any failure."""
+    ref = (tcfg.tickers() or ["SPX"])[0]
+    ysym = tcfg.yahoo_symbol(ref) or "%5EGSPC"   # ^GSPC fallback
+    try:
+        async with httpx.AsyncClient(timeout=_YAHOO_TIMEOUT) as cli:
+            r = await cli.get(_YAHOO_URL.format(sym=ysym), headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            st = r.json()["chart"]["result"][0]["meta"].get("marketState")
+            return str(st) if st else None
+    except Exception as e:
+        log.warning("yahoo market state failed (%s): %s", ysym, e)
         return None
 
 
@@ -179,6 +206,11 @@ async def _get_chain(client, symbol: str) -> tuple[float, str, list[dict]]:
     hit = _CHAIN_CACHE.get(sym)
     if hit and now - hit[0] < _CHAIN_TTL:
         return hit[1], hit[2], hit[3]
+    # brief negative cache: serve the last error instead of re-hitting Tradier on
+    # every poll during an outage (recovers after _CHAIN_FAIL_TTL).
+    fail = _CHAIN_FAIL.get(sym)
+    if fail and now - fail[0] < _CHAIN_FAIL_TTL:
+        raise HTTPException(fail[1], fail[2])
     try:
         q = await client.stock_quote(sym)
         spot = teng._f(q.get("last") or q.get("close") or q.get("prevclose"))
@@ -187,10 +219,13 @@ async def _get_chain(client, symbol: str) -> tuple[float, str, list[dict]]:
         if not exp:
             raise HTTPException(404, f"no listed option expirations for {sym}")
         raw = await client.options_chain(sym, exp)
-    except HTTPException:
+    except HTTPException as e:
+        _CHAIN_FAIL[sym] = (now, e.status_code, e.detail if isinstance(e.detail, str) else str(e.detail))
         raise
     except Exception as e:
-        raise HTTPException(502, f"Tradier chain fetch failed for {sym}: {e}")
+        msg = f"Tradier chain fetch failed for {sym}: {e}"
+        _CHAIN_FAIL[sym] = (now, 502, msg)
+        raise HTTPException(502, msg)
     contracts = teng.normalize_chain(raw)
     # Spot source order: Yahoo live quote → Tradier put-call parity → raw broker
     # quote → median strike. Yahoo is the primary live print; parity covers a
@@ -202,6 +237,7 @@ async def _get_chain(client, symbol: str) -> tuple[float, str, list[dict]]:
         ks = sorted(c["strike"] for c in contracts)
         spot = ks[len(ks) // 2]
     _CHAIN_CACHE[sym] = (now, spot, exp, contracts)
+    _CHAIN_FAIL.pop(sym, None)   # recovered — drop any stale negative-cache entry
     return spot, exp, contracts
 
 
@@ -257,6 +293,24 @@ async def torque_cfg():
         "mode": settings.tradier_mode,
         "devmode": bool(getattr(settings, "devmode", False)),
     }
+
+
+@router.get("/torque/clock", dependencies=_GATE)
+async def torque_clock():
+    """Authoritative market-open flag from Yahoo `marketState` — handles holidays
+    and early closes with no hardcoded calendar. Cached ~30s (one Yahoo hit per
+    window). `open` is None (unknown) on a Yahoo failure, so the client falls back
+    to its own weekday+time gate."""
+    now = time.time()
+    # serve cache while fresh — a good read for _MKT_OK_TTL, a failed one (state None)
+    # for the shorter _MKT_FAIL_TTL so a sustained Yahoo outage is shielded, not spammed.
+    ttl = _MKT_OK_TTL if _MKT_CACHE["state"] is not None else _MKT_FAIL_TTL
+    if _MKT_CACHE["t"] and now - _MKT_CACHE["t"] < ttl:
+        return {"market_state": _MKT_CACHE["state"], "open": _MKT_CACHE["open"]}
+    st = await _yahoo_market_state()
+    is_open = (st == "REGULAR") if st is not None else None
+    _MKT_CACHE.update(t=now, state=st, open=is_open)
+    return {"market_state": st, "open": is_open}
 
 
 # ── analysis ───────────────────────────────────────────────────────────────
@@ -664,9 +718,10 @@ _WORKING_STATES = {"open", "pending", "partially_filled", "calculated", "accepte
 @router.get("/torque/orders", dependencies=_GATE)
 async def torque_orders(request: Request, account_id: str | None = None,
                         user: dict = Depends(get_current_user)):
-    """ONLY the live/working orders (no filled/closed history) plus active
-    auto-close watchers still waiting for their entry to fill — feeds the
-    bottom orders panel. Orders come from the caller's own broker account."""
+    """Feeds the bottom orders panel from the caller's own broker account:
+    `orders` = live/working only, `watchers` = active auto-close watchers, and
+    `history` = every Torque-tagged order today at any status (the account-wide
+    Past Orders list, identical from any tab)."""
     client, aid, per_user = await _resolve_torque_broker(request, user, account_id)
     try:
         try:
@@ -674,20 +729,30 @@ async def torque_orders(request: Request, account_id: str | None = None,
         except Exception as e:
             raise HTTPException(502, f"orders fetch failed: {e}")
         orders = []
+        history = []
         for o in raw:
             st = str(o.get("status") or "").lower()
-            if st not in _WORKING_STATES:
-                continue                          # skip filled/canceled/expired history
-            orders.append({
+            tag = str(o.get("tag") or "")
+            row = {
                 "id": str(o.get("id") or ""), "symbol": o.get("symbol"),
                 "class": o.get("class"), "type": o.get("type"), "side": o.get("side"),
-                "status": st, "working": True,
+                "status": st,
                 "quantity": teng._f(o.get("quantity")), "exec_quantity": teng._f(o.get("exec_quantity")),
                 "price": teng._f(o.get("price")), "avg_fill_price": teng._f(o.get("avg_fill_price")),
-                "duration": o.get("duration"), "tag": o.get("tag"),
+                "duration": o.get("duration"), "tag": tag,
                 "create_date": o.get("create_date"),
-            })
+            }
+            if st in _WORKING_STATES:
+                orders.append({**row, "working": True})
+            # Past Orders: EVERY Torque-tagged order on this account today, any status
+            # (pending → filled/canceled/rejected/expired). Account-scoped, so it's the
+            # same list from every tab, and the status is the broker's own — no per-tab
+            # tracking to drift. Torque tags all its orders "torque…" / "torqueClose…".
+            if tag.lower().startswith("torque"):
+                history.append(row)
         orders.sort(key=lambda x: x.get("create_date") or "", reverse=True)
+        history.sort(key=lambda x: x.get("create_date") or "", reverse=True)
+        history = history[:100]
         # Show watchers that are still PENDING a close (entry not yet confirmed
         # closed) AND belong to THIS caller — _WATCHERS is process-global and
         # shared across users, so scope by uid or another user's in-flight
@@ -698,7 +763,7 @@ async def torque_orders(request: Request, account_id: str | None = None,
         watchers = [{k: v for k, v in w.items() if k not in ("task", "uid")}
                     for w in _WATCHERS.values()
                     if w.get("state") in ("watching_fill",) and w.get("uid") == my_uid]
-        return {"account_id": aid, "orders": orders, "watchers": watchers}
+        return {"account_id": aid, "orders": orders, "watchers": watchers, "history": history}
     finally:
         if per_user:
             await client.close()

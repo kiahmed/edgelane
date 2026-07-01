@@ -27,7 +27,7 @@
   .wrap{max-width:1320px;margin:0 auto;padding:12px 16px;height:100vh;
     box-sizing:border-box;display:flex;flex-direction:column;overflow:hidden}
   .grid{flex:0 0 auto}
-  .panel.orders{flex:1 1 auto;min-height:120px;display:flex;flex-direction:column}
+  .panel.orders{flex:1 1 auto;min-height:150px;display:flex;flex-direction:column}
   .panel.orders .oscroll{flex:1 1 auto;min-height:0;overflow-y:auto;margin-top:6px}
   header{display:flex;align-items:center;gap:14px;padding:6px 2px 16px;border-bottom:1px solid var(--line)}
   .logomark{width:38px;height:38px;display:block}
@@ -39,6 +39,7 @@
   .tag{font-size:11px;padding:2px 8px;border-radius:4px;border:1px solid var(--line2);color:var(--dim);letter-spacing:1px}
   .tag.sandbox{color:var(--debit);border-color:#5a4a1a;background:#1c1606}
   .tag.production{color:var(--put);border-color:#5a1a1a;background:#1c0606}
+  .tag.closed{color:#e6b84a;border-color:#5a4a1a;background:#1c1606;font-weight:700;margin-left:8px;cursor:help}
   .grow{flex:1}
   .clock{color:var(--dim);font-size:12px}
   .grid{display:grid;grid-template-columns:1fr 360px;gap:14px;margin-top:14px}
@@ -102,8 +103,10 @@
   .btn.limit{background:var(--accent);border-color:var(--accent);color:#04121f}
   .btn.market{background:#2a1c06;border-color:#5a4a1a;color:var(--debit)}
   .btn:disabled{opacity:.4;cursor:not-allowed}
-  .confirm{margin-top:14px;padding:12px;border:1px dashed var(--accent);border-radius:8px;background:#0c1824}
-  .confirm .summary{font-size:13px;color:#fff;margin-bottom:10px;line-height:1.6}
+  .confirm{margin-top:12px;padding:10px 12px;border:1px dashed var(--accent);border-radius:8px;background:#0c1824;
+    display:flex;align-items:center;gap:12px}
+  .confirm .summary{font-size:12px;color:#fff;margin-bottom:0;line-height:1.5;flex:1;min-width:0}
+  .confirm .btns{display:flex;gap:8px;flex-shrink:0}
   .muted{color:var(--dim)}
   .result{margin-top:14px;padding:12px;border-radius:8px;border:1px solid var(--line2);font-size:12px;white-space:pre-wrap}
   .result.good{border-color:#1c4a32;background:#08160e}
@@ -123,7 +126,7 @@
   .sugg{margin:8px 0 4px;font-size:12px;color:var(--dim)}
   .sugg b{color:var(--txt)}
   .sugg .pill{padding:2px 8px;border-radius:4px;font-weight:700;margin-left:4px}
-  .metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+  .metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
   .metric{background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:8px}
   .metric .l{font-size:11px;letter-spacing:1px;color:var(--dim2);text-transform:uppercase}
   .metric .v{font-size:15px;font-weight:700;margin-top:2px}
@@ -136,7 +139,7 @@
   .flowtag.conf,.flowtag.call{color:var(--call);background:#0c2018}
   .flowtag.div,.flowtag.put{color:var(--put);background:#200c0c}
   .flowtag.flat{color:var(--dim);background:#151c25}
-  .flowblk{margin-top:12px;background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:8px 10px;cursor:help}
+  .flowblk{margin-top:8px;background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:7px 10px;cursor:help}
   .flowttl{font-size:11px;letter-spacing:1px;color:var(--dim2);text-transform:uppercase;margin-bottom:6px}
   .flowrow{display:flex;align-items:center;gap:14px;font-size:13px;flex-wrap:wrap}
   .flowrow .fcell{display:flex;align-items:center;gap:6px}
@@ -148,7 +151,10 @@
   .fverdict.conf,.fverdict.call{color:var(--call);background:#0c2018}
   .fverdict.div,.fverdict.put{color:var(--put);background:#200c0c}
   .fverdict.flat{color:var(--dim);background:#151c25}
-  .disc{margin-top:12px;font-size:12px;color:var(--dim);line-height:1.55;border-top:1px solid var(--line);padding-top:10px}
+  .flowblk.sess{margin-top:8px}
+  .dbar{height:6px;border-radius:3px;background:var(--line2);margin-top:8px;overflow:hidden}
+  .dbar i{display:block;height:100%;border-radius:3px;transition:width .3s}
+  .disc{margin-top:10px;font-size:11px;color:var(--dim);line-height:1.5;border-top:1px solid var(--line);padding-top:8px}
   .err{color:var(--bad);font-size:12px;margin-top:8px}
   .panel.orders{margin-top:14px}
   .watchers{margin:6px 0 10px}
@@ -156,8 +162,8 @@
   .dotpulse{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent);margin-right:7px;animation:pulse 1.2s infinite}
   @keyframes pulse{0%,100%{opacity:.35}50%{opacity:1}}
   table.otable{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}
-  table.otable th{text-align:left;color:var(--dim2);font-size:11px;letter-spacing:1px;text-transform:uppercase;padding:4px 8px;border-bottom:1px solid var(--line)}
-  table.otable td{padding:5px 8px;border-bottom:1px solid var(--line)}
+  table.otable th{text-align:left;color:var(--dim2);font-size:11px;letter-spacing:1px;text-transform:uppercase;padding:3px 8px;border-bottom:1px solid var(--line)}
+  table.otable td{padding:3px 8px;border-bottom:1px solid var(--line)}
   table.otable tr.working td{background:#15202b}
   .ostat{font-size:11px;font-weight:700;padding:2px 7px;border-radius:4px;text-transform:uppercase}
   .ostat.open,.ostat.pending,.ostat.partially_filled,.ostat.ok,.ostat.sent{color:var(--accent);background:#10202b}
@@ -192,6 +198,12 @@ if(TOK)sessionStorage.setItem('tq_tok',TOK);
 const j=(u,o={})=>fetch(API+u,{...o,headers:{...(o.headers||{}),...(TOK?{'X-Admin-Token':TOK}:{})}}).then(async r=>{const t=await r.text();let d;try{d=JSON.parse(t)}catch{d={detail:t}}if(!r.ok)throw new Error(d.detail||r.statusText);return d});
 const fmt=(n,d=2)=>n==null||isNaN(n)?'—':Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const fmt0=n=>n==null?'—':Number(n).toLocaleString('en-US');
+const fmtTime=s=>{if(!s)return '—';const d=new Date(s);return isNaN(d)?'—':d.toLocaleTimeString();};
+// Torque tags every order "torque<strategy>" (entry) or "torqueClose<strategy>";
+// turn that back into a readable label for the Past Orders list.
+const tagLabel=tag=>{tag=tag||'';const close=/^torqueClose/i.test(tag);
+  const s=tag.replace(/^torqueClose/i,'').replace(/^torque/i,'').replace(/_/g,' ');
+  return (close?'close · ':'')+(s||'—');};
 
 function App(){
   const [cfg,setCfg]=useState(null);
@@ -201,9 +213,11 @@ function App(){
   const [build,setBuild]=useState(null);
   const [price,setPrice]=useState(null);      // live reprice
   const [analysis,setAnalysis]=useState(null);
-  const [flow,setFlow]=useState(null);          // live call/put $ flow over the window
-  const flowBuf=useRef([]);                      // rolling {t,cd,pd} samples (this tab only)
-  const autoStratRef=useRef(null);               // ticker we've auto-landed a strategy for
+  const [flow,setFlow]=useState(null);           // 3m instant call/put $ flow
+  const [sess,setSess]=useState(null);           // trailing-60m cumulative flow (CVD)
+  const flowBuf=useRef([]);                       // per-poll {t,dc,dp} $ increments, ≤60m
+  const prevRaw=useRef(null);                     // last raw {cv,pv,cd,pd} to diff against
+  const autoStratRef=useRef(null);                // ticker we've auto-landed a strategy for
   const [limit,setLimit]=useState('');
   const [userLimit,setUserLimit]=useState(false);
   const [qty,setQty]=useState(1);
@@ -215,13 +229,20 @@ function App(){
   const [result,setResult]=useState(null);
   const [err,setErr]=useState(null);
   const [now,setNow]=useState('');
-  // Past Orders: in-memory log of orders THIS tool sent this session. Lost on
-  // refresh/close — purely for operational transparency, never persisted.
-  const [past,setPast]=useState([]);
-  const pastRef=useRef(past); pastRef.current=past;
-  const resolving=useRef(new Set());  // ids whose final status is being fetched
+  const [mktClock,setMktClock]=useState(null);   // {market_state, open} from Yahoo (holiday-aware)
+  // Past Orders is now account-wide: it comes from the /torque/orders `history`
+  // list (every Torque-tagged order on the broker account), so it's identical from
+  // any tab and shows the broker's own live status. No per-tab tracking here.
 
   useEffect(()=>{const t=setInterval(()=>setNow(new Date().toLocaleTimeString()),1000);return()=>clearInterval(t)},[]);
+
+  // market clock: Yahoo marketState, polled slowly and ALWAYS (even when closed, so
+  // we notice the reopen). Authoritative over the local weekday+time gate — it knows
+  // holidays and early closes. On failure (open==null) we fall back to isMarketOpen().
+  useEffect(()=>{let live=true;
+    const run=()=>j('/torque/clock').then(c=>{if(live)setMktClock(c)}).catch(()=>{if(live)setMktClock(null)});
+    run();const t=setInterval(run,45000);return()=>{live=false;clearInterval(t)};
+  },[]);
 
   // the order-status panel (entry id / SENT confirmation) auto-clears after 10s
   // so it doesn't linger — the order lives on in Working / Past Orders below.
@@ -233,6 +254,13 @@ function App(){
   }).catch(e=>setErr('config: '+e.message))},[]);
 
   const sdef=cfg&&strategy?cfg.strategies.find(s=>s.key===strategy):null;
+  // Options-data polling pauses outside market hours in PRODUCTION only; sandbox/dev
+  // always polls so it stays testable off-hours (mirrors backend DEVMODE gating).
+  // Prefer Yahoo's live marketState (holiday/half-day aware); fall back to the local
+  // weekday+time gate only if the clock is unavailable. Recomputes every render — the
+  // 1s clock keeps it fresh.
+  const liveGate=cfg&&!cfg.devmode&&cfg.env!=='sandbox';
+  const mktOpen=!liveGate?true:(mktClock&&mktClock.open!=null)?mktClock.open:isMarketOpen();
 
   // build (on ticker/strategy/adj change)
   const doBuild=useCallback(()=>{
@@ -246,7 +274,7 @@ function App(){
         if(b.price&&b.price.complete){setPrice(b.price);if(!userLimit)setLimit(String(b.suggested_limit));}})
       .catch(e=>{setErr('build: '+e.message);setBuild(null)});
   },[ticker,strategy,adj,userLimit]);
-  useEffect(()=>{doBuild()},[ticker,strategy,adj]);
+  useEffect(()=>{if(mktOpen)doBuild()},[ticker,strategy,adj,mktOpen]);
 
   // reset on ticker/strategy change
   useEffect(()=>{setAdj({});setUserLimit(false);setResult(null);},[ticker,strategy]);
@@ -257,22 +285,33 @@ function App(){
   // moving NOW, vs the static lean which is where positioning already sits.
   const trackFlow=(a)=>{
     const v=a&&a.components&&a.components.volume;
-    if(!v||v.call_dollar==null||v.put_dollar==null)return;
-    const buf=flowBuf.current,t=Date.now();
-    buf.push({t,cd:v.call_dollar,pd:v.put_dollar});
-    while(buf.length>2&&t-buf[0].t>FLOW_WINDOW_MS)buf.shift();
-    if(buf.length<2){setFlow(null);return;}
-    const a0=buf[0],a1=buf[buf.length-1];
-    const call=Math.max(0,a1.cd-a0.cd),put=Math.max(0,a1.pd-a0.pd);  // cumulative → only rises
-    setFlow({call,put,net:call-put,span:Math.round((a1.t-a0.t)/1000)});
+    if(!v||v.call==null||v.put==null||v.call_dollar==null||v.put_dollar==null)return;
+    const now=Date.now(),pr=prevRaw.current;
+    // per-poll increment: NEW contracts since the last poll (cumulative vol → Δ ≥ 0),
+    // valued at the side's CURRENT $/contract. Never diff mid×cumVol — that revalues
+    // the whole day's volume on a mid tick and leaks the price move into the flow.
+    if(pr){
+      const dc=v.call>0?Math.max(0,v.call-pr.cv)*(v.call_dollar/v.call):0;
+      const dp=v.put >0?Math.max(0,v.put -pr.pv)*(v.put_dollar /v.put ):0;
+      const buf=flowBuf.current;
+      buf.push({t:now,dc,dp});
+      while(buf.length&&now-buf[0].t>SESS_WINDOW_MS)buf.shift();   // keep trailing 60m
+      setFlow(windowFlow(buf,now-FLOW_WINDOW_MS));                  // last-3m slice (fast)
+      setSess(sessionFlow(buf));                                   // full 60m CVD (slow)
+    }
+    prevRaw.current={cv:v.call,pv:v.put,cd:v.call_dollar,pd:v.put_dollar};
   };
 
-  // analysis poll 5s — also reset the flow window when the ticker changes
+  // reset the flow windows on ticker change ONLY — not when the market closes, so
+  // the session flow freezes in place at the close instead of getting wiped.
+  useEffect(()=>{flowBuf.current=[];prevRaw.current=null;setFlow(null);setSess(null);},[ticker]);
+
+  // analysis poll 5s — paused outside market hours (options data stops after 4pm ET)
   useEffect(()=>{
-    if(!ticker)return;let live=true;flowBuf.current=[];setFlow(null);
+    if(!ticker||!mktOpen)return;let live=true;
     const run=()=>j('/torque/analyze/'+ticker).then(a=>{if(live){setAnalysis(a);trackFlow(a);}}).catch(()=>{});
     run();const t=setInterval(run,5000);return()=>{live=false;clearInterval(t)};
-  },[ticker]);
+  },[ticker,mktOpen]);
 
   // auto-land the strategy grid on the structure the snapshot makes playable —
   // ONCE per ticker, then leave it alone so manual picks stick (never yanks
@@ -293,44 +332,28 @@ function App(){
   // shift under the user. The chain itself is cached 2s server-side, so this
   // is at most one fetch per tick.
   useEffect(()=>{
-    if(!ticker||!strategy||confirm||placing)return;let live=true;
+    if(!ticker||!strategy||confirm||placing||!mktOpen)return;let live=true;
     const t=setInterval(()=>{if(live)doBuild()},3000);
     return()=>{live=false;clearInterval(t)};
-  },[ticker,strategy,confirm,placing,doBuild]);
+  },[ticker,strategy,confirm,placing,mktOpen,doBuild]);
 
   const step=(role,n)=>setAdj(a=>({...a,[role]:(a[role]||0)+n}));
 
   // busy cursor for any in-flight request (place is the slow one)
   useEffect(()=>{document.body.style.cursor=placing?'progress':'';return()=>{document.body.style.cursor='';};},[placing]);
 
-  // orders panel: poll working + filled orders + auto-close watchers every 4s
+  // orders panel: poll working + auto-close watchers every 4s. Fetch once always
+  // (so resting GTC orders show, and to capture final state at the close), but the
+  // recurring poll runs only during market hours — nothing fills after 4pm ET.
   const [orders,setOrders]=useState(null);
   useEffect(()=>{let live=true;
     const run=()=>j('/torque/orders').then(o=>{if(live)setOrders(o)}).catch(()=>{});
-    run();const t=setInterval(run,4000);return()=>{live=false;clearInterval(t)};
-  },[]);
+    run();
+    if(!mktOpen)return()=>{live=false};
+    const t=setInterval(run,4000);return()=>{live=false;clearInterval(t)};
+  },[mktOpen]);
   const refreshOrders=()=>j('/torque/orders').then(setOrders).catch(()=>{});
 
-  // reconcile Past Orders against the live poll: while an order is still working
-  // its row tracks the working status/fill; once it drops off the working list we
-  // fetch its final status (filled / canceled / rejected / expired) one time.
-  useEffect(()=>{
-    if(!orders)return;
-    const TERMINAL=new Set(['filled','canceled','cancelled','rejected','expired','error']);
-    const liveById={};(orders.orders||[]).forEach(o=>{liveById[String(o.id)]=o;});
-    setPast(prev=>prev.map(p=>{const o=p.id!=null&&liveById[String(p.id)];
-      return o?{...p,status:o.status,quantity:o.quantity,exec_quantity:o.exec_quantity,avg_fill_price:o.avg_fill_price}:p;}));
-    pastRef.current.forEach(p=>{
-      if(p.id==null||TERMINAL.has(p.status)||liveById[String(p.id)]||resolving.current.has(p.id))return;
-      resolving.current.add(p.id);
-      j('/torque/order/'+p.id).then(o=>{const st=String((o&&o.status)||'').toLowerCase();
-        if(st)setPast(prev=>prev.map(x=>x.id===p.id?{...x,status:st,
-          avg_fill_price:o.avg_fill_price??x.avg_fill_price,
-          exec_quantity:o.exec_quantity??x.exec_quantity,
-          quantity:o.quantity??x.quantity}:x));})
-        .catch(()=>{}).finally(()=>{resolving.current.delete(p.id);});
-    });
-  },[orders]);
   const cancelOrder=(id)=>{setPlacing(true);
     j('/torque/cancel/'+id,{method:'POST'}).catch(e=>setErr('cancel: '+e.message))
       .finally(()=>{setPlacing(false);refreshOrders();});};
@@ -346,27 +369,9 @@ function App(){
       auto_close:autoClose,close_target_pct:Number(targetPct),
       spread_type:build.type,confirm:!dry,dry_run:dry};
     j('/torque/place',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-      .then(r=>{setResult(r);if(!dry)recordPast(r,order_type);})
-      .catch(e=>{setErr('place: '+e.message);
-        if(!dry)recordPast({rejected:true,reason:e.message},order_type);})
+      .then(r=>{setResult(r);if(!dry)refreshOrders();})   // pull the new order into the account-wide lists
+      .catch(e=>setErr('place: '+e.message))
       .finally(()=>{setPlacing(false);setConfirm(null)});
-  };
-
-  // append a snapshot of a just-sent order to the in-memory Past Orders log.
-  // The orders poll (below) reconciles its status as it changes / fills / closes.
-  const recordPast=(r,order_type)=>{
-    const id=(r.entry&&r.entry.id)||r.order_id||null;
-    const d=new Date();
-    setPast(prev=>[{
-      key:d.getTime()+'·'+(id||prev.length),
-      id, ts:d.getTime(), time:d.toLocaleTimeString(),
-      symbol:ticker, strategy, sname:sdef&&sdef.name,
-      otype:order_type, limit:order_type==='limit'?Number(limit):null,
-      qty:Number(qty), auto_close:autoClose, mode:r.mode,
-      status:r.rejected?'rejected':((r.entry&&r.entry.status)||'sent'),
-      reason:r.rejected?r.reason:null,
-      quantity:null, exec_quantity:null, avg_fill_price:null,
-    },...prev].slice(0,50));
   };
 
   if(!cfg)return <div className="wrap"><div className="spin">loading…{err&&<div className="err">{err}</div>}</div></div>;
@@ -385,6 +390,7 @@ function App(){
       </div>
       <span className={"tag "+(cfg.env==='sandbox'||cfg.devmode?'sandbox':'production')}>
         {cfg.devmode||cfg.env==='sandbox'?'SANDBOX':'PRODUCTION'} · {cfg.mode}</span>
+      {!mktOpen&&<span className="tag closed" title="Polling pauses whenever the market isn't in its regular session — from Yahoo's live marketState, so holidays and early closes are handled automatically (no calendar). Positioning/flow freeze; orders shown as of the pause (cancel/modify still work). Resumes automatically at the next regular session.">MARKET {mktLabel(mktClock)} · PAUSED</span>}
       <div className="grow"></div>
       <div className="clock">{now}</div>
     </header>
@@ -441,7 +447,7 @@ function App(){
                 <td>{lp?fmt(lp.mid):'—'}</td>
               </tr>;
             })}
-            {!build&&<tr><td colSpan="5" className="spin">building…</td></tr>}
+            {!build&&<tr><td colSpan="5" className="spin">{mktOpen?'building…':'market closed — options data paused'}</td></tr>}
           </tbody>
         </table>
 
@@ -490,8 +496,10 @@ function App(){
               {sdef.legs===1&&confirm.t==='limit'?' (native OTO bracket)':' (place→confirm→close)'}</span></>}
             <br/><span className="muted">{build.legs.map(l=>(l.action.startsWith('buy')?'+':'-')+(l.quantity>1?l.quantity:'')+l.side[0].toUpperCase()+fmt(l.strike,0)).join('  ')}</span>
           </div>
-          <button className="btn limit" disabled={placing} onClick={()=>place(confirm.t)}>CONFIRM & SEND</button>
-          <button className="btn" style={{marginLeft:8}} onClick={()=>setConfirm(null)}>cancel</button>
+          <div className="btns">
+            <button className="btn limit" disabled={placing} onClick={()=>place(confirm.t)}>CONFIRM & SEND</button>
+            <button className="btn" onClick={()=>setConfirm(null)}>cancel</button>
+          </div>
         </div>}
 
         {err&&<div className="err">{err}</div>}
@@ -500,7 +508,8 @@ function App(){
 
       {/* ── analysis ── */}
       <div className="panel">
-        <h3>Positioning <span className="muted" style={{textTransform:'none',letterSpacing:0}}>(snapshot — not a forecast)</span></h3>
+        <h3>Positioning <span className="muted" style={{textTransform:'none',letterSpacing:0}}>(snapshot — not a forecast)</span>
+          {!mktOpen&&<span className="muted" style={{textTransform:'none',letterSpacing:0,color:'var(--put)'}}> · paused · frozen at close</span>}</h3>
         {!analysis&&<div className="spin">analyzing…</div>}
         {analysis&&<>
           <div className="lean-head" title={LEAN_HELP}>
@@ -520,7 +529,7 @@ function App(){
               onClick={()=>setStrategy(analysis.suggested_side==='call'?'long_call':'long_put')}>use →</button>}
           </div>
           <div className="flowblk" title={FLOW_HELP}>
-            <div className="flowttl">flow · last {fst?Math.max(1,Math.round(fst.span/60))+'m':'3m'} <span className="muted" style={{textTransform:'none',letterSpacing:0,fontWeight:400}}>· premium $ traded · this tab only</span></div>
+            <div className="flowttl">flow · last 3m <span className="muted" style={{textTransform:'none',letterSpacing:0,fontWeight:400}}>· premium $ traded · this tab only</span></div>
             {fst?<div className="flowrow">
               <span className="fcell"><i className="flab call">calls</i><b>+${abbr(fst.call)}</b></span>
               <span className="fcell"><i className="flab put">puts</i><b>+${abbr(fst.put)}</b></span>
@@ -530,10 +539,21 @@ function App(){
                 <span className={"fverdict "+fst.cls}>{fst.word}</span></span>
             </div>:<div className="muted" style={{fontSize:12,padding:'2px 0'}}>building flow window… (need ~10s of polling)</div>}
           </div>
+          <div className="flowblk sess" title={SESS_HELP}>
+            <div className="flowttl">session flow · trailing 60m <span className="muted" style={{textTransform:'none',letterSpacing:0,fontWeight:400}}>· cumulative Δ · this tab only</span></div>
+            {sess?<>
+              <div className="flowrow">
+                <span className="fcell net" style={{marginLeft:0}}><i className="flab">net</i>
+                  <b style={{fontSize:16,color:sess.net>0?'var(--call)':sess.net<0?'var(--put)':'var(--dim)'}}>
+                    {sess.net>0?'+':sess.net<0?'−':''}${abbr(sess.net)}{sess.net>0?' call':sess.net<0?' put':''}</b></span>
+                <span className={"fverdict "+sess.regimeCls} style={{marginLeft:'auto',fontSize:11}}>{sess.regime}</span>
+              </div>
+              <div className="dbar" title="trend strength — how consistently the 3m windows agree on one side (full = trend, empty = chop)"><i style={{width:sess.barPct+'%',background:sess.regimeColor}}></i></div>
+              <div className="muted" style={{fontSize:11,marginTop:5}}>{sess.agree}/{sess.total} windows {sess.sideWord} · {Math.round(sess.dir*100)}% one-sided flow</div>
+            </>:<div className="muted" style={{fontSize:12,padding:'2px 0'}}>building session window… (fills over a few minutes)</div>}
+          </div>
           <div className="metrics">
-            <Metric l="Volume P/C" v={analysis.components.volume.pcr} sig={analysis.components.volume.signal}/>
             <Metric l="Premium skew" v={null} sig={analysis.components.premium_skew.signal} txt={sigTxt(analysis.components.premium_skew.signal)}/>
-            <Metric l="OI P/C" v={analysis.components.oi.pcr} sig={-(analysis.components.oi.signal||0)}/>
             <Metric l="Magnet" v={null} txt={fmt0(analysis.components.magnet.strike)} sub={analysis.components.magnet.dist_pct+'%'} sig={analysis.components.magnet.signal}/>
           </div>
           <div className="disc">{analysis.disclaimer}</div>
@@ -541,7 +561,7 @@ function App(){
       </div>
     </div>
 
-    <OrdersPanel data={orders} past={past} onCancel={cancelOrder} onModify={modifyOrder} busy={placing}/>
+    <OrdersPanel data={orders} onCancel={cancelOrder} onModify={modifyOrder} busy={placing}/>
   </div>;
 }
 
@@ -559,10 +579,11 @@ function PriceEdit({o,onModify,busy}){
   </span>;
 }
 
-function OrdersPanel({data,past,onCancel,onModify,busy}){
+function OrdersPanel({data,onCancel,onModify,busy}){
   const [tab,setTab]=useState('working');
-  const orders=(data&&data.orders)||[];      // backend returns ONLY working orders
+  const orders=(data&&data.orders)||[];      // live/working only
   const watchers=(data&&data.watchers)||[];
+  const past=(data&&data.history)||[];        // account-wide Torque-tagged orders, any status
   const empty=orders.length===0&&watchers.length===0;
   return <div className="panel orders">
     <div className="otabs">
@@ -602,18 +623,17 @@ function OrdersPanel({data,past,onCancel,onModify,busy}){
 }
 
 function PastList({past}){
-  if(!past.length)return <div className="muted">no orders sent from Torque this session.</div>;
+  if(!past.length)return <div className="muted">no Torque orders on this account today.</div>;
   return <table className="otable">
-    <thead><tr><th>time</th><th>id</th><th>sym</th><th>strategy</th><th>type</th><th>fill</th><th>status</th></tr></thead>
-    <tbody>{past.map(p=><tr key={p.key}>
-      <td className="muted">{p.time}</td>
-      <td className="muted">{p.id||'—'}</td>
-      <td>{p.symbol}</td>
-      <td>{p.sname||p.strategy}{p.auto_close?<span className="muted" style={{fontSize:10}}> +ac</span>:null}</td>
-      <td>{p.otype==='limit'?'LMT $'+fmt(p.limit):'MKT'} ×{p.qty}</td>
-      <td>{p.exec_quantity!=null?(p.exec_quantity+'/'+(p.quantity!=null?p.quantity:p.qty)):'—'}{p.avg_fill_price!=null?' @$'+fmt(p.avg_fill_price):''}</td>
-      <td><span className={"ostat "+p.status}>{p.status}</span>
-        {p.reason?<div className="err" style={{fontSize:10,marginTop:2}}>{p.reason}</div>:null}</td>
+    <thead><tr><th>time</th><th>id</th><th>sym</th><th>kind</th><th>px</th><th>fill</th><th>status</th></tr></thead>
+    <tbody>{past.map(o=><tr key={o.id}>
+      <td className="muted">{fmtTime(o.create_date)}</td>
+      <td className="muted">{o.id||'—'}</td>
+      <td>{o.symbol}</td>
+      <td>{tagLabel(o.tag)}</td>
+      <td>{o.price!=null?'$'+fmt(o.price):(o.type||'').toUpperCase()}</td>
+      <td>{(o.exec_quantity||0)}/{(o.quantity||0)}{o.avg_fill_price!=null?' @$'+fmt(o.avg_fill_price):''}</td>
+      <td><span className={"ostat "+o.status}>{o.status}</span></td>
     </tr>)}</tbody>
   </table>;
 }
@@ -662,14 +682,64 @@ function ResultView({r}){
   </div>;
 }
 const leanColor=v=>v>=25?'#36d399':v<=-25?'#f87272':'#7d8b9a';
+// true during US equity/index regular hours (weekday 09:30–16:00 ET), DST-aware
+// via Intl. Used to pause options-data polling after the close in production.
+function isMarketOpen(){
+  const p=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',weekday:'short',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(new Date());
+  const g=t=>p.find(x=>x.type===t).value;
+  const wd=g('weekday');
+  if(wd==='Sat'||wd==='Sun')return false;
+  let hh=+g('hour');if(hh===24)hh=0;
+  const mins=hh*60+(+g('minute'));
+  return mins>=570&&mins<960;   // 09:30 … 16:00 ET
+}
+// short label for the closed banner from Yahoo's marketState (falls back to CLOSED).
+const MKT_STATE_LABEL={REGULAR:'OPEN',PRE:'PRE-MARKET',PREPRE:'PRE-MARKET',POST:'AFTER-HOURS',POSTPOST:'AFTER-HOURS',CLOSED:'CLOSED'};
+const mktLabel=c=>(c&&MKT_STATE_LABEL[c.market_state])||'CLOSED';
 // Positioning is a snapshot of where premium/OI/volume cluster — NOT a price
 // forecast. Label reads as call-/put-leaning, never bullish/bearish.
 const LEAN_LAB={bullish:'call-leaning',bearish:'put-leaning',neutral:'balanced'};
 const sigTxt=s=>s>0.05?'calls rich':s<-0.05?'puts rich':'balanced';
 
 // ── live flow tracking (browser-only, ephemeral) ──────────────────────────────
-const FLOW_WINDOW_MS=3*60*1000;
+const FLOW_WINDOW_MS=3*60*1000;     // fast tape window
+const SESS_WINDOW_MS=60*60*1000;    // slow CVD horizon (trailing 60m)
+const BUCKET_MS=3*60*1000;          // consistency sub-window
 const abbr=n=>{n=Math.abs(Math.round(n));return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?Math.round(n/1e3)+'K':String(n);};
+// sum the $ increments newer than fromT → the fast (3m) call/put flow.
+function windowFlow(incs,fromT){
+  let call=0,put=0,n=0;
+  for(const x of incs){if(x.t<fromT)continue;call+=x.dc;put+=x.dp;n++;}
+  if(n<1)return null;
+  return {call,put,net:call-put};
+}
+// aggregate the whole trailing-60m increment series into a cumulative-delta read.
+// net $ (call−put) and directionality = |net|/gross (how one-sided the raw flow is)
+// describe SIZE; but TREND-vs-CHOP is judged by PERSISTENCE — how many 3-min windows
+// agree on a side. A persistent-but-mild drift (every window call, small edge) is a
+// trend, not chop, so net/gross alone would mislabel it. This is also the noise
+// filter: a lone opposite print can't out-vote dozens of same-side windows.
+function sessionFlow(incs){
+  if(incs.length<3)return null;
+  let net=0,gross=0;
+  for(const x of incs){net+=x.dc-x.dp;gross+=x.dc+x.dp;}
+  if(gross<=0)return null;
+  const dir=Math.min(1,Math.abs(net)/gross);
+  const buckets={};
+  for(const x of incs){const b=Math.floor(x.t/BUCKET_MS);buckets[b]=(buckets[b]||0)+(x.dc-x.dp);}
+  const bnets=Object.keys(buckets).map(k=>buckets[k]);
+  const callB=bnets.filter(n=>n>0).length,putB=bnets.filter(n=>n<0).length;
+  const total=bnets.length,dom=Math.max(callB,putB);
+  const consistency=total?dom/total:0;                 // 1 = every window same side, .5 = split (chop)
+  const barPct=Math.round(Math.max(0,Math.min(1,(consistency-0.5)*2))*100);
+  const side=net>0?'call':net<0?'put':'';
+  let regime,regimeCls,regimeColor;
+  if(consistency>=0.70&&side){regime='trending '+side;regimeCls=net>0?'conf':'div';regimeColor=net>0?'var(--call)':'var(--put)';}
+  else if(consistency<=0.58){regime='chop / range';regimeCls='flat';regimeColor='var(--dim)';}
+  else{regime='mixed';regimeCls='flat';regimeColor='var(--dim2)';}
+  return {net,gross,dir,consistency,barPct,agree:dom,total,regime,regimeCls,regimeColor,
+          sideWord:net>0?'call-side':net<0?'put-side':'mixed'};
+}
 // classify the window's net $ flow against the static lean: same side = the lean
 // is live (confirms), opposite = it's being faded (diverging). On a balanced lean
 // there's nothing to confirm, so just name the side the money is hitting.
@@ -695,8 +765,9 @@ function recommendStrategy(a){
   return pinned?'iron_fly':'iron_condor';
 }
 const LEAN_HELP="Positioning lean (−100 puts … +100 calls): a heuristic blend of 40% volume P/C + 30% premium skew + 30% OI-magnet pull, from the current chain. ≥ +25 = call-leaning, ≤ −25 = put-leaning, in between = balanced. Where positioning SITS now — not a price forecast. The strategy grid auto-lands on this on load (overridable).";
-const FLOW_HELP="Flow = premium dollars actually traded (mid × volume) added to calls vs puts over the last 3 min, tracked in this tab only (cleared on refresh). Volume is intraday, so this is where money is hitting RIGHT NOW. 'confirms' = flow pushing the same way as the lean (live); 'diverging' = flow fading it (possible exhaustion).";
+const FLOW_HELP="Flow = premium $ of NEW contracts traded on calls vs puts over the last 3 min (Δvolume × current $/contract), tracked in this tab only (cleared on refresh). It's fresh order flow — NOT a revaluation of the day's open interest by a price tick. $0 on a side = zero new contracts traded there in the window. 'confirms' = flow pushing the same way as the lean (live); 'diverging' = flow fading it (possible exhaustion).";
 const POSNOTE_HELP="This is where options positioning currently sits (live), NOT advice to trade this structure. The strategy grid auto-lands once on load from this read; it does not keep flipping as the lean drifts, so your pick stays put while you build/execute. Change it any time — your choice sticks.";
+const SESS_HELP="Session flow = the flow accumulated over a trailing 60 min (cumulative delta, premium $). NET is call$−put$ over the hour — steadily one way = sustained pressure; a lone opposite print barely dents it, so noise filters itself. The TREND-vs-CHOP verdict is by PERSISTENCE: how many 3-min windows agree on a side (the bar). Mostly one side → trend → directional debit spread; ~50/50 → chop/range → Iron Condor. 'X/Y windows' is that count; '% one-sided' (|net|/gross) is how lopsided the raw flow is. Pressure, not a forecast — dealers can absorb it.";
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
 </script>
