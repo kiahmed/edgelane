@@ -240,6 +240,8 @@ stage_frontend() {
 
 deploy_frontend() {
   need vercel "npm i -g vercel + run 'vercel login'"
+  # Telemetry adds end-of-run network calls that can stall the CLI on exit.
+  export VERCEL_TELEMETRY_DISABLED=1
   if ! $DRY_RUN; then
     vercel whoami >/dev/null 2>&1 && ok "Vercel auth OK ($(vercel whoami 2>/dev/null))" \
       || die "not logged in to Vercel — run 'vercel login' or export VERCEL_TOKEN=..."
@@ -263,7 +265,11 @@ deploy_frontend() {
   fi
 
   info "Deploying market UI -> Vercel project '$VERCEL_PROJECT'"
-  run vercel deploy --prod --yes
+  # --no-wait: the static build is ~2s and reliably reaches READY; without it the
+  # CLI keeps the build log-stream open and never exits (worse when stdout isn't a
+  # TTY, e.g. under `make`), forcing a manual Ctrl+C even though the deploy already
+  # succeeded. The final production URL is resolved via `vercel project ls` below.
+  run vercel deploy --prod --yes --no-wait
   # NB: the bare $VERCEL_PROJECT.vercel.app domain may be taken by another
   # account (global namespace) — Vercel then assigns a suffixed alias
   # (e.g. edgelane-hazel.vercel.app for the old 'edgelane' name). Print the real

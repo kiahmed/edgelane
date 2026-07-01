@@ -45,11 +45,11 @@ async def status(request: Request):
     is_open, reason = _is_market_open(s.market_hours_tz, s.market_open, s.market_close)
     using_mock = bool(getattr(request.app.state, "using_mock", False))
     rl = get_rate_limit_state() or None
-    resolved_account_id = (
-        getattr(request.app.state, "tradier_account_id", "")
-        or s.active_account_id
-        or ""
-    )
+    # NOTE: the house Tradier account number is deliberately NOT exposed here.
+    # /status is public and the house connection is read-only for regular users;
+    # leaking the account id let the market UI prefill it into the order ticket
+    # ("implicit admin config"). Orders now resolve the account from each user's
+    # own broker connection (see routes/orders.py:_resolve_broker).
     return {
         "alive": True,
         "version": "0.1.0",
@@ -58,7 +58,6 @@ async def status(request: Request):
         "symbols": s.symbols,
         "poll_interval_sec": s.poll_interval_sec,
         "tradier_env": s.tradier_env,
-        "tradier_account_id": resolved_account_id,
         "using_mock": using_mock,
         "tradier_mode": s.tradier_mode,
         "tradier_rate_limit": rl,

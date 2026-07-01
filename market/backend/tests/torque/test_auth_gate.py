@@ -1,6 +1,7 @@
-"""Torque is an admin/owner tool (it trades the server's single broker account),
-so when AUTH_ENABLED=true every data/action endpoint must require the admin token
-or a Supabase JWT, and the page must require ?token= on navigation."""
+"""Torque is an admin/owner tool (it trades a broker account), so when
+AUTH_ENABLED=true every data/action endpoint must require the admin token (or a
+Supabase user entitled to the "torque" tool in profiles.tools_enabled) — a bare
+Supabase JWT is NOT enough — and the page must require ?token= on navigation."""
 from __future__ import annotations
 
 import pytest
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 from app import config
 from app.config import Settings
 from app.routes import torque as troute
+from app import supabase_admin
 
 from .conftest import FakeTradier
 
@@ -61,6 +63,35 @@ def test_page_unlocks_with_query_token(auth_on):
     r = c.get("/torque", params={"token": ADMIN})
     assert r.status_code == 200
     assert "<html" in r.text.lower() or "torque" in r.text.lower()
+
+
+def test_plain_supabase_user_rejected(auth_on, monkeypatch):
+    """A signed-in Supabase user NOT entitled to 'torque' cannot reach it —
+    a bare JWT must not grant access."""
+    from app.auth import get_current_user
+    async def _no_tools(uid):
+        return []
+    monkeypatch.setattr(supabase_admin, "get_user_tools", _no_tools)
+    c = _make_client(True)
+    c.app.dependency_overrides[get_current_user] = lambda: {"id": "user-123", "auth": "supabase"}
+    try:
+        assert c.get("/torque/config").status_code == 403
+    finally:
+        c.app.dependency_overrides.clear()
+
+
+def test_entitled_supabase_user_allowed(auth_on, monkeypatch):
+    """A Supabase user with 'torque' in profiles.tools_enabled gets in."""
+    from app.auth import get_current_user
+    async def _has_torque(uid):
+        return ["torque"]
+    monkeypatch.setattr(supabase_admin, "get_user_tools", _has_torque)
+    c = _make_client(True)
+    c.app.dependency_overrides[get_current_user] = lambda: {"id": "user-123", "auth": "supabase"}
+    try:
+        assert c.get("/torque/config").status_code == 200
+    finally:
+        c.app.dependency_overrides.clear()
 
 
 def test_gate_is_noop_when_auth_disabled(monkeypatch):

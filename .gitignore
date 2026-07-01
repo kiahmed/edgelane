@@ -102,3 +102,4 @@ token.txt
 
 # Supabase CLI scratch (project ref/org id — not secret, but not source)
 supabase/.temp/
+.env*

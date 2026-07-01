@@ -71,6 +71,43 @@ async def get_profile_plan(user_id: str) -> Optional[str]:
     return row.get("plan") if row else None
 
 
+async def get_user_tools(user_id: str) -> list[str]:
+    """Tool keys this user is entitled to (public.profiles.tools_enabled),
+    authoritative server-side read. Returns [] if none / not found."""
+    row = await _select_one("profiles", "id", user_id, "tools_enabled")
+    tools = (row or {}).get("tools_enabled") or []
+    return list(tools) if isinstance(tools, list) else []
+
+
+async def grant_user_tools(user_id: str, tools: list[str]) -> bool:
+    """Idempotently union `tools` into a user's profiles.tools_enabled, written
+    via the service_role key (bypasses RLS). Used to seed the server operator(s)
+    at startup from config — never grants from the browser. No-op (returns True)
+    when the user already has every tool, or when Supabase isn't configured."""
+    settings = get_settings()
+    if not (settings.supabase_url and settings.supabase_service_key):
+        log.debug("[supabase] URL/service key not configured; skipping tool grant")
+        return False
+    current = set(await get_user_tools(user_id))
+    merged = sorted(current | set(tools))
+    if merged == sorted(current):
+        return True  # already entitled — nothing to write
+    base, headers = _rest(settings)
+    headers = {**headers, "Content-Type": "application/json", "Prefer": "return=minimal"}
+    params = {"id": f"eq.{user_id}"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.patch(f"{base}/profiles", headers=headers, params=params,
+                              json={"tools_enabled": merged})
+            if r.status_code >= 300:
+                log.error("[supabase] grant tools failed (%s): %s", r.status_code, r.text[:200])
+                return False
+            return True
+    except Exception as exc:
+        log.error("[supabase] grant tools error (uid=%s): %s", user_id, exc)
+        return False
+
+
 async def insert_row(table: str, row: dict) -> bool:
     """Insert one row via PostgREST using the service_role key (bypasses RLS)."""
     settings = get_settings()

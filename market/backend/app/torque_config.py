@@ -173,6 +173,28 @@ def default_strategy() -> str:
     return _load_overrides_file().get("default_strategy") or DEFAULT_STRATEGY
 
 
+def operator_uids() -> list[str]:
+    """Auth uid(s) (Supabase `profiles.id`) of the server operator(s) to auto-grant
+    the full toolset on startup. Sourced from config — never hardcoded: the
+    `TORQUE_OPERATOR_UIDS` env var (comma-separated) and/or an `operator_uids`
+    array in torque_tickers.json. Empty by default (no seeding). Used by the
+    backend to seed `profiles.tools_enabled` via service_role (see
+    supabase_admin.grant_user_tools); the admin token bypasses the gate anyway."""
+    out: list[str] = []
+    env = os.environ.get("TORQUE_OPERATOR_UIDS", "")
+    out.extend(u.strip() for u in env.split(",") if u.strip())
+    f = _load_overrides_file().get("operator_uids")
+    if isinstance(f, list):
+        out.extend(str(u).strip() for u in f if str(u).strip())
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq
+
+
 def strategy_list() -> list[dict[str, Any]]:
     """Public strategy registry for the frontend (key + display fields)."""
     return [{"key": k, **{kk: vv for kk, vv in v.items()}} for k, v in STRATEGY_DEFS.items()]

@@ -1228,10 +1228,16 @@
     return Math.max(1, Math.abs(Number(longShort) || 1)) * baseQty;
   }
 
+  // The user's active per-user broker connection (synced from Supabase), or null.
+  // Trade execution requires this — the house connection is read-only here.
+  function _activeBrokerConn() {
+    try { return (_connCache || []).find(c => c.is_active) || null; } catch (_) { return null; }
+  }
+
   function _readBrokerAccountId() {
     // Prefer the active per-user broker connection synced from Supabase.
     try {
-      const active = (_connCache || []).find(c => c.is_active) || (_connCache || [])[0];
+      const active = _activeBrokerConn();
       if (active && active.tradier_account_id) return active.tradier_account_id;
     } catch (_) {}
     // Legacy fallback: sessionStorage broker connections from the single-file app.
@@ -1280,6 +1286,14 @@
   function openOrderDialog(strategy) {
     const snap = state.snapshot;
     if (!snap) { toast('No snapshot yet'); return; }
+    // Trade execution requires the user's OWN active broker connection. The
+    // EdgeLane house connection is read-only (data display only) and must never
+    // be used to place orders. No active connection → send them to Settings.
+    if (!_activeBrokerConn()) {
+      toast('Connect and activate your own broker in Settings to place trades');
+      try { toggleSettings(true); } catch (_) {}
+      return;
+    }
     const bucket = (snap.strategies || {})[strategy];
     if (!bucket || !bucket.best) { toast('No candidate available'); return; }
     const cand = bucket.best;
@@ -1294,10 +1308,10 @@
     $('orderQty').value = 1;
     $('orderLimit').value = (cand.limit_price != null ? cand.limit_price : cand.net_premium) || '';
     $('orderDuration').value = 'day';
-    // Account id: prefer the backend's configured TRADIER_ACCOUNT_ID (surfaced
-    // via /status); fall back to sessionStorage broker connection.
-    const cfgAcc = (state.status && state.status.tradier_account_id) || '';
-    $('orderAccount').value = cfgAcc || _readBrokerAccountId() || '';
+    // Account id comes ONLY from the user's own active broker connection — never
+    // the house account. Left blank, the backend resolves it from the user's own
+    // broker token (see routes/orders.py).
+    $('orderAccount').value = _readBrokerAccountId() || '';
     $('orderPreviewPane').textContent = 'No preview yet. Click "Preview" to validate against your broker.';
     $('orderStatus').textContent = '';
     $('orderSubmitBtn').disabled = true;
@@ -1373,6 +1387,7 @@
   }
 
   async function doSubmit() {
+    if (!_activeBrokerConn()) { toast('No active broker connection — orders route only to your own broker'); return; }
     if (!orderModal.previewOk) { toast('Run Preview first'); return; }
     const body = _buildOrderReq();
     body.confirm = true;

@@ -13,6 +13,12 @@ from fastapi import HTTPException
 
 from .conftest import FakeTradier, FakeRequest
 
+# Calling the route fns directly bypasses FastAPI's dependency injection, so we
+# pass the resolved user ourselves. A dev/owner user routes to the house client
+# (per_user=False) — exactly what these tests exercised before the per-user
+# broker change.
+DEV = {"id": "dev-local", "email": "dev@local", "auth": "dev"}
+
 
 @pytest.fixture(autouse=True)
 def _fast_poll(monkeypatch):
@@ -101,7 +107,7 @@ async def test_place_requires_confirm():
     req = PlaceRequest(symbol="NDX", strategy="bull_call", legs=legs,
                        order_type="limit", limit_price=10, account_id="T", confirm=False)
     with pytest.raises(HTTPException) as e:
-        await torque_place(req, FakeRequest(FakeTradier()))
+        await torque_place(req, FakeRequest(FakeTradier()), user=DEV)
     assert e.value.status_code == 400
 
 
@@ -113,7 +119,7 @@ async def test_dry_run_previews_both_and_places_nothing():
     legs, _ = await _build_legs(client, "NDX", "bull_call")
     req = PlaceRequest(symbol="NDX", strategy="bull_call", legs=legs, order_type="limit",
                        limit_price=20.0, auto_close=True, account_id="T", dry_run=True)
-    r = await torque_place(req, FakeRequest(client))
+    r = await torque_place(req, FakeRequest(client), user=DEV)
     assert r["mode"] == "dry_run"
     assert r["entry_ok"] is True and r["close_ok"] is True
     assert r["close_target_price"] == 26.0
@@ -127,7 +133,7 @@ async def test_dry_run_skips_confirm_requirement():
     legs, _ = await _build_legs(client, "NDX", "bull_call")
     req = PlaceRequest(symbol="NDX", strategy="bull_call", legs=legs, order_type="market",
                        account_id="T", dry_run=True, confirm=False)
-    r = await torque_place(req, FakeRequest(client))   # must NOT raise
+    r = await torque_place(req, FakeRequest(client), user=DEV)   # must NOT raise
     assert r["mode"] == "dry_run"
 
 
@@ -136,7 +142,7 @@ async def test_place_rejects_unresolved_legs():
                        legs=[{"action": "buy_to_open", "quantity": 1, "side": "call", "strike": 1}],
                        order_type="market", account_id="T", confirm=True)
     with pytest.raises(HTTPException):
-        await torque_place(req, FakeRequest(FakeTradier()))
+        await torque_place(req, FakeRequest(FakeTradier()), user=DEV)
 
 
 # ── place: multileg confirm-then-close ─────────────────────────────────────
@@ -149,7 +155,7 @@ async def test_multileg_filled_then_close_placed():
     req = PlaceRequest(symbol="NDX", strategy="bull_call", legs=legs, order_type="limit",
                        limit_price=20.0, quantity=1, auto_close=True, close_target_pct=30,
                        account_id="T", confirm=True)
-    r = await torque_place(req, FakeRequest(client))
+    r = await torque_place(req, FakeRequest(client), user=DEV)
     assert r["mode"] == "watching_fill"        # returns immediately, doesn't block
     assert r["rejected"] is False
     w = await _await_watch(r)                  # background watcher fills + closes
@@ -165,7 +171,7 @@ async def test_multileg_rejected_no_close():
     legs, _ = await _build_legs(client, "NDX", "bull_call")
     req = PlaceRequest(symbol="NDX", strategy="bull_call", legs=legs, order_type="limit",
                        limit_price=20.0, auto_close=True, account_id="T", confirm=True)
-    r = await torque_place(req, FakeRequest(client))
+    r = await torque_place(req, FakeRequest(client), user=DEV)
     assert r["rejected"] is True
     assert r["close_placed"] is False
     assert r["close"] is None
@@ -179,7 +185,7 @@ async def test_multileg_not_filled_no_close():
     legs, _ = await _build_legs(client, "NDX", "bull_call")
     req = PlaceRequest(symbol="NDX", strategy="bull_call", legs=legs, order_type="limit",
                        limit_price=20.0, auto_close=True, account_id="T", confirm=True)
-    r = await torque_place(req, FakeRequest(client))
+    r = await torque_place(req, FakeRequest(client), user=DEV)
     assert r["mode"] == "watching_fill"
     w = await _await_watch(r)
     assert w["state"] == "entry_not_filled"    # never filled → close NOT placed
@@ -194,7 +200,7 @@ async def test_credit_spread_close_is_debit_buyback():
     req = PlaceRequest(symbol="NDX", strategy="iron_condor", legs=legs, order_type="limit",
                        limit_price=10.0, auto_close=True, close_target_pct=30,
                        account_id="T", confirm=True)
-    r = await torque_place(req, FakeRequest(client))
+    r = await torque_place(req, FakeRequest(client), user=DEV)
     w = await _await_watch(r)
     assert w["state"] == "close_placed"
     assert w["close_target_price"] == 7.0      # credit: buy back at 0.70×
@@ -208,7 +214,7 @@ async def test_single_leg_limit_autoclose_uses_oto():
     req = PlaceRequest(symbol="NDX", strategy="long_call", legs=legs, order_type="limit",
                        limit_price=70.0, auto_close=True, close_target_pct=30,
                        account_id="T", confirm=True)
-    r = await torque_place(req, FakeRequest(client))
+    r = await torque_place(req, FakeRequest(client), user=DEV)
     assert r["mode"] == "oto_bracket"
     assert r["close_target_price"] == 91.0     # 70 × 1.30
     p = client.placed[0]
@@ -225,7 +231,7 @@ async def test_single_leg_market_autoclose_falls_back_to_confirm():
     legs, _ = await _build_legs(client, "NDX", "long_call")
     req = PlaceRequest(symbol="NDX", strategy="long_call", legs=legs, order_type="market",
                        auto_close=True, account_id="T", confirm=True)
-    r = await torque_place(req, FakeRequest(client))
+    r = await torque_place(req, FakeRequest(client), user=DEV)
     assert r["mode"] == "watching_fill"        # market entry → background watch+close
     w = await _await_watch(r)
     assert w["state"] == "close_placed"
@@ -237,7 +243,7 @@ async def test_no_autoclose_single_order():
     legs, _ = await _build_legs(client, "NDX", "bull_call")
     req = PlaceRequest(symbol="NDX", strategy="bull_call", legs=legs, order_type="market",
                        auto_close=False, account_id="T", confirm=True)
-    r = await torque_place(req, FakeRequest(client))
+    r = await torque_place(req, FakeRequest(client), user=DEV)
     assert r["auto_close"] is False
     assert r["close_placed"] is False
     assert len(client.placed) == 1
@@ -246,7 +252,7 @@ async def test_no_autoclose_single_order():
 # ── order status passthrough ───────────────────────────────────────────────
 async def test_order_status_endpoint():
     client = FakeTradier(order_status={"status": "filled", "avg_fill_price": 5.0})
-    o = await torque_order("123", FakeRequest(client), account_id="T")
+    o = await torque_order("123", FakeRequest(client), account_id="T", user=DEV)
     assert o["status"] == "filled" and o["id"] == "123"
 
 
@@ -262,7 +268,7 @@ async def test_orders_endpoint_returns_only_working():
         {"id": 3, "symbol": "SPY", "class": "option", "type": "limit", "status": "canceled",
          "quantity": 1, "create_date": "2026-06-18T17:00:00Z"},
     ])
-    r = await torque_orders(FakeRequest(client), account_id="T")
+    r = await torque_orders(FakeRequest(client), account_id="T", user=DEV)
     assert len(r["orders"]) == 1                # only the OPEN one (no filled/canceled)
     assert r["orders"][0]["id"] == "2" and r["orders"][0]["working"] is True
 
@@ -270,21 +276,50 @@ async def test_orders_endpoint_returns_only_working():
 async def test_orders_endpoint_shows_pending_watcher():
     client = FakeTradier(orders=[])
     troute._WATCHERS["99"] = {"entry_order_id": "99", "symbol": "NDX", "strategy": "bull_call",
-                              "state": "watching_fill", "close_target_price": 26.0, "done": False}
-    r = await torque_orders(FakeRequest(client), account_id="T")
+                              "state": "watching_fill", "close_target_price": 26.0,
+                              "done": False, "uid": DEV["id"]}
+    r = await torque_orders(FakeRequest(client), account_id="T", user=DEV)
     assert len(r["watchers"]) == 1 and r["watchers"][0]["state"] == "watching_fill"
+    assert "uid" not in r["watchers"][0]        # caller identity is never leaked out
+
+
+async def test_orders_endpoint_hides_other_users_watchers():
+    # _WATCHERS is process-global; a watcher placed by another user must NOT show
+    # up in this caller's orders panel (cross-user isolation).
+    client = FakeTradier(orders=[])
+    troute._WATCHERS["mine"] = {"entry_order_id": "mine", "symbol": "NDX", "strategy": "bull_call",
+                                "state": "watching_fill", "close_target_price": 26.0,
+                                "done": False, "uid": DEV["id"]}
+    troute._WATCHERS["theirs"] = {"entry_order_id": "theirs", "symbol": "SPY", "strategy": "long_call",
+                                  "state": "watching_fill", "close_target_price": 9.0,
+                                  "done": False, "uid": "other-user-uuid"}
+    r = await torque_orders(FakeRequest(client), account_id="T", user=DEV)
+    ids = {w["entry_order_id"] for w in r["watchers"]}
+    assert ids == {"mine"}                       # only DEV's own watcher, not the other user's
+
+
+async def test_place_stamps_caller_uid_on_watcher():
+    # a placed auto-close watcher carries the placing user's uid for scoping.
+    client = FakeTradier(place_responses=[{"order": {"id": 7, "status": "ok"}}],
+                         order_status={"status": "open", "remaining_quantity": 1.0})
+    legs, _ = await _build_legs(client, "NDX", "bull_call")
+    req = PlaceRequest(symbol="NDX", strategy="bull_call", legs=legs, order_type="limit",
+                       limit_price=20.0, auto_close=True, account_id="T", confirm=True)
+    r = await torque_place(req, FakeRequest(client), user=DEV)
+    assert troute._WATCHERS[r["watch_id"]]["uid"] == DEV["id"]
+    await _await_watch(r)                        # drain the background task
 
 
 async def test_cancel_endpoint():
     client = FakeTradier()
-    r = await torque_cancel("2", FakeRequest(client), account_id="T")
+    r = await torque_cancel("2", FakeRequest(client), account_id="T", user=DEV)
     assert r["order_id"] == "2"
 
 
 async def test_modify_endpoint_changes_price():
     from app.routes.torque import torque_modify, ModifyRequest
     client = FakeTradier()
-    r = await torque_modify("2", ModifyRequest(price=24.5, account_id="T"), FakeRequest(client))
+    r = await torque_modify("2", ModifyRequest(price=24.5, account_id="T"), FakeRequest(client), user=DEV)
     assert r["order_id"] == "2"
     assert any(p.get("_modify") == "2" and p.get("price") == 24.5 for p in client.placed)
 
@@ -299,7 +334,7 @@ async def test_autoclose_retries_when_position_not_settled():
     legs, _ = await _build_legs(client, "NDX", "bull_call")
     req = PlaceRequest(symbol="NDX", strategy="bull_call", legs=legs, order_type="limit",
                        limit_price=20.0, auto_close=True, account_id="T", confirm=True)
-    r = await torque_place(req, FakeRequest(client))
+    r = await torque_place(req, FakeRequest(client), user=DEV)
     w = await _await_watch(r)
     assert w["state"] == "close_placed"
     assert len(client.placed) == 3              # entry + 2 close attempts

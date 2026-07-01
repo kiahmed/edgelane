@@ -9,7 +9,7 @@ CLI summary
 
     List
         tp                                       # list positions (default)
-        tp -O                                    # list working orders
+        tp -O                                    # list working orders (w/ live bid/mid/ask)
 
     Existing positions
         tp -S 3                                  # Sell (close) position #3 at MARKET
@@ -1769,16 +1769,84 @@ def _summarize_order_legs(o: dict) -> str:
     return underlying or "?"
 
 
-def render_orders_table(orders: list[dict]) -> None:
+def _order_legs_signed(o: dict) -> list[tuple[str, int]]:
+    """Return [(option_symbol, sign)] for an order — sign +1 long (buy), −1 short (sell)."""
+    out: list[tuple[str, int]] = []
+    cls = (o.get("class") or "").lower()
+    if cls == "multileg":
+        legs = o.get("leg") or o.get("legs") or []
+        if isinstance(legs, dict):
+            legs = [legs]
+        for leg in legs:
+            sym = leg.get("option_symbol") or leg.get("symbol")
+            if not sym:
+                continue
+            side = (leg.get("side") or "").lower()
+            sign = 1 if side.startswith("buy") else -1 if side.startswith("sell") else 0
+            out.append((sym, sign))
+    else:
+        sym = o.get("option_symbol") or o.get("symbol")
+        if sym:
+            side = (o.get("side") or "").lower()
+            sign = 1 if side.startswith("buy") else -1 if side.startswith("sell") else 1
+            out.append((sym, sign))
+    return out
+
+
+def order_leg_symbols(orders: list[dict]) -> list[str]:
+    """All option symbols referenced by a list of orders (for a quote fetch)."""
+    syms: set[str] = set()
+    for o in orders:
+        for sym, _ in _order_legs_signed(o):
+            syms.add(sym)
+    return sorted(syms)
+
+
+def order_spread_quote(o: dict, quotes: dict) -> tuple[float | None, float | None]:
+    """Live (bid, ask) for the order's net spread, as an absolute quote.
+
+    Mirrors compute_pnl's convention: long legs contribute their bid (low) /
+    ask (high), short legs subtract ask (low) / bid (high); the result is
+    abs-valued and sorted so a credit spread still reads as a positive quote.
+    Returns (None, None) if any leg is unquoted.
+    """
+    legs = _order_legs_signed(o)
+    if not legs:
+        return None, None
+    mark_low = 0.0
+    mark_high = 0.0
+    for sym, sign in legs:
+        q = quotes.get(sym)
+        if not q:
+            return None, None
+        b = _num(q.get("bid")) or 0
+        a = _num(q.get("ask")) or 0
+        if sign > 0:
+            mark_low += b
+            mark_high += a
+        elif sign < 0:
+            mark_low -= a
+            mark_high -= b
+        else:
+            return None, None
+    raw_bid, raw_ask = sorted([abs(mark_low), abs(mark_high)])
+    return raw_bid, raw_ask
+
+
+def render_orders_table(orders: list[dict], quotes: dict | None = None) -> None:
     if not orders:
         print(f"{Y}No working orders.{N}")
         return
+    quotes = quotes or {}
     cols = [
         ("#",         3,  "right"),
         ("ID",        10, "right"),
         ("Ticker",    34, "left"),
         ("Type",      8,  "left"),
         ("Price",     9,  "right"),
+        ("Bid",       8,  "right"),
+        ("Mid",       8,  "right"),
+        ("Ask",       8,  "right"),
         ("Qty",       5,  "right"),
         ("Status",    11, "left"),
         ("Submitted", 16, "left"),
@@ -1798,6 +1866,10 @@ def render_orders_table(orders: list[dict]) -> None:
                 price_str = f"${float(price):.2f}"
             except (TypeError, ValueError):
                 price_str = str(price)
+        bid, ask = order_spread_quote(o, quotes)
+        bid_str = f"${bid:.2f}" if bid is not None else "—"
+        ask_str = f"${ask:.2f}" if ask is not None else "—"
+        mid_str = f"${(bid + ask) / 2:.2f}" if (bid is not None and ask is not None) else "—"
         qty = o.get("quantity") or o.get("num_legs") or "—"
         status = (o.get("status") or "?").lower()
         submitted = _format_date(o.get("create_date") or o.get("transaction_date"))
@@ -1807,10 +1879,13 @@ def render_orders_table(orders: list[dict]) -> None:
             _pad(ticker, cols[2][1], cols[2][2]),
             _pad(otype.upper(), cols[3][1], cols[3][2]),
             _pad(price_str, cols[4][1], cols[4][2]),
+            _pad(bid_str, cols[5][1], cols[5][2]),
+            _pad(mid_str, cols[6][1], cols[6][2]),
+            _pad(ask_str, cols[7][1], cols[7][2]),
             _pad(str(int(float(qty))) if str(qty).replace('.','',1).isdigit() else str(qty),
-                 cols[5][1], cols[5][2]),
-            _pad(status, cols[6][1], cols[6][2]),
-            _pad(submitted, cols[7][1], cols[7][2]),
+                 cols[8][1], cols[8][2]),
+            _pad(status, cols[9][1], cols[9][2]),
+            _pad(submitted, cols[10][1], cols[10][2]),
         ])
         print(row)
 
@@ -2148,7 +2223,11 @@ def main():
         wo = working_orders(all_orders)
 
         if args["mode"] == "orders" and args["row"] is None:
-            render_orders_table(wo)
+            # Quote each working order's legs so the table can show the live
+            # bid/mid/ask of the spread (otherwise there's no way to see the
+            # current market on an order that isn't yet a held position).
+            order_quotes = fetch_quotes(token, base, order_leg_symbols(wo))
+            render_orders_table(wo, order_quotes)
             return
 
         if not wo:

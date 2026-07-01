@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -11,8 +10,8 @@ from pydantic import BaseModel, Field
 from ..poller import state as poller_state
 from ..config import get_settings
 from ..auth import get_current_user
-from .. import supabase_admin
-from ..tradier_client import TradierClient
+from ..broker_resolver import resolve_broker
+from ..entitlements import ensure_tool
 from ..webull_client import WebullClient, WebullError
 from ..webull_order_builder import build_webull_option_order
 from ..order_builder import (
@@ -124,44 +123,6 @@ async def _ensure_leg_symbols(legs: list[Leg], symbol: str, expiration: str,
         raise HTTPException(400, str(e))
 
 
-def _tradier_client(request: Request):
-    client = getattr(request.app.state, "tradier", None)
-    if client is None:
-        raise HTTPException(500, "tradier client not initialized on app.state")
-    return client
-
-
-async def _resolve_broker(request: Request, user: dict) -> tuple[str, Any, str | None, bool]:
-    """Resolve the broker client + account for this order.
-
-    Prefer the authenticated user's OWN broker credentials (broker_configs in
-    Supabase) — Tradier or Webull, decrypted server-side via get_broker_secret.
-    Falls back to the system Tradier client + account when the user hasn't
-    connected a broker (and for dev/admin).
-    Returns (broker, client, account_override_or_None, is_per_user).
-    """
-    uid = user.get("id")
-    cfg = None
-    if uid and user.get("auth") == "supabase":
-        cfg = await supabase_admin.get_broker_config(uid)
-    if cfg:
-        broker = (cfg.get("broker") or "tradier").lower()
-        if broker == "webull" and cfg.get("webull_app_key") and cfg.get("webull_app_secret"):
-            client = WebullClient(
-                app_key=cfg["webull_app_key"], app_secret=cfg["webull_app_secret"],
-                region=cfg.get("webull_region") or "us", env=cfg.get("webull_env") or "production",
-            )
-            account = (cfg.get("webull_account_id") or "").strip() or None
-            return "webull", client, account, True
-        if cfg.get("tradier_token"):
-            env = (cfg.get("tradier_env") or "production").lower()
-            base = "https://sandbox.tradier.com" if env == "sandbox" else "https://api.tradier.com"
-            client = TradierClient(base_url=base, token=cfg["tradier_token"])
-            account = (cfg.get("tradier_account_id") or "").strip() or None
-            return "tradier", client, account, True
-    return "tradier", _tradier_client(request), None, False
-
-
 async def _submit_webull(req: OrderRequest, client: WebullClient, preview: bool,
                          account_override: str | None = None) -> dict:
     snap, cand = _lookup_candidate(req.symbol, req.strategy, req.candidate_label)
@@ -202,9 +163,25 @@ async def _submit_webull(req: OrderRequest, client: WebullClient, preview: bool,
 
 
 async def _submit_order(req: OrderRequest, tradier_client, preview: bool,
-                        account_override: str | None = None) -> dict:
+                        account_override: str | None = None,
+                        per_user: bool = False) -> dict:
     snap, cand = _lookup_candidate(req.symbol, req.strategy, req.candidate_label)
-    account_id = (account_override or "").strip() or _resolve_account_id(req)
+    if account_override and account_override.strip():
+        account_id = account_override.strip()
+    elif per_user:
+        # Per-user orders must target the USER's own account, resolved from their
+        # own broker token — never the house-config account fallback.
+        account_id = (req.account_id or "").strip()
+        if not account_id:
+            account_id = await tradier_client.resolve_account_id()
+        if not account_id:
+            raise HTTPException(
+                400,
+                "could not determine an account from your broker connection; set "
+                "the account id on your broker connection in Settings.",
+            )
+    else:
+        account_id = _resolve_account_id(req)
     order_type = _resolve_order_type(req, cand)
     limit_price = _resolve_limit_price(req, cand, order_type)
     expiration = snap.get("expiration")
@@ -274,13 +251,15 @@ async def _post_to_tradier(tradier_client, account_id: str, payload: dict) -> di
 @router.post("/orders/preview")
 async def preview_order(req: OrderRequest, request: Request,
                         user: dict = Depends(get_current_user)):
-    broker, client, account_override, per_user = await _resolve_broker(request, user)
+    await ensure_tool(user, "market")
+    broker, client, account_override, per_user = await resolve_broker(request, user)
     try:
         if broker == "webull":
             return await _submit_webull(req, client, preview=True,
                                         account_override=account_override)
         return await _submit_order(req, client, preview=True,
-                                   account_override=account_override)
+                                   account_override=account_override,
+                                   per_user=per_user)
     finally:
         if per_user:
             await client.close()
@@ -291,14 +270,16 @@ async def submit_order(req: OrderRequest, request: Request,
                        user: dict = Depends(get_current_user)):
     if not req.confirm:
         raise HTTPException(400, "submit requires confirm=true in the request body")
-    broker, client, account_override, per_user = await _resolve_broker(request, user)
+    await ensure_tool(user, "market")
+    broker, client, account_override, per_user = await resolve_broker(request, user)
     try:
         if broker == "webull":
             result = await _submit_webull(req, client, preview=False,
                                           account_override=account_override)
         else:
             result = await _submit_order(req, client, preview=False,
-                                         account_override=account_override)
+                                         account_override=account_override,
+                                         per_user=per_user)
     finally:
         if per_user:
             await client.close()

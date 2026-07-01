@@ -2,9 +2,16 @@
 
 Torque is a standalone web page served from the EdgeLane **market** backend. It's
 the place-order dialog pulled out of the main JSX app into its own fast,
-auto-filling advanced order menu. It does **no** bias detection or strategy
-picking — you choose a ticker + one strategy, it auto-fills the legs, prices them
-live, and places the order (optionally with an auto-close profit target).
+auto-filling advanced order menu. You choose a ticker + one strategy, it auto-fills
+the legs, prices them live, and places the order (optionally with an auto-close
+profit target).
+
+It does **no forecasting** — no predictive bias engine like the main app. What it
+*does* show is a **Positioning** panel: an honest, deterministic snapshot of where
+options money currently sits (a heuristic "lean") plus a **live flow** read of
+where premium is being traded right now. That read also **auto-lands a starting
+strategy** in the grid on load — a convenience, fully overridable, never a
+recommendation. See [Reading the market](#reading-the-market-positioning--flow).
 
 ## Run
 
@@ -60,9 +67,15 @@ from the backend origin and browsers isolate storage per-origin.
 ## Using it
 
 - **Ticker** dropdown (left). First entry (NDX) is selected on load.
-- **Strategy** — one of 10, single-select. **Bull Call** selected by default:
-  Long Call, Long Put, Bull Call, Bear Put, Bull Put, Bear Call, Iron Condor,
-  Iron Fly, Call Fly, Put Fly.
+- **Strategy** — one of 10, single-select: Long Call, Long Put, Bull Call,
+  Bear Put, Bull Put, Bear Call, Iron Condor, Iron Fly, Call Fly, Put Fly. On load
+  (and when you switch ticker) the grid **auto-lands once** on the structure the
+  current positioning makes playable — `call-leaning → Bull Call`,
+  `put-leaning → Bear Put`, `balanced → Iron Condor` (or **Iron Fly** when OI is
+  pinned tight to a near-spot magnet). It **does not keep flipping** as the lean
+  drifts, and any manual pick sticks — so it never yanks the strategy out from
+  under you mid-build. The small caption beside "Strategy" (`positioning now: …`)
+  restates that this reflects **where the market sits, not a recommended play**.
 - **Legs** auto-fill from per-ticker offset rules (snapped to the live chain
   grid). Use the −/+ steppers to move any leg up/down the real strike grid.
 - **Net price** card shows the spread's live **bid / mid / ask** (debit or
@@ -122,14 +135,103 @@ stayed NDXP, build and `/torque/price` agreed every sample, zero single-digit
 dips).
 - **Auto-close +N%** toggle (default 30%) places a profit-target close — see
   below.
-- **Right panel — Positioning** — a real-time **snapshot** score (−100…+100 from
-  volume skew + premium skew + OI magnet), shown as where premium/OI/volume
-  *cluster*: ≥+25 → **call-leaning**, ≤−25 → **put-leaning**, in between →
-  **balanced** (no side). It is **NOT a price forecast** — static OI/premium
-  can't tell direction (OI has a long *and* a short side; index put OI is mostly
-  hedging). Same-index products legitimately diverge (e.g. thin institutional NDX
-  vs liquid retail-hedged QQQ), which is exactly why it isn't a directional call.
-  Read it as positioning context only.
+- **Right panel — Positioning** — a real-time **snapshot** score plus a **live
+  flow** read. It is **NOT a price forecast** — static OI/premium can't tell
+  direction (OI has a long *and* a short side; index put OI is mostly hedging).
+  Read it as positioning context only. Full breakdown:
+  [Reading the market](#reading-the-market-positioning--flow).
+
+## Reading the market (Positioning + Flow)
+
+This panel is the one piece of "analysis" in Torque. It does **not** predict
+price — it describes **where options money is positioned now** and **where it's
+moving this minute**, then leaves the trade to you. Two layers:
+
+### Layer 1 — the Lean (state: where positioning *sits*)
+
+The big signed number (−100 … +100) is a deterministic heuristic blend of three
+things in the current chain (±3% around spot):
+
+| Component (shown as a metric tile) | What it measures | Weight |
+|---|---|---|
+| **Volume P/C** | call vs put **contracts traded today** | 40% |
+| **Premium skew** | call vs put **$ resting in open interest** (mid × OI) | 30% |
+| **Magnet** | pull toward the most **OI-concentrated strike** near spot | 30% |
+
+Thresholds: **≥ +25 → call-leaning**, **≤ −25 → put-leaning**, in between →
+**balanced** (deliberately no side — a small score isn't an edge). The bar under
+the number is the same value drawn left↔right. Hover the number for the formula.
+
+Think of the Lean as **where the crowd already is**. It's slow — built from
+standing positioning — so on its own it can be *stale* (call-heavy because of
+yesterday, not because of now).
+
+### Layer 2 — the Flow (momentum: where money is moving *now*)
+
+The **flow** block tracks **premium dollars actually traded** — `mid × volume`
+per side — and reports how much hit **calls vs puts over the last 3 minutes**
+(`calls +$1.2M · puts +$0.4M · net +$0.8M call`). It's kept in **browser memory
+for this tab only** (cleared on refresh), sampled every 5s.
+
+Why volume, not the premium-skew $? Because **open interest only settles
+overnight** — intraday the premium-skew number moves mostly because price moved,
+so its "rate of change" would just echo the chart. **Volume is intraday and
+cumulative**, so its delta is real, fresh order flow. That's the whole reason
+flow adds something the Lean doesn't.
+
+### The tag that ties them together: confirms / diverging
+
+The little tag on the Lean (and the word on the net-flow line) compares the two
+layers:
+
+- **confirms** — fresh money is flowing the **same** side as the Lean → the lean
+  is **live**, the move has fuel.
+- **diverging** — money is flowing the **opposite** side → the lean is being
+  **faded**, possible exhaustion.
+- **flat** — no decisive net flow (within ~6% of total) → chop.
+- On a **balanced** lean there's nothing to confirm, so it just names the side
+  the money is hitting (`call flow` / `put flow`) — an early tell before the
+  Lean itself tips.
+
+**The key idea:** *the Lean tells you where the crowd is; the Flow tells you
+whether the crowd is still right.* A **small lean that flow confirms** is often
+more tradeable than a **big lean that flow is fading** — the first is fresh
+momentum with room to run, the second is a crowded position the money is already
+leaving.
+
+### How to read every combination
+
+Rows = the Lean (where positioning sits). Columns = the Flow tag.
+
+| Lean ↓ \ Flow → | **Confirms** (money same side) | **Flat** (no net flow) | **Diverges** (money opposite) |
+|---|---|---|---|
+| **Strong call** (+50+) | Crowded long **and still being bought** — trend has fuel, but late-stage; watch for a blow-off top. | Extended long, no fresh fuel — likely to drift/stall. | ⚠ **Exhaustion / reversal risk** — heavily call-positioned but money rotating to puts. Fade or stand aside. |
+| **Mild call** (+25–50) | **Sweet spot** — fresh call bias *with money behind it*. Cleanest long read. | Weak call tilt, no momentum — low conviction. | No edge — a mild lean already being faded. Stay flat. |
+| **Balanced** (−25…+25) | *(call flow)* money picking the call side **before** positioning shows it — early bullish tell. | True **range / chop** — premium-selling turf (Condor / Fly). | *(put flow)* early put-side tell forming under a flat surface. |
+| **Mild put** (−25–−50) | **Sweet spot down** — fresh put bias with money behind it. Cleanest short read. | Weak put tilt, no momentum. | No edge — mild put lean being faded. |
+| **Strong put** (−50+) | Crowded short **and still being sold** — fuel, but late-stage. | Extended short, no fresh fuel. | ⚠ **Exhaustion / bounce risk** — heavily put-positioned but money rotating to calls. |
+
+None of these is a "buy/sell" instruction — they're context for the structure
+*you* already had in mind. Torque's job is to make that read fast and then
+execute cleanly.
+
+### The other tiles & levels
+
+- **OI P/C** — put/call **open interest** ratio (standing positioning, not today's
+  flow). High put OI on an index is often *hedging*, not bearish conviction.
+- **Magnet** — the near-spot strike with the most concentrated OI, and its
+  distance from spot; a tight near-spot magnet is what flips the balanced
+  auto-pick from **Iron Condor** to **Iron Fly** (sell the pin).
+- **premium / OI clusters** pill — the side OI/premium leans; for single-leg
+  strategies a **use →** button drops you straight into Long Call / Long Put.
+
+### Does the auto-selected strategy keep changing?
+
+**No.** The grid **auto-lands once per ticker on load**, then stays put — your
+manual picks stick and it never re-selects underneath you while you build. The
+live **`positioning now: …`** caption beside "Strategy" *does* update with the
+Lean, but it's **context only** ("where the market sits, not a recommended
+play") — it changes the words, not your selection.
 
 ## Auto-close (hybrid, +30% target)
 
@@ -240,7 +342,9 @@ Anchoring model (points from spot, snapped to the chain grid):
 
 ## Orders panel
 
-A bottom panel shows **only working orders** (entries still resting + GTC
+A bottom panel with two tabs:
+
+**Working** (default) — shows **only live orders** (entries still resting + GTC
 profit-target closes), newest-first. Each row's **limit price is click-to-edit**
 (Enter or ✓ submits a modify; Tradier `PUT`), and has a **cancel** button. An
 **auto-close watcher** strip shows the armed close while its entry is still
@@ -248,6 +352,20 @@ filling ("auto-close armed — waiting for entry N to fill → ~$X GTC"); once t
 close order is actually placed it becomes a working order in the table. Polls
 `/torque/orders` every ~4s; a **busy cursor** shows during any place/modify/
 cancel.
+
+**Past Orders** — an **in-memory log of every order Torque sent this session**
+(whatever the outcome: pending, filled, rejected, canceled, expired), newest
+first. Each send appends a row; as the working poll runs it updates that row's
+status/fills, and once an order drops off the working list a one-time
+`GET /torque/order/{id}` fetches its **final** status. It's purely for
+operational transparency — **browser memory only, capped at 50, lost on refresh
+or tab close** (no server record). This is just so you can see what you fired and
+how it resolved, without hunting in the broker UI.
+
+**Order-status panel** — the "✓ ENTRY SENT · entry id N" confirmation that
+appears under the order builder after you place **auto-dismisses after 10s** (the
+order lives on in Working / Past Orders below, so the confirmation doesn't need to
+linger).
 
 **Layout:** the page is a fixed-viewport SPA — centered, never scrolls. The
 orders panel fills the remaining height and scrolls **internally** when it has

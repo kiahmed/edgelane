@@ -29,6 +29,8 @@ from .evaluator import evaluator_loop
 from .tradier_client import TradierClient
 from .mock_tradier import MockTradierClient
 from .external_gex import state as _external_gex_state
+from . import torque_config as tcfg
+from . import supabase_admin
 
 
 # Module-level handles exposed for routes (avoid import cycles).
@@ -110,6 +112,17 @@ async def lifespan(app: FastAPI):
     elif _tradier_account_id:
         log.info("  tradier_account_id=%s  (from config)", _tradier_account_id)
     app.state.tradier_account_id = _tradier_account_id
+
+    # Seed operator entitlements from config (NOT hardcoded in the SQL migration):
+    # grant the configured operator uid(s) the full toolset so they can use the
+    # market + Torque tools from a normal signed-in session. Idempotent union;
+    # no-op when unconfigured or when Supabase isn't wired.
+    for _uid in tcfg.operator_uids():
+        try:
+            if await supabase_admin.grant_user_tools(_uid, ["market", "torque"]):
+                log.info("  operator entitlements ensured for uid=%s", _uid)
+        except Exception as e:
+            log.warning("  operator seed failed for uid=%s: %s", _uid, e)
 
     poll_task = asyncio.create_task(
         poll_loop(client, db, runtime_settings),

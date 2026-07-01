@@ -409,6 +409,10 @@ def analyze(spot: float, contracts: list[dict], band_pct: float = 3.0) -> dict:
     put_vol = sum(c["volume"] for c in puts)
     call_prem = sum((c["mid"] or 0) * c["open_interest"] for c in calls)
     put_prem = sum((c["mid"] or 0) * c["open_interest"] for c in puts)
+    # mid × VOLUME × 100 = premium $ actually traded today (volume is intraday and
+    # cumulative, unlike OI which settles overnight) — feeds the live flow tracker.
+    call_dollar = sum((c["mid"] or 0) * c["volume"] for c in calls) * 100
+    put_dollar = sum((c["mid"] or 0) * c["volume"] for c in puts) * 100
     call_oi = sum(c["open_interest"] for c in calls)
     put_oi = sum(c["open_interest"] for c in puts)
 
@@ -456,13 +460,14 @@ def analyze(spot: float, contracts: list[dict], band_pct: float = 3.0) -> dict:
         "suggested_side": side,
         "components": {
             "volume": {"signal": round(vol_sig, 3), "call": call_vol, "put": put_vol,
-                       "pcr": round(put_vol / call_vol, 3) if call_vol else None},
+                       "pcr": round(put_vol / call_vol, 3) if call_vol else None,
+                       "call_dollar": round(call_dollar), "put_dollar": round(put_dollar)},
             "premium_skew": {"signal": round(skew_sig, 3), "call_oi_premium": round(call_prem, 1),
                              "put_oi_premium": round(put_prem, 1)},
             "oi": {"call": call_oi, "put": put_oi,
                    "pcr": round(put_oi / call_oi, 3) if call_oi else None},
             "magnet": {"signal": round(magnet_sig, 3), "strike": magnet,
-                       "dist_pct": round(dist * 100, 2)},
+                       "dist_pct": round(dist * 100, 2), "strength": round(strength, 3)},
         },
         "levels": {
             "top_call_oi": _level(top_call_oi),

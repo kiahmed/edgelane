@@ -62,6 +62,12 @@ services:
     restart: unless-stopped
     environment:
       TUNNEL_TARGET: http://edgelane-backend:8789
+      # Force HTTP/2 (TCP 443) instead of QUIC (UDP 7844). The QUIC datagram
+      # path to Cloudflare's edge degrades intermittently on this host (WSL2
+      # NAT), and cloudflared can get stuck retrying QUIC instead of falling
+      # back — surfacing as endless "control stream encountered a failure" /
+      # "datagram handler: context canceled" loops. TCP is stable here.
+      TUNNEL_TRANSPORT_PROTOCOL: http2
       # service_role write to app_config (the URL pointer). Server-only secret.
       SUPABASE_URL: ${SUPABASE_URL:-}
       SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY:-}
