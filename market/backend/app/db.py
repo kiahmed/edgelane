@@ -4,12 +4,29 @@ Tables:
     gex_snapshots      one row per (symbol, expiration, strike, ts)
     bias_decisions     one row per derived bias (poller-submitted)
     outcomes           evaluator-populated win/loss per decision
+    outcome_daily_summary  one row per (session_date, symbol): end-of-day rollup
+                       + data-quality flag (see evaluator.archive_completed_days)
 """
 from __future__ import annotations
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 import duckdb
+
+
+def _utc_iso(v):
+    """Render a stored (naive-UTC) datetime as an explicit UTC ISO string (…Z).
+
+    DuckDB hands back naive datetimes; serialized bare they read as local time in
+    the browser. Stamping UTC keeps the instant unambiguous. Passes through None
+    and already-formatted strings untouched.
+    """
+    if isinstance(v, datetime):
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
+        return v.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return v
 
 
 _SCHEMA = """
@@ -73,6 +90,29 @@ CREATE TABLE IF NOT EXISTS outcomes (
     favorable_delta    DOUBLE,
     friction_band      DOUBLE,
     spread_type        VARCHAR
+);
+
+-- End-of-day rollup + data-quality flag, one row per (session_date, symbol).
+-- Written by the evaluator after the ET day rolls over (archive_completed_days).
+-- Raw bias_decisions/outcomes are kept forever; this is the modeling-friendly,
+-- deduped daily record. `complete` = session was fully/mostly covered with no big
+-- polling gaps (partial days are kept but flagged so modeling can filter them out).
+CREATE TABLE IF NOT EXISTS outcome_daily_summary (
+    session_date  DATE       NOT NULL,
+    symbol        VARCHAR    NOT NULL,
+    n             INTEGER    NOT NULL,
+    wins          INTEGER    NOT NULL,
+    losses        INTEGER    NOT NULL,
+    neutrals      INTEGER    NOT NULL,
+    accuracy_pct  DOUBLE,
+    first_ts      TIMESTAMP,
+    last_ts       TIMESTAMP,
+    span_min      DOUBLE,
+    max_gap_min   DOUBLE,
+    coverage_pct  DOUBLE,
+    complete      BOOLEAN    NOT NULL,
+    created_at    TIMESTAMP  NOT NULL,
+    PRIMARY KEY (session_date, symbol)
 );
 
 -- Additive migrations for DuckDB files created before the spread-outcome eval.
@@ -371,4 +411,97 @@ class Database:
                     'pick_strategy', 'spread_type',
                     'entry_net_premium', 'eval_net_premium',
                     'favorable_delta', 'friction_band']
-            return [dict(zip(cols, row)) for row in cur.fetchall()]
+            out = [dict(zip(cols, row)) for row in cur.fetchall()]
+            # Timestamps are stored as naive-UTC; emit them as explicit UTC ISO
+            # (…Z) so the browser's new Date() parses the correct instant and
+            # localizes it, instead of misreading a bare "T19:59" as local time.
+            for r in out:
+                for k in ("ts", "evaluated_at"):
+                    r[k] = _utc_iso(r.get(k))
+            return out
+
+    def fetch_regime_replay(self, per_symbol: int = 200, since=None) -> list[tuple]:
+        """Recent spread-outcome results per symbol, oldest→newest, for rebuilding
+        the in-memory regime counters after a restart (see evaluator.rehydrate_regime).
+
+        Returns (symbol, result) tuples. `since` (a datetime) scopes the replay to
+        the current trading session — yesterday's streak belongs to a different
+        market regime and must not carry over (see evaluator.rehydrate_regime).
+        Only the last `per_symbol` graded outcomes of each ticker are replayed —
+        more than enough to reproduce the current consecutive-loss/win streak (any
+        opposite result resets the counter). Legacy spot-diff rows (NULL
+        favorable_delta) are excluded, matching fetch_accuracy.
+        """
+        where = "o.favorable_delta IS NOT NULL"
+        params: list = []
+        if since is not None:
+            where += " AND bd.ts >= ?"
+            params.append(since)
+        params.append(per_symbol)
+        with self._lock:
+            cur = self.connect().execute(
+                f"""
+                SELECT symbol, result FROM (
+                    SELECT bd.symbol AS symbol, o.result AS result, bd.ts AS ts,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY bd.symbol ORDER BY bd.ts DESC
+                           ) AS rn
+                    FROM bias_decisions bd
+                    JOIN outcomes o ON o.decision_id = bd.id
+                    WHERE {where}
+                )
+                WHERE rn <= ?
+                ORDER BY symbol ASC, rn DESC
+                """,
+                params,
+            )
+            return cur.fetchall()
+
+    def fetch_graded_for_archive(self, before) -> list[tuple]:
+        """(symbol, ts, result) for every graded outcome with bd.ts < `before`
+        (a UTC datetime = start of today ET). Feeds the end-of-day rollup; the
+        caller buckets by ET calendar date (done in Python so the day boundary
+        matches the rest of the regime logic — no DuckDB tz math)."""
+        with self._lock:
+            cur = self.connect().execute(
+                """
+                SELECT bd.symbol, bd.ts, o.result
+                FROM bias_decisions bd
+                JOIN outcomes o ON o.decision_id = bd.id
+                WHERE o.favorable_delta IS NOT NULL AND bd.ts < ?
+                ORDER BY bd.symbol ASC, bd.ts ASC
+                """,
+                [before],
+            )
+            return cur.fetchall()
+
+    def summarized_pairs(self) -> set[tuple]:
+        """Set of (session_date_iso, symbol) already rolled up — so archival only
+        computes days it hasn't seen (idempotent, cheap on repeat runs)."""
+        with self._lock:
+            cur = self.connect().execute(
+                "SELECT session_date, symbol FROM outcome_daily_summary"
+            )
+            out = set()
+            for d, sym in cur.fetchall():
+                out.add((d.isoformat() if hasattr(d, "isoformat") else str(d), sym))
+            return out
+
+    def upsert_daily_summary(self, row: dict) -> None:
+        with self._lock:
+            self.connect().execute(
+                """
+                INSERT OR REPLACE INTO outcome_daily_summary
+                  (session_date, symbol, n, wins, losses, neutrals, accuracy_pct,
+                   first_ts, last_ts, span_min, max_gap_min, coverage_pct,
+                   complete, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    row["session_date"], row["symbol"], row["n"], row["wins"],
+                    row["losses"], row["neutrals"], row.get("accuracy_pct"),
+                    row.get("first_ts"), row.get("last_ts"), row.get("span_min"),
+                    row.get("max_gap_min"), row.get("coverage_pct"),
+                    row["complete"], row["created_at"],
+                ],
+            )

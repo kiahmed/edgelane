@@ -25,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import get_settings
 from .db import Database
 from .poller import poll_loop, state as poller_state
-from .evaluator import evaluator_loop
+from .evaluator import evaluator_loop, rehydrate_regime as evaluator_rehydrate_regime
 from .tradier_client import TradierClient
 from .mock_tradier import MockTradierClient
 from .external_gex import state as _external_gex_state
@@ -129,6 +129,14 @@ async def lifespan(app: FastAPI):
         name="edgelane.poll_loop",
     )
     app.state.poll_task = poll_task
+
+    # Restore per-symbol regime counters (consec loss/win + pause flag) from the
+    # outcomes table BEFORE the evaluator loop starts — otherwise a restart wipes
+    # an active pause / loss streak and the win-rate gets republished mid-meltdown.
+    try:
+        await asyncio.to_thread(evaluator_rehydrate_regime, db, settings)
+    except Exception as e:
+        log.warning("  regime rehydrate skipped: %s", e)
 
     eval_task = asyncio.create_task(
         evaluator_loop(db, poller_state, settings),

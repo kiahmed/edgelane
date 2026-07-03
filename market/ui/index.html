@@ -783,6 +783,17 @@
     sigInt:(v) => (v === null || v === undefined || Number.isNaN(v)) ? '—' : Math.round(Number(v)).toLocaleString(),
   };
 
+  // Market timestamps are UTC (…Z from the backend); render them in exchange
+  // time (ET) with a label so an outcome at 15:59 ET never looks like "7:59 PM"
+  // just because the viewer's machine is on another timezone.
+  const ET_TZ = 'America/New_York';
+  const etDateTime = (iso) => { if(!iso) return '—';
+    try { return new Date(iso).toLocaleString('en-US', {timeZone:ET_TZ, month:'numeric', day:'numeric',
+      hour:'numeric', minute:'2-digit', second:'2-digit', hour12:true}) + ' ET'; } catch { return iso; } };
+  const etTime = (iso) => { if(!iso) return '—';
+    try { return new Date(iso).toLocaleTimeString('en-US', {timeZone:ET_TZ, hour:'numeric',
+      minute:'2-digit', second:'2-digit', hour12:true}) + ' ET'; } catch { return iso; } };
+
   const BIAS_COLOR = {
     bullish:      { bg:'bg-emerald-500/25', text:'text-emerald-200', stripe:'stripe-bull' },
     mild_bullish: { bg:'bg-emerald-500/15', text:'text-emerald-300', stripe:'stripe-bull' },
@@ -1549,7 +1560,7 @@
         banner.classList.remove('hidden');
         $('regimeMsg').textContent = `${acc.regime_consec_losses} consecutive losses — engine confidence rebuilding…`;
         $('regimeTs').textContent = acc.regime_triggered_at
-          ? `since ${new Date(acc.regime_triggered_at).toLocaleTimeString()}`
+          ? `since ${etTime(acc.regime_triggered_at)}`
           : '';
       } else {
         banner.classList.add('hidden');
@@ -1583,15 +1594,25 @@
     const list = $('outcomeList');
     const rows = acc.recent_outcomes || [];
     $('outcomeMeta').textContent = acc.last_evaluated_at
-      ? `last eval ${new Date(acc.last_evaluated_at).toLocaleTimeString()} · ${acc.n}/${acc.window} in window`
+      ? `last eval ${etTime(acc.last_evaluated_at)} · ${acc.n}/${acc.window} in window`
       : 'awaiting first sweep';
     if (!rows.length) {
       list.innerHTML = '<div class="text-slate-500 italic">No evaluations yet — first outcomes will land ' +
         '3 minutes after the first bias decision.</div>';
       return;
     }
+    // While paused (bias out of sync) grading keeps running underneath, but we
+    // stop spraying the loss rows — a wall of red defeats the point of going
+    // quiet. Collapse to a calm status line; the rows return once back in sync.
+    if (acc.state === 'paused') {
+      const need = acc.wins_to_resume || 0;
+      const plural = need === 1 ? '' : 's';
+      list.innerHTML = `<div class="text-slate-500 italic">Bias re-syncing — grading continues quietly ` +
+        `underneath. Outcomes hidden until back in sync (${need} confirming win${plural} to resume).</div>`;
+      return;
+    }
     list.innerHTML = rows.map(r => {
-      const t = r.evaluated_at ? new Date(r.evaluated_at).toLocaleString() : '—';
+      const t = etDateTime(r.evaluated_at);
       const cls = RESULT_CLASS[r.result] || 'text-slate-400';
       // Premium-movement rows (new eval) show the spread's own favorable delta;
       // fall back to the legacy spot-move display for older outcome rows.

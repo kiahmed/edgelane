@@ -111,3 +111,38 @@ Hidden in **In sync**.
 - Re-price: saved legs re-marked from a chain where the bias has since rotated to
   a different pick (must mark the ORIGINAL legs).
 - Parity: existing 56 JSX-parity tests untouched (engine math unchanged).
+
+## Daily archive + data-quality (implemented)
+
+Raw `bias_decisions`/`outcomes` are **never flushed** — they are the only labeled
+ground-truth dataset. Instead the live reads are scoped (regime = today only;
+accuracy = rolling window) and each **completed** ET day is rolled up once into
+`outcome_daily_summary` (same DuckDB), written by `evaluator.archive_completed_days`
+at startup and on ET-day rollover (idempotent; runs even when market closed).
+
+Per `(session_date, symbol)`: `n / wins / losses / neutrals / accuracy_pct`,
+`first_ts / last_ts / span_min`, `max_gap_min`, `coverage_pct`, and a **`complete`**
+flag = covered ≥75% of the 390-min RTH session **and** no polling gap > 15 min.
+Partial days (backend left off, frontend never launched) are **kept but flagged**
+`complete=false` so modeling can require full sessions (`WHERE complete`). Tunable
+constants live in `evaluator.py` (`_SESSION_MINUTES`, `_MAX_GAP_MIN`, `_MIN_COVERAGE`).
+
+## Roadmap: historical modeling (future features)
+
+The archive above exists to make these answerable — none should ever trigger a
+daily flush; they all need longitudinal history:
+
+1. **Threshold tuning** — is `regime_alert_consec_losses=3` / `clear=2` optimal?
+   Replay real streaks. Same for `friction_band` and `neutral_band_pct`.
+2. **Confidence calibration** — does bias `confidence=low` actually lose more than
+   `high`? Today it's an assumption (it's the `low_conf` branch that still
+   publishes the win-rate). Prove or kill it from `(confidence → result)` data.
+3. **Per-strategy / per-regime edge** — e.g. "does `iron_condor` on NDX in a
+   low-conviction regime actually win?" Join `pick_strategy` + regime state to
+   outcomes over time. (`pick_strategy` is already persisted per decision.)
+4. **Engine drift detection** — is accuracy trending down week-over-week (model
+   going stale)? Chart `outcome_daily_summary.accuracy_pct` over `complete` days.
+
+Note: the live regime streak is intentionally **strategy-agnostic** (a bias-trust
+signal, not a per-strategy tracker); (3) is an offline modeling view, not a change
+to the live gate.

@@ -32,6 +32,19 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+# Trading-session timezone; the regime streak resets at the ET day boundary
+# (matches the market-hours clock the poller uses).
+_SESSION_TZ = ZoneInfo("America/New_York")
+
+# Data-quality gate for the end-of-day rollup. A day is `complete` only if it
+# covers most of the RTH session with no big polling gaps — partial days (backend
+# left off, frontend never launched) are still archived but flagged incomplete so
+# modeling can require full sessions.
+_SESSION_MINUTES = 390.0          # 09:30–16:00 ET
+_MAX_GAP_MIN = 15.0               # a gap this big = backend was down mid-session
+_MIN_COVERAGE = 0.75             # first→last decision must span ≥75% of the session
 
 log = logging.getLogger("edgelane.market.evaluator")
 
@@ -48,6 +61,8 @@ class EvaluatorState:
         self.regime_alert_active_by_symbol: dict[str, bool] = {}
         self.regime_alert_triggered_at: dict[str, str] = {}
         self.last_error: str | None = None
+        # ET date (isoformat) of the last end-of-day archival check.
+        self.last_archive_date: str | None = None
 
 
 state = EvaluatorState()
@@ -175,6 +190,148 @@ def _update_regime(symbol: str, result: str, settings) -> None:
     # 'neutral' result: counters untouched (noise shouldn't trigger/clear regime)
 
 
+def rehydrate_regime(db, settings) -> None:
+    """Rebuild the in-memory regime counters from the outcomes table on startup.
+
+    The consec-loss/win counters + alert flag live only on the `state` singleton
+    (in memory), and are advanced solely when a NEW decision is graded. A process
+    restart therefore wipes an active pause / loss streak, and it is never rebuilt
+    from history — so after a redeploy the paused state silently resets to zero and
+    the win-rate gets published again mid-meltdown. This replays each ticker's
+    recent graded outcomes (oldest→newest) through the same state machine as
+    `_update_regime`, per symbol, to restore the pre-restart position. Runtime
+    maintenance (increment on grade, reset on win, clear after N wins) is unchanged
+    — this only closes the restart gap.
+
+    Scoped to the CURRENT trading session (outcomes since ET midnight today):
+    yesterday's streak is a different market regime and must not carry over. So a
+    restart mid-session restores the live streak, but the first boot of a new day
+    starts clean. Strategy-agnostic by design — the streak tracks the engine's top
+    pick regardless of which structure it wore (a bias-trust signal, not a
+    per-strategy edge). Best-effort: never blocks startup.
+    """
+    alert_thresh = int(getattr(settings, "regime_alert_consec_losses", 3))
+    clear_thresh = int(getattr(settings, "regime_clear_consec_wins", 2))
+    session_start = datetime.now(_SESSION_TZ).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).astimezone(timezone.utc)
+    try:
+        rows = db.fetch_regime_replay(since=session_start)
+    except Exception:
+        log.exception("regime rehydrate: fetch failed; starting with empty counters")
+        return
+
+    # Group results per symbol (already ordered symbol ASC, oldest→newest).
+    by_symbol: dict[str, list[str]] = {}
+    for symbol, result in rows:
+        by_symbol.setdefault(symbol, []).append(result)
+
+    restored = 0
+    for symbol, results in by_symbol.items():
+        cl = cw = 0
+        alert = False
+        for result in results:
+            if result == "loss":
+                cl += 1
+                cw = 0
+                if cl >= alert_thresh:
+                    alert = True
+            elif result == "win":
+                cw += 1
+                cl = 0
+                if alert and cw >= clear_thresh:
+                    alert = False
+            # 'neutral': counters untouched (mirrors _update_regime)
+        state.consec_losses_by_symbol[symbol] = cl
+        state.consec_wins_by_symbol[symbol] = cw
+        state.regime_alert_active_by_symbol[symbol] = alert
+        if alert:
+            restored += 1
+            log.warning(
+                "regime rehydrate: %s restored PAUSED (%d consec losses, %d/%d "
+                "confirming wins to resume)", symbol, cl, cw, clear_thresh,
+            )
+        else:
+            log.info("regime rehydrate: %s consec_losses=%d consec_wins=%d", symbol, cl, cw)
+    log.info("regime rehydrate complete: %d symbol(s), %d paused", len(by_symbol), restored)
+
+
+def archive_completed_days(db) -> int:
+    """Roll up each COMPLETED trading day (ET) into outcome_daily_summary once.
+
+    Runs at startup and whenever the ET day rolls over (see evaluator_loop). Only
+    days strictly before today are archived (today is still live); days already
+    summarized are skipped (idempotent). Raw rows are never deleted — this is a
+    deduped, modeling-friendly daily record with a data-quality flag.
+
+    Each (ET date, symbol) gets win/loss/neutral counts, accuracy, session span,
+    the largest polling gap, and `complete` = covered ≥75% of the RTH session with
+    no gap > 15 min. Partial days (backend was off / frontend never launched) are
+    kept but flagged incomplete. Returns the number of (day,symbol) rows written.
+    """
+    today_start = datetime.now(_SESSION_TZ).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).astimezone(timezone.utc)
+    try:
+        rows = db.fetch_graded_for_archive(today_start)
+        already = db.summarized_pairs()
+    except Exception:
+        log.exception("daily archive: fetch failed; skipping")
+        return 0
+
+    # Bucket (symbol, ts, result) into ET calendar days.
+    buckets: dict[tuple, list] = {}
+    for symbol, ts, result in rows:
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        et_date = ts.astimezone(_SESSION_TZ).date().isoformat()
+        buckets.setdefault((et_date, symbol), []).append((ts, result))
+
+    written = 0
+    for (et_date, symbol), items in buckets.items():
+        if (et_date, symbol) in already:
+            continue
+        items.sort(key=lambda x: x[0])
+        results = [r for _, r in items]
+        wins = results.count("win")
+        losses = results.count("loss")
+        neutrals = results.count("neutral")
+        n = len(results)
+        first_ts = items[0][0]
+        last_ts = items[-1][0]
+        span_min = (last_ts - first_ts).total_seconds() / 60.0
+        max_gap_min = 0.0
+        for (a_ts, _), (b_ts, _) in zip(items, items[1:]):
+            gap = (b_ts - a_ts).total_seconds() / 60.0
+            if gap > max_gap_min:
+                max_gap_min = gap
+        coverage_pct = min(1.0, span_min / _SESSION_MINUTES)
+        complete = bool(coverage_pct >= _MIN_COVERAGE and max_gap_min <= _MAX_GAP_MIN)
+        try:
+            db.upsert_daily_summary({
+                "session_date": et_date,
+                "symbol": symbol,
+                "n": n, "wins": wins, "losses": losses, "neutrals": neutrals,
+                "accuracy_pct": round(wins / n * 100.0, 1) if n else 0.0,
+                "first_ts": first_ts.astimezone(timezone.utc).replace(tzinfo=None),
+                "last_ts": last_ts.astimezone(timezone.utc).replace(tzinfo=None),
+                "span_min": round(span_min, 1),
+                "max_gap_min": round(max_gap_min, 1),
+                "coverage_pct": round(coverage_pct, 3),
+                "complete": complete,
+                "created_at": datetime.now(timezone.utc).replace(tzinfo=None),
+            })
+            written += 1
+            log.info(
+                "daily archive %s %s: n=%d w=%d l=%d nu=%d cov=%.0f%% maxgap=%.1fm complete=%s",
+                et_date, symbol, n, wins, losses, neutrals,
+                coverage_pct * 100, max_gap_min, complete,
+            )
+        except Exception:
+            log.exception("daily archive: upsert failed for %s %s", et_date, symbol)
+    return written
+
+
 async def evaluate_pending(db, poller_state, settings) -> int:
     """Single sweep over pending decisions. Returns count evaluated.
 
@@ -276,6 +433,17 @@ async def evaluator_loop(db, poller_state, settings) -> None:
     try:
         while True:
             try:
+                # End-of-day rollup: runs on the FIRST sweep (startup catch-up)
+                # and whenever the ET day rolls over — BEFORE the market-open
+                # guard below, because archival happens once the session is over
+                # (market closed). Archives only completed (past) days; idempotent.
+                today_et = datetime.now(_SESSION_TZ).date().isoformat()
+                if state.last_archive_date != today_et:
+                    written = await asyncio.to_thread(archive_completed_days, db)
+                    if written:
+                        log.info("daily archive: wrote %d day/symbol summaries", written)
+                    state.last_archive_date = today_et
+
                 # Self-eval is paused while the market is closed: prices are
                 # frozen, so any "outcome" would be manufactured noise. The
                 # poller leaves evaluation_active False during display-only
