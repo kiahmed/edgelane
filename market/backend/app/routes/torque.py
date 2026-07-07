@@ -37,6 +37,7 @@ from .. import torque_config as tcfg
 from .. import torque_engine as teng
 
 log = logging.getLogger("edgelane.market.torque")
+TORQUE_VERSION = "0.2.0"
 router = APIRouter()
 
 # Access gate for Torque's data/action endpoints. get_current_user maps the
@@ -292,6 +293,7 @@ async def torque_cfg():
         "env": settings.tradier_env,
         "mode": settings.tradier_mode,
         "devmode": bool(getattr(settings, "devmode", False)),
+        "version": TORQUE_VERSION,
     }
 
 
@@ -329,6 +331,7 @@ class BuildRequest(BaseModel):
     symbol: str
     strategy: str
     adjustments: dict[str, int] = Field(default_factory=dict)
+    anchor_spot: float | None = None   # Lock Strikes: derive strikes from this frozen spot instead of live
 
 
 @router.post("/torque/build", dependencies=_GATE)
@@ -337,7 +340,11 @@ async def torque_build(req: BuildRequest, request: Request):
         raise HTTPException(400, f"unknown strategy {req.strategy!r}")
     client = _client(request)
     spot, exp, contracts = await _get_chain(client, req.symbol)
-    struct = teng.build_structure(spot, contracts, req.symbol, req.strategy, req.adjustments)
+    # Lock Strikes: when the client sends a frozen anchor spot, derive the strikes
+    # from THAT (so they stop re-centering as price moves). Prices still come from
+    # the live chain below, so premiums keep updating for the locked strikes.
+    anchor = req.anchor_spot if (req.anchor_spot and req.anchor_spot > 0) else spot
+    struct = teng.build_structure(anchor, contracts, req.symbol, req.strategy, req.adjustments)
     px_map = {c["symbol"]: c for c in contracts if c.get("symbol")}
     price = teng.price_structure(struct["legs"], px_map)
     tick = float(struct["rule"].get("tick", 0.05))

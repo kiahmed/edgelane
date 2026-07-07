@@ -89,6 +89,23 @@ async def test_build_endpoint_resolves_symbols():
     assert all("grid" in l for l in legs)   # stepper neighbors attached
 
 
+async def test_build_anchor_spot_locks_strikes_off_frozen_spot():
+    # Lock Strikes: strikes derive from the frozen anchor, not live spot, while the
+    # displayed spot stays live and prices still come from the live chain.
+    live = FakeTradier(spot=22000.0)   # chain spans 21000–23000
+    base = await torque_build(
+        BuildRequest(symbol="NDX", strategy="bull_call"), FakeRequest(live))
+    locked = await torque_build(
+        BuildRequest(symbol="NDX", strategy="bull_call", anchor_spot=21500.0),
+        FakeRequest(live))
+    assert base["spot"] == 22000.0 and locked["spot"] == 22000.0   # display spot unchanged
+    assert locked["missing_legs"] == [] and locked["price"]["complete"] is True
+    bs = {l["role"]: l["strike"] for l in base["legs"]}
+    ls = {l["role"]: l["strike"] for l in locked["legs"]}
+    assert set(bs) == set(ls)
+    assert all(ls[r] < bs[r] for r in bs)   # every leg re-centered off the lower anchor
+
+
 async def test_build_rejects_unknown_strategy():
     with pytest.raises(HTTPException) as e:
         await torque_build(BuildRequest(symbol="NDX", strategy="bogus"), FakeRequest(FakeTradier()))

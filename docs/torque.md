@@ -90,6 +90,17 @@ from the backend origin and browsers isolate storage per-origin.
     quote is momentarily missing, the net is returned as `None` and the UI keeps
     its last complete price — it will **never** flash a partial single-leg
     number.
+- **Lock Strikes** *(toggle, right of the spot line)* — freezes the strikes so they
+  **stop re-anchoring** as spot moves. The page keeps rebuilding every 3s, but the
+  strikes are derived from the spot **at the moment you locked** (a frozen anchor)
+  instead of live spot — so **premiums keep updating** for exactly those strikes
+  while the strikes themselves stay put. The **−/+ steppers still work** (relative to
+  the frozen anchor), so you can dial in a specific set of strikes and target them
+  without the constant drift distracting you. The displayed spot stays **live** (only
+  the strikes are pinned). Toggle **off** to drop the anchor and resume normal
+  auto-anchoring; it also resets to unlocked on any ticker/strategy change. *(Backend:
+  optional `anchor_spot` on `POST /torque/build` — strikes derive from it, prices
+  still come from the live chain.)*
 
 ### Spot price (Yahoo live, parity fallback)
 
@@ -247,23 +258,47 @@ The 3m flow is the tape; a single reading is noisy and swings side to side. The
 - **Net $** — `Σ(call$ − put$)` over the hour. Steadily one way = sustained
   pressure. A lone opposite print (your `+$1M` call against `−$42M` puts) barely
   dents it — **the noise filters itself.**
-- **Trend-strength bar + regime** — judged by **persistence**, i.e. how many of
-  the 3-min windows in the hour agree on a side (`X/Y windows put-side`):
+- **Signed flow bar + commitment color** — one bar carries two facts at once:
+  - **Length = magnitude past the flip.** A center line marks the **flip point**
+    (call/put parity). The fill grows *from* center — **right / green = call**
+    pressure, **left / red = put** — and its length is the `|net|/gross` ratio (how
+    far past the flip the hour's net currently sits).
+  - **Color = how committed it is.** **Amber & pulsing** when the net is within
+    ~10% of the flip line (**contested** — the sign isn't trustworthy yet);
+    **solid green/red** once it's persistent (≳70% of windows agree) *and* clear of
+    the flip; **amber steady** in between (**building**).
+- **Persistence (`X/Y windows put-side`)** — how many of the 3-min windows in the
+  hour agree on a side. This is what decides **trend vs chop** (and colors the bar):
   - **mostly one side** (≳70%) → **`trending put` / `trending call`** → a
     directional debit spread is in play, and a small counter-print is a
     pullback/entry, not a reversal.
   - **~50/50, sign flipping** → **`chop / range`** → two-sided, rangebound →
     **Iron Condor / Fly** territory.
-  - in between → **`mixed`** (building or transitioning).
+  - in between → **`building`** (transitioning).
   - *Why persistence, not `|net|/gross`?* A **mild but relentless** drift (every
     window slightly call-side) is a *trend* even though its net/gross is low —
     counting windows catches that; a raw lopsidedness ratio would miscall it chop.
-- **`% one-sided flow`** — the `|net|/gross` ratio, shown as a secondary stat:
-  how lopsided the raw flow is (size of the edge), distinct from how *persistent*
-  it is (the bar).
+- **`% call/put dominance`** *(was `% one-sided`)* — the `|net|/gross` ratio: how
+  lopsided the raw flow is (size of the edge), labelled by the side the net sits on
+  (`call dominance` when net is call-side, `put dominance` when put-side). Distinct
+  from how *persistent* it is (the windows). **Read it as a live magnitude, not a
+  running total** — see the box below.
+- **`held Nm`** — how long since the hour's net last **crossed zero** (the flip).
+  This is the *only* "since the flip" number; the `%` is **not**.
 
-Regime turnover — e.g. a `chop → trending put` shift, or the trend-strength bar
-climbing off a flat base — is your **early mid-day regime-change** cue. As always:
+> **What the `%` is — and isn't.** The `%` is `|net| / gross` computed over the
+> **trailing 60 minutes** (a rolling window) — the **current** magnitude of the
+> hour's net call/put imbalance. It is **not** an accumulation "since the last flip,"
+> and it is **not** unbounded: increments older than 60 min continuously drop out of
+> the window, so it always reflects roughly the last hour — whether or not a flip
+> happened inside it. When the net drifts back toward parity the `%` **falls toward
+> 0**; if it crosses, the side label flips, `held` resets to `<1m`, and the `%`
+> re-grows on the *other* side. So a rising `%` means the *current* hourly imbalance
+> is widening — it says nothing about how long it's held (that's what `held` is for).
+
+Regime turnover — e.g. a `contested → trending put` shift, the bar **hardening from
+amber-pulse to solid** as it clears the flip line, or `held` resetting while the fill
+re-grows on the other side — is your **early mid-day regime-change** cue. As always:
 this is *pressure*, not a forecast; dealers can absorb sustained flow.
 
 **Browser-only, this tab** — the 60m series (and the 3m flow) live in memory and
@@ -410,7 +445,7 @@ Anchoring model (points from spot, snapped to the chain grid):
 | `GET /torque/config` | tickers + strategy registry + env/mode |
 | `GET /torque/clock` | `{market_state, open}` from Yahoo `marketState` (holiday/early-close aware; cached ~30s success / ~8s failure so an outage doesn't re-hit each poll) — gates the pause |
 | `GET /torque/analyze/{sym}` | spot + positioning snapshot (poll ~5s) |
-| `POST /torque/build` | auto-filled legs for (ticker, strategy, step adjustments) |
+| `POST /torque/build` | auto-filled legs for (ticker, strategy, step adjustments); optional `anchor_spot` freezes the strikes (Lock Strikes) |
 | `POST /torque/price` | live net bid/mid/ask for a set of legs (poll ~2.5s) |
 | `POST /torque/place` | submit entry; arm background fill-watch + auto-close (`confirm:true`) |
 | `GET /torque/order/{id}` | single order status |
