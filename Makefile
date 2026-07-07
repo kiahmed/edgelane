@@ -18,6 +18,10 @@ DEPLOY       ?= local_container     # backend target: local_container | cloud
 DEPLOY_SH    = ./deploy.sh
 ARGS         ?=                     # extra flags, e.g. make deploy-prod ARGS=-n
 COMPOSE      = docker compose -f deploy/docker-compose.yml --env-file deploy/.env
+# Dedicated buildx builder for THIS repo. The docker-container driver gives it a
+# private cache pool, so `make deploy-prune` reclaims only EdgeLane's build cache
+# and never touches other projects' layers on the shared `default` builder.
+BUILDER      = edgelane-builder
 # DuckDB store (compose-prefixed volume name) + gitignored migration tarball
 DATA_VOLUME  = edgelane_edgelane-data
 DATA_DUMP    = deploy/edgelane-data.tar.gz
@@ -30,7 +34,7 @@ DATA_DUMP    = deploy/edgelane-data.tar.gz
         webhook-debug webhook-post ext-version ext-policy \
         ui clean \
         deploy-be deploy-fe deploy-prod deploy-dry db-push db-push-dry \
-        deploy-down deploy-be-down deploy-be-restart deploy-prune \
+        deploy-down deploy-be-down deploy-be-restart deploy-prune deploy-builder \
         deploy-data-dump deploy-data-restore \
         doctor vercel-setup check-tunnel
 
@@ -86,7 +90,8 @@ help:
 	@echo "    make deploy-down   stop+remove the stack (keeps DB volume; ARGS=-v drops it)"
 	@echo "    make deploy-be-down    remove ONLY the backend (cloudflared keeps running)"
 	@echo "    make deploy-be-restart rebuild+recreate ONLY the backend (latest code)"
-	@echo "    make deploy-prune  delete dangling images from rebuilds (ARGS=-a = all unused)"
+	@echo "    make deploy-prune  reclaim dangling images + THIS repo's build cache ($(BUILDER)); ARGS=-a = all unused images"
+	@echo "    make deploy-builder    create the dedicated buildx builder if missing (auto-run by deploy targets)"
 	@echo "    make deploy-data-dump     tar the DuckDB volume -> deploy/edgelane-data.tar.gz (migration)"
 	@echo "    make deploy-data-restore  restore that tarball into the volume on a new host"
 	@echo "    make db-push       apply Supabase migrations (idempotent)"
@@ -195,14 +200,14 @@ ui:
 # Frontend (market UI) → Vercel; backend (FastAPI + Torque) → Docker container
 # behind a Cloudflare tunnel. See deploy.sh + deploy/ for config.
 
-deploy-be:
-	@$(DEPLOY_SH) -b --target $(DEPLOY) $(ARGS)
+deploy-be: deploy-builder
+	@BUILDX_BUILDER=$(BUILDER) $(DEPLOY_SH) -b --target $(DEPLOY) $(ARGS)
 
 deploy-fe:
 	@$(DEPLOY_SH) -f $(ARGS)
 
-deploy-prod:
-	@$(DEPLOY_SH) --target $(DEPLOY) $(ARGS)
+deploy-prod: deploy-builder
+	@BUILDX_BUILDER=$(BUILDER) $(DEPLOY_SH) --target $(DEPLOY) $(ARGS)
 
 deploy-dry:
 	@$(DEPLOY_SH) --target $(DEPLOY) -n $(ARGS)
@@ -217,13 +222,25 @@ deploy-be-down:
 	@$(COMPOSE) rm -sf edgelane-backend
 
 # Rebuild + recreate ONLY the backend (latest code), without touching cloudflared.
-deploy-be-restart:
-	@$(COMPOSE) up -d --no-deps --build edgelane-backend
+deploy-be-restart: deploy-builder
+	@BUILDX_BUILDER=$(BUILDER) $(COMPOSE) up -d --no-deps --build edgelane-backend
 
-# Reclaim disk: delete dangling (untagged) images left by repeated rebuilds.
-# ARGS=-a prunes all unused images (more aggressive).
+# Ensure the dedicated buildx builder exists (idempotent). No-op when it's
+# already registered; only creates it on a fresh machine or after `docker buildx
+# rm $(BUILDER)`. Survives reboots — buildx auto-starts its backing container on
+# the next build. Prerequisite of every backend build target, so you never run it
+# by hand. Removing it (undo isolation): docker buildx rm $(BUILDER)
+deploy-builder:
+	@docker buildx inspect $(BUILDER) >/dev/null 2>&1 || \
+		docker buildx create --name $(BUILDER) --driver docker-container --bootstrap >/dev/null
+
+# Reclaim disk. Two pools: (1) dangling (untagged) images left by rebuilds, and
+# (2) THIS repo's BuildKit cache — scoped to the $(BUILDER) instance, so other
+# projects' cache on the shared `default` builder is untouched. ARGS=-a prunes
+# all unused images (more aggressive); it does not affect the builder-cache sweep.
 deploy-prune:
 	@docker image prune -f $(ARGS)
+	@docker buildx prune --builder $(BUILDER) -f
 
 # Machine migration — DuckDB volume in/out. Dump tars the volume into
 # $(DATA_DUMP) (gitignored); copy that file to the new host and run restore
