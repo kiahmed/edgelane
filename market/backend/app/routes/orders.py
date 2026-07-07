@@ -172,6 +172,10 @@ async def _submit_order(req: OrderRequest, tradier_client, preview: bool,
         # Per-user orders must target the USER's own account, resolved from their
         # own broker token — never the house-config account fallback.
         account_id = (req.account_id or "").strip()
+        # A real account id is never an email — ignore an autofilled/mis-entered
+        # email and resolve the real account_number from the user's token instead.
+        if "@" in account_id:
+            account_id = ""
         if not account_id:
             account_id = await tradier_client.resolve_account_id()
         if not account_id:

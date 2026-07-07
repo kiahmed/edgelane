@@ -213,6 +213,44 @@ app.include_router(strike_profiles.page_router)
 app.include_router(strike_profiles.router)
 
 
+# --- Broker error → clean HTTP response (so CORS headers are attached) --------
+# A raw TradierError/WebullError raised from a route (e.g. a slow/timing-out or
+# rejecting broker on /orders/preview or /torque/place) would otherwise escape as
+# an UNHANDLED 500. Starlette generates that 500 in ServerErrorMiddleware, which
+# sits OUTSIDE CORSMiddleware, so the response ships with no Access-Control-Allow-
+# Origin header — the browser then blocks it and the frontend fetch REJECTS,
+# leaving the order dialog stuck on "Previewing…" forever. Registering handlers
+# routes the response back out through CORSMiddleware, so the browser can read it
+# and the UI shows the real broker reason instead of hanging.
+from fastapi.responses import JSONResponse  # noqa: E402
+from .tradier_client import (  # noqa: E402
+    TradierError, TradierAuthError, TradierRateLimitError, TradierTimeoutError,
+)
+from .webull_client import WebullError  # noqa: E402
+
+
+@app.exception_handler(TradierError)
+async def _tradier_error_handler(request, exc: TradierError):
+    # Map to a status that reflects the upstream cause; 401 is deliberately NOT
+    # used so a bad *broker* token never trips the frontend's session-expiry path.
+    if isinstance(exc, TradierTimeoutError):
+        status = 504
+    elif isinstance(exc, TradierRateLimitError):
+        status = 429
+    elif isinstance(exc, TradierAuthError):
+        status = 502  # broker token rejected — an upstream problem, not the app session
+    else:
+        status = 502
+    log.warning("broker error on %s: %s", request.url.path, str(exc)[:300])
+    return JSONResponse(status_code=status, content={"detail": str(exc)[:600]})
+
+
+@app.exception_handler(WebullError)
+async def _webull_error_handler(request, exc: WebullError):
+    log.warning("broker error on %s: %s", request.url.path, str(exc)[:300])
+    return JSONResponse(status_code=502, content={"detail": str(exc)[:600]})
+
+
 @app.get("/")
 async def root():
     return {

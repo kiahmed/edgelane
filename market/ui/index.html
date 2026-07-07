@@ -508,8 +508,10 @@
         </select>
       </div>
       <div class="col-span-2 md:col-span-3">
-        <label for="orderAccount">Tradier account id</label>
-        <input id="orderAccount" type="text" placeholder="VA00000000" value="" />
+        <label for="orderAccount">Tradier account id <span class="text-slate-600">(optional — resolved from your broker if blank)</span></label>
+        <input id="orderAccount" name="edgelane-tradier-acct" type="text" placeholder="VA00000000" value=""
+               autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+               data-lpignore="true" data-1p-ignore data-form-type="other" />
       </div>
     </div>
 
@@ -770,7 +772,7 @@
   }
   // UI-owned version, auto-bumped by .githooks/pre-commit on any commit that
   // touches this file (manual: tools/bump_ui_version.sh).
-  const UI_VERSION = '2.0.3';
+  const UI_VERSION = '2.0.4';
   console.info('[edgelane] API_BASE =', API_BASE,
     '  (override with ?api=http://host:port; clear with localStorage.removeItem("edgelane_api_base"))');
 
@@ -1245,11 +1247,20 @@
     try { return (_connCache || []).find(c => c.is_active) || null; } catch (_) { return null; }
   }
 
+  // A Tradier account id looks like "VA12345678"/"6YA12345" — never an email.
+  // Reject anything with an '@' so a browser-autofilled email, or an email a
+  // user mistakenly saved in the account-id field, is ignored (blank → backend
+  // resolves the real account_number from the user's own broker token).
+  function _looksLikeAccountId(v) {
+    const s = String(v || '').trim();
+    return s.length > 0 && !s.includes('@');
+  }
+
   function _readBrokerAccountId() {
     // Prefer the active per-user broker connection synced from Supabase.
     try {
       const active = _activeBrokerConn();
-      if (active && active.tradier_account_id) return active.tradier_account_id;
+      if (active && _looksLikeAccountId(active.tradier_account_id)) return active.tradier_account_id;
     } catch (_) {}
     // Legacy fallback: sessionStorage broker connections from the single-file app.
     try {
@@ -1261,7 +1272,7 @@
         const obj = JSON.parse(raw);
         const conns = obj.connections || [];
         const active = conns.find(c => c.id === obj.activeId) || conns[0];
-        if (active && active.config && active.config.account_id) return active.config.account_id;
+        if (active && active.config && _looksLikeAccountId(active.config.account_id)) return active.config.account_id;
       }
     } catch (_) {}
     return '';
@@ -1347,20 +1358,38 @@
       quantity: Math.max(1, parseInt($('orderQty').value || '1', 10)),
       limit_price: ($('orderLimit').value === '') ? null : parseFloat($('orderLimit').value),
       duration: $('orderDuration').value || 'day',
-      account_id: $('orderAccount').value.trim() || null,
+      // Only pass an account id that actually looks like one; otherwise send null
+      // so the backend resolves the real account from the user's broker token.
+      account_id: _looksLikeAccountId($('orderAccount').value) ? $('orderAccount').value.trim() : null,
     };
   }
 
-  async function _postOrder(path, body) {
-    const r = await fetch(`${API_BASE}${path}`, {
-      method: 'POST',
-      mode: 'cors',
-      headers: { 'Content-Type': 'application/json', ..._authHeaders() },
-      body: JSON.stringify(body),
-    });
-    let payload = null;
-    try { payload = await r.json(); } catch { payload = { detail: await r.text() }; }
-    return { ok: r.ok, status: r.status, payload };
+  // Never rejects — a network failure or timeout resolves to {ok:false,status:0}
+  // so callers always update the UI instead of leaving "Previewing…" stuck. The
+  // backend chains up to two 30s Tradier round-trips, so give it 60s before we
+  // give up and report the stall rather than hanging forever.
+  async function _postOrder(path, body, timeoutMs = 60000) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const r = await fetch(`${API_BASE}${path}`, {
+        method: 'POST',
+        mode: 'cors',
+        headers: { 'Content-Type': 'application/json', ..._authHeaders() },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      let payload = null;
+      try { payload = await r.json(); } catch { payload = { detail: await r.text().catch(() => '') }; }
+      return { ok: r.ok, status: r.status, payload };
+    } catch (e) {
+      const detail = (e && e.name === 'AbortError')
+        ? `request timed out after ${Math.round(timeoutMs / 1000)}s — the backend/broker did not respond`
+        : `network error: ${(e && e.message) || e}`;
+      return { ok: false, status: 0, payload: { detail } };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async function doPreview() {
@@ -1393,7 +1422,8 @@
         $('orderSubmitBtn').disabled = false;
       }
     } else {
-      $('orderStatus').innerHTML = `<span class="text-rose-300">HTTP ${status}: ${(payload && (payload.detail || payload.error)) || 'unknown'}</span>`;
+      const msg = (payload && (payload.detail || payload.error)) || 'unknown';
+      $('orderStatus').innerHTML = `<span class="text-rose-300">${status ? 'HTTP ' + status + ': ' : ''}${msg}</span>`;
     }
   }
 
@@ -1411,7 +1441,8 @@
       toast(`Order ${oid} submitted`);
       setTimeout(closeOrderDialog, 3000);
     } else {
-      $('orderStatus').innerHTML = `<span class="text-rose-300">HTTP ${status}: ${(payload && (payload.detail || payload.error)) || 'unknown'}</span>`;
+      const msg = (payload && (payload.detail || payload.error)) || 'unknown';
+      $('orderStatus').innerHTML = `<span class="text-rose-300">${status ? 'HTTP ' + status + ': ' : ''}${msg}</span>`;
     }
   }
 

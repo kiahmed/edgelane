@@ -15,13 +15,26 @@ The house client is reachable for execution ONLY via the server-owner bypasses
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import HTTPException, Request
 
 from . import supabase_admin
 from .tradier_client import TradierClient
 from .webull_client import WebullClient
+
+
+def _clean_account_id(raw: Any) -> Optional[str]:
+    """Sanitize a stored broker account id. A real Tradier/Webull account id is
+    never an email — if a user accidentally saved their login/email in the
+    account-id field, ignore it (return None) so the caller resolves the real
+    account_number from the user's own broker token instead of shipping a bad id
+    into the order payload (which Tradier rejects, and which — before this — read
+    as an order that just wouldn't go through)."""
+    s = (str(raw or "")).strip()
+    if not s or "@" in s:
+        return None
+    return s
 
 
 def house_client(request: Request):
@@ -51,13 +64,13 @@ async def resolve_broker(request: Request, user: dict) -> tuple[str, Any, str | 
                 app_key=cfg["webull_app_key"], app_secret=cfg["webull_app_secret"],
                 region=cfg.get("webull_region") or "us", env=cfg.get("webull_env") or "production",
             )
-            account = (cfg.get("webull_account_id") or "").strip() or None
+            account = _clean_account_id(cfg.get("webull_account_id"))
             return "webull", client, account, True
         if cfg.get("tradier_token"):
             env = (cfg.get("tradier_env") or "production").lower()
             base = "https://sandbox.tradier.com" if env == "sandbox" else "https://api.tradier.com"
             client = TradierClient(base_url=base, token=cfg["tradier_token"])
-            account = (cfg.get("tradier_account_id") or "").strip() or None
+            account = _clean_account_id(cfg.get("tradier_account_id"))
             return "tradier", client, account, True
         # cfg row exists but carries no usable credentials → treat as "no
         # connection" and fall through to the rejection below.
