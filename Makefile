@@ -225,14 +225,17 @@ deploy-be-down:
 deploy-be-restart: deploy-builder
 	@BUILDX_BUILDER=$(BUILDER) $(COMPOSE) up -d --no-deps --build edgelane-backend
 
-# Ensure the dedicated buildx builder exists (idempotent). No-op when it's
-# already registered; only creates it on a fresh machine or after `docker buildx
-# rm $(BUILDER)`. Survives reboots — buildx auto-starts its backing container on
-# the next build. Prerequisite of every backend build target, so you never run it
-# by hand. Removing it (undo isolation): docker buildx rm $(BUILDER)
+# Ensure the dedicated buildx builder exists AND boots (self-healing). Prereq of
+# every backend build target, so you never run it by hand. On Docker Desktop/WSL2
+# the builder's backing container gets a stale Docker-Desktop bind-mount across a
+# reboot and won't boot (`Exited 127`); a plain `inspect` still succeeds, so we
+# must actively `--bootstrap` and, if that fails, rm + recreate a fresh one.
+# Removing it entirely (undo isolation): docker buildx rm $(BUILDER)
 deploy-builder:
-	@docker buildx inspect $(BUILDER) >/dev/null 2>&1 || \
-		docker buildx create --name $(BUILDER) --driver docker-container --bootstrap >/dev/null
+	@docker buildx inspect --bootstrap $(BUILDER) >/dev/null 2>&1 || { \
+		docker buildx rm $(BUILDER) >/dev/null 2>&1 || true; \
+		docker buildx create --name $(BUILDER) --driver docker-container --bootstrap >/dev/null; \
+	}
 
 # Reclaim disk. Two pools: (1) dangling (untagged) images left by rebuilds, and
 # (2) THIS repo's BuildKit cache — scoped to the $(BUILDER) instance, so other
