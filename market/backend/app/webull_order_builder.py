@@ -21,6 +21,12 @@ from .order_builder import Leg
 
 # EdgeLane strategy → Webull option_strategy (multi-leg). SINGLE is chosen
 # automatically when there's only one leg.
+#
+# Two callers use two different names for the same structures: the market
+# strategy_engine emits `iron_butterfly`/`call_butterfly`/`put_butterfly`, while
+# Torque's registry (torque_config.STRATEGY_DEFS) emits `iron_fly`/`call_fly`/
+# `put_fly`. Both spellings map here — omitting Torque's raised ValueError and
+# made butterflies unplaceable on Webull.
 WEBULL_STRATEGY = {
     "bull_put": "VERTICAL",
     "bear_call": "VERTICAL",
@@ -28,12 +34,16 @@ WEBULL_STRATEGY = {
     "bear_put": "VERTICAL",
     "iron_condor": "IRON_CONDOR",
     "iron_butterfly": "IRON_BUTTERFLY",
+    "iron_fly": "IRON_BUTTERFLY",
     "call_butterfly": "BUTTERFLY",
+    "call_fly": "BUTTERFLY",
     "put_butterfly": "BUTTERFLY",
+    "put_fly": "BUTTERFLY",
 }
 
 # Net direction of the strategy: credit spreads are a net SELL, debit a net BUY.
-_CREDIT_STRATEGIES = {"bull_put", "bear_call", "iron_condor", "iron_butterfly"}
+_CREDIT_STRATEGIES = {"bull_put", "bear_call", "iron_condor",
+                      "iron_butterfly", "iron_fly"}
 
 
 def _fmt_strike(strike: float) -> str:

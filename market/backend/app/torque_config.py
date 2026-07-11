@@ -54,14 +54,36 @@ _BASE_OFFSETS: dict[str, Any] = {
 }
 
 # First entry = the default ticker (NDX), pre-selected on load.
-TICKERS: list[str] = ["NDX", "SPX", "RUT", "SPY", "QQQ"]
+TICKERS: list[str] = ["NDX", "SPX", "RUT", "SPY", "QQQ", "DJX"]
 
 # Yahoo Finance chart symbols for the live spot quote (indices need the ^ form;
 # ETFs are the bare ticker). Used as the primary spot source, with Tradier
 # put-call parity as fallback. A ticker absent here just uses the fallback.
+# ^DJX already quotes at the 1/100 DJIA scale (~525) that the option strike grid
+# uses, so it needs no rescaling — do NOT substitute ^DJI (~52,550).
 YAHOO_SYMBOLS: dict[str, str] = {
     "NDX": "^NDX", "SPX": "^GSPC", "RUT": "^RUT", "SPY": "SPY", "QQQ": "QQQ",
+    "DJX": "^DJX",
 }
+
+# ── Root allowlist ─────────────────────────────────────────────────────────
+# Tradier serves option chains only by BASE symbol, returning every root listed
+# for that expiration mixed together. For most indices the generic dedup in
+# torque_engine._keep_primary_root picks the live root. DJX needs an explicit
+# allowlist: the AM-settled monthly `DJX` root and the daily/weekly `DJXW` root
+# never coexist except on the monthly expiration itself, and we trade DJXW only.
+# An expiration whose chain has no allowed root is skipped (see choose_expiration).
+TICKER_ROOTS: dict[str, list[str]] = {
+    "DJX": ["DJXW"],
+}
+
+
+def allowed_roots(ticker: str) -> list[str]:
+    """Roots we're willing to trade for `ticker`. Empty list = no restriction."""
+    f = _load_overrides_file().get("roots", {}).get((ticker or "").upper())
+    if isinstance(f, list):
+        return [str(r).upper() for r in f]
+    return list(TICKER_ROOTS.get((ticker or "").upper(), []))
 
 
 def yahoo_symbol(ticker: str) -> str | None:
@@ -103,9 +125,170 @@ _TICKER_OVERRIDES: dict[str, dict[str, Any]] = {
         "iron_fly":  {"width": 5},
         "butterfly": {"body_offset": 0, "wing": 5},
     },
+    # DJX (DJXW root) ~525, 1pt grid, PENNY-quoted (bids like 2.68/1.41 are not
+    # 0.05 multiples, so tick=0.01). Widths are deliberately wider than the
+    # 1pt grid would suggest: DJX is 1/100 of the Dow, so its option premiums
+    # are ~1/12 of SPX's while market makers still quote a ~$0.30 wide market.
+    # A 2-3pt vertical therefore has a package spread of 47-60% of its own mid
+    # and cannot be closed profitably; at width 10 that falls to ~16-20%.
+    "DJX": {
+        "tick": 0.01,
+        "vertical":  {"anchor": 1, "width": 10},
+        "condor":    {"short_offset": 10, "width": 10},
+        "iron_fly":  {"width": 10},
+        "butterfly": {"body_offset": 0, "wing": 10},
+    },
 }
 
 DEFAULT_CLOSE_TARGET_PCT = 30.0   # +30% profit target for the auto-close order
+
+# ── Auto-close profit targets ──────────────────────────────────────────────
+# The close order is a limit at entry*(1±pct). For it to ever fill, `pct` must
+# exceed the round-trip cost of crossing the package bid/ask — otherwise the
+# target price sits inside the spread and the position can only be closed at a
+# loss. On SPX/NDX the package spread is ~3-4% of mid, so the 30% default has
+# huge headroom. On DJX it is 16-43% of mid (measured live), so 30% is BELOW
+# the round-trip cost for tighter widths. Hence a per-ticker floor that the API
+# clamps UP to — a user cannot select a target that is structurally unfillable.
+#   "default" = pre-filled in the UI, "min" = hard floor enforced server-side.
+#   "spread_scaled": also raise the floor to the LIVE package spread at place
+#   time. Opt-in per ticker: on tight names the static floor already clears the
+#   spread by 10x, and scaling there would silently move long-standing SPX/NDX
+#   close targets. DJX needs it because its spread% swings 16% → 800% intraday
+#   as premium decays.
+#   "required": auto-close cannot be turned OFF for this ticker. The user may
+#   raise the profit target but never disarm the exit. Consequence: when the
+#   package is wider than MAX_AUTO_CLOSE_SPREAD_PCT the close cannot be armed,
+#   so the ENTRY is refused too — a mandatory exit means no exit, no trade.
+CLOSE_TARGETS: dict[str, dict[str, float]] = {
+    "DJX": {"default": 60.0, "min": 45.0, "spread_scaled": True, "required": True},
+}
+
+# A package whose own bid/ask is this wide relative to its mid cannot support ANY
+# profit target — the close limit would sit inside the spread forever. Observed on
+# DJX 0DTE once premium decays to a few cents (net_mid 0.02, net_bid -0.06). We
+# refuse to arm auto-close rather than place an entry whose exit can never fill.
+MAX_AUTO_CLOSE_SPREAD_PCT = 100.0
+
+# ── Stop-loss (app-managed) ────────────────────────────────────────────────
+# The profit-target close is a PASSIVE resting limit: it never crosses, so it
+# never pays the exit half-spread. A stop is the opposite — it fires when the
+# trade is going wrong and must CROSS to get out, paying the half-spread it
+# would otherwise have avoided. On DJX that exit half can be ~90% of the
+# position's mid, so:
+#   * the trigger is measured at MID (fair value), never at the bid — measuring
+#     at the bid would fire instantly, since a wide package is underwater by
+#     half the spread the moment it fills;
+#   * if the book is wider than STOP_MAX_EXIT_SPREAD_PCT at trigger time we do
+#     NOT dump into it. Crossing a 180%-of-mid market hands back more than the
+#     stop was meant to save. The watcher flags `stop_blocked_wide_market` and
+#     keeps polling for a sane book instead.
+STOP_LOSS: dict[str, dict[str, float]] = {
+    "DJX": {"default": 50.0},
+}
+STOP_MAX_EXIT_SPREAD_PCT = 60.0
+
+# ── Market orders ──────────────────────────────────────────────────────────
+# A market order crosses to whatever the book shows. On a penny-wide name that
+# costs a cent; on DJX the ask can be 10.00 against a 5.22 mid, so a market
+# entry silently pays ~2x fair value. There is no legitimate reason to send a
+# market order into that book — force a limit and let the user see the price.
+NO_MARKET_ORDER_TICKERS: set[str] = {"DJX"}
+
+
+def market_orders_allowed(ticker: str) -> bool:
+    f = _load_overrides_file().get("no_market_order_tickers")
+    banned = {str(t).upper() for t in f} if isinstance(f, list) else NO_MARKET_ORDER_TICKERS
+    return (ticker or "").upper() not in banned
+
+
+# ── Execution fees ─────────────────────────────────────────────────────────
+# Commission is charged PER CONTRACT PER LEG, both opening and closing. Values
+# below were read off Tradier's own order preview (`commission` field) against a
+# live production account — identical in sandbox:
+#     DJX  buy 1 contract  -> 0.53      DJX  buy 10 -> 5.30   (linear)
+#     DJX  2-leg vertical  -> 1.06      (= 2 legs x 0.53)
+#     SPX  buy 1 contract  -> 0.95
+# Index options carry a proprietary exchange fee, hence DJX/SPX > the plain
+# equity-option rate. A ticker not listed here uses DEFAULT_COMMISSION.
+#
+# `extra_fee_per_contract` covers regulatory pass-throughs (ORF, TAF) which
+# Tradier's preview reports as fees=0 because they are assessed at settlement,
+# not at order time. It defaults to 0.0 — we do NOT invent a number. Set it in
+# torque_tickers.json if you want the target to absorb them too.
+DEFAULT_COMMISSION = 0.35
+COMMISSION_PER_CONTRACT: dict[str, float] = {
+    "DJX": 0.53,
+    "SPX": 0.95,
+    "NDX": 0.95,
+    "RUT": 0.95,
+}
+DEFAULT_EXTRA_FEE = 0.0
+
+
+def commission_per_contract(ticker: str) -> float:
+    f = _load_overrides_file().get("commissions", {})
+    tk = (ticker or "").upper()
+    if isinstance(f, dict) and tk in f:
+        return float(f[tk])
+    return float(COMMISSION_PER_CONTRACT.get(tk, DEFAULT_COMMISSION))
+
+
+def extra_fee_per_contract(ticker: str) -> float:
+    f = _load_overrides_file().get("extra_fees", {})
+    tk = (ticker or "").upper()
+    if isinstance(f, dict) and tk in f:
+        return float(f[tk])
+    return DEFAULT_EXTRA_FEE
+
+
+def fee_per_contract(ticker: str) -> float:
+    """All-in per-contract, per-leg, one-way execution cost."""
+    return commission_per_contract(ticker) + extra_fee_per_contract(ticker)
+
+
+def stop_loss_default(ticker: str) -> float | None:
+    f = _load_overrides_file().get("stop_loss", {}).get((ticker or "").upper(), {})
+    sl = {**STOP_LOSS.get((ticker or "").upper(), {}), **(f if isinstance(f, dict) else {})}
+    d = sl.get("default")
+    return float(d) if d is not None else None
+
+
+def close_target_default(ticker: str) -> float:
+    f = _load_overrides_file().get("close_targets", {}).get((ticker or "").upper(), {})
+    ct = {**CLOSE_TARGETS.get((ticker or "").upper(), {}), **(f if isinstance(f, dict) else {})}
+    return float(ct.get("default", DEFAULT_CLOSE_TARGET_PCT))
+
+
+def close_target_min(ticker: str) -> float:
+    """Hard floor for the auto-close profit target. Default 1.0 (= the API's
+    existing lower bound) for tickers whose spreads are tight enough not to
+    need one."""
+    f = _load_overrides_file().get("close_targets", {}).get((ticker or "").upper(), {})
+    ct = {**CLOSE_TARGETS.get((ticker or "").upper(), {}), **(f if isinstance(f, dict) else {})}
+    return float(ct.get("min", 1.0))
+
+
+def close_target_spread_scaled(ticker: str) -> bool:
+    """True when the floor must also clear the live package bid/ask (DJX)."""
+    f = _load_overrides_file().get("close_targets", {}).get((ticker or "").upper(), {})
+    ct = {**CLOSE_TARGETS.get((ticker or "").upper(), {}), **(f if isinstance(f, dict) else {})}
+    return bool(ct.get("spread_scaled", False))
+
+
+def close_target_required(ticker: str) -> bool:
+    """True when auto-close may not be disarmed for this ticker (DJX)."""
+    f = _load_overrides_file().get("close_targets", {}).get((ticker or "").upper(), {})
+    ct = {**CLOSE_TARGETS.get((ticker or "").upper(), {}), **(f if isinstance(f, dict) else {})}
+    return bool(ct.get("required", False))
+
+
+def close_targets_map() -> dict[str, dict[str, float]]:
+    """Per-ticker {default,min,spread_scaled,required} for the frontend."""
+    return {t: {"default": close_target_default(t), "min": close_target_min(t),
+                "spread_scaled": close_target_spread_scaled(t),
+                "required": close_target_required(t)}
+            for t in tickers()}
 
 
 def _deep_merge(base: dict, over: dict) -> dict:

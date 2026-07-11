@@ -244,9 +244,148 @@ Rows = the Lean (where positioning sits). Columns = the Flow tag.
 | **Mild put** (−25–−50) | **Sweet spot down** — fresh put bias with money behind it. Cleanest short read. | Weak put tilt, no momentum. | No edge — mild put lean being faded. |
 | **Strong put** (−50+) | Crowded short **and still being sold** — fuel, but late-stage. | Extended short, no fresh fuel. | ⚠ **Exhaustion / bounce risk** — heavily put-positioned but money rotating to calls. |
 
+**Now add the Session bar's two axes.** The table above reads the *3-minute* flow
+against the Lean. The **Session flow bar** (Layer 3, below) carries the same
+call/put *side* but adds two **independent** facts the 3m tag can't:
+
+- **Length = magnitude** — how hard the hour's net is pushing *right now*
+  (`|net|/gross`). Longer = harder.
+- **Color = commitment** — how *persistent* that push is: **solid green/red** once
+  ≳70% of the 3-min windows agree, **amber** while contested/building.
+
+Because they're independent, **read them separately.** A **longer amber** bar (hard
+but not yet trusted) sitting next to a **shorter solid-red** bar (milder but
+persistent) is a normal, informative pairing — **not** a contradiction. Length
+answers *"how hard now?"*; color answers *"can I trust the direction?"* A short,
+committed drift is more tradeable than a long, contested lurch — so **don't read a
+longer/higher-% bar as "closer to red."** The `%` only sets length; only the window
+count (persistence) turns it solid.
+
+Crossing the **session bar's color** with the **Lean** gives the persistent read
+(side of the bar vs side of the Lean):
+
+| Session bar vs Lean | **Solid** (persistent) | **Amber** (contested / building) |
+|---|---|---|
+| **Confirms** (bar side = Lean) | **Strongest continuation** — the book sits one way *and* the hour keeps pushing it. Ride the directional debit; a small counter-print is a pullback, not a reversal. | Flow agrees with the lean but isn't sticking → **chop around an established lean** → Condor / Fly, not a trend. |
+| **Diverges** (bar side ≠ Lean) | ⚠ **Early rotation — the most valuable contradiction.** Positioning still sits one way but persistent hourly flow is *fading* it. Flow leads, OI/premium lag, so a regime change often starts **here, before the Lean has repriced.** | **Tentative fade** — likely noise testing the lean. Watch `held` and the window count; don't act until it hardens to solid. |
+
+So when the two bars **agree by side**, conviction is high; when they **split**, let
+the session bar's **color** break the tie — *diverges + solid* is the book about to
+be dragged, *diverges + amber* is just chop testing it. Always correlate the bars by
+**side, never by their raw numbers** — the Lean is a −100…+100 composite, the bar `%`
+is `|net|/gross` of flow dollars; different scales, so only their direction is
+comparable.
+
 None of these is a "buy/sell" instruction — they're context for the structure
 *you* already had in mind. Torque's job is to make that read fast and then
 execute cleanly.
+
+### Putting it together — flow leads, positioning lags
+
+The three reads update at **different speeds**, and that lag *is* the signal.
+Fastest to slowest:
+
+| Tab | What it shows | Speed | Example (an SPX day) |
+|---|---|---|---|
+| **Session flow bar** | fresh money over the trailing hour (flow) | **fastest** — flips first | **solid green, trending call** |
+| **Lean** | where the whole book sits (blended snapshot) | medium | still **balanced (0)** |
+| **Premium skew** | resting option richness (positioning) | **slowest** — repositions last | still **puts rich** |
+
+Read it top-to-bottom: **flow leads, positioning lags.** When the fast tab has moved
+but the slow ones haven't, you're watching a rotation *in progress* — not yet a done
+deal. The gap between the tabs is where early rotations live — and where fakeouts hide.
+
+**A worked life-cycle** (a full regime turn, top of the day to the flip):
+
+1. **Strong put regime** — session bar solid red, high `%`, skew puts-rich, Lean
+   put-leaning. Every tab agrees → high-conviction short.
+2. **Bleed-out** — bar shrinks (e.g. 60% → 16%), red → **amber**, windows slip under
+   70%. Puts losing grip; magnitude *and* persistence fading together.
+3. **Flip zone** — `%` drops under 10%, bar **flashes amber** through parity. No
+   trusted side → chop / indecision.
+4. **New side commits** — `%` re-grows on the other side, bar hardens to **solid
+   green, trending call**. The *flow* has rotated.
+5. **Positioning still lagging** — Lean stuck **balanced**, skew still **puts rich**.
+   The *book* hasn't repriced, so the tag reads **`call flow`, not `confirms`.**
+
+Step 5 is the state to recognize: **the tape has flipped, the book hasn't.**
+
+**Compare / contrast — the two ways step 5 resolves:**
+
+| | **Confirmed rotation** | **Fakeout** |
+|---|---|---|
+| Session bar | stays solid green, holds / widens | shrinks back toward 10%, **re-flashes** |
+| Premium skew | eases off puts-rich → neutral / calls | stays puts-rich |
+| Lean | climbs and crosses **+25** → tag flips to **`confirms`** | never crosses; drifts back |
+| Read | flow *and* book now agree — **validated** | flow-only pop; the puts-rich book was right, puts can reassert |
+
+**What actually flips the tag to `confirms`:** the **Lean crossing ±25** — *not* any
+single tab. Skew is only ~30% of the Lean, so it doesn't have to go fully call-side;
+it just has to stop dragging hard enough that call volume + OI-magnet carry the Lean
+past the line. In practice skew is usually the heaviest anchor, so **it's the one to
+watch first** — but the literal trigger is the Lean number, not the skew label.
+
+**What to watch, in order:**
+
+1. **Premium skew** — the first thing that has to give; `puts rich → neutral` is the
+   earliest tell that the book is starting to agree with the flow.
+2. **Lean number** — `0 → +25` (or `→ −25`) is the literal trigger; the tag turns
+   `call flow → confirms` there.
+3. **Session bar** — must *hold* solid green meanwhile. If it fades and **re-flashes**
+   before the Lean crosses, the rotation failed — treat it as a fakeout.
+
+**One-line rule:** *when all three tabs agree, conviction is highest; when they split,
+the flow tells you a move is **starting**, the skew and Lean tell you it's **real**.*
+
+### Verdict cheat-sheet — reading the whole board at once
+
+Quick refreshers for the cross-tab states, as verdicts to come back to. Each is a
+**prior, not a promise** — the named **invalidation** is what tells you the prior is
+breaking. *(Most of this is a read you assemble across tabs — the tags surface the
+raw pieces. The one exception is the **book-leads / hour-flow-lags** case below, which
+Torque now flags for you as a slim **⚡ STRETCHED** chip in the Positioning panel when
+the full config lines up.)*
+
+- **All tabs agree** — session bar, Lean, skew, and 3m flow all the same side.
+  → **Highest conviction**; ride the directional debit; a small counter-print is a
+  pullback, not a reversal. *Invalidation:* 3m flow flips **and** the session bar
+  starts shrinking off its high.
+
+- **Flow leads, book lags** — the session bar has flipped **solid** to a new side,
+  but the Lean is still balanced and skew still reads the *old* side *(the SPX case)*.
+  → Rotation **in progress, not yet real.** **Verdict:** wait for the Lean to cross
+  ±25 and the tag to turn `confirms`. *Invalidation:* the session bar fades and
+  **re-flashes** before the Lean crosses → it was a flow-only pop (**fakeout**).
+
+- **Book leads, hour-flow lags** — the Lean, skew, *and* freshest 3m flow are all one
+  side, but the 60m **session bar is still deep the *other* way** *(the NDX case:
+  Lean +34 / calls-rich / 3m call, yet session net −$18.6M trending put)*.
+  → The hour's flow is **fighting the entire structure.** **Verdict / prior:** the
+  tension **tends to resolve by flow reverting *toward* positioning** — the session
+  bar grinds back and flips — *not* by the book collapsing to meet the flow. Two
+  reasons: the resting book (OI / skew / magnet) is where dealers defend, and the 60m
+  residue **decays as its oldest prints age out of the window** (so a big negative net
+  under a `held 55m` regime is about to start deflating from the back, not just the
+  front). So a deeply-negative session net **under a call-leaning, calls-rich book
+  reads as room to recover**, not a reason to keep pressing the losing side.
+  *Invalidation — the one that flips it to a **real regime change**:* **skew
+  capitulates** (calls-rich → puts-rich) and/or fresh 3m flow swings back to the
+  session-bar side. **Until skew gives, the outnumbered side is fighting uphill.**
+  *(Torque flags exactly this config with a slim **⚡ STRETCHED · {call/put} favored**
+  chip in the Positioning panel — amber, appears only when the session bar is trending
+  one way while the Lean is committed, skew is rich, and the 3m flow has turned the
+  other way. Hover it for the full read + invalidation. It's a state, not advice.)*
+
+- **Chop / contested** — session bar amber (contested near the flip), Lean balanced,
+  3m flow flat. → No trusted side → **premium-selling / range** (Condor / Fly), not a
+  directional debit. *Invalidation:* the bar hardens solid off the flip and windows
+  push past 70% one way → a trend is establishing.
+
+> **Prior, not law.** The "flow reverts toward positioning" verdict is an intraday
+> *tendency* (price pins toward dealer positioning; the 60m residue decays), **not a
+> guarantee.** On a true trend day positioning **does** collapse to meet the flow —
+> that *is* a regime change — and the **skew flip is your early warning** that you're
+> in that case, not the reversion case. Trade the prior; respect the invalidation.
 
 ### Layer 3 — Session flow (trend vs chop over the day)
 
@@ -299,7 +438,10 @@ The 3m flow is the tape; a single reading is noisy and swings side to side. The
 Regime turnover — e.g. a `contested → trending put` shift, the bar **hardening from
 amber-pulse to solid** as it clears the flip line, or `held` resetting while the fill
 re-grows on the other side — is your **early mid-day regime-change** cue. As always:
-this is *pressure*, not a forecast; dealers can absorb sustained flow.
+this is *pressure*, not a forecast; dealers can absorb sustained flow. To read this
+bar's **color and length against the Lean**, see the bar-vs-Lean matrix in
+[*How to read every combination*](#how-to-read-every-combination) above — length is
+magnitude, color is commitment, and the two are independent.
 
 **Browser-only, this tab** — the 60m series (and the 3m flow) live in memory and
 clear on refresh; they're per-tab, so two tabs on different tickers each keep their
@@ -505,6 +647,171 @@ Logo and favicon live in `market/backend/ui/assets/` (`torque-logo.svg`,
 - `market/backend/app/torque_config.py` — per-ticker offsets + strategy registry.
 - Reuses `order_builder.py` (multileg payloads) and the async `TradierClient`
   (`quotes`, `place_order`, `get_order` added for Torque).
+
+## DJX (Dow) — DJXW root only
+
+DJX is Cboe's 1/100th-DJIA index option (spot ~525 when the Dow is ~52,500).
+Torque trades **only the `DJXW` root** — the daily/weekly, PM-settled listing
+(dailies launched 2026-05-18). The AM-settled monthly `DJX` root is excluded via
+`torque_config.TICKER_ROOTS`, and any expiration that lists *only* that root
+(the 3rd-Friday monthlies) is **skipped** — `_get_chain` walks forward through
+`teng.expiration_candidates()` until an expiration yields DJXW contracts.
+
+**Why DJX needs special handling.** It is ~1/12th the premium of SPX while market
+makers still quote a ~$0.30-wide package. Measured live (2026-07-09):
+
+| | ATM package spread | zero-bid strikes (±2.9%) |
+|---|---|---|
+| SPX 0DTE | ~3.4% of mid | 0–6% |
+| DJX (DJXW) | 16–43% of mid, →800% as 0DTE premium decays | 22–40% |
+
+Consequences, all encoded in config rather than in the page:
+
+* **`tick = 0.01`** — DJX quotes in pennies (2.68 / 1.41 are not 0.05 multiples).
+* **`width = 10`** on verticals/wings. At width 2–5 the package spread is 47–60%
+  of its own mid and cannot be closed profitably; width 10 brings it to ~16%.
+* **Auto-close floor.** The global +30% target is *below* DJX's round-trip cost,
+  so a 30% close order prices inside the package bid/ask and can never fill.
+  `CLOSE_TARGETS["DJX"]` sets `default 60% / min 45%` and marks the ticker
+  `spread_scaled`, which additionally raises the floor to the **live** package
+  spread at place time. `/torque/place` clamps **up** to that floor and reports
+  `close_target_pct` + `close_target_clamped` + `package_spread_pct`.
+* **Untradeable-package guard.** If the package's own bid/ask exceeds
+  `MAX_AUTO_CLOSE_SPREAD_PCT` (100% of mid) the order is refused with a 400
+  rather than armed with an exit that can never fill.
+
+Spread-scaling is **opt-in per ticker** (`spread_scaled: true`) so SPX/NDX/RUT
+behaviour is byte-for-byte unchanged.
+
+> Reality check: DJX is genuinely illiquid — Dow options flow lives in **DIA**
+> (penny-wide) and YM/MYM futures options. Short-horizon DJX spread trading is
+> dominated by transaction cost. The floors above stop guaranteed-loss configs;
+> they do not make DJX a good scalping vehicle.
+>
+> Note DIA has **no dailies** (Fridays only), so it cannot serve 0DTE. For daily
+> Dow 0DTE, DJXW is the only instrument on Tradier — and it is expensive.
+
+### The spread is not a fee
+
+The most common misreading. **Filling at the mid costs nothing** — the mid *is*
+fair value, and no fee is "baked in" (DJX's actual Cboe exchange fees are cents
+per contract). The spread only costs you when you **cross**:
+
+| Fill | Cost |
+|---|---|
+| at the mid | zero |
+| at the ask (market order / crossing) | the full half-spread |
+
+So the cost is a tax on *needing to trade now*, not on the instrument. On SPX
+there is size resting at the mid and a mid limit fills instantly; on DJX 22–40%
+of near-money strikes have no bid at all, so a mid limit may never fill and you
+end up improving toward the ask.
+
+This shapes every guardrail:
+
+* **Auto-close is a passive resting GTC limit** — it never crosses, so it never
+  pays the exit half-spread. That is why it remains viable on a wide book.
+* **Auto-close is MANDATORY on DJX** (`CLOSE_TARGETS["DJX"]["required"]`). The
+  target % is editable (floored); the toggle is locked on. `/torque/place`
+  rejects `auto_close=false` rather than silently coercing it — a coerced `true`
+  would place a second real order the caller never asked for.
+  **Consequence:** a mandatory exit that cannot be armed means the *entry* is
+  refused too. When the package exceeds `MAX_AUTO_CLOSE_SPREAD_PCT`, DJX cannot
+  be traded at all until the book tightens — the Send buttons grey out. This is
+  intended: no fillable exit, no trade.
+* **A stop must cross** (you need out now), so it *does* pay. `_monitor_stop`
+  therefore triggers off the **mid**, never the bid (a wide package is underwater
+  by half its spread the instant it fills — a bid-based stop fires immediately),
+  and refuses to cross a book wider than `STOP_MAX_EXIT_SPREAD_PCT` (60%).
+  Config: `STOP_LOSS["DJX"] = {"default": 50.0}`.
+* **Market orders are disabled for DJX** (`NO_MARKET_ORDER_TICKERS`), enforced in
+  `/torque/place` and greyed out in the page. A market order is "cross at any
+  price", and DJX's ask has been measured at 4× its own mid.
+* **`/torque/price` surfaces the real cost** — `marketable_price` (what crossing
+  now costs), `cross_cost` (how much you overpay vs mid), `package_spread_pct`,
+  `untradeable`, and the live `min_close_target_pct` the server will clamp to.
+  The Send row labels this, so the true price is visible *before* you send.
+
+### Execution fees are folded into the close target
+
+`close_target_price()` nets the profit target **after commissions**, so a debit
+target is priced *above* naive `entry×(1+pct)` and a credit buy-back *below*
+`entry×(1−pct)`. `breakeven_close_price()` is the same function at `pct=0`.
+
+Commission is charged **per contract, per leg, on the open and again on the
+close**. Because fee and premium both scale with quantity, the per-unit cost is
+quantity-independent: `round_trip_fee = 2 × legs × fee ÷ multiplier`.
+
+Rates in `COMMISSION_PER_CONTRACT` were read off Tradier's own order-preview
+`commission` field against a live production account (sandbox agrees):
+
+| | 1 contract | 10 contracts | 2-leg vertical |
+|---|---|---|---|
+| DJX | 0.53 | 5.30 | 1.06 |
+| SPX | 0.95 | — | — |
+
+Preview reports `fees = 0` — regulatory pass-throughs (ORF, TAF) are assessed at
+settlement, not at order time. We do **not** invent them; `extra_fee_per_contract`
+defaults to `0.0` and is configurable in `torque_tickers.json`.
+
+**Credit targets are bounded below 100%.** A credit buy-to-close is priced at
+`entry×(1−pct)`, which goes **non-positive at pct ≥ ~100%** (sooner with fees) —
+Tradier rejects a ≤0 limit, which would *silently unarm* the auto-close. Two
+guards: `close_target_price()` floors every credit result at one tick (the
+cheapest real buy-back = "keep essentially all the credit"), and `/torque/place`
+caps the *reported* `close_target_pct` at `max_credit_pct()` for credit orders so
+the response is honest. The field still accepts up to 500 because the same field
+carries debit targets (sell at 6×), where high values are legitimate.
+
+Two consequences worth knowing:
+
+* **Tick rounding is directional** — debit targets round UP, credit targets round
+  DOWN. Nearest-tick rounding could price a "breakeven" order *below* the entry
+  (e.g. entry 2.123, tick 0.05 → 2.10). A property test asserts the target never
+  prices below breakeven, for every leg count.
+* **This shifts SPX/NDX targets too**, by the round-trip commission (e.g. a 2-leg
+  NDX debit at 20.00 targets 26.05 rather than 26.00). That is a correction, not a
+  regression: the old target did not cover its own commissions.
+
+`/torque/price` returns `breakeven_at_mid` / `close_target_at_mid` and
+`breakeven_at_market` / `close_target_at_market`, so both fill scenarios are
+priced before you send. On a 5-cent DJX contract the commission alone is ~21% of
+premium — the readout makes that visible.
+* **`/torque/modify` re-applies the floor.** Editing a `torqueClose…` order in the
+  orders panel used to bypass every guardrail (the modify payload carries only a
+  price). `_CLOSE_GUARD` records the entry fill + floor when the close is placed,
+  and `_enforce_close_floor_on_modify` rejects an edit that prices the close
+  inside the package bid/ask.
+
+**Not protected:** the spread cost itself. The guardrails stop you *placing a
+trade whose exit cannot fill* and stop you crossing a garbage book. They do not
+cap losses from the spread, and max loss remains the debit paid (or wing width).
+
+## Brokers (Tradier / Webull)
+
+Torque places through the **signed-in user's own active `broker_configs` row**
+(`broker_resolver.resolve_broker`); the admin/dev path uses the house Tradier
+account. Both Tradier and Webull connections are accepted, but Webull is
+**capability-limited** because `WebullClient` exposes only `list_accounts` /
+`first_account_id` / `preview_option` / `place_option`:
+
+| Torque feature | Tradier | Webull |
+|---|---|---|
+| Entry (single + multileg) | ✅ | ✅ (always `preview_option` first) |
+| Auto-close | ✅ | ❌ 501 — needs order-status polling |
+| Native OTO bracket | ✅ | ❌ (no OCO in this SDK surface) |
+| Orders panel / cancel / modify | ✅ | ❌ 501 |
+
+Auto-close is **refused** (not silently dropped) on Webull: it is app-managed
+(place → poll until FILLED → place close), and without `get_order` the entry fill
+can't be confirmed — placing anyway would either never close or leave a naked
+close against an unfilled entry.
+
+> ⚠️ **Webull cannot run in this venv today.** `pyproject.toml` pins
+> `webull-openapi-python-sdk>=2.0`, but every release requires `python >=3.8,<3.14`
+> and the backend venv is **3.14**. The SDK is not installed, so *any* Webull call
+> (here or in `/orders`) raises `WebullError: Webull SDK not installed`. Pin the
+> backend to Python 3.13 to light it up.
 
 ## Status / not yet exercised
 

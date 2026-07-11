@@ -12,15 +12,17 @@ caller can step a leg up/down by whole grid increments.
 """
 from __future__ import annotations
 
+import math
+
 from datetime import date, datetime, timezone
 from typing import Any
 
 from .order_builder import Leg
-from .torque_config import ticker_rule, STRATEGY_DEFS
+from .torque_config import ticker_rule, STRATEGY_DEFS, allowed_roots
 
 
 # ── chain helpers ──────────────────────────────────────────────────────────
-def normalize_chain(raw: list[dict]) -> list[dict]:
+def normalize_chain(raw: list[dict], ticker: str | None = None) -> list[dict]:
     """Map raw Tradier option rows → {symbol, strike, side, bid, ask, mid,
     last, open_interest, volume, iv, delta}. Drops rows without a strike.
 
@@ -29,9 +31,17 @@ def normalize_chain(raw: list[dict]) -> list[dict]:
     `NDXP` (live). When two rows share (side, strike) we keep the one with the
     freshest quote timestamp (bid_date/ask_date/trade_date, epoch ms), so the
     live root wins generically (NDX→NDXP, SPX→SPXW) without hardcoding roots.
-    Tie-break: higher volume, then open interest, then first seen."""
+    Tie-break: higher volume, then open interest, then first seen.
+
+    When `ticker` has an explicit root allowlist (torque_config.TICKER_ROOTS —
+    today only DJX→DJXW), rows from any other root are dropped up front rather
+    than being left to the generic dedup. Returns [] if the expiration lists no
+    allowed root at all, which is the caller's signal to try the next one."""
+    allow = {r.upper() for r in allowed_roots(ticker)} if ticker else set()
     best: dict[tuple[str, float], dict] = {}
     for o in raw or []:
+        if allow and str(o.get("root_symbol") or "").upper() not in allow:
+            continue
         try:
             strike = float(o.get("strike"))
         except (TypeError, ValueError):
@@ -90,7 +100,7 @@ def normalize_chain(raw: list[dict]) -> list[dict]:
 # and the stale AM-settled monthly root mixed together. We translate NDX→NDXP
 # (etc.) by keeping only the live root. Preferring a KNOWN weekly root makes the
 # pick deterministic even pre-market when volume is still 0.
-KNOWN_LIVE_ROOTS = {"NDXP", "NDXW", "SPXW", "SPXPM", "RUTW", "XSP", "VIXW"}
+KNOWN_LIVE_ROOTS = {"NDXP", "NDXW", "SPXW", "SPXPM", "RUTW", "XSP", "VIXW", "DJXW"}
 
 
 def _keep_primary_root(rows: list[dict]) -> list[dict]:
@@ -118,13 +128,23 @@ def _keep_primary_root(rows: list[dict]) -> list[dict]:
 
 def choose_expiration(expirations: list[str]) -> str | None:
     """0DTE if today is listed, else the nearest future expiration."""
+    cands = expiration_candidates(expirations)
+    return cands[0] if cands else None
+
+
+def expiration_candidates(expirations: list[str], limit: int = 4) -> list[str]:
+    """Expirations in the order Torque should try them: 0DTE first, then
+    nearest-future ascending. More than one is returned because a ticker with a
+    root allowlist (DJX→DJXW) may have expirations that list *only* the excluded
+    root — DJX's monthly 3rd-Friday dates carry the AM-settled `DJX` root and no
+    `DJXW` — and those must be skipped rather than traded."""
     if not expirations:
-        return None
+        return []
     today = datetime.now(timezone.utc).date().isoformat()
-    if today in expirations:
-        return today
     future = sorted(e for e in expirations if e >= today)
-    return future[0] if future else sorted(expirations)[-1]
+    if not future:
+        return [sorted(expirations)[-1]]
+    return future[:limit]
 
 
 def _f(v: Any) -> float | None:
@@ -360,13 +380,131 @@ def suggested_limit(price: dict, tick: float) -> float:
 
 
 # ── auto-close (+30% target) ───────────────────────────────────────────────
-def close_target_price(entry_price: float, order_type: str, pct: float, tick: float) -> float:
-    """Profit-target close price. Debit entry → sell to close at (1+pct%)×debit.
-    Credit entry → buy to close at (1-pct%)×credit (keep pct% of the credit)."""
+def package_spread_pct(px: dict) -> float | None:
+    """Width of the SPREAD's own bid/ask as a % of its mid — the round-trip cost
+    of getting in and out. None when the package has no complete two-sided price.
+
+    This, not the per-leg spread, is what an auto-close target must clear: a
+    profit target below this number prices the close order inside the package's
+    own bid/ask, so it can never fill. SPX/NDX run ~3-4%; DJX runs 16-45% on
+    healthy widths and blows past 100% once 0DTE premium decays to a few cents."""
+    if not px.get("complete"):
+        return None
+    mid = px.get("abs_mid")
+    nb, na = px.get("net_bid"), px.get("net_ask")
+    if not mid or nb is None or na is None:
+        return None
+    return abs(na - nb) / mid * 100.0
+
+
+def stop_breached(mark: float, entry_fill: float, order_type: str, stop_pct: float) -> bool:
+    """Has the position lost `stop_pct`% of the entry fill?
+
+    `mark` is the package's ABSOLUTE mid (fair value), never the bid — a wide
+    package is underwater by half its spread the instant it fills, so a bid-based
+    stop would fire immediately on DJX.
+
+      debit  → you paid `entry_fill`; you're down when the mark falls.
+      credit → you received `entry_fill`; you're down when the buy-back cost rises.
+    """
+    if not entry_fill or mark is None or stop_pct is None:
+        return False
+    f = float(stop_pct) / 100.0
+    e = abs(float(entry_fill))
+    if order_type == "credit":
+        return abs(mark) >= e * (1.0 + f)
+    return abs(mark) <= e * (1.0 - f)
+
+
+def stop_exit_price(px: dict, order_type: str, tick: float) -> float | None:
+    """Marketable limit to GET OUT — we cross, but with a bounded price so a
+    garbage quote can't fill us at absurd levels. debit → sell at the package's
+    net bid; credit → buy back at its net ask. None when the package has no
+    complete two-sided price."""
+    if not px.get("complete"):
+        return None
+    raw = px.get("net_ask") if order_type == "credit" else px.get("net_bid")
+    if raw is None:
+        return None
+    return round_to_tick(abs(float(raw)), tick)
+
+
+def _ceil_tick(price: float, tick: float) -> float:
+    if not tick:
+        return round(price, 2)
+    return round(math.ceil(round(price / tick, 9)) * tick, 4)
+
+
+def _floor_tick(price: float, tick: float) -> float:
+    if not tick:
+        return round(price, 2)
+    return round(math.floor(round(price / tick, 9)) * tick, 4)
+
+
+def round_trip_fee_price(ticker_fee: float, legs: int, multiplier: int = 100) -> float:
+    """Both-ways execution cost expressed in PREMIUM units (per 1 spread).
+
+    Commission is per contract PER LEG, charged on the open and again on the
+    close. Because both the fee and the premium scale with quantity, the
+    per-unit fee is independent of how many contracts you trade:
+        total = 2 * legs * qty * fee      premium = price * multiplier * qty
+        fee_in_price = total / (multiplier * qty) = 2 * legs * fee / multiplier
+    DJX single leg: 2*1*0.53/100 = 0.0106 (~1 tick). Vertical: 0.0212.
+    """
+    return 2.0 * int(legs) * float(ticker_fee) / float(multiplier)
+
+
+def close_target_price(entry_price: float, order_type: str, pct: float, tick: float,
+                       *, legs: int = 1, fee_per_contract: float = 0.0,
+                       multiplier: int = 100) -> float:
+    """Profit-target close price that nets `pct`% AFTER execution fees.
+
+    Debit  → you paid `entry_price` plus the opening fee, and the closing fee is
+             deducted from your sale proceeds, so you must sell for MORE than the
+             naive entry*(1+pct).
+    Credit → you collected `entry_price` minus the opening fee, and buying back
+             costs the closing fee too, so you must buy back for LESS.
+
+    With fee_per_contract=0 this reduces exactly to the old entry*(1±pct).
+    Rounding is directional — debit targets round UP, credit targets round DOWN —
+    so tick rounding can never drag the target back below true breakeven.
+    """
     f = pct / 100.0
+    one_way = int(legs) * float(fee_per_contract) / float(multiplier)   # per premium unit
     if order_type == "debit":
-        return round_to_tick(entry_price * (1 + f), tick)
-    return round_to_tick(entry_price * (1 - f), tick)
+        cost = entry_price + one_way            # what the position really cost you
+        return _ceil_tick(cost * (1 + f) + one_way, tick)
+    credit = entry_price - one_way              # what you really collected
+    price = _floor_tick(credit * (1 - f) - one_way, tick)
+    # A credit buy-to-close limit MUST be a positive price. At pct≥~100 (or with
+    # fees, slightly under) the formula goes ≤0 — Tradier rejects a non-positive
+    # limit, which would silently unarm the auto-close. Floor it at one tick: the
+    # cheapest real buy-back, i.e. "keep essentially all the credit". Callers that
+    # want the target reported honestly should also cap pct (see max_credit_pct).
+    return max(price, tick if tick else 0.01)
+
+
+def max_credit_pct(entry_credit: float, tick: float, *, legs: int = 1,
+                   fee_per_contract: float = 0.0, multiplier: int = 100) -> float:
+    """Largest close-target pct for a CREDIT whose buy-back limit is still ≥ one
+    tick (a fillable, positive price). Above this the position can only be closed
+    by letting it expire, not by a resting limit. Returns a value in [1, 99]."""
+    one_way = int(legs) * float(fee_per_contract) / float(multiplier)
+    credit = float(entry_credit) - one_way
+    floor_px = tick if tick else 0.01
+    if credit <= floor_px:                      # credit already ≤ the min buy-back
+        return 1.0
+    f = 1.0 - (floor_px + one_way) / credit     # price(f) == floor_px
+    return max(1.0, min(99.0, round(f * 100.0, 2)))
+
+
+def breakeven_close_price(entry_price: float, order_type: str, tick: float,
+                          *, legs: int = 1, fee_per_contract: float = 0.0,
+                          multiplier: int = 100) -> float:
+    """The close price at which the round trip nets exactly zero (pct=0)."""
+    return close_target_price(entry_price, order_type, 0.0, tick,
+                              legs=legs, fee_per_contract=fee_per_contract,
+                              multiplier=multiplier)
 
 
 def build_close_legs(legs: list[dict]) -> list[dict]:

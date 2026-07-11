@@ -139,7 +139,7 @@ async def test_dry_run_previews_both_and_places_nothing():
     r = await torque_place(req, FakeRequest(client), user=DEV)
     assert r["mode"] == "dry_run"
     assert r["entry_ok"] is True and r["close_ok"] is True
-    assert r["close_target_price"] == 26.0
+    assert r["close_target_price"] == 26.05   # 20.0 × 1.30, + round-trip NDX commission
     # both submitted payloads carried preview=true (nothing executed)
     assert len(client.placed) == 2
     assert all(p.get("preview") == "true" for p in client.placed)
@@ -177,7 +177,7 @@ async def test_multileg_filled_then_close_placed():
     assert r["rejected"] is False
     w = await _await_watch(r)                  # background watcher fills + closes
     assert w["state"] == "close_placed"
-    assert w["close_target_price"] == 26.0     # 20.0 × 1.30
+    assert w["close_target_price"] == 26.05    # 20.0 × 1.30, net of round-trip commission
     assert len(client.placed) == 2             # entry + close both sent
 
 
@@ -220,7 +220,9 @@ async def test_credit_spread_close_is_debit_buyback():
     r = await torque_place(req, FakeRequest(client), user=DEV)
     w = await _await_watch(r)
     assert w["state"] == "close_placed"
-    assert w["close_target_price"] == 7.0      # credit: buy back at 0.70×
+    # credit: buy back at 0.70× — and BELOW that, because the 4-leg round-trip
+    # commission comes out of the credit you keep.
+    assert w["close_target_price"] == 6.9
     assert client.placed[1]["type"] == "debit"  # closing a credit spread is a debit
 
 
@@ -233,7 +235,7 @@ async def test_single_leg_limit_autoclose_uses_oto():
                        account_id="T", confirm=True)
     r = await torque_place(req, FakeRequest(client), user=DEV)
     assert r["mode"] == "oto_bracket"
-    assert r["close_target_price"] == 91.0     # 70 × 1.30
+    assert r["close_target_price"] == 91.05    # 70 × 1.30, + round-trip commission
     p = client.placed[0]
     assert p["class"] == "oto"
     assert p["side[0]"] == "buy_to_open" and p["side[1]"] == "sell_to_close"

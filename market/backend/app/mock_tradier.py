@@ -103,6 +103,8 @@ _DEFAULT_SPOTS: dict[str, float] = {
     "QQQ": 600.0,
     "IWM": 220.0,
     "NDX": 24000.0,
+    "RUT": 2960.0,
+    "DJX": 525.0,   # 1/100 of the Dow — NOT ~52,500
 }
 
 

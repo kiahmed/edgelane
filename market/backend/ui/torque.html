@@ -170,6 +170,10 @@
   .sbar.building i{background:var(--warn)}
   .sbar.contested i{background:var(--warn);animation:pulse 1.1s infinite}
   .disc{margin-top:10px;font-size:11px;color:var(--dim);line-height:1.5;border-top:1px solid var(--line);padding-top:8px}
+  .tension{display:block;margin-top:8px;padding:4px 10px;border-radius:5px;
+    font-size:11px;font-weight:800;letter-spacing:.4px;line-height:1.35;white-space:normal;
+    cursor:help;color:#160f00;background:var(--warn);
+    box-shadow:0 0 0 1px var(--warn),0 0 12px -3px var(--warn)}
   .err{color:var(--bad);font-size:12px;margin-top:8px}
   .panel.orders{margin-top:14px}
   .watchers{margin:6px 0 10px}
@@ -203,8 +207,10 @@
   .social-btn{width:28px;height:28px;justify-content:center}
   .share-btn{height:28px;padding:0 10px;font:inherit;font-size:11px;letter-spacing:.5px}
   .social-btn:hover,.share-btn:hover{border-color:var(--accent);color:#fff}
-  .strat-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:4px}
+  .strat-head{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:4px}
   .share-top{display:flex;align-items:center;gap:8px;flex-shrink:0}
+  .heur-note{flex:1 1 auto;min-width:0;font-size:9px;line-height:1.2;color:var(--dim);letter-spacing:0;text-transform:none;font-weight:400}
+  .heur-note .hwarn{color:var(--warn);font-weight:700;margin-right:3px}
   .site-foot .cpy a{color:var(--accent);cursor:pointer;text-decoration:none}
   .site-foot .cpy a:hover{text-decoration:underline}
   .site-foot .fdot{opacity:.45;margin:0 5px}
@@ -286,6 +292,13 @@ function App(){
   useEffect(()=>{j('/torque/config').then(c=>{
     setCfg(c);setTicker(c.tickers[0]);setStrategy(c.default_strategy);setTargetPct(c.close_target_pct);
   }).catch(e=>setErr('config: '+e.message))},[]);
+
+  // Per-ticker auto-close target. Wide-spread names (DJX) have a hard server-side
+  // floor — a target under it prices the close order inside the package bid/ask and
+  // can never fill, so /torque/place clamps UP. Mirror that here: prefill the
+  // ticker's default on switch and don't let the input go below its floor.
+  const ctgt=(cfg&&cfg.close_targets&&ticker&&cfg.close_targets[ticker])||null;
+  useEffect(()=>{if(ctgt)setTargetPct(ctgt.default);},[ticker]);   // eslint-disable-line
 
   const sdef=cfg&&strategy?cfg.strategies.find(s=>s.key===strategy):null;
   // Options-data polling pauses outside market hours in PRODUCTION only; sandbox/dev
@@ -418,7 +431,9 @@ function App(){
     const legs=build.legs.map(l=>({symbol:l.symbol,action:l.action,quantity:l.quantity,side:l.side,strike:l.strike,role:l.role}));
     const body={symbol:ticker,strategy,legs,order_type,
       limit_price:order_type==='limit'?Number(limit):null,duration,quantity:Number(qty),
-      auto_close:autoClose,close_target_pct:Number(targetPct),
+      // DJX-class tickers: auto-close is mandatory, so always request it.
+      auto_close:(price&&price.auto_close_required)?true:(autoClose&&!(price&&price.untradeable)),
+      close_target_pct:Number(targetPct),
       spread_type:build.type,confirm:!dry,dry_run:dry};
     j('/torque/place',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
       .then(r=>{setResult(r);if(!dry)refreshOrders();})   // pull the new order into the account-wide lists
@@ -432,6 +447,18 @@ function App(){
   const bp=build&&build.price;
   const p=price||((bp&&bp.complete)?bp:null);
   const fst=analysis?flowState(flow,analysis.lean):null;   // live flow vs the lean
+  // Live floor from /torque/price (spread-aware) — falls back to the ticker's
+  // static min until the first price tick lands. Mirrors the server's clamp.
+  const tgtMin=(p&&p.min_close_target_pct!=null)?p.min_close_target_pct:(ctgt?ctgt.min:1);
+  const mktAllowed=(p&&p.market_orders_allowed!=null)?p.market_orders_allowed
+                   :!(ctgt&&ctgt.spread_scaled);
+  const untradeable=!!(p&&p.untradeable);
+  // Auto-close is MANDATORY on some tickers (DJX): the % is editable, the toggle
+  // is not. Falls back to the config flag until the first price tick lands.
+  const acRequired=(p&&p.auto_close_required!=null)?p.auto_close_required:!!(ctgt&&ctgt.required);
+  // A mandatory exit that cannot fill ⇒ no trade at all.
+  const blocked=untradeable&&acRequired;
+  const tens=(analysis&&sess&&fst)?tensionRead(sess,analysis.lean,analysis.components.premium_skew.signal,fst):null;
 
   return <div className="wrap">
     <header>
@@ -455,9 +482,10 @@ function App(){
       </label>
       <div style={{flex:1}}>
         <div className="strat-head">
-          <label className="fld" style={{margin:0}}>Strategy
+          <label className="fld" style={{margin:0,flexShrink:0}}>Strategy
             {analysis&&<span className="posnote" title={POSNOTE_HELP}> · positioning now: {LEAN_LAB[analysis.label]||analysis.label} <span className="muted">— where the market sits, not a recommended play</span></span>}
           </label>
+          {analysis&&<div className="heur-note"><span className="hwarn">⚠</span>{analysis.disclaimer}</div>}
           <ShareRow/>
         </div>
         <div className="strat-grid">
@@ -532,27 +560,64 @@ function App(){
             <select value={duration} onChange={e=>setDuration(e.target.value)}>
               <option value="day">DAY</option><option value="gtc">GTC</option></select>
           </label>
-          <div className={"toggle"+(autoClose?' on':'')} onClick={()=>setAutoClose(v=>!v)} style={{alignSelf:'center',marginBottom:4}}>
+          {/* acRequired (DJX): the toggle is locked ON — the target % stays editable
+              (floored), but the exit can never be disarmed. The server rejects
+              auto_close=false for these tickers, so the UI must not offer it. */}
+          <div className={"toggle"+((autoClose||acRequired)?' on':'')}
+            onClick={()=>{if(!acRequired)setAutoClose(v=>!v);}}
+            title={acRequired?ticker+': auto-close is required — its spread is too wide to hold a position without a resting exit':undefined}
+            style={{alignSelf:'center',marginBottom:4,cursor:acRequired?'not-allowed':'pointer'}}>
             <span className="sw"></span> auto-close +
-            <input type="number" min="1" max="500" value={targetPct} onClick={e=>e.stopPropagation()}
-              onChange={e=>setTargetPct(e.target.value)} style={{width:54,padding:'4px 6px',fontSize:12}}/>%
+            <input type="number" min={tgtMin} max="500" value={targetPct}
+              onClick={e=>e.stopPropagation()}
+              onChange={e=>setTargetPct(e.target.value)}
+              onBlur={e=>{const v=Number(e.target.value);if(!(v>=tgtMin))setTargetPct(tgtMin);}}
+              style={{width:54,padding:'4px 6px',fontSize:12}}/>%
+            {tgtMin>1&&<span className="muted" style={{fontSize:11,marginLeft:6}}>min {fmt0(tgtMin)}%</span>}
+            {acRequired&&<span className="muted" style={{fontSize:11,marginLeft:6,fontWeight:700}}>required</span>}
           </div>
         </div>
 
         <div className="sendrow">
-          <button className="btn limit" disabled={!build||placing||!limit} onClick={()=>setConfirm({t:'limit'})}>
+          <button className="btn limit" disabled={!build||placing||!limit||blocked} onClick={()=>setConfirm({t:'limit'})}
+            title={blocked?ticker+': auto-close is required but the book is too wide for any target to fill — no trade':undefined}>
             SEND LIMIT ${limit||'—'}</button>
-          <button className="btn market" disabled={!build||placing} onClick={()=>setConfirm({t:'market'})}>
+          <button className="btn market" disabled={!build||placing||!mktAllowed||blocked} onClick={()=>setConfirm({t:'market'})}
+            title={mktAllowed?undefined:ticker+' has too wide a book for a market order — its ask can be ~2x the mid. Use a limit.'}>
             SEND MARKET</button>
           <button className="btn" disabled={!build||placing||!limit} title="Validate format against the broker — places nothing"
             onClick={()=>place('limit',true)}>DRY RUN</button>
           {placing&&<span className="spin" style={{alignSelf:'center'}}>working…</span>}
         </div>
 
+        {/* What crossing actually costs. Not a fee — you pay the ask and are
+            immediately marked at the mid, so it shows up as instant unrealized loss. */}
+        {p&&p.complete&&p.marketable_price!=null&&<div className="muted" style={{fontSize:11,marginTop:6,lineHeight:1.5}}>
+          cross now: <b>${fmt(p.marketable_price)}</b> ({p.type}) · fair mid <b>${fmt(p.abs_mid)}</b>
+          {p.cross_cost>0&&<> · <span style={{color:p.package_spread_pct>=25?'var(--bad)':'inherit'}}>
+            {p.type==='credit'?'under-collect':'overpay'} ${fmt(p.cross_cost)}
+            {p.package_spread_pct!=null?' · spread '+fmt0(p.package_spread_pct)+'% of mid':''}</span></>}
+          {/* Pre-calculated close economics: breakeven and the floored target, both
+              net of the round-trip commission (per contract, per leg, open+close). */}
+          {p.breakeven_at_mid!=null&&<><br/>
+            if filled at mid ${fmt(p.abs_mid)} → breakeven <b>${fmt(p.breakeven_at_mid)}</b>
+            {' '}· close target <b>${fmt(p.close_target_at_mid)}</b> (min {fmt0(p.min_close_target_pct)}%)
+          </>}
+          {p.breakeven_at_market!=null&&p.cross_cost>0&&<><br/>
+            <span style={{color:p.package_spread_pct>=25?'var(--bad)':'inherit'}}>
+            if you cross at ${fmt(p.marketable_price)} → breakeven <b>${fmt(p.breakeven_at_market)}</b>
+            {' '}· close target <b>${fmt(p.close_target_at_market)}</b></span></>}
+          {p.round_trip_fee>0&&<><br/><span style={{opacity:.75}}>
+            round-trip commission ${fmt(p.fee_per_contract)}/contract/leg = ${fmt(p.round_trip_fee,4)} of
+            premium (already folded into the targets above)</span></>}
+          {p.untradeable&&<><br/><span style={{color:'var(--bad)',fontWeight:700}}>
+            book too wide — no profit target can fill{blocked?'; auto-close is required, so this trade is blocked':'; auto-close is blocked'}</span></>}
+        </div>}
+
         {confirm&&<div className="confirm">
           <div className="summary">
             <b>{confirm.t==='market'?'MARKET':'LIMIT $'+limit}</b> · {sdef.name} · {ticker} · {qty} contract{qty>1?'s':''} · {duration.toUpperCase()}
-            {autoClose&&<><br/><span className="muted">↳ auto-close at +{targetPct}% once the entry confirms FILLED
+            {(autoClose||acRequired)&&<><br/><span className="muted">↳ auto-close at +{targetPct}% once the entry confirms FILLED
               {sdef.legs===1&&confirm.t==='limit'?' (native OTO bracket)':' (place→confirm→close)'}</span></>}
             <br/><span className="muted">{build.legs.map(l=>(l.action.startsWith('buy')?'+':'-')+(l.quantity>1?l.quantity:'')+l.side[0].toUpperCase()+fmt(l.strike,0)).join('  ')}</span>
           </div>
@@ -612,14 +677,14 @@ function App(){
                 <span className="szero"></span>
                 <i style={{left:(sess.net>=0?50:50-sess.half)+'%',width:sess.half+'%'}}></i>
               </div>
-              <div className="muted" style={{fontSize:11,marginTop:5}}>{sess.agree}/{sess.total} windows {sess.sideWord} · {Math.round(sess.dir*100)}% {sess.net>=0?'call':'put'} dominance{sess.heldMs>0?' · held '+fmtHeld(sess.heldMs):''}</div>
+              <div className="muted" style={{fontSize:11,marginTop:5}}>{sess.agree}/{sess.total} windows {sess.sideWord} · <b style={{color:sess.net>=0?'var(--call)':'var(--put)',fontWeight:800,fontSize:12.5}}>{Math.round(sess.dir*100)}%</b> {sess.net>=0?'call':'put'} dominance{sess.heldMs>0?' · held '+fmtHeld(sess.heldMs):''}</div>
             </>:<div className="muted" style={{fontSize:12,padding:'2px 0'}}>building session window… (fills over a few minutes)</div>}
           </div>
           <div className="metrics">
             <Metric l="Premium skew" v={null} sig={analysis.components.premium_skew.signal} txt={sigTxt(analysis.components.premium_skew.signal)}/>
             <Metric l="Magnet" v={null} txt={fmt0(analysis.components.magnet.strike)} sub={analysis.components.magnet.dist_pct+'%'} sig={analysis.components.magnet.signal}/>
           </div>
-          <div className="disc">{analysis.disclaimer}</div>
+          {tens&&<div className={"tension "+tens.side} title={tens.title}>{tens.label}</div>}
         </>}
       </div>
     </div>
@@ -821,6 +886,25 @@ function flowState(flow,lean){
   if(ls===0)return {...flow,arrow,word:(ns>0?'call':'put')+' flow',cls:ns>0?'call':'put'};
   if(ns===ls)return {...flow,arrow,word:'confirms',cls:'conf'};
   return {...flow,arrow,word:'diverging',cls:'div'};
+}
+// Cross-tab "stretched" read. Fires only in the specific tension config: the 60m
+// session flow is TRENDING one way, but the resting book (Lean committed + skew
+// rich) AND the freshest 3m flow all point the OTHER way. Prior: that tension
+// tends to resolve by the hour-flow reverting TOWARD positioning (the session-bar
+// side is the one likely to give) — the book rarely collapses to meet the flow, and
+// the 60m residue also decays as its oldest prints age out. Descriptive state, not a
+// forecast. Skew flipping to the session-bar side is the invalidation (regime change).
+function tensionRead(sess,lean,skew,fst){
+  if(!sess||!fst)return null;
+  const sSide=sess.net>0?1:sess.net<0?-1:0;                 // session-bar (hour flow) side
+  if(sSide===0||sess.consistency<0.60||sess.dir<0.15)return null;  // must be a real, persistent regime
+  const bookSide=lean>=25?1:lean<=-25?-1:0;                 // Lean committed?
+  if(bookSide===0||bookSide===sSide)return null;            // book must be committed OPPOSITE the hour flow
+  if((skew>0.05?1:skew<-0.05?-1:0)!==bookSide)return null;  // skew must reinforce the book
+  if((fst.net>0?1:fst.net<0?-1:0)!==bookSide)return null;   // and fresh 3m money already turning to the book
+  const w=bookSide>0?'call':'put', s=sSide>0?'call':'put';
+  return {side:w,label:'⚡ STRETCHED · '+w+' favored',
+    title:'Cross-tab tension. The trailing-60m session flow is trending '+s+', but the resting book (Lean '+(lean>0?'+':'')+Math.round(lean)+' '+w+'-leaning, skew '+w+'s-rich) AND the freshest 3m flow have all turned '+w+'. Prior: this tends to resolve by the hour-flow reverting TOWARD positioning — the '+s+' session bar is the side likely to give, not the book — and the 60m residue also decays as it ages out of the window, so there is room to recover toward '+w+'. Invalidation (a real regime change): skew capitulates to '+s+'s-rich, or 3m flow swings back to '+s+'. A prior, not a promise — pressure, not a forecast.'};
 }
 // snapshot → playable structure (simple map, not a conviction engine). Balanced
 // splits on the magnet: tight near-spot OI pin → iron fly, otherwise iron condor.

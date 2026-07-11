@@ -65,17 +65,32 @@ async def _resolve_torque_broker(request: Request, user: dict,
 
     Mirrors the market /orders path: an entitled signed-in user trades their own
     active broker connection; the admin/dev (server-owner) path uses the house
-    client + configured house account. Torque is Tradier-only, so a user whose
-    active connection is Webull gets a clear 400.
+    client + configured house account.
 
-    Returns (client, account_id, per_user). When per_user is True the caller owns
-    the client and MUST close it (or hand it to the background watcher).
+    Tradier and Webull are both accepted. Webull is capability-limited (no OTO
+    bracket, no order-status/cancel/modify surface on WebullClient), so the
+    individual routes gate on `broker` — see _require_tradier().
+
+    Returns (broker, client, account_id, per_user). When per_user is True the
+    caller owns the client and MUST close it (or hand it to the watcher).
     """
     broker, client, account_override, per_user = await resolve_broker(request, user)
-    if broker != "tradier":
+    if broker not in ("tradier", "webull"):
         if per_user:
             await client.close()
-        raise HTTPException(400, "Torque currently supports Tradier broker connections only.")
+        raise HTTPException(400, f"Torque does not support the {broker!r} broker.")
+    if broker == "webull":
+        account_id = (account_override or "").strip() or (req_account or "").strip()
+        if not account_id:
+            try:
+                account_id = await client.first_account_id()
+            except Exception as e:
+                await client.close()
+                raise HTTPException(502, f"could not resolve your Webull account: {e}")
+        if not account_id:
+            await client.close()
+            raise HTTPException(400, "could not determine a Webull account from your connection.")
+        return broker, client, account_id, per_user
     if per_user:
         account_id = (account_override or "").strip() or (req_account or "").strip()
         if not account_id:
@@ -90,7 +105,40 @@ async def _resolve_torque_broker(request: Request, user: dict,
                                      "set the account id on your broker connection in Settings.")
     else:
         account_id = _account_id(req_account)
-    return client, account_id, per_user
+    return broker, client, account_id, per_user
+
+
+async def _require_tradier(broker: str, client, per_user: bool, what: str):
+    """Torque features that have no Webull equivalent yet. WebullClient exposes
+    only list_accounts / first_account_id / preview_option / place_option — no
+    order status, cancel, or modify — so these routes cannot be served for a
+    Webull connection. Fail with a clear 501 instead of an AttributeError."""
+    if broker != "tradier":
+        if per_user:
+            await client.close()
+        raise HTTPException(501, f"{what} is not available for {broker} connections yet.")
+
+
+def _fee_kw(symbol: str, legs) -> dict:
+    """Fee params for close_target_price: commission is per contract PER LEG,
+    charged on the open and again on the close. Sourced from torque_config,
+    calibrated against Tradier's own order-preview `commission` field."""
+    n = len(legs) if isinstance(legs, (list, tuple)) else int(legs or 1)
+    return {"legs": n, "fee_per_contract": tcfg.fee_per_contract(symbol)}
+
+
+_OCC_RE = re.compile(r"^[A-Z]+(\d{6})[CP]\d{8}$")
+
+
+def _expiration_from_occ(sym: str) -> str | None:
+    """`DJXW260710C00526000` → `2026-07-10`. Webull legs are structured
+    (strike + expiry + type) rather than OCC strings, so the expiration has to
+    be recovered from the symbol Torque already resolved off the chain."""
+    m = _OCC_RE.match((sym or "").upper())
+    if not m:
+        return None
+    yy, mm, dd = m.group(1)[0:2], m.group(1)[2:4], m.group(1)[4:6]
+    return f"20{yy}-{mm}-{dd}"
 
 
 def _page_authorized(request: Request) -> bool:
@@ -125,6 +173,16 @@ _CLOSE_RETRY_DELAY = 2.0
 # entry_order_id -> watcher state dict (also holds the asyncio task ref so it's
 # not garbage-collected mid-flight).
 _WATCHERS: dict[str, dict] = {}
+
+# Stop-loss poll cadence (slower than the fill poll — this runs for hours).
+_STOP_INTERVAL = 10.0
+
+# close_order_id -> {symbol, entry_type, entry_fill, tick, floor_pct}
+# Populated when a profit-target close is placed, so /torque/modify can re-apply
+# the ticker's auto-close floor if the user edits that order in the orders panel.
+# Without this, editing the close price bypasses every guardrail /torque/place
+# enforced (the modify payload carries only a price — no symbol, no strategy).
+_CLOSE_GUARD: dict[str, dict] = {}
 
 # tiny TTL cache so analyze + build hitting within one tick share a chain fetch
 _CHAIN_CACHE: dict[str, tuple[float, float, str, list[dict]]] = {}
@@ -216,10 +274,21 @@ async def _get_chain(client, symbol: str) -> tuple[float, str, list[dict]]:
         q = await client.stock_quote(sym)
         spot = teng._f(q.get("last") or q.get("close") or q.get("prevclose"))
         exps = await client.option_expirations(sym)
-        exp = teng.choose_expiration(exps)
-        if not exp:
+        cands = teng.expiration_candidates(exps)
+        if not cands:
             raise HTTPException(404, f"no listed option expirations for {sym}")
-        raw = await client.options_chain(sym, exp)
+        # Walk forward until an expiration yields a tradeable chain. For tickers
+        # with a root allowlist (DJX→DJXW) the monthly 3rd-Friday dates list only
+        # the excluded AM-settled root and normalize to []; skip them.
+        exp, contracts = None, []
+        for cand in cands:
+            raw = await client.options_chain(sym, cand)
+            rows = teng.normalize_chain(raw, sym)
+            if rows:
+                exp, contracts = cand, rows
+                break
+        if not contracts:
+            raise HTTPException(404, f"no tradeable option chain for {sym} in {cands}")
     except HTTPException as e:
         _CHAIN_FAIL[sym] = (now, e.status_code, e.detail if isinstance(e.detail, str) else str(e.detail))
         raise
@@ -227,7 +296,6 @@ async def _get_chain(client, symbol: str) -> tuple[float, str, list[dict]]:
         msg = f"Tradier chain fetch failed for {sym}: {e}"
         _CHAIN_FAIL[sym] = (now, 502, msg)
         raise HTTPException(502, msg)
-    contracts = teng.normalize_chain(raw)
     # Spot source order: Yahoo live quote → Tradier put-call parity → raw broker
     # quote → median strike. Yahoo is the primary live print; parity covers a
     # Yahoo outage and is computed from the real-time option bid/ask we already
@@ -290,6 +358,11 @@ async def torque_cfg():
         "default_strategy": tcfg.default_strategy(),
         "strategies": tcfg.strategy_list(),
         "close_target_pct": tcfg.DEFAULT_CLOSE_TARGET_PCT,
+        # Per-ticker {default,min} auto-close profit targets. `min` is a hard
+        # floor the server clamps up to (wide-spread names like DJX cannot be
+        # closed at the global 30% default) — the UI should prefill `default`
+        # and refuse to submit below `min`.
+        "close_targets": tcfg.close_targets_map(),
         "env": settings.tradier_env,
         "mode": settings.tradier_mode,
         "devmode": bool(getattr(settings, "devmode", False)),
@@ -365,6 +438,7 @@ async def torque_build(req: BuildRequest, request: Request):
 class PriceRequest(BaseModel):
     legs: list[dict]            # [{symbol, action, quantity, side, strike, role}]
     symbol: str | None = None   # underlying (optional; recovered from legs if absent)
+    strategy: str | None = None # optional; only used to resolve `tick`
 
 
 @router.post("/torque/price", dependencies=_GATE)
@@ -382,7 +456,60 @@ async def torque_price(req: PriceRequest, request: Request):
         raise HTTPException(400, "cannot determine underlying for pricing")
     _, _, contracts = await _get_chain(client, sym)
     px = {c["symbol"]: c for c in contracts if c.get("symbol")}
-    return teng.price_structure(req.legs, px)
+    out = teng.price_structure(req.legs, px)
+
+    # Cost-of-crossing, surfaced so the Send button can label what you ACTUALLY
+    # pay vs fair value. `cross_cost` is not a fee — it's the amount you overpay
+    # (debit) or under-collect (credit) by taking the marketable price instead of
+    # the mid. It shows up as an instant unrealized loss, never as a line item.
+    sp = teng.package_spread_pct(out)
+    out["package_spread_pct"] = round(sp, 2) if sp is not None else None
+    out["market_orders_allowed"] = tcfg.market_orders_allowed(sym)
+    out["auto_close_required"] = tcfg.close_target_required(sym)
+    out["untradeable"] = bool(sp is not None and sp > tcfg.MAX_AUTO_CLOSE_SPREAD_PCT)
+    if out.get("complete"):
+        if out["type"] == "credit":
+            out["marketable_price"] = out["abs_bid"]          # you receive the bid
+            out["cross_cost"] = round(abs(out["abs_mid"] - out["abs_bid"]), 4)
+        else:
+            out["marketable_price"] = out["abs_ask"]          # you pay the ask
+            out["cross_cost"] = round(abs(out["abs_ask"] - out["abs_mid"]), 4)
+    else:
+        out["marketable_price"] = out["cross_cost"] = None
+
+    # LIVE auto-close floor — the same number /torque/place will clamp to, so the
+    # UI's min never disagrees with the server's.
+    floor = tcfg.close_target_min(sym)
+    if tcfg.close_target_spread_scaled(sym) and sp is not None:
+        floor = max(floor, sp)
+    out["min_close_target_pct"] = round(min(floor, 500.0), 2)
+
+    # PRE-CALCULATED close economics. The entry fill isn't known yet, so both
+    # scenarios are shown: filling passively at the mid, and crossing to the
+    # marketable price. Both fold in the round-trip commission (per contract PER
+    # LEG, open + close), so `breakeven_*` is the price at which the trade nets
+    # exactly zero and `close_target_*` is the price that nets the floor %.
+    # `tick` is a per-ticker property of the merged rule, identical across
+    # strategies, so any strategy resolves it. Fall back if the name is unknown.
+    try:
+        tick = float(tcfg.ticker_rule(sym, req.strategy or "long_call")["tick"])
+    except KeyError:
+        tick = float(tcfg.ticker_rule(sym, "long_call")["tick"])
+    fee = tcfg.fee_per_contract(sym)
+    nlegs = len(req.legs)
+    out["fee_per_contract"] = fee
+    out["round_trip_fee"] = round(teng.round_trip_fee_price(fee, nlegs), 4)
+    out["tick"] = tick
+    if out.get("complete") and out.get("abs_mid"):
+        kw = {"legs": nlegs, "fee_per_contract": fee}
+        t = out["type"]
+        for label, entry in (("at_mid", out["abs_mid"]), ("at_market", out["marketable_price"])):
+            if entry is None:
+                continue
+            out[f"breakeven_{label}"] = teng.breakeven_close_price(entry, t, tick, **kw)
+            out[f"close_target_{label}"] = teng.close_target_price(
+                entry, t, out["min_close_target_pct"], tick, **kw)
+    return out
 
 
 def _underlying_from_legs(legs: list[dict]) -> str | None:
@@ -411,6 +538,8 @@ class PlaceRequest(BaseModel):
     quantity: int = Field(default=1, ge=1, le=50)
     auto_close: bool = False
     close_target_pct: float = Field(default=tcfg.DEFAULT_CLOSE_TARGET_PCT, ge=1, le=500)
+    # None → use the ticker's configured default (DJX: 50%). 0/false → disable.
+    stop_loss_pct: float | None = Field(default=None, ge=1, le=99)
     spread_type: str | None = None        # "debit"|"credit" (net direction of the entry)
     confirm: bool = False
     dry_run: bool = False                 # preview-only: validate entry+close, place nothing
@@ -481,6 +610,67 @@ async def _submit(client, account_id, payload) -> dict:
     return resp.get("order") or resp
 
 
+async def _place_webull(req: PlaceRequest, client, account_id: str, legs: list[dict]) -> dict:
+    """Entry-only placement through a per-user Webull connection.
+
+    Torque's auto-close is app-managed: place → poll until FILLED → place the
+    close. WebullClient has no order-status surface (no get_order), so we cannot
+    confirm the entry filled. Placing the entry anyway and *hoping* would either
+    (a) never place the close, or (b) place a naked close against an unfilled
+    entry. Both are worse than refusing, so auto_close is rejected up front —
+    the user can still place the entry and close manually.
+
+    Webull has no OTO/OCO bracket in this SDK surface either, so the single-leg
+    fast path doesn't apply.
+    """
+    from ..webull_client import WebullError
+    from ..webull_order_builder import build_webull_option_order
+
+    if req.auto_close:
+        raise HTTPException(501, (
+            "auto-close is not available for Webull connections yet — it needs order-status "
+            "polling, which the Webull client does not expose. Place with auto_close=false "
+            "and close manually, or connect Tradier."))
+
+    expiration = next((e for e in (_expiration_from_occ(l.get("symbol")) for l in legs) if e), None)
+    if not expiration:
+        raise HTTPException(400, "could not recover the expiration from the leg symbols")
+
+    sdef = tcfg.STRATEGY_DEFS.get(req.strategy, {})
+    entry_type = (sdef.get("type") or req.spread_type or "debit").lower()
+    order_type = "market" if req.order_type.lower() == "market" else entry_type
+
+    try:
+        orders = build_webull_option_order(
+            strategy=req.strategy,
+            legs=teng.legs_to_order_legs(legs, req.quantity),
+            expiration=expiration,
+            underlying=req.symbol.upper(),
+            quantity=int(req.quantity),
+            order_type=order_type,
+            limit_price=req.limit_price,
+        )
+    except ValueError as e:
+        raise HTTPException(400, f"could not build Webull order: {e}")
+
+    try:
+        # Always preview first — the option_strategy enum mapping is best-effort,
+        # so Webull validates the payload before anything goes live.
+        preview = await client.preview_option(account_id, orders)
+        if req.dry_run:
+            return {"mode": "dry_run", "broker": "webull", "account_id": account_id,
+                    "entry_ok": True, "entry_preview": preview, "payload": orders,
+                    "expiration": expiration, "auto_close": False}
+        placed = await client.place_option(account_id, orders)
+    except WebullError as e:
+        raise HTTPException(502, str(e))
+
+    return {"mode": "entry_only", "broker": "webull", "account_id": account_id,
+            "entry": placed, "entry_preview": preview, "payload": orders,
+            "expiration": expiration, "rejected": False, "reason": "",
+            "auto_close": False, "close": None, "close_placed": False}
+
+
 @router.post("/torque/place", dependencies=_GATE)
 async def torque_place(req: PlaceRequest, request: Request,
                        user: dict = Depends(get_current_user)):
@@ -495,12 +685,88 @@ async def torque_place(req: PlaceRequest, request: Request,
         raise HTTPException(400, "order_type must be 'market' or 'limit'")
     if otype == "limit" and req.limit_price is None:
         raise HTTPException(400, "limit order needs limit_price")
+    if otype == "market" and not tcfg.market_orders_allowed(req.symbol):
+        raise HTTPException(400, (
+            f"market orders are disabled for {req.symbol.upper()} — its book is too wide "
+            f"(the ask can be ~2x the mid). Use a limit order so you see the fill price."))
+
+    # Auto-close target floor. A target below the package's OWN bid/ask width
+    # prices the close order inside the spread, so it can never fill and the
+    # position sits open to expiry. The floor is therefore the greater of the
+    # per-ticker static minimum and the LIVE package spread — static alone is not
+    # enough (DJX 0DTE decays to net_mid 0.02 with a 0.16 spread = 800%).
+    # Best-effort: a chain hiccup must not block an order, so fall back to static.
+    # Auto-close is MANDATORY on some tickers (DJX): the exit may be re-priced but
+    # never disarmed. Reject rather than silently coercing — auto_close=true places
+    # a second real order, and no caller should get one they didn't ask for.
+    if tcfg.close_target_required(req.symbol) and not req.auto_close:
+        raise HTTPException(400, (
+            f"auto-close is mandatory for {req.symbol.upper()} — its spread is too wide to "
+            f"leave a position without a resting exit. Raise close_target_pct if you want a "
+            f"wider target, but it cannot be disabled."))
+
+    close_floor = tcfg.close_target_min(req.symbol)
+    live_spread_pct = None
+    spread_warning = None
+    if tcfg.close_target_spread_scaled(req.symbol):
+        try:
+            _, _, _contracts = await _get_chain(_client(request), req.symbol)
+            _px = teng.price_structure(legs, {c["symbol"]: c for c in _contracts})
+            live_spread_pct = teng.package_spread_pct(_px)
+        except Exception:
+            live_spread_pct = None
+        if live_spread_pct is not None and live_spread_pct > tcfg.MAX_AUTO_CLOSE_SPREAD_PCT:
+            if req.auto_close:
+                # Can't arm an exit that provably cannot fill. Where auto-close is
+                # mandatory that also means the ENTRY is refused: no exit, no trade.
+                tail = ("Widen the spread or pick a further expiration."
+                        if tcfg.close_target_required(req.symbol)
+                        else "Widen the spread, pick a further expiration, or place without auto_close.")
+                raise HTTPException(400, (
+                    f"{req.symbol.upper()} {req.strategy}: package bid/ask is "
+                    f"{live_spread_pct:.0f}% of its mid — no profit target can fill. " + tail))
+            # Manual close: the trade is the caller's call — WARN loudly, allow.
+            spread_warning = (
+                f"package bid/ask is {live_spread_pct:.0f}% of its mid — you pay roughly "
+                f"half of that crossing in, and again crossing out. No auto-close is armed.")
+        if live_spread_pct is not None and req.auto_close:
+            close_floor = max(close_floor, live_spread_pct)
+    close_floor = min(close_floor, 500.0)          # PlaceRequest caps at 500
+    close_target_clamped = req.close_target_pct < close_floor
+    if close_target_clamped:
+        req.close_target_pct = round(close_floor, 2)
+
+    # Credit CEILING. A credit buy-to-close at entry*(1-pct) goes non-positive at
+    # pct≥~100 — the broker rejects a ≤0 limit and the auto-close silently unarms.
+    # Cap pct so the buy-back stays a fillable, positive price, using the entry
+    # credit (limit_price) as the fill proxy; the watcher re-derives from the real
+    # fill and close_target_price() floors at one tick as a final backstop.
+    _sdef = tcfg.STRATEGY_DEFS.get(req.strategy, {})
+    _entry_type = (_sdef.get("type") or req.spread_type or "debit").lower()
+    if req.auto_close and _entry_type == "credit" and req.limit_price:
+        _tick = float(tcfg.ticker_rule(req.symbol, req.strategy).get("tick", 0.05))
+        ceil = teng.max_credit_pct(abs(float(req.limit_price)), _tick, **_fee_kw(req.symbol, legs))
+        if req.close_target_pct > ceil:
+            req.close_target_pct = ceil
+            close_target_clamped = True
+
+    # Stop-loss: explicit value wins, else the ticker default (DJX 50%). The stop
+    # needs the background watcher, so a stop alone is enough to arm one.
+    stop_pct = req.stop_loss_pct if req.stop_loss_pct is not None else tcfg.stop_loss_default(req.symbol)
 
     # Resolve the broker AFTER input validation so a malformed request never
     # opens a per-user client. Entitled users trade their OWN connection; the
     # admin/dev path uses the house account.
-    client, account_id, per_user = await _resolve_torque_broker(request, user, req.account_id)
+    broker, client, account_id, per_user = await _resolve_torque_broker(request, user, req.account_id)
     handed_off = False    # set True once the background watcher owns the client
+
+    if broker == "webull":
+        try:
+            return await _place_webull(req, client, account_id, legs)
+        finally:
+            if per_user:
+                await client.close()
+
     try:
         tick = float(tcfg.ticker_rule(req.symbol, req.strategy).get("tick", 0.05))
         # Authoritative: a bull_call is a debit and a long fly is a debit
@@ -547,7 +813,8 @@ async def torque_place(req: PlaceRequest, request: Request,
             entry_prev = await _submit(client, account_id, _entry_payload(True))
             e_rej, e_why = _is_rejected(entry_prev)
             proxy_fill = float(req.limit_price) if req.limit_price else 1.0
-            close_px = teng.close_target_price(proxy_fill, entry_type, req.close_target_pct, tick)
+            close_px = teng.close_target_price(proxy_fill, entry_type, req.close_target_pct, tick,
+                                                **_fee_kw(req.symbol, legs))
             close_prev = await _submit(client, account_id, _close_payload(close_px, True))
             c_rej, c_why = _is_rejected(close_prev)
             # A close preview can't fully validate without the position open yet —
@@ -564,11 +831,19 @@ async def torque_place(req: PlaceRequest, request: Request,
                 "close_needs_position": unverifiable,
                 "close_reason": c_why, "close_preview": close_prev,
                 "close_target_price": close_px,
+                "close_target_pct": req.close_target_pct,
+                "close_target_clamped": close_target_clamped,
+                "package_spread_pct": live_spread_pct,
+                "spread_warning": spread_warning,
             }
 
         # ── single-leg + limit + auto_close → native OTO bracket ──────────────
-        if is_single and req.auto_close and otype == "limit":
-            close_px = teng.close_target_price(float(req.limit_price), entry_type, req.close_target_pct, tick)
+        # ...but NOT when a stop is armed: the broker-held OTO has no stop leg and
+        # returns before the watcher exists, so the stop would be silently dropped.
+        # Fall through to the app-managed path, which owns both target and stop.
+        if is_single and req.auto_close and otype == "limit" and not stop_pct:
+            close_px = teng.close_target_price(float(req.limit_price), entry_type, req.close_target_pct, tick,
+                                                **_fee_kw(req.symbol, legs))
             close_side = "sell_to_close" if legs[0]["action"].startswith("buy") else "buy_to_close"
             oto = {
                 "class": "oto", "duration": req.duration,
@@ -608,10 +883,15 @@ async def torque_place(req: PlaceRequest, request: Request,
             "mode": "confirm_then_close", "entry": entry, "order_id": order_id,
             "rejected": rej, "reason": why, "account_id": account_id,
             "auto_close": req.auto_close, "close": None, "close_placed": False,
+            "close_target_pct": req.close_target_pct,
+            "close_target_clamped": close_target_clamped,
+            "package_spread_pct": live_spread_pct,
+            "spread_warning": spread_warning,
+            "stop_loss_pct": stop_pct,
         }
         if rej or not order_id:
             return result
-        if not req.auto_close:
+        if not req.auto_close and not stop_pct:
             return result
 
         # ── auto-close: watch for the fill in the BACKGROUND, then place the close.
@@ -622,12 +902,17 @@ async def torque_place(req: PlaceRequest, request: Request,
         # orders panel (/torque/orders). For a per-user broker, the watcher takes
         # ownership of the client (it needs it to poll for hours) and closes it.
         est_fill = float(req.limit_price) if req.limit_price else 0.0
-        est_close = teng.close_target_price(est_fill, entry_type, req.close_target_pct, tick) if est_fill else None
+        # Only meaningful when a profit-target close will actually be placed. A
+        # stop-only watcher (auto_close=false) must not advertise a close target.
+        est_close = (teng.close_target_price(est_fill, entry_type, req.close_target_pct, tick,
+                                            **_fee_kw(req.symbol, legs))
+                     if (est_fill and req.auto_close) else None)
         w = {
             "entry_order_id": str(order_id), "symbol": req.symbol.upper(),
             "strategy": req.strategy, "state": "watching_fill", "entry_status": "open",
             "close_order_id": None, "close_target_price": est_close,
             "close_reason": None, "done": False,
+            "stop_loss_pct": stop_pct, "stop_order_id": None, "stop_exit_price": None,
             # Caller identity. _WATCHERS is a process-global store shared across
             # every user hitting this backend, so tag each watcher with the uid
             # that placed it; /torque/orders returns only the caller's own (never
@@ -639,7 +924,8 @@ async def torque_place(req: PlaceRequest, request: Request,
             client, account_id, str(order_id), w,
             is_single=is_single, legs=legs, symbol=req.symbol, strategy=req.strategy,
             entry_type=entry_type, pct=req.close_target_pct, tick=tick,
-            quantity=req.quantity, close_client=per_user))
+            quantity=req.quantity, close_client=per_user,
+            floor_pct=close_floor, stop_pct=stop_pct, auto_close=req.auto_close))
         handed_off = True
         result["mode"] = "watching_fill"
         result["watch_id"] = str(order_id)
@@ -653,25 +939,100 @@ async def torque_place(req: PlaceRequest, request: Request,
 
 
 def _build_close_payload(*, account_id, symbol, strategy, legs, is_single,
-                         entry_type, close_px, quantity):
-    """Closing order payload (single option or multileg), GTC limit."""
+                         entry_type, close_px, quantity, duration="gtc",
+                         tag_prefix="torqueClose"):
+    """Closing order payload (single option or multileg), limit.
+
+    `tag_prefix` distinguishes the passive profit-target close (torqueClose…)
+    from a stop exit (torqueStop…) so the orders panel and the modify guard can
+    tell them apart. A stop uses duration=day and a marketable price."""
+    tag = f"{tag_prefix}{strategy}"
     if is_single:
         cs = "sell_to_close" if legs[0]["action"].startswith("buy") else "buy_to_close"
         return _single_option_payload(
             symbol=symbol, leg={"symbol": legs[0]["symbol"], "action": cs,
                                 "quantity": int(legs[0]["quantity"]) * quantity},
-            otype="limit", price=close_px, duration="gtc", preview=False,
-            tag=f"torqueClose{strategy}", side_override=cs)
+            otype="limit", price=close_px, duration=duration, preview=False,
+            tag=tag, side_override=cs)
     c_legs = teng.legs_to_order_legs(teng.build_close_legs(legs), quantity)
     return build_tradier_order_payload(
         account_id=account_id, symbol=symbol, legs=c_legs,
         order_type=_multileg_close_type(entry_type), limit_price=close_px,
-        duration="gtc", preview=False, tag=f"torqueClose{strategy}")
+        duration=duration, preview=False, tag=tag)
+
+
+async def _package_price(client, symbol: str, legs: list[dict]) -> dict | None:
+    """Live net bid/mid/ask for the open position's legs, or None."""
+    try:
+        _, _, contracts = await _get_chain(client, symbol)
+    except Exception:
+        return None
+    px = teng.price_structure(legs, {c["symbol"]: c for c in contracts})
+    return px if px.get("complete") else None
+
+
+async def _monitor_stop(client, account_id, w, *, legs, symbol, strategy, is_single,
+                        entry_type, entry_fill, stop_pct, tick, quantity, close_order_id):
+    """Poll the package's fair value; cross out if it loses `stop_pct`% of entry.
+
+    Two deliberate refusals, both DJX-driven:
+      * the trigger reads the MID, not the bid — a wide package is underwater by
+        half its spread the moment it fills, and a bid-based stop fires instantly;
+      * if the book is wider than STOP_MAX_EXIT_SPREAD_PCT when the stop trips, we
+        do NOT dump into it (crossing a 180%-of-mid market costs more than the
+        stop saves). The watcher parks in `stop_blocked_wide_market` and re-checks.
+    """
+    deadline = time.time() + _WATCH_TIMEOUT
+    while time.time() < deadline:
+        await asyncio.sleep(_STOP_INTERVAL)
+        if close_order_id:                       # target already hit → nothing to protect
+            try:
+                o = await client.get_order(account_id, close_order_id)
+                if str(o.get("status") or "").lower() == "filled":
+                    w["state"] = "closed_at_target"
+                    return
+            except Exception:
+                pass
+        px = await _package_price(client, symbol, legs)
+        if not px:
+            continue
+        mark = px.get("abs_mid")
+        w["mark"] = mark
+        if not teng.stop_breached(mark, entry_fill, entry_type, stop_pct):
+            continue
+        sp = teng.package_spread_pct(px)
+        if sp is not None and sp > tcfg.STOP_MAX_EXIT_SPREAD_PCT:
+            w["state"] = "stop_blocked_wide_market"
+            w["stop_note"] = (f"stop hit (mark {mark}) but the package bid/ask is {sp:.0f}% of mid — "
+                              f"crossing would cost more than the stop saves; holding and re-checking")
+            continue
+        exit_px = teng.stop_exit_price(px, entry_type, tick)
+        if exit_px is None:
+            continue
+        if close_order_id:                       # cancel the resting target, else double-close
+            try:
+                await client.cancel_order(account_id, close_order_id)
+                _CLOSE_GUARD.pop(str(close_order_id), None)
+            except Exception as e:
+                log.warning("stop: could not cancel target close %s: %s", close_order_id, e)
+        payload = _build_close_payload(
+            account_id=account_id, symbol=symbol, strategy=strategy, legs=legs,
+            is_single=is_single, entry_type=entry_type, close_px=exit_px,
+            quantity=quantity, duration="day", tag_prefix="torqueStop")
+        res = await _submit(client, account_id, payload)
+        rej, why = _is_rejected(res)
+        w["stop_exit_price"] = exit_px
+        w["stop_order_id"] = str(res.get("id") or "")
+        w["state"] = "stop_rejected" if rej else "stop_placed"
+        if rej:
+            w["stop_note"] = why
+        return
 
 
 async def _watch_and_close(client, account_id, entry_id, w, *, is_single, legs,
                            symbol, strategy, entry_type, pct, tick, quantity,
-                           close_client=False):
+                           close_client=False, floor_pct=1.0, stop_pct=None,
+                           auto_close=True):
     """Background: poll the entry until it fills, then place the close (with
     retries if the freshly-filled position isn't settled yet). Updates `w`.
 
@@ -686,26 +1047,51 @@ async def _watch_and_close(client, account_id, entry_id, w, *, is_single, legs,
             w["state"] = "entry_not_filled"
             return
         entry_fill = teng._f(filled.get("avg_fill_price")) or 0.0
-        close_px = teng.close_target_price(float(entry_fill), entry_type, pct, tick)
-        w["close_target_price"] = close_px
-        payload = _build_close_payload(
-            account_id=account_id, symbol=symbol, strategy=strategy, legs=legs,
-            is_single=is_single, entry_type=entry_type, close_px=close_px,
-            quantity=quantity)
-        for attempt in range(_CLOSE_RETRIES):
-            close = await _submit(client, account_id, payload)
-            crej, cwhy = _is_rejected(close)
-            if not crej:
-                w["state"] = "close_placed"
-                w["close_order_id"] = str(close.get("id") or "")
+        w["entry_fill"] = entry_fill
+        close_order_id = None
+
+        if auto_close:
+            close_px = teng.close_target_price(float(entry_fill), entry_type, pct, tick,
+                                               **_fee_kw(symbol, legs))
+            w["close_target_price"] = close_px
+            payload = _build_close_payload(
+                account_id=account_id, symbol=symbol, strategy=strategy, legs=legs,
+                is_single=is_single, entry_type=entry_type, close_px=close_px,
+                quantity=quantity)
+            placed = False
+            for attempt in range(_CLOSE_RETRIES):
+                close = await _submit(client, account_id, payload)
+                crej, cwhy = _is_rejected(close)
+                if not crej:
+                    placed = True
+                    close_order_id = str(close.get("id") or "")
+                    w["close_order_id"] = close_order_id
+                    # Arm the modify guard: editing this order in the orders panel
+                    # must re-apply the same floor /torque/place enforced.
+                    if close_order_id:
+                        _CLOSE_GUARD[close_order_id] = {
+                            "symbol": symbol.upper(), "entry_type": entry_type,
+                            "entry_fill": float(entry_fill), "tick": tick,
+                            "floor_pct": float(floor_pct), **_fee_kw(symbol, legs),
+                        }
+                    break
+                w["close_reason"] = cwhy
+                # position may not be settled the instant the entry fills — retry
+                if "position" in (cwhy or "").lower() and attempt < _CLOSE_RETRIES - 1:
+                    await asyncio.sleep(_CLOSE_RETRY_DELAY)
+                    continue
+                break
+            w["state"] = "close_placed" if placed else "close_rejected"
+            if not placed and not stop_pct:
                 return
-            w["close_reason"] = cwhy
-            # position may not be settled the instant the entry fills — retry
-            if "position" in (cwhy or "").lower() and attempt < _CLOSE_RETRIES - 1:
-                await asyncio.sleep(_CLOSE_RETRY_DELAY)
-                continue
-            break
-        w["state"] = "close_rejected"
+
+        if stop_pct:
+            w["stop_loss_pct"] = float(stop_pct)
+            await _monitor_stop(
+                client, account_id, w, legs=legs, symbol=symbol, strategy=strategy,
+                is_single=is_single, entry_type=entry_type, entry_fill=entry_fill,
+                stop_pct=float(stop_pct), tick=tick, quantity=quantity,
+                close_order_id=close_order_id)
     except Exception as e:                       # never let the task die silently
         log.warning("auto-close watcher failed for %s: %s", entry_id, e)
         w["state"] = "error"
@@ -729,7 +1115,8 @@ async def torque_orders(request: Request, account_id: str | None = None,
     `orders` = live/working only, `watchers` = active auto-close watchers, and
     `history` = every Torque-tagged order today at any status (the account-wide
     Past Orders list, identical from any tab)."""
-    client, aid, per_user = await _resolve_torque_broker(request, user, account_id)
+    broker, client, aid, per_user = await _resolve_torque_broker(request, user, account_id)
+    await _require_tradier(broker, client, per_user, "the orders panel")
     try:
         try:
             raw = await client.get_orders(aid)
@@ -780,7 +1167,8 @@ async def torque_orders(request: Request, account_id: str | None = None,
 async def torque_cancel(order_id: str, request: Request, account_id: str | None = None,
                         user: dict = Depends(get_current_user)):
     """Cancel a working order (entry or close) from the orders panel."""
-    client, aid, per_user = await _resolve_torque_broker(request, user, account_id)
+    broker, client, aid, per_user = await _resolve_torque_broker(request, user, account_id)
+    await _require_tradier(broker, client, per_user, "cancelling an order")
     try:
         try:
             resp = await client.cancel_order(aid, order_id)
@@ -798,11 +1186,45 @@ class ModifyRequest(BaseModel):
     account_id: str | None = None
 
 
+def _enforce_close_floor_on_modify(order_id: str, new_price: float) -> None:
+    """Reject an edit that pushes a profit-target close below the ticker's floor.
+
+    debit  close = SELL to close → a LOWER price is a smaller profit → floor is a
+                   MINIMUM price.
+    credit close = BUY to close  → a HIGHER price keeps less of the credit → the
+                   floor is a MAXIMUM price.
+    Unknown orders (not placed by this process, or a native OTO close) pass
+    through — we have no entry fill to measure against.
+    """
+    g = _CLOSE_GUARD.get(order_id)
+    if not g or not tcfg.close_target_spread_scaled(g["symbol"]):
+        return
+    floor_px = teng.close_target_price(g["entry_fill"], g["entry_type"],
+                                       g["floor_pct"], g["tick"],
+                                       legs=g.get("legs", 1),
+                                       fee_per_contract=g.get("fee_per_contract", 0.0))
+    too_low = g["entry_type"] != "credit" and new_price < floor_px
+    too_high = g["entry_type"] == "credit" and new_price > floor_px
+    if too_low or too_high:
+        raise HTTPException(400, (
+            f"{g['symbol']}: close target must stay at or beyond {floor_px} "
+            f"(≥{g['floor_pct']:.0f}% of the {g['entry_type']} entry fill "
+            f"{g['entry_fill']}). A closer target prices the order inside the "
+            f"package bid/ask and can never fill."))
+
+
 @router.post("/torque/modify/{order_id}", dependencies=_GATE)
 async def torque_modify(order_id: str, req: ModifyRequest, request: Request,
                         user: dict = Depends(get_current_user)):
-    """Change a working order's limit price (and optionally duration)."""
-    client, aid, per_user = await _resolve_torque_broker(request, user, req.account_id)
+    """Change a working order's limit price (and optionally duration).
+
+    If this is a Torque profit-target close on a floor-enforced ticker (DJX), the
+    same floor /torque/place applied is re-applied here — otherwise the orders
+    panel would be a trivial bypass: place at the clamped 60% target, then edit
+    the close down to 5% and get an order that can never fill."""
+    broker, client, aid, per_user = await _resolve_torque_broker(request, user, req.account_id)
+    await _require_tradier(broker, client, per_user, "modifying an order")
+    _enforce_close_floor_on_modify(str(order_id), float(req.price))
     try:
         try:
             resp = await client.modify_order(aid, order_id, price=req.price, duration=req.duration)
@@ -817,7 +1239,8 @@ async def torque_modify(order_id: str, req: ModifyRequest, request: Request,
 @router.get("/torque/order/{order_id}", dependencies=_GATE)
 async def torque_order(order_id: str, request: Request, account_id: str | None = None,
                        user: dict = Depends(get_current_user)):
-    client, aid, per_user = await _resolve_torque_broker(request, user, account_id)
+    broker, client, aid, per_user = await _resolve_torque_broker(request, user, account_id)
+    await _require_tradier(broker, client, per_user, "order status")
     try:
         try:
             return await client.get_order(aid, order_id)

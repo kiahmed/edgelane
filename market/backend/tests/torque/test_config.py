@@ -82,3 +82,57 @@ def test_file_override_merges(tmp_path, monkeypatch):
     assert r["tick"] == 0.10        # overridden
     assert r["anchor"] == 5         # overridden
     assert r["width"] == 100        # untouched base/ticker value preserved
+
+
+# ── DJX (DJXW root) ────────────────────────────────────────────────────────
+def test_djx_is_a_tradeable_ticker_with_yahoo_spot():
+    assert "DJX" in tc.tickers()
+    # ^DJX already quotes at the 1/100 DJIA scale the strike grid uses.
+    assert tc.yahoo_symbol("DJX") == "^DJX"
+
+
+def test_djx_vertical_is_wide_enough_to_clear_its_own_spread():
+    r = tc.ticker_rule("DJX", "bull_call")
+    assert r["anchor"] == 1
+    # DJX market makers quote a ~$0.30 wide package on a ~$0.70 mid at width 5.
+    # Narrow widths are structurally unclosable; width>=10 keeps pkg spread ~16%.
+    assert r["width"] >= 10
+    # DJX quotes in pennies (2.68 / 1.41 are not 0.05 multiples).
+    assert r["tick"] == 0.01
+
+
+def test_djx_trades_only_the_djxw_root():
+    assert tc.allowed_roots("DJX") == ["DJXW"]
+    # every other ticker is unrestricted (generic dedup handles them)
+    assert tc.allowed_roots("SPX") == []
+    assert tc.allowed_roots("NDX") == []
+
+
+def test_djx_close_target_floor_exceeds_round_trip_spread_cost():
+    # Measured live: DJX package spread is 16-43% of mid depending on width.
+    # A 30% target would price the close order inside the spread.
+    assert tc.close_target_min("DJX") >= 45.0
+    assert tc.close_target_default("DJX") > tc.close_target_min("DJX")
+    assert tc.close_target_default("DJX") > tc.DEFAULT_CLOSE_TARGET_PCT
+
+
+def test_tight_tickers_keep_the_permissive_floor():
+    for t in ("SPX", "NDX", "SPY"):
+        assert tc.close_target_min(t) == 1.0
+        assert tc.close_target_default(t) == tc.DEFAULT_CLOSE_TARGET_PCT
+
+
+def test_close_targets_map_covers_every_ticker():
+    m = tc.close_targets_map()
+    assert set(m) == set(tc.tickers())
+    assert m["DJX"]["min"] >= 45.0
+
+
+def test_only_djx_opts_into_spread_scaled_floor():
+    assert tc.close_target_spread_scaled("DJX") is True
+    for t in ("SPX", "NDX", "RUT", "SPY", "QQQ"):
+        assert tc.close_target_spread_scaled(t) is False
+
+
+def test_untradeable_package_ceiling_is_configured():
+    assert tc.MAX_AUTO_CLOSE_SPREAD_PCT == 100.0

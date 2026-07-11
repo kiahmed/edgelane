@@ -252,7 +252,9 @@ def test_incomplete_never_emits_partial_net(spot, chain):
 def test_close_target_debit_and_credit():
     assert teng.close_target_price(25.95, "debit", 30, 0.05) == 33.75   # 1.30×, tick-rounded
     assert teng.close_target_price(10.0, "credit", 30, 0.05) == 7.0     # 0.70×
-    assert teng.close_target_price(2.123, "debit", 0, 0.05) == 2.10     # tick rounding
+    # Debit targets round UP: nearest-tick would give 2.10, BELOW the 2.123 paid,
+    # i.e. a "breakeven" order that actually books a loss.
+    assert teng.close_target_price(2.123, "debit", 0, 0.05) == 2.15
 
 
 def test_round_to_tick():
@@ -317,3 +319,71 @@ def test_choose_expiration_prefers_today(monkeypatch):
     assert e.choose_expiration(["2026-06-18", "2026-06-25"]) == "2026-06-18"
     assert e.choose_expiration(["2026-06-25", "2026-07-02"]) == "2026-06-25"  # nearest future
     assert e.choose_expiration([]) is None
+
+
+# ── DJX root allowlist (DJXW only) ─────────────────────────────────────────
+def _djx_row(root, strike, side="call", bid=1.0, ask=1.2, vol=5):
+    return {"symbol": f"{root}260710C00{int(strike)}000", "strike": strike,
+            "option_type": side, "bid": bid, "ask": ask, "volume": vol,
+            "open_interest": 10, "root_symbol": root}
+
+
+def test_djx_keeps_only_djxw_root():
+    raw = [_djx_row("DJX", 525), _djx_row("DJXW", 525),
+           _djx_row("DJX", 530), _djx_row("DJXW", 530)]
+    out = teng.normalize_chain(raw, "DJX")
+    assert out, "DJXW rows must survive"
+    assert {r["symbol"][:4] for r in out} == {"DJXW"}
+
+
+def test_djx_monthly_only_expiration_normalizes_to_empty():
+    # 3rd-Friday chains list ONLY the AM-settled DJX root -> caller skips the date
+    raw = [_djx_row("DJX", 525), _djx_row("DJX", 530)]
+    assert teng.normalize_chain(raw, "DJX") == []
+
+
+def test_djxw_wins_even_when_stale_djx_root_has_more_volume():
+    # volume tiebreak would otherwise pick the stale monthly root
+    raw = [_djx_row("DJX", 525, vol=9999), _djx_row("DJXW", 525, vol=0)]
+    out = teng.normalize_chain(raw, "DJX")
+    assert [r["symbol"][:4] for r in out] == ["DJXW"]
+
+
+def test_root_allowlist_is_opt_in_only():
+    # SPX has no allowlist -> both roots reach the generic dedup, one survives
+    raw = [_djx_row("SPX", 7500, vol=0), _djx_row("SPXW", 7500, vol=100)]
+    out = teng.normalize_chain(raw, "SPX")
+    assert len(out) == 1 and out[0]["symbol"].startswith("SPXW")
+    # and passing no ticker at all is unchanged (back-compat)
+    assert len(teng.normalize_chain(raw)) == 1
+
+
+def test_expiration_candidates_returns_ordered_future_dates():
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().isoformat()
+    exps = ["2020-01-01", today, "2099-01-01", "2098-01-01"]
+    c = teng.expiration_candidates(exps)
+    assert c[0] == today                      # 0DTE first
+    assert c == sorted(c)                     # ascending
+    assert "2020-01-01" not in c              # past dropped
+    assert teng.choose_expiration(exps) == today
+
+
+# ── package spread (the auto-close feasibility metric) ─────────────────────
+def test_package_spread_pct_measures_round_trip_cost():
+    px = {"complete": True, "abs_mid": 10.0, "net_bid": 9.5, "net_ask": 10.5}
+    assert teng.package_spread_pct(px) == 10.0            # $1.00 wide on $10 mid
+    tight = {"complete": True, "abs_mid": 8.85, "net_bid": 8.70, "net_ask": 9.00}
+    assert round(teng.package_spread_pct(tight), 1) == 3.4   # SPX-like
+
+
+def test_package_spread_pct_flags_decayed_djx_package():
+    # real DJX 0DTE snapshot: net_bid -0.06 / net_mid 0.02 / net_ask 0.10
+    px = {"complete": True, "abs_mid": 0.02, "net_bid": -0.06, "net_ask": 0.10}
+    assert teng.package_spread_pct(px) == 800.0
+
+
+def test_package_spread_pct_none_without_a_complete_price():
+    assert teng.package_spread_pct({"complete": False}) is None
+    assert teng.package_spread_pct({"complete": True, "abs_mid": 0.0,
+                                    "net_bid": 0.0, "net_ask": 0.1}) is None
