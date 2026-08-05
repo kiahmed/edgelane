@@ -321,7 +321,20 @@ function App(){
         if(b.price&&b.price.complete){setPrice(b.price);if(!userLimit)setLimit(String(b.suggested_limit));}})
       .catch(e=>{setErr('build: '+e.message);setBuild(null)});
   },[ticker,strategy,adj,userLimit]);
-  useEffect(()=>{if(mktOpen)doBuild()},[ticker,strategy,adj,mktOpen]);
+  // Background tabs get their setInterval throttled to ~1/min (or frozen) by
+  // Chromium, so a backgrounded ticker's spot — and the legs derived from it —
+  // appear stuck while the foreground tab stays live. Bump focusTick whenever the
+  // tab becomes visible/focused; it's a dep of every poll effect below, so each
+  // re-fires an immediate fetch on return instead of waiting out a throttled tick.
+  // Declared HERE — before the first effect that reads it (const isn't hoisted).
+  const [focusTick,setFocusTick]=useState(0);
+  useEffect(()=>{
+    const wake=()=>{if(!document.hidden)setFocusTick(t=>t+1)};
+    document.addEventListener('visibilitychange',wake);
+    window.addEventListener('focus',wake);
+    return()=>{document.removeEventListener('visibilitychange',wake);window.removeEventListener('focus',wake);};
+  },[]);
+  useEffect(()=>{if(mktOpen)doBuild()},[ticker,strategy,adj,mktOpen,focusTick]);
 
   // reset on ticker/strategy change
   useEffect(()=>{setAdj({});setUserLimit(false);setResult(null);setLockStrikes(false);anchorRef.current=null;},[ticker,strategy]);
@@ -364,7 +377,7 @@ function App(){
     if(!ticker||!mktOpen)return;let live=true;
     const run=()=>j('/torque/analyze/'+ticker).then(a=>{if(live){setAnalysis(a);trackFlow(a);}}).catch(()=>{});
     run();const t=setInterval(run,5000);return()=>{live=false;clearInterval(t)};
-  },[ticker,mktOpen]);
+  },[ticker,mktOpen,focusTick]);
 
   // auto-land the strategy grid on the structure the snapshot makes playable —
   // ONCE per ticker, then leave it alone so manual picks stick (never yanks
@@ -388,7 +401,7 @@ function App(){
     if(!ticker||!strategy||confirm||placing||!mktOpen)return;let live=true;
     const t=setInterval(()=>{if(live)doBuild()},3000);
     return()=>{live=false;clearInterval(t)};
-  },[ticker,strategy,confirm,placing,mktOpen,doBuild]);
+  },[ticker,strategy,confirm,placing,mktOpen,doBuild,focusTick]);
 
   const step=(role,n)=>setAdj(a=>({...a,[role]:(a[role]||0)+n}));
 
@@ -416,7 +429,7 @@ function App(){
     run();
     if(!mktOpen)return()=>{live=false};
     const t=setInterval(run,4000);return()=>{live=false;clearInterval(t)};
-  },[mktOpen]);
+  },[mktOpen,focusTick]);
   const refreshOrders=()=>j('/torque/orders').then(setOrders).catch(()=>{});
 
   const cancelOrder=(id)=>{setPlacing(true);
