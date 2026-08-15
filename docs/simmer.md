@@ -30,6 +30,7 @@ for the risk.
 - [Data sourcing](#data-sourcing)
 - [The watcher loop](#the-watcher-loop)
 - [Alerts](#alerts)
+- [User settings and overrides](#user-settings-and-overrides)
 - [Frontend](#frontend)
 - [Deployment](#deployment)
 - [Configuration](#configuration)
@@ -344,6 +345,11 @@ create table if not exists public.simmer_settings (
     min_dte            int not null default 7,
     notify_email       boolean not null default false,
     risk_profile       text not null default 'balanced',  -- conservative|balanced|aggressive
+    structures_enabled text[] not null default '{bull_put,bear_call,iron_condor}',
+    gate_overrides     jsonb not null default '{}'::jsonb, -- TOGGLEABLE tier only;
+                                                           -- validated server-side
+    regime_strictness  text not null default 'balanced',   -- relaxed|balanced|strict
+    max_concurrent     int  not null default 5,
     prefs              jsonb not null default '{}'::jsonb,
     updated_at         timestamptz not null default now()
 );
@@ -848,6 +854,89 @@ than vetoing it. Expressing spread **in IV points** rather than dollars is the
 one genuinely professional formulation found in the survey — it normalizes across
 price levels and DTE. Adopt both.
 
+### Squeeze risk — a call-side veto (v1.1)
+
+The product's core loop is: *a name gets hyped, IV goes rich, we sell it.* But
+hype is also when the tail is fattest, and a heavily-shorted name has a
+**mechanical amplifier on upside moves**.
+
+```
+if days_to_cover >= SQUEEZE_DTC_VETO:      # config, start ~7
+    block bear_call and the call side of an iron condor
+    bull_put remains eligible
+```
+
+Asymmetric on purpose: forced covering only pushes price **up**, so it threatens
+the call side alone. See
+[Short interest](#short-interest--free-and-the-one-squeeze-guard-deferred-to-v11)
+for sourcing and the daily-short-volume caveat.
+
+### Market regime — the put-side guard
+
+**The most dangerous property of this product: a crash is when IV is richest, and
+the engine hunts rich IV.** Left alone it would look at a post-bad-CPI tape and
+see "IV rank 95, premium fat, expected move wide, strikes comfortably far away"
+and sell a bull put spread into a falling knife. Post-shock IV is **compensation
+for genuinely elevated risk, not mispricing** — the same sign error as "IV
+crushed after earnings, so sell now."
+
+No sentiment input is needed to detect this. A macro shock leaves three *priced*
+fingerprints, computed **once per sweep at the index level**, not per ticker:
+
+| Fingerprint | Risk-off when | Why it works |
+|---|---|---|
+| **Term structure** | `VIX / VIX3M > 1.00` | Front end inverts because the market expects near-term realized vol to exceed longer-term — and it's usually right |
+| **Index put skew** | 25Δ put/call skew steepening vs its own trailing distribution | Mechanically compresses put-spread credit: the further-OTM leg you *buy* gets expensive faster than the one you sell |
+| **Gamma flip** | Index spot below the volatility trigger | Realized vol ~18% below vs ~13% above; 1-day return stdev 1.3% vs 0.9% |
+
+Acting asymmetrically — the mirror of the short-interest veto:
+
+```
+risk_off  → suppress bull_put and the put leg of iron condors
+            (selling into continued selling); bear_call stays eligible
+stressed  → hard cap on total concurrent open positions
+```
+
+> **Index products are excluded from *trading*, not from *data*.** The regime gate
+> requires SPY/QQQ/VIX chains every sweep. Do not remove that fetch when
+> implementing the index exclusion — they are separate concerns.
+
+**Two honest limits.** These describe *state*, not warning: spot below the gamma
+flip means you are already through it. That is fine for the question actually
+being asked ("should I open a position right now?") but it is not an early
+warning and must not be presented as one. And `VIX/VIX3M > 1.00` is a fairly high
+bar — a moderately bad print can drop the index 1.5% without inverting the curve,
+which hurts a bull put without tripping the gate. Treat the bands as **sizing**
+first and a veto only at the extreme, per the term-structure section.
+
+### Sector dislocation — the cross-sectional check
+
+The regime gate is index-level, and **we trade single names**. A sector shock —
+an export restriction hitting AI memory, say — can tank SNDK and MU while
+VIX/VIX3M barely moves and the index gamma flip is untouched. None of the three
+fingerprints sees it.
+
+That is the genuinely dangerous case, because on the name itself the shock looks
+like *opportunity*: IV spikes, so IV/RV widens, so the VRP gate opens further. No
+filing, so no catalyst veto. No index stress, so no regime veto. **Rich premium,
+no red flags.** Only the per-ticker news-velocity detector guards it, and that is
+a soft suppressor rather than a hard gate.
+
+The fix falls out of the union-of-watchlists architecture for almost nothing —
+every watched name is already computed in one pass:
+
+```
+if (names_with_IV_spike / names_watched) > DISPERSION_THRESHOLD
+   and index_regime == calm:
+       → sector dislocation; suppress the affected cluster
+```
+
+Cluster membership can start as a simple sector tag and improve later with the
+pairwise correlation matrix (computable from the OHLC already stored for
+Yang-Zhang). This is the same machinery as the concurrency flag: **many names
+going "ready" together is one bet, not many**, and many names spiking IV together
+without index stress is one shock, not many.
+
 ### Sentiment's constrained role
 
 Per the sourcing section: sentiment **selects the side and can veto — it never
@@ -1131,6 +1220,44 @@ after-the-fact pattern matching.
 If it is ever wanted anyway: use any stock-trades API exposing per-trade
 exchange ID, filter for `D`, bucket notional by price level. No "dark pool
 product" purchase is warranted.
+
+### Short interest — free, and the one squeeze guard (deferred to v1.1)
+
+The natural contrast with dark pool: same "positioning" theme, but this one is
+**free, licensed, and has a defensible mechanism.**
+
+| Source | Gives | Cadence | Cost |
+|---|---|---|---|
+| FINRA short interest | Shares short outstanding | Semi-monthly, ~2-week lag | **Free** |
+| FINRA daily short sale volume | Short vs total volume per ticker | Next-day | **Free** |
+
+```
+days_to_cover = short_interest / average_daily_volume
+```
+
+**Why the lag doesn't matter here.** This is not a directional forecast — it is a
+description of the **tail shape**. Short interest changes slowly, so a two-week
+lag that would ruin a momentum signal barely dents a structural one.
+
+**Why it matters to Simmer specifically.** A bear call spread is **short upside
+convexity**. Shorts who cover *must buy* — forced buying stacked on top of any
+rally — and days-to-cover measures how trapped they are. Two names at identical
+delta, IV and wall distance are **not** the same trade if one has days-to-cover
+of 10 and the other 0.5: the first has a mechanically fatter right tail, and that
+tail is exactly what breaks the position.
+
+So it enters as a **call-side veto**, never as a promoter — the same asymmetry as
+sentiment.
+
+> ⚠️ **Do not use daily short *volume* as a level.** It includes market-maker
+> hedging (a MM filling your buy sells short to you, then covers), so the
+> baseline routinely sits at 40–50% on liquid names. That is plumbing, not
+> bearish positioning — the same misreading trap as dark pool prints. Use short
+> **interest** and days-to-cover for the veto; if the daily series is used at
+> all, use it as a change-versus-its-own-baseline signal per ticker.
+
+**Priority: deferred to v1.1.** Nothing else depends on it, and it is cheap to
+add once the core engine is proven.
 
 ### Vendors evaluated and rejected
 
@@ -1694,6 +1821,95 @@ cold ──score ≥ user.min_score AND no veto──▶ ready ──score < min
 
 ---
 
+## User settings and overrides
+
+Not every gate should be adjustable. The governing distinction is **safety gates
+vs preference gates** — the first exist to prevent a loss the user won't see
+coming, the second encode legitimate taste.
+
+### Three tiers
+
+**🔒 Locked — never user-adjustable**
+
+| Gate | Why it cannot be optional |
+|---|---|
+| Catalyst lockout | Selling through an unpriced binary is the fastest way to lose more than the trade could earn |
+| Liquidity floor | An un-exitable spread is not a position |
+| Dollar-friction test | Below it the edge is arithmetically inside costs |
+| Chain sanity | Defensive; a crossed/locked market produces nonsense |
+| Macro-table validity | Must fail visible, not open |
+
+These are correctness, not preference. Making them optional would also **poison
+calibration**, because outcomes across users would no longer be comparable.
+
+**🎚 Tunable within bounds** — exposed as bounded ranges, never free text:
+
+`min_score` · `min_iv_percentile` · DTE window · **short-delta band (hard-clamped
+to 0.15–0.40)** · max concurrent alerts · regime-gate strictness (three levels,
+not a raw ratio) · alert hysteresis margin.
+
+> The clamp matters. A user who sets short delta to 0.05 has silently opted into
+> the measurably negative-EV region. Bounds are how the research reaches the user
+> without a lecture.
+
+**🔘 Freely toggleable**
+
+Structures traded (bull put / bear call / iron condor) · notification channels ·
+per-ticker overrides · and the **soft** signals: sentiment weighting, squeeze
+veto, sector-dispersion check.
+
+### Why this is nearly free
+
+Per-user thresholds apply at **read/alert time, not compute time**. The engine
+produces one readiness row per `(symbol, expiration)` regardless of who is
+watching; each user's filter runs on read. **Twenty users with twenty different
+configurations still cost one computation.** Settings do not multiply the sweep —
+they are a view over shared state.
+
+### The hard requirement: calibration is config-independent
+
+**`simmer_outcomes` records the *engine's* verdict, never the user's filtered
+view.** If outcomes were keyed to whatever thresholds happened to be set, the
+table becomes a mush of configurations and can never answer "does this component
+predict anything" — which is the entire point of the loop.
+
+Useful consequence: because every alert already stores the full component
+breakdown in `payload`, a user can be shown retroactively what they *would* have
+seen at a looser threshold, with no recomputation.
+
+### Schema
+
+Extends `public.simmer_settings` (migration `0010`):
+
+```sql
+structures_enabled  text[]  not null default '{bull_put,bear_call,iron_condor}',
+gate_overrides      jsonb   not null default '{}'::jsonb,  -- toggleable tier only
+regime_strictness   text    not null default 'balanced',   -- relaxed|balanced|strict
+max_concurrent      int     not null default 5,
+```
+
+Per-ticker overrides live on `simmer_watchlist` rather than here, so a user can
+disable the squeeze veto for one name without loosening it globally.
+
+**Server-side enforcement is authoritative.** `gate_overrides` is validated
+against the toggleable allow-list on write; a client asking to disable a locked
+gate is rejected, not silently ignored.
+
+### UI shape
+
+**Presets first** — Conservative / Balanced / Aggressive (`risk_profile`) — with
+an **Advanced** drawer for individual knobs. Most users should never open it.
+
+**Surface active overrides on the card, not buried in settings:**
+
+> ⚠️ *Squeeze veto off — this name has 11 days-to-cover.*
+
+A user who sees a suggestion they don't understand will lose trust in the engine
+rather than in their own configuration. Say which guard is down, where they are
+looking.
+
+---
+
 ## Frontend
 
 **Stack: SvelteKit (Svelte 5 runes) + TypeScript + Tailwind v4 +
@@ -2014,28 +2230,44 @@ Each phase is independently shippable and leaves the system working.
 8. `simmer_engine.py` — hard gates, Yang-Zhang RV, cross-sectional VRP
    percentile, expected move (1.2533 × straddle), payoff-integrated EV,
    `Alpha = EV/MaxLoss`, POP at breakeven, delta-solved width. Pure functions.
-9. `macro_calendar.json` + the `valid_through` startup assertion.
-10. SEC EDGAR `getcurrent` poller, CIK→ticker map, hard-block item list, keyed on
+9. **Market-regime state** — fetch SPY/QQQ/VIX chains each sweep (index data is
+   needed even though index *trading* is excluded); compute VIX/VIX3M term
+   structure, index put skew vs its trailing distribution, and gamma-flip
+   position; expose a single `risk_off` / `stressed` state that suppresses the
+   put side.
+10. `macro_calendar.json` + the `valid_through` startup assertion.
+11. SEC EDGAR `getcurrent` poller, CIK→ticker map, hard-block item list, keyed on
     `acceptanceDateTime`.
-11. Earnings calendar with two-source cross-check and week-blocking on disagreement.
-12. `tests/simmer/test_engine.py` + `test_gates.py` with checked-in
+12. Earnings calendar with two-source cross-check and week-blocking on disagreement.
+13. `tests/simmer/test_engine.py` + `test_gates.py` with checked-in
     input→expected fixtures. **Include a regression test asserting risk-neutral
     EV ≈ 0** — it catches whole classes of pricing error.
 
 ### Phase 2 — API and watcher
 
-13. `routes/simmer.py`, full surface behind the gate.
-14. `simmer_watcher.py` — 5-minute union-of-watchlists sweep.
-15. **Two-tier cache**: `simmer_research_cache` (keyed `symbol`, per-field TTLs)
+14. `routes/simmer.py`, full surface behind the gate.
+15. `simmer_watcher.py` — 5-minute union-of-watchlists sweep.
+16. **Two-tier cache**: `simmer_research_cache` (keyed `symbol`, per-field TTLs)
     behind a single accessor, so tier-1 reuse and invalidation are enforced in
     one place rather than at each call site. Tier-1 is mostly empty until
     Phase 3 fills it with news — build the mechanism now so news lands into it.
-16. Alert state machine with hysteresis; `simmer_alerts` writes.
-17. **`simmer_outcomes` table + paper-outcome evaluator** — for every
+17. **Cross-sectional dispersion check** — in the same sweep, flag a sector
+    dislocation when a disproportionate share of watched names spike IV together
+    while the index regime reads calm; suppress the affected cluster. Start with
+    sector tags, upgrade to the pairwise correlation matrix later.
+18. Alert state machine with hysteresis; `simmer_alerts` writes.
+19. **`simmer_outcomes` table + paper-outcome evaluator** — for every
     recommendation the engine has ever emitted, revisit it at expiry and record
     the one fact that matters: *did the short strike hold?* Reuses the
     `evaluator.py` pattern; needs no broker, no fill, no Torque.
-18. `test_auth_gate.py`, `test_watcher.py`, `test_alerts.py`, `test_outcomes.py`.
+20. **Settings enforcement** — apply per-user thresholds at read/alert time;
+    validate `gate_overrides` against the toggleable allow-list on write so a
+    client can never disable a locked gate; clamp the short-delta band to
+    0.15–0.40. Outcomes keep recording the **engine's** verdict, not the user's
+    filtered view.
+21. `test_auth_gate.py`, `test_watcher.py`, `test_alerts.py`, `test_outcomes.py`,
+    `test_settings.py` (locked gates reject; bounds clamp; calibration
+    unaffected by config).
 
 At this point Simmer is fully functional via `curl`. **Validate it there before
 building any UI.**
@@ -2051,24 +2283,27 @@ building any UI.**
 
 ### Phase 3 — news and sentiment
 
-19. Alpaca news client (REST backfill + WebSocket live) with wire-RSS fallback;
+22. Alpaca news client (REST backfill + WebSocket live) with wire-RSS fallback;
     headline-cluster dedup (Jaccard ≥ 0.70 / 6h). Store derived outputs and
     headline+URL only — never re-host article bodies.
-20. Gemini client — structured output, clamping, article-id-keyed caching so only
+23. Gemini client — structured output, clamping, article-id-keyed caching so only
     *new* headlines are ever scored.
-21. Velocity detector (NB tail-p, seasonal baseline, EB shrinkage, min-cluster gate).
-22. Sentiment persistence with asymmetric half-lives and the earnings gate.
-23. Wire sentiment in as **side-selection and veto only**.
+24. Velocity detector (NB tail-p, seasonal baseline, EB shrinkage, min-cluster gate).
+25. Sentiment persistence with asymmetric half-lives and the earnings gate.
+26. Wire sentiment in as **side-selection and veto only**.
 
 ### Phase 4 — frontend
 
-24. Scaffold `simmer/ui` (SvelteKit 5 + TS + Tailwind v4 + `adapter-static`);
+27. Scaffold `simmer/ui` (SvelteKit 5 + TS + Tailwind v4 + `adapter-static`);
     port `app.css` from Matrix; deploy an empty shell to validate the pipeline.
-25. `deploy-smr-fe`; CORS, Turnstile and Supabase allow-list updates.
-26. AuthGate → ProductGate → AppShell → WatchlistManager → ReadinessCard.
-27. SSO ticket hand-off — **update Matrix in the same PR**; SSO is symmetric and
+28. `deploy-smr-fe`; CORS, Turnstile and Supabase allow-list updates.
+29. AuthGate → ProductGate → AppShell → WatchlistManager → ReadinessCard.
+30. SSO ticket hand-off — **update Matrix in the same PR**; SSO is symmetric and
     half of it is useless.
-28. Charts: `GexWallChart`, `IvRankGauge`, `ExpectedMoveViz` (load the `dataviz`
+31. **SettingsPanel** — presets (Conservative/Balanced/Aggressive) front and
+    centre, Advanced drawer behind them, and active overrides surfaced **on the
+    readiness card** rather than only in settings.
+32. Charts: `GexWallChart`, `IvRankGauge`, `ExpectedMoveViz` (load the `dataviz`
     skill first). Surface **two POP numbers — market-implied and forecast — since
     the gap between them is the edge.**
 
@@ -2077,21 +2312,30 @@ building any UI.**
 Paper outcomes already exist from Phase 2. This phase upgrades them to actual
 ones and puts the results on screen.
 
-29. **"Send to Torque" hand-off**, writing a `simmer_positions` row: the
+33. **"Send to Torque" hand-off**, writing a `simmer_positions` row: the
     recommendation, the **actual fill price**, and the exit targets. This is what
     turns a paper outcome into a real one.
-30. **Predicted vs achieved credit** — feeds straight back into the fill model,
+34. **Predicted vs achieved credit** — feeds straight back into the fill model,
     so the ranking gets more honest the longer the product runs.
-31. **Calibration surface** — forecast vs realized POP, and per-component
+35. **Calibration surface** — forecast vs realized POP, and per-component
     predictive value, so components that don't predict can be *retired*.
-32. **Public scorecard** — live, timestamped, including losers. No competitor in
+36. **Public scorecard** — live, timestamped, including losers. No competitor in
     the category has third-party-audited performance; publishing a falsifiable
     one is a cheap and durable differentiator.
-33. Email alerts via the existing `emailer`.
+37. Email alerts via the existing `emailer`.
 
 > This loop is the only genuinely durable asset in the design. A screener can
 > never close it (it never sees a fill); a broker will never build the engine
 > (liability). Simmer is the only party that can hold both ends.
+
+### Deferred to v1.1 — not on the critical path
+
+38. **Short interest + days-to-cover as a call-side squeeze veto.** Ingest the
+    free FINRA short-interest file (semi-monthly) and daily short-sale volume;
+    compute `days_to_cover`; block bear calls and the call leg of iron condors
+    above the configured threshold. Nothing else depends on it, so it lands after
+    the core engine is proven. *(Use short **interest**, not daily short volume
+    as a level — see the market-maker hedging caveat in Data sourcing.)*
 
 ### Sequencing note
 
