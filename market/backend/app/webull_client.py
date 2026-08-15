@@ -31,6 +31,17 @@ _UAT_ENDPOINT = "us-openapi-alb.uat.webullbroker.com"
 # a request for ~5 minutes.
 _INIT_TIMEOUT_SEC = 20
 
+# Cap on every individual SDK call (account list, preview, place). The SDK is
+# synchronous and is driven from a worker thread, and its own socket handling
+# offers no guarantee of returning — an unbounded call here means an order
+# request that never completes, so the browser hangs AND uvicorn never logs the
+# request (its access line is only written once a response exists). Bound it so
+# a wedged SDK surfaces as a clean, reportable error instead.
+#
+# Note the thread itself cannot be killed: on timeout it keeps running detached,
+# exactly as _ensure_trade already documents. We stop *waiting* on it.
+_CALL_TIMEOUT_SEC = 25
+
 # Short, user-facing hint for the most common Webull production gotcha.
 WEBULL_AUTH_HINT = (
     "Webull production requires the account owner to authorize the app for "
@@ -109,7 +120,14 @@ class WebullClient:
 
     async def _call(self, fn, *args, **kwargs):
         try:
-            return await asyncio.to_thread(fn, *args, **kwargs)
+            return await asyncio.wait_for(
+                asyncio.to_thread(fn, *args, **kwargs), timeout=_CALL_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            raise WebullError(
+                f"Webull did not respond within {_CALL_TIMEOUT_SEC}s "
+                f"({getattr(fn, '__name__', 'call')}). Nothing was placed — try again."
+            )
         except WebullError:
             raise
         except Exception as e:

@@ -1366,30 +1366,50 @@
 
   // Never rejects — a network failure or timeout resolves to {ok:false,status:0}
   // so callers always update the UI instead of leaving "Previewing…" stuck. The
-  // backend chains up to two 30s Tradier round-trips, so give it 60s before we
-  // give up and report the stall rather than hanging forever.
-  async function _postOrder(path, body, timeoutMs = 60000) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    try {
-      const r = await fetch(`${API_BASE}${path}`, {
-        method: 'POST',
-        mode: 'cors',
-        headers: { 'Content-Type': 'application/json', ..._authHeaders() },
-        body: JSON.stringify(body),
-        signal: ctrl.signal,
-      });
-      let payload = null;
-      try { payload = await r.json(); } catch { payload = { detail: await r.text().catch(() => '') }; }
-      return { ok: r.ok, status: r.status, payload };
-    } catch (e) {
-      const detail = (e && e.name === 'AbortError')
-        ? `request timed out after ${Math.round(timeoutMs / 1000)}s — the backend/broker did not respond`
-        : `network error: ${(e && e.message) || e}`;
-      return { ok: false, status: 0, payload: { detail } };
-    } finally {
-      clearTimeout(timer);
+  // backend now bounds every broker stage and answers well inside this window,
+  // so a 60s abort is the last-resort backstop rather than the usual path — a
+  // real stall comes back from the server naming the stage that gave up.
+  //
+  // `retryOnNetworkError` re-runs the request once against a freshly resolved
+  // API base, the same self-heal getJSON does when the quick tunnel's hostname
+  // rotates mid-session (otherwise the order path is the one screen that stays
+  // broken until reload). ONLY safe for idempotent calls: preview places
+  // nothing, so a retry is free. A live submit must never auto-retry — the
+  // first attempt may have reached the broker, and a second would double-place.
+  async function _postOrder(path, body, timeoutMs = 60000, retryOnNetworkError = false) {
+    async function _attempt() {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      try {
+        const r = await fetch(`${API_BASE}${path}`, {
+          method: 'POST',
+          mode: 'cors',
+          headers: { 'Content-Type': 'application/json', ..._authHeaders() },
+          body: JSON.stringify(body),
+          signal: ctrl.signal,
+        });
+        let payload = null;
+        try { payload = await r.json(); } catch { payload = { detail: await r.text().catch(() => '') }; }
+        return { ok: r.ok, status: r.status, payload };
+      } catch (e) {
+        const aborted = e && e.name === 'AbortError';
+        const detail = aborted
+          ? `request timed out after ${Math.round(timeoutMs / 1000)}s — the backend/broker did not respond`
+          : `network error: ${(e && e.message) || e}`;
+        return { ok: false, status: 0, aborted, payload: { detail } };
+      } finally {
+        clearTimeout(timer);
+      }
     }
+    const first = await _attempt();
+    // Retry only a genuine "couldn't reach the backend" failure — never a
+    // timeout (the request may still be in flight at the broker).
+    if (first.ok || !retryOnNetworkError || first.status !== 0 || first.aborted) return first;
+    const before = API_BASE;
+    await resolveApiBasePointer();
+    if (API_BASE === before) return first;    // same URL → nothing new to try
+    console.info('[edgelane] retrying order request against refreshed API_BASE');
+    return _attempt();
   }
 
   async function doPreview() {
@@ -1399,8 +1419,17 @@
     $('orderPreviewPane').textContent = '';
     $('orderSubmitBtn').disabled = true;
     orderModal.previewOk = false;
-    const { ok, status, payload } = await withBusy(() => _postOrder('/orders/preview', body));
+    // Preview is idempotent (the broker validates and places nothing), so it may
+    // safely retry against a refreshed API base.
+    const { ok, status, payload } = await withBusy(
+      () => _postOrder('/orders/preview', body, 60000, true));
     $('orderPreviewPane').textContent = JSON.stringify(payload, null, 2);
+    // Show the account the broker actually used. Left blank the backend resolves
+    // it from the user's own token, and echoing it back is the only way the user
+    // ever sees which account a trade would hit.
+    if (ok && payload && payload.account_id) {
+      $('orderAccount').value = payload.account_id;
+    }
     if (ok && payload && payload.broker === 'webull') {
       // Webull preview: success = HTTP 200 with an estimate (no Tradier-style
       // order.status / rejection field).
@@ -1987,8 +2016,10 @@
       <div><label class="text-[10px] text-slate-400">Access token</label>
         <input id="cfToken" type="password" class="w-full font-mono" value="" placeholder="${existing ? 'Leave blank to keep current token' : 'Tradier bearer token'}" autocomplete="off" spellcheck="false" />
         ${existing && c.token_last4 ? `<div class="text-[9px] text-slate-500 font-mono mt-0.5">current ••••${c.token_last4}</div>` : ''}</div>
-      <div><label class="text-[10px] text-slate-400">Account id</label>
-        <input id="cfAccount" type="text" class="w-full font-mono" value="${esc(c.tradier_account_id)}" placeholder="VA00000000" autocomplete="off" spellcheck="false" /></div>
+      <div><label class="text-[10px] text-slate-400">Account id <span class="text-slate-600">(optional — resolved from your token if blank)</span></label>
+        <input id="cfAccount" name="edgelane-tradier-acct" type="text" class="w-full font-mono" value="${esc(c.tradier_account_id)}" placeholder="VA00000000"
+               autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+               data-lpignore="true" data-1p-ignore data-form-type="other" /></div>
       <div><label class="text-[10px] text-slate-400">Environment</label>
         <select id="cfEnv" class="w-full">
           <option value="sandbox" ${c.tradier_env === 'sandbox' ? 'selected' : ''}>Sandbox (paper trading)</option>
@@ -2040,16 +2071,31 @@
       const broker = existing ? existing.broker : $('cfBroker').value;
       let row;
       if (broker === 'webull') {
+        const wbAcct = $('cfWbAccount').value.trim();
+        if (wbAcct && wbAcct.includes('@')) {
+          toast('That looks like an email, not an account id — leave it blank to auto-resolve');
+          return;
+        }
         row = { broker: 'webull', webull_region: 'us',
                 webull_env: $('cfWbEnv').value,
-                webull_account_id: $('cfWbAccount').value.trim() || null };
+                webull_account_id: wbAcct || null };
         const k = $('cfWbKey').value.trim(), s = $('cfWbSecret').value.trim();
         if (k) row.webull_app_key = k;          // omit on edit → backend keeps existing (encrypted) value
         if (s) row.webull_app_secret = s;
         if (!existing && (!k || !s)) { toast('App key and secret required'); return; }
       } else {
+        // An account id is never an email. Browsers happily autofill one here,
+        // and a saved email then rides along into every order payload — which
+        // the broker rejects. Refuse it at the source rather than papering over
+        // it downstream; blank is a better value than wrong (the backend then
+        // resolves the real account_number from the user's own token).
+        const acct = $('cfAccount').value.trim();
+        if (acct && acct.includes('@')) {
+          toast('That looks like an email, not an account id — leave it blank to auto-resolve');
+          return;
+        }
         row = { broker: 'tradier',
-                tradier_account_id: $('cfAccount').value.trim() || null,
+                tradier_account_id: acct || null,
                 tradier_env: $('cfEnv').value };
         const t = $('cfToken').value.trim();
         if (t) row.tradier_token = t;

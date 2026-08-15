@@ -23,6 +23,9 @@ from . import supabase_admin
 from .tradier_client import TradierClient
 from .webull_client import WebullClient
 
+# Socket timeout for a per-user *execution* client (see resolve_broker below).
+EXECUTION_HTTP_TIMEOUT_SEC = 15.0
+
 
 def _clean_account_id(raw: Any) -> Optional[str]:
     """Sanitize a stored broker account id. A real Tradier/Webull account id is
@@ -69,7 +72,13 @@ async def resolve_broker(request: Request, user: dict) -> tuple[str, Any, str | 
         if cfg.get("tradier_token"):
             env = (cfg.get("tradier_env") or "production").lower()
             base = "https://sandbox.tradier.com" if env == "sandbox" else "https://api.tradier.com"
-            client = TradierClient(base_url=base, token=cfg["tradier_token"])
+            # Tighter socket timeout than the data-polling default: every call on
+            # the execution path is a small JSON round-trip, and a user is
+            # watching the Preview button while it runs. Keeping it well under
+            # the route's stage budgets means a slow broker surfaces as a named
+            # timeout rather than a spinner that outlives the browser's patience.
+            client = TradierClient(base_url=base, token=cfg["tradier_token"],
+                                   timeout=EXECUTION_HTTP_TIMEOUT_SEC)
             account = _clean_account_id(cfg.get("tradier_account_id"))
             return "tradier", client, account, True
         # cfg row exists but carries no usable credentials → treat as "no

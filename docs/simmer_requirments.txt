@@ -1,0 +1,88 @@
+Simmer-Let it simmer. We’ll tell you when it’s ready
+
+I want a new page as a tool calling it simmer. Concept is user adds a ticker asking the simmer enginer to cook and analyze what it does it fetches the news around it from the last 24 horus,
+picks IV, GEX, DEx, premium skews, latest price targets all that and picks next  expiration or let user pick one (but user can pick only one expiry date) by when it might be fully baked ready to be enjoyed its premium through spread selling. the
+main purpose of the tool is to generate consistment income- should be monitorign the user added tickers and alert the ones ready most to be served to collect big premium. The way legacy ui 
+does things when "deted bias" was it same way it would pick the given ticekr and start working on it on all those different legs. It doesnt have to be anotehr jsx, could be a direct copy fo the
+market ui logic (if thats the better logic for gex aand otehr wall detection or premium analysis) rateher than legacy ui but you can coy its TEX, VEX concepty if usefule here. Build the
+front end Svelte 5 / SolidJS but it should resemble the edgleage matrix like multiuser signup/signin model with each users settings and auth and watched tickers saved seprately in the db table. let if work off of existing
+in a different simmer specefic table taht would have relation to user profiels. In profiels products enabled make a new prodcut named simmer and make it enable/dsiable for the user. It should pick the users browser session as well 
+if suer already singed in from edgelane matrix and browse to simmer it should let him in as long as the product is enabled for him and vice versa. It would be deployed and manaed uder different 
+targets like deploy-smr-fe . New deploymen under new vercel app simmer-edgelane.vercel.app
+
+for backend it could use same backedn engine for now but on a different endpoint like /simmer for all its operations excep auth which already being handled by the main backend component and routed accordinlgy.
+
+here are the highlevel requirements: 
+Okay, so I have an idea to build an indicator or some kind of watchdog engine that would track the recent lovable names like MU or SNDK or any other AI bottleneck stocks, or if I mention a particular ticker. But the idea is it would watch all the recent news on that particular ticker, extract the sentiment from that, and also it would need to find how the order volume looks like for today and let's say next few days to a week in order to determine where the premium or price gonna go very immediately, maybe tomorrow or in a couple days. Really, the idea is about picking the right sentiment as of right now and if there's gonna hold unless a major groundbreaking catalyst happen in the industry or something like that. I need this in order to play only spreads and mostly credit spreads to collect premium. Do you think something like that could be built? Then what would be the crucial data parameters? Could you list them? 
+
+Yes, absolutely. Not only can this be built, but what you are describing is essentially the architecture of a modern quantitative sentiment-and-flow engine used by proprietary trading desks and advanced retail analytics platforms.
+
+Because your end goal is specifically selling credit spreads to collect premium, the engine’s job isn't just predicting direction; it is predicting where price is unlikely to go and whether option volatility (premium) is overpriced.
+
+Here is a breakdown of the exact data parameters and architecture you need to feed into this engine.
+
+1. Sentiment & Catalyst NLP Engine (The "News & Noise" Module)
+This module measures the narrative driver and checks if a sudden catalyst could ruin a credit spread.
+
+Real-time News Sentiment Score (NLP): Natural Language Processing (using models like FinBERT or an LLM pipeline) parsing ticker news feeds to generate a continuous score from −1.0 (extreme panic) to +1.0 (extreme hype).
+
+News Velocity & Spike Detector: Measures the volume of news headlines per hour. A sudden 300% spike in headline frequency—even before sentiment is fully scored—usually precedes immediate volatility.
+
+Catalyst & Event Lockout Flag: Boolean parameter checking for upcoming binary events (Earnings releases, SEC filings, analyst days, major semiconductor conferences, or CPI/FOMC releases).
+
+Credit Spread Rule: Never sell credit spreads inside an unpriced catalyst window unless IV rank is astronomically high.
+
+2. Options Order Flow & Smart Money Module (The "Direction" Engine)
+You cannot predict future volume directly, but you can read where volume is aggressively flowing right now to infer multi-day institutional positioning.
+
+Net Premium Flow (Buyers vs. Sellers): Total dollar volume spent on calls vs. puts. Crucially, this must differentiate between orders filled at the Ask (aggressive buyers pushing price) vs. Bid (sellers writing options).
+
+Sweep & Block Order Aggression: Captures large institutional multi-exchange orders ("sweeps"). A cluster of $500k+ OTM Call Sweeps indicates immediate directional bias for the next 24–72 hours.
+
+Volume to Open Interest (Vol/OI) Ratio: Identifies whether high daily volume is new positioning (Vol > OI) or just old trades closing out (Vol < OI).
+
+3. Structural Market Maker & Volatility Metrics (The "Credit Spread Edge")
+This is the most crucial layer for selling credit spreads. It tells you where the price will stall or bounce, allowing you to pick safe short strikes.
+
+Gamma Exposure (GEX) & Delta Exposure (DEX) Walls:
+
+Zero Gamma Level: The inflection point between high volatility (trending) and low volatility (mean-reverting).
+
+Call/Put Gamma Walls: The absolute price levels where market makers are forced to buy/sell shares to hedge. These act as natural ceilings and floors for the stock over the next 1–5 days—the exact spot to place your short strikes outside of.
+
+Implied Volatility Rank (IVR) / IV Percentile: Compares current IV to its 52-week high/low.
+
+Credit Spread Rule: Only sell credit spreads when IVR is high (e.g., above 40–50%). This ensures you are getting paid maximum premium for your risk.
+
+Expected Move (1-SD & 2-SD Ranges): Derived from the current price of the At-The-Money (ATM) straddle for the upcoming expiration. Your engine should automatically place credit spread strikes outside the 1-Standard-Deviation expected move.
+
+Volatility Skew & Term Structure: Measures whether front-week options are significantly more expensive than back-week options (Backwardation vs. Contango). High front-week skew means panic is priced in, creating ideal short-term credit spread selling conditions.
+
+4. Technical Guardrails & Anchor Levels
+Anchored VWAP (Volume-Weighted Average Price): VWAP anchored from major swing highs, swing lows, or earnings days. Institutional order algorithms execute around these anchors.
+
+Dark Pool Print Concentrations: Aggregated price levels where massive off-exchange equity trades settle. These act as multi-day support/resistance magnets.
+
+How the Engine Makes a Decision (Composite Scoring Example)
+To put it all together, your watchdog script would calculate a Composite Confidence Score for a ticker (e.g., Micron - MU):
+
+Sentiment Score: +0.75 (Strong positive AI memory demand headlines)
+
+Order Flow: $2.5M net call sweeps at the Ask (Bullish)
+
+Volatility Rank: IVR is at 62% (High premium available)
+
+Structural Wall: Massive Put GEX Wall identified at $95.00; 1-SD Expected Move points to $94.50.
+
+Engine Output:
+
+"Bullish bias confirmed. High IV detected. Recommend Bull Put Credit Spread with Short Strike at or below $95.00 (below GEX Wall & Expected Move) for Friday's expiration. Estimated Win Probability: 86%."
+
+so other than existing options data analysis it should add those other avenues as well. It could be useful for tickets pre/post eanings or any big event coming up or PR stuff like that.
+for news sources and sentime analysis let it define mulitple providers like - tradivng view news, wor webull ticekr news or semtime (if available over api), for raw news you'd have to user gemini api for sentiment pick
+for block trade and darkpool data i have no idea : make best suggestin if any reasonable function api out there to meet those need . Rest I guess you could steal from tradier/yahoo plumbing that we already built for matrix and torque ?
+
+I need it a fully funcionl app that'd be actually useful to collect optimal premium for the ticker , not a toy to begin with based on my requirmetns. Form a multi agent team, do 
+deep analysis and how market standard solves this problem. Write a technical impl spec in docs folder for it. put its code in new simmer folder in the root like market. Follow the existing 
+project architecure and practice. It wont be like a page living in the backen only like torque, but more like edgelane matrix. Do any major gap analysis,  feel free to make suggestion and if you see something 
+crucial missing to achieve the targeted goal. So for this the backend shoudl have a different simmer_config and I belive the engine could watch the addet tickers in every 5 minutes or so.

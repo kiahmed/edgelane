@@ -2,7 +2,9 @@
 /orders/submit requires explicit confirm flag in the body."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -23,6 +25,43 @@ from ..order_builder import (
 
 log = logging.getLogger("edgelane.market.orders")
 router = APIRouter()
+
+# --- Order-path deadlines --------------------------------------------------
+#
+# A user-initiated order request must ALWAYS come back with an answer. When a
+# stage stalls with no bound, the browser sits on "Previewing…" forever AND the
+# stall leaves no trace in the access log -- uvicorn writes its line only once a
+# response is produced, so a request that never finishes is simply invisible.
+# That combination is what makes "the Preview button hangs" so hard to diagnose.
+#
+# So: every remote stage is bounded, every stage is logged, and the timeout
+# error names the stage that stalled. Budgets are sized to land comfortably
+# inside the frontend's own abort so the server -- not the browser -- is what
+# reports the failure, with a reason attached.
+BROKER_RESOLVE_TIMEOUT_SEC = 20.0    # Supabase RPC that decrypts the user's broker creds
+ACCOUNT_RESOLVE_TIMEOUT_SEC = 15.0   # Tradier /user/profile -> account_number
+CHAIN_RESOLVE_TIMEOUT_SEC = 25.0     # options chain fetch (only when OCC symbols are missing)
+PREVIEW_DEADLINE_SEC = 45.0          # whole-request ceiling for preview (places nothing)
+
+
+async def _stage(name: str, coro, timeout: float):
+    """Await one order stage under a hard deadline, logging how long it took.
+
+    On timeout the partial work is cancelled and the caller gets a 504 naming
+    the stage, instead of an open-ended wait the browser has to guess about.
+    """
+    t0 = time.monotonic()
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        log.error("order stage %s TIMED OUT after %.0fs", name, timeout)
+        raise HTTPException(
+            504,
+            f"broker step '{name}' timed out after {timeout:.0f}s — your broker "
+            f"did not respond. Nothing was placed; try again in a moment.",
+        )
+    finally:
+        log.info("order stage %s took %.2fs", name, time.monotonic() - t0)
 
 
 class OrderRequest(BaseModel):
@@ -114,7 +153,11 @@ async def _ensure_leg_symbols(legs: list[Leg], symbol: str, expiration: str,
     if all(l.occ_symbol for l in legs):
         return legs
     try:
-        chain = await tradier_client.options_chain(symbol, expiration)
+        chain = await _stage("chain-fetch",
+                             tradier_client.options_chain(symbol, expiration),
+                             CHAIN_RESOLVE_TIMEOUT_SEC)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(502, f"failed to fetch chain for symbol resolution: {e}")
     try:
@@ -130,7 +173,8 @@ async def _submit_webull(req: OrderRequest, client: WebullClient, preview: bool,
     if not expiration:
         raise HTTPException(500, f"snapshot missing expiration for {req.symbol}")
     try:
-        account_id = (account_override or "").strip() or await client.first_account_id()
+        account_id = (account_override or "").strip() or await _stage(
+            "account-resolve", client.first_account_id(), ACCOUNT_RESOLVE_TIMEOUT_SEC)
     except WebullError as e:
         raise HTTPException(502, f"Webull account lookup failed: {e}")
     if not account_id:
@@ -175,9 +219,13 @@ async def _submit_order(req: OrderRequest, tradier_client, preview: bool,
         # A real account id is never an email — ignore an autofilled/mis-entered
         # email and resolve the real account_number from the user's token instead.
         if "@" in account_id:
+            log.warning("order: ignoring email-shaped account_id on the request; "
+                        "resolving the real account from the user's broker token")
             account_id = ""
         if not account_id:
-            account_id = await tradier_client.resolve_account_id()
+            account_id = await _stage("account-resolve",
+                                      tradier_client.resolve_account_id(),
+                                      ACCOUNT_RESOLVE_TIMEOUT_SEC)
         if not account_id:
             raise HTTPException(
                 400,
@@ -255,15 +303,35 @@ async def _post_to_tradier(tradier_client, account_id: str, payload: dict) -> di
 @router.post("/orders/preview")
 async def preview_order(req: OrderRequest, request: Request,
                         user: dict = Depends(get_current_user)):
+    # Log on ENTRY, not just on completion: a stalled order request never
+    # reaches uvicorn's access log, so without this line a hang is invisible.
+    t0 = time.monotonic()
+    log.info("order preview: START user=%s symbol=%s strategy=%s label=%s qty=%s",
+             str(user.get("id"))[:8], req.symbol, req.strategy,
+             req.candidate_label, req.quantity)
     await ensure_tool(user, "market")
-    broker, client, account_override, per_user = await resolve_broker(request, user)
+    broker, client, account_override, per_user = await _stage(
+        "broker-resolve", resolve_broker(request, user), BROKER_RESOLVE_TIMEOUT_SEC)
+    log.info("order preview: broker=%s per_user=%s", broker, per_user)
     try:
         if broker == "webull":
-            return await _submit_webull(req, client, preview=True,
-                                        account_override=account_override)
-        return await _submit_order(req, client, preview=True,
-                                   account_override=account_override,
-                                   per_user=per_user)
+            coro = _submit_webull(req, client, preview=True,
+                                  account_override=account_override)
+        else:
+            coro = _submit_order(req, client, preview=True,
+                                 account_override=account_override,
+                                 per_user=per_user)
+        # A preview places nothing, so cancelling it mid-flight is always safe.
+        result = await _stage("preview", coro, PREVIEW_DEADLINE_SEC)
+        log.info("order preview: DONE in %.2fs", time.monotonic() - t0)
+        return result
+    except HTTPException as e:
+        log.warning("order preview: FAILED in %.2fs — HTTP %s: %s",
+                    time.monotonic() - t0, e.status_code, e.detail)
+        raise
+    except Exception as e:
+        log.exception("order preview: ERROR in %.2fs — %s", time.monotonic() - t0, e)
+        raise
     finally:
         if per_user:
             await client.close()
@@ -274,8 +342,18 @@ async def submit_order(req: OrderRequest, request: Request,
                        user: dict = Depends(get_current_user)):
     if not req.confirm:
         raise HTTPException(400, "submit requires confirm=true in the request body")
+    t0 = time.monotonic()
+    log.info("order submit: START user=%s symbol=%s strategy=%s label=%s qty=%s",
+             str(user.get("id"))[:8], req.symbol, req.strategy,
+             req.candidate_label, req.quantity)
     await ensure_tool(user, "market")
-    broker, client, account_override, per_user = await resolve_broker(request, user)
+    broker, client, account_override, per_user = await _stage(
+        "broker-resolve", resolve_broker(request, user), BROKER_RESOLVE_TIMEOUT_SEC)
+    # NOTE: deliberately NO whole-request deadline here. The preparation stages
+    # are individually bounded, but the live order POST must never be cancelled
+    # mid-flight — a cancelled-but-delivered order would be reported as failed
+    # while actually resting at the broker, inviting a duplicate resubmit. That
+    # call is bounded by the Tradier/Webull client's own socket timeout instead.
     try:
         if broker == "webull":
             result = await _submit_webull(req, client, preview=False,
