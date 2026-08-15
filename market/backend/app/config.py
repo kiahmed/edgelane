@@ -180,6 +180,14 @@ class Settings(BaseModel):
     display_when_closed: bool = Field(default=True)
     closed_display_interval_sec: int = Field(default=60)
 
+    # --- Simmer sweep data provider ---
+    # Which market-data source the Simmer 5-minute watcher sweep uses for
+    # quote/expirations/chain/daily-bars. "tradier" (default) keeps today's
+    # behavior; "yahoo" moves the sweep off Tradier's 120 req/min budget
+    # (Matrix + Torque keep it) onto Yahoo's public endpoints — unofficial,
+    # personal-use posture; see app/simmer_data_provider.py. Needs no key.
+    simmer_data_provider: str = Field(default="tradier")
+
     # External GEX override (private GEX provider extension webhook)
     use_external_gex: bool = Field(default=True)         # prefer extension data over Tradier-OI walls when fresh
     external_gex_timeout_sec: int = Field(default=30)    # how stale before falling back
@@ -348,6 +356,10 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
         out["display_when_closed"] = raw["DISPLAY_WHEN_CLOSED"].strip().lower() in ("true", "1", "yes", "on")
     if "CLOSED_DISPLAY_INTERVAL_SEC" in raw:
         out["closed_display_interval_sec"] = int(raw["CLOSED_DISPLAY_INTERVAL_SEC"])
+
+    if "SIMMER_DATA_PROVIDER" in raw:
+        v = raw["SIMMER_DATA_PROVIDER"].strip().lower()
+        out["simmer_data_provider"] = v if v in ("tradier", "yahoo") else "tradier"
 
     if "USE_EXTERNAL_GEX" in raw:
         out["use_external_gex"] = raw["USE_EXTERNAL_GEX"].strip().lower() in ("true", "1", "yes", "on")

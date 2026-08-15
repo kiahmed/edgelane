@@ -109,6 +109,14 @@ def _normalize_tradier_contract(o: dict) -> dict:
         "bid":  f(o.get("bid")),
         "ask":  f(o.get("ask")),
         "last": f(o.get("last")),
+        # Simmer: `last_volume` + `trade_date` turn repeated chain polls into a
+        # poll-sampled quote-rule tape. `trade_date` is the dedup key -- without
+        # it the same print is counted once per poll. Cheap to carry, and the
+        # only way to sign premium flow without a websocket subscription.
+        "last_volume": i(o.get("last_volume")),
+        "trade_date":  o.get("trade_date"),
+        "bid_size":    i(o.get("bidsize")),
+        "ask_size":    i(o.get("asksize")),
     }
 
 

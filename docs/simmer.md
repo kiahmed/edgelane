@@ -616,6 +616,13 @@ structure with `IV = IV_ATM` at both strikes and compare to the real quote. That
 difference *is* what skew is costing or paying you on this specific structure —
 a directly meaningful number, unlike a raw skew reading.
 
+> **⚠️ Measure it by pricing the legs directly, NOT by integrating `N(−d2)`.**
+> The identity `C(W) = ∫ N(−d2) dK` holds only at **flat** vol; along a smile the
+> total derivative picks up a `vega · dσ/dK` term. Integrating with a per-strike
+> vol reports skew as *paying* +13% on a put credit spread — the exact opposite
+> of the truth. Direct Black-Scholes leg pricing gives −3.2% and reconciles with
+> the quoted mid. Found during implementation.
+
 Measure skew as `RR25 = IV(25Δ put) − IV(25Δ call)` (equity convention, positive
 = put bias) and **name the field for the convention** (`rr25_put_minus_call`) —
 FX uses the opposite sign, and a silent sign flip inverts every downstream gate.
@@ -718,8 +725,30 @@ BE_put_spread = K_short − credit
 POP = P(S_T > BE) = N(d2) with K := BE, σ := IV interpolated at BE
 ```
 
-**Short-strike rule: place it outside BOTH the 1-SD expected move AND the
-structural wall, whichever is further** — then verify POP at the breakeven.
+**Short-strike rule — and a correction to an earlier draft of this spec.**
+
+An earlier version said "place the short strike outside BOTH the 1-SD expected
+move AND the structural wall, whichever is further." **That is not simultaneously
+satisfiable with the 0.20–0.35 delta band**, because the 1-SD point sits near
+16Δ — which the delta gate itself vetoes. It is the *same* contradiction
+documented above for "⅓ width at 16 delta", reintroduced two sections later.
+
+The resolution, as implemented:
+
+1. **The delta band is the hard gate and wins.** Candidates are built at the
+   delta target (0.25–0.30) and vetoed outside 0.20–0.35.
+2. **The expected-move and wall barriers are honoured *within* the band** — if a
+   strike inside the band also clears them, take it.
+3. **Otherwise keep the delta-target strike and let the expected-move-headroom
+   component score it down.** A candidate that can't reach the barrier isn't
+   rejected outright; it's just worse, which is what a soft component is for.
+
+Consequence worth knowing: inside a 0.20Δ floor a candidate reaches at most
+~0.84 EM, so scoring "full headroom" at 1.5 EM would be unreachable by
+construction and silently cap the composite ~12 points below 100. **Full headroom
+is therefore 1.0 EM, not 1.5.**
+
+Then verify POP at the breakeven.
 
 ### The result that should drive the whole engine
 
@@ -782,6 +811,14 @@ internally consistent.
 
 **Engine implication: credit/width is a dependent variable. Fix short delta,
 target C/W, solve for width.**
+
+**And the C/W target must be a fraction of its own ceiling, not an absolute.** At
+the optimal 25Δ the bound is ≈0.286, so an absolute 0.30 target is *infeasible* —
+and chasing it drives the solver toward 1–2 wide spreads whose package bid/ask is
+~8.9% of their own credit, tripping the very liquidity gate the target was meant
+to support. As implemented: target `min(0.70 × bound, 0.30)`, and when the
+absolute target is unreachable the engine says so in `avoid_if` rather than
+silently retargeting.
 
 ### Optimal short delta — not where convention puts it
 
@@ -1057,6 +1094,47 @@ The governing principle, which inverts the priority implied by the requirements
 doc: **the free signals are the ones with peer-reviewed support at our horizon;
 the expensive ones have marketing support and no published evidence.** Build the
 free stack first, prove a signal works, and only then pay for fidelity.
+
+### Market data — provider switch (decided 2026-08-15)
+
+Matrix and Torque already lean heavily on Tradier (120 req/min market data), and
+Simmer's sweep should not become a chokepoint on that shared limit. Market data
+therefore sits behind a **provider abstraction** with a config switch:
+
+```
+SIMMER_DATA_PROVIDER = tradier | yahoo      # edgelane_market.config, default tradier
+```
+
+**Honest sizing first:** at 20 tickers the sweep costs ~2–3 requests per symbol
+per 5 minutes ≈ **12 req/min against the 120/min limit** — about 10%. The
+chokepoint becomes real at 50–100 tickers, multi-expiry, or faster cadence. The
+switch is future-proofing, not an emergency.
+
+**Webull was evaluated and abandoned** (2026-08-15). Verified against the
+installed SDK: its REST market data has **no greeks, no IV, and no open
+interest** (`open_interest` exists only in the streaming protobuf). GEX walls
+need OI and everything needs IV, so pure-Webull cannot drive the engine, and the
+Tradier-OI hybrid wasn't worth its complexity. The SDK stays as a dependency for
+per-user *brokerage* (Torque orders) only.
+
+**Yahoo is the alternate provider.** Its unofficial options endpoint
+(`query1.finance.yahoo.com/v7/finance/options/{symbol}`) returns, per contract:
+strike, bid/ask/last, volume, **`openInterest`**, and **`impliedVolatility`** —
+everything the engine needs, with greeks computed analytically from the supplied
+IV. The v8 chart endpoint provides **daily OHLC**, which Tradier's client lacks —
+upgrading Yang-Zhang to real high/low and letting outcomes fill `touched`. The
+repo already talks to Yahoo (Torque's live spot).
+
+Caveats, by design not afterthought:
+
+- **ToS: unofficial, personal-use.** Fine for a personal deployment; must be
+  revisited before Simmer is sold. Same posture as the Nasdaq earnings
+  cross-check, and part of why `tradier` stays the default.
+- **Auth churn**: cookie+crumb handshake, aggressive 429s. Graceful degradation
+  only — a persistent 401/429 skips the symbol with a `data_quality` note, never
+  crashes the loop, never retry-storms.
+- **Stale IV on illiquid strikes**: clamp/reject IV outside [0.01, 5.0], reject
+  bid=ask=0 contracts, stamp `data_quality` when >20% of a chain is rejected.
 
 ### Market data — Tradier (already owned)
 
@@ -1587,6 +1665,18 @@ never live alerting.
 8-K wave that gaps the underlying at tomorrow's open — keying on `filingDate`
 misses precisely the filings that matter most.
 
+> **⚠️⚠️ And `acceptanceDateTime` lies about its timezone.** `data.sec.gov`
+> appends a `Z` to the value, but the timestamp is **Eastern, not UTC**. Parsing
+> it as UTC shifts a 17:32 ET earnings 8-K to 13:32 ET — reclassifying an
+> after-hours gap-maker as a harmless mid-session filing, which is precisely the
+> failure this gate exists to prevent. Strip the `Z` and tag ET; honour a real
+> numeric offset when one is present (the Atom feed does send one). Found by a
+> failing test during implementation, not by reading the docs.
+
+> **Implementation note:** `Database.connect()` runs migrations while holding the
+> non-reentrant `_lock`, so any persistence helper must resolve the connection
+> *before* taking that lock or it self-deadlocks.
+
 Hard-block list (block outright, don't merely down-weight):
 
 | Item / form | Meaning | Why |
@@ -1654,9 +1744,38 @@ A deliberate decision, not laziness:
 - **The dates essentially never move.**
 
 So: `market/backend/app/macro_calendar.json` with `{date, time_et, event,
-severity}` for FOMC (plus `sep: true` on dot-plot meetings — the higher-vol
-ones), CPI, NFP, PCE, and a **`valid_through`** field. Refresh each December:
-~15 minutes of work per year.
+severity, confirmed, source}` for FOMC (plus `sep: true` on dot-plot meetings —
+the higher-vol ones), CPI, PPI, NFP and PCE, plus **`valid_through`** and
+**`confirmed_through`**.
+
+**As built: 113 rows, `valid_through` 2027-12-31, `confirmed_through`
+2026-12-23.** Verified against primary sources: all FOMC 2026+2027 with SEP
+flags (federalreserve.gov), and CPI/PPI/NFP for all of 2026 (bls.gov 403s
+scripted requests, but reads cleanly through a text-extraction proxy) plus
+PCE Aug–Dec 2026 (bea.gov).
+
+**55 rows are derived, not verified** — all 2027 CPI/PPI/NFP/PCE, because BLS's
+calendar index stops at December 2026 and BEA's 2027 query returns 2026 rows;
+neither agency had published 2027 yet. Each derived row records its rule and an
+`uncertainty_days`, backtested against 2026 actuals:
+
+| Series | Derivation | Backtest | `uncertainty_days` |
+|---|---|---|---|
+| CPI | 8th business day | 6/12 exact, all within 2 days | 3 |
+| PPI | CPI + 1 business day | — | 3 |
+| NFP | First Friday (second when the 1st is a Friday) | all 12 of 2026 correct | 2 |
+| PCE | Business day nearest the 27th | 2026 spanned the 23rd–30th | 5 |
+
+**A derived date blocks a *range*, not a day** — unconfirmed rows expand to
+`date ± uncertainty_days`. Same principle as unconfirmed earnings: an
+unverified date is a distribution.
+
+> Worth knowing when reading the 2026 rows: **NFP Feb 11 is not a Friday**, and
+> PPI lands Jan 30 / Feb 27 / Mar 18. Those are 2025-shutdown backlog artifacts,
+> verified — not derivation errors. Don't "fix" them.
+
+**Refresh path:** BLS and BEA publish the following year in autumn. Replace the
+derived rows and bump `confirmed_through` then — roughly 15 minutes once a year.
 
 **The failure mode is asymmetric, so bound it.** A stale table fails *open* —
 you'd hold a spread through a CPI print. Add a startup assertion that

@@ -1,0 +1,106 @@
+{
+  "optionChain": {
+    "result": [
+      {
+        "underlyingSymbol": "NVDA",
+        "expirationDates": [
+          1789689600,
+          1792108800
+        ],
+        "strikes": [
+          90.0,
+          94.0,
+          100.0,
+          106.0,
+          110.0
+        ],
+        "hasMiniOptions": false,
+        "quote": {
+          "symbol": "NVDA",
+          "regularMarketPrice": 100.0,
+          "regularMarketPreviousClose": 99.4,
+          "marketState": "REGULAR"
+        },
+        "options": [
+          {
+            "expirationDate": 1789689600,
+            "hasMiniOptions": false,
+            "calls": [
+              {
+                "contractSymbol": "NVDA260918C00106000",
+                "strike": 106.0,
+                "currency": "USD",
+                "lastPrice": 1.53,
+                "change": -0.12,
+                "percentChange": -3.1,
+                "volume": 320,
+                "openInterest": 1800,
+                "bid": 1.52,
+                "ask": 1.54,
+                "contractSize": "REGULAR",
+                "expiration": 1789689600,
+                "lastTradeDate": 1787097600,
+                "impliedVolatility": 0.3228,
+                "inTheMoney": false
+              },
+              {
+                "contractSymbol": "NVDA260918C00110000",
+                "strike": 110.0,
+                "currency": "USD",
+                "lastPrice": 0.73,
+                "change": -0.12,
+                "percentChange": -3.1,
+                "volume": 140,
+                "openInterest": 2600,
+                "bid": 0.72,
+                "ask": 0.74,
+                "contractSize": "REGULAR",
+                "expiration": 1789689600,
+                "lastTradeDate": 1787097600,
+                "impliedVolatility": 0.318,
+                "inTheMoney": false
+              }
+            ],
+            "puts": [
+              {
+                "contractSymbol": "NVDA260918P00094000",
+                "strike": 94.0,
+                "currency": "USD",
+                "lastPrice": 1.61,
+                "change": -0.12,
+                "percentChange": -3.1,
+                "volume": 410,
+                "openInterest": 2100,
+                "bid": 1.6,
+                "ask": 1.62,
+                "contractSize": "REGULAR",
+                "expiration": 1789689600,
+                "lastTradeDate": 1787097600,
+                "impliedVolatility": 0.351,
+                "inTheMoney": false
+              },
+              {
+                "contractSymbol": "NVDA260918P00090000",
+                "strike": 90.0,
+                "currency": "USD",
+                "lastPrice": 0.82,
+                "change": -0.12,
+                "percentChange": -3.1,
+                "volume": 220,
+                "openInterest": 3300,
+                "bid": 0.81,
+                "ask": 0.83,
+                "contractSize": "REGULAR",
+                "expiration": 1789689600,
+                "lastTradeDate": 1787097600,
+                "impliedVolatility": 0.365,
+                "inTheMoney": false
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "error": null
+  }
+}

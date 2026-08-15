@@ -48,6 +48,13 @@ CREATE TABLE IF NOT EXISTS gex_snapshots (
 CREATE INDEX IF NOT EXISTS idx_gex_lookup
     ON gex_snapshots (symbol, expiration, ts);
 
+-- Volume alongside OI. The poller already normalizes contract volume; it was
+-- simply never persisted. Vol/OI (is today's volume NEW positioning?) and the
+-- day-over-day OI delta (how much of it STUCK?) are the two order-flow signals
+-- with peer-reviewed support at a 1-5 day horizon, and both need this column.
+ALTER TABLE gex_snapshots ADD COLUMN IF NOT EXISTS call_volume INTEGER;
+ALTER TABLE gex_snapshots ADD COLUMN IF NOT EXISTS put_volume  INTEGER;
+
 CREATE SEQUENCE IF NOT EXISTS seq_bias_decisions;
 CREATE TABLE IF NOT EXISTS bias_decisions (
     id                    BIGINT     PRIMARY KEY DEFAULT nextval('seq_bias_decisions'),
@@ -172,6 +179,154 @@ CREATE TABLE IF NOT EXISTS strike_profiles (
     min_vol         INTEGER,
     updated_at      TIMESTAMP
 );
+
+-- ---------------------------------------------------------------------------
+-- Simmer — premium-selling readiness engine (see docs/simmer.md).
+-- NOTE: none of these tables carries a user identifier. They are market data,
+-- computed once per (symbol[, expiration]) and shared across every user
+-- watching that ticker; all user-scoped state (watchlists, alerts, settings)
+-- lives in Supabase under RLS. Per-user thresholds are applied at READ time.
+-- ---------------------------------------------------------------------------
+
+-- Daily IV/RV history. This is the series IV Rank and IV Percentile are computed
+-- from, so it only accrues forward -- start recording before anything reads it.
+-- atm_iv_xern is EX-EARNINGS: including the earnings hump would let one
+-- quarterly spike pin the 52-week max for a year.
+CREATE TABLE IF NOT EXISTS simmer_iv_history (
+    session_date  DATE    NOT NULL,
+    symbol        VARCHAR NOT NULL,
+    atm_iv        DOUBLE,          -- 30d constant-maturity, variance-interpolated
+    atm_iv_xern   DOUBLE,          -- same, earnings effect removed
+    iv60          DOUBLE,
+    iv90          DOUBLE,
+    rv20_yz       DOUBLE,          -- Yang-Zhang realized vol, 20d
+    rv20_cc       DOUBLE,          -- zero-mean close-to-close, 20d (cross-check)
+    open_px       DOUBLE,
+    high_px       DOUBLE,
+    low_px        DOUBLE,
+    close_px      DOUBLE,
+    skew_25d      DOUBLE,          -- IV(25d put) - IV(25d call), equity convention
+    PRIMARY KEY (session_date, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_simmer_iv_history_symbol
+    ON simmer_iv_history (symbol, session_date);
+
+-- Tier-1 research cache: keyed on SYMBOL ONLY, so a second expiration on the
+-- same ticker reuses the whole block. Per-field TTLs are enforced in code via
+-- the *_at columns; a catalyst or velocity burst invalidates regardless of age.
+CREATE TABLE IF NOT EXISTS simmer_research_cache (
+    symbol             VARCHAR PRIMARY KEY,
+    sentiment_score    DOUBLE,      -- trailing 5-session weighted mean, -1..+1
+    sentiment_n        INTEGER,     -- headline count: distinguishes "0.0 balanced"
+                                    -- from "0.0 no news"
+    velocity_p         DOUBLE,      -- NB upper-tail p-value
+    velocity_tier      VARCHAR,     -- none | warn | alert
+    catalyst_flags     VARCHAR,     -- JSON: earnings/ex-div/8-K items in window
+    catalyst_blocking  BOOLEAN,
+    iv_rank            DOUBLE,
+    iv_percentile      DOUBLE,
+    iv_rv_ratio        DOUBLE,
+    vrp_xsect_pct      DOUBLE,      -- cross-sectional VRP percentile (cold-start path)
+    vol_oi_ratio       DOUBLE,
+    oi_delta           DOUBLE,
+    pcr_volume         DOUBLE,
+    short_interest     DOUBLE,      -- v1.1
+    days_to_cover      DOUBLE,      -- v1.1
+    news_at            TIMESTAMP,
+    catalyst_at        TIMESTAMP,
+    daily_at           TIMESTAMP,   -- IV rank / RV / OI-delta group
+    flow_at            TIMESTAMP,
+    updated_at         TIMESTAMP
+);
+
+-- Tier-2 readiness: keyed (symbol, expiration, ts). Recomputed EVERY sweep and
+-- never served from cache across sweeps -- the chain moves, and a stale "ready"
+-- would recommend a spread whose credit has since collapsed.
+CREATE SEQUENCE IF NOT EXISTS seq_simmer_readiness;
+CREATE TABLE IF NOT EXISTS simmer_readiness (
+    id                BIGINT    PRIMARY KEY DEFAULT nextval('seq_simmer_readiness'),
+    ts                TIMESTAMP NOT NULL,
+    symbol            VARCHAR   NOT NULL,
+    expiration        DATE      NOT NULL,
+    spot              DOUBLE,
+    score             DOUBLE,             -- 0-100 composite, NULL when vetoed
+    vetoed            BOOLEAN,
+    veto_reasons      VARCHAR,            -- JSON array of gate keys that tripped
+    components        VARCHAR,            -- JSON: per-component sub-scores
+    regime            VARCHAR,            -- calm | risk_off | stressed
+    structure         VARCHAR,            -- bull_put | bear_call | iron_condor
+    short_strike      DOUBLE,
+    long_strike       DOUBLE,
+    width             DOUBLE,
+    credit_mid        DOUBLE,             -- advertised
+    credit_fill       DOUBLE,             -- achievable-fill estimate (what we rank on)
+    max_loss          DOUBLE,
+    pop_breakeven     DOUBLE,             -- POP at the BREAKEVEN, not the short strike
+    expected_value    DOUBLE,             -- payoff-integrated, not the binary formula
+    alpha             DOUBLE,             -- EV / MaxLoss
+    engine_version    VARCHAR
+);
+CREATE INDEX IF NOT EXISTS idx_simmer_readiness_lookup
+    ON simmer_readiness (symbol, expiration, ts);
+
+-- Scored headlines, deduped by cluster. Cache by article id so the same wire
+-- story is never re-scored -- this is the main LLM cost control.
+CREATE TABLE IF NOT EXISTS simmer_news (
+    article_id     VARCHAR PRIMARY KEY,
+    symbol         VARCHAR   NOT NULL,
+    cluster_key    VARCHAR,            -- 3-shingle hash; counts clusters, not articles
+    headline       VARCHAR,
+    source         VARCHAR,
+    url            VARCHAR,
+    published_at   TIMESTAMP,
+    sentiment      DOUBLE,             -- -1..+1, clamped server-side
+    confidence     DOUBLE,
+    model          VARCHAR,            -- model id: scores are NOT reproducible
+    scored_at      TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_simmer_news_symbol_pub
+    ON simmer_news (symbol, published_at);
+CREATE INDEX IF NOT EXISTS idx_simmer_news_cluster
+    ON simmer_news (symbol, cluster_key, published_at);
+
+-- Binary events. acceptance_at (NOT filing_date) is authoritative: an
+-- after-hours 8-K carries the NEXT business day's filing date, and that is
+-- exactly the filing that gaps the underlying at tomorrow's open.
+CREATE TABLE IF NOT EXISTS simmer_catalysts (
+    id             VARCHAR PRIMARY KEY,   -- accession no. / vendor id / synthetic
+    symbol         VARCHAR   NOT NULL,
+    event_type     VARCHAR   NOT NULL,    -- earnings | sec_filing | ex_div | macro
+    event_date     DATE,
+    session        VARCHAR,               -- bmo | amc | dmh | unknown
+    confirmed      BOOLEAN,               -- false => treat as a DISTRIBUTION, block the week
+    blocking       BOOLEAN,               -- hard-block item (4.02/1.03/3.01/4.01/NT/424B)
+    detail         VARCHAR,               -- JSON: 8-K item numbers, vendor payload
+    source         VARCHAR,
+    acceptance_at  TIMESTAMP,
+    created_at     TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_simmer_catalysts_symbol_date
+    ON simmer_catalysts (symbol, event_date);
+
+-- Paper outcomes: did the short strike hold? Recorded from the moment the engine
+-- starts emitting, and keyed to the ENGINE's verdict -- never to any user's
+-- filtered view -- so calibration stays comparable across configurations.
+CREATE TABLE IF NOT EXISTS simmer_outcomes (
+    readiness_id      BIGINT PRIMARY KEY,
+    symbol            VARCHAR NOT NULL,
+    expiration        DATE    NOT NULL,
+    evaluated_at      TIMESTAMP,
+    spot_at_expiry    DOUBLE,
+    short_strike      DOUBLE,
+    held              BOOLEAN,            -- short strike never breached at expiry
+    touched           BOOLEAN,            -- breached intraday at any point
+    max_adverse_pct   DOUBLE,
+    score_at_entry    DOUBLE,
+    components        VARCHAR,            -- snapshot, so components can be retired
+    engine_version    VARCHAR
+);
+CREATE INDEX IF NOT EXISTS idx_simmer_outcomes_symbol
+    ON simmer_outcomes (symbol, expiration);
 """
 
 _STRIKE_PROFILE_COLS = (
@@ -258,13 +413,15 @@ class Database:
             self.connect().execute(
                 """
                 INSERT INTO gex_snapshots
-                  (ts, symbol, expiration, spot, strike, call_gex, put_gex, net_gex, call_oi, put_oi)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  (ts, symbol, expiration, spot, strike, call_gex, put_gex, net_gex,
+                   call_oi, put_oi, call_volume, put_volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     row["ts"], row["symbol"], row["expiration"], row["spot"], row["strike"],
                     row.get("call_gex"), row.get("put_gex"), row.get("net_gex"),
                     row.get("call_oi"), row.get("put_oi"),
+                    row.get("call_volume"), row.get("put_volume"),
                 ],
             )
 
@@ -486,6 +643,206 @@ class Database:
             for d, sym in cur.fetchall():
                 out.add((d.isoformat() if hasattr(d, "isoformat") else str(d), sym))
             return out
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Simmer (Phase 2) — every method resolves the connection BEFORE taking
+    # self._lock: Database.connect() migrates under the (non-reentrant) lock on
+    # first use, so `with self._lock: self.connect()` on a cold Database would
+    # self-deadlock. See simmer_catalysts.persist_catalysts for the precedent.
+    # All callers run these via asyncio.to_thread (DuckDB is sync).
+    # ────────────────────────────────────────────────────────────────────────
+
+    _SIMMER_RESEARCH_COLS = (
+        "symbol", "sentiment_score", "sentiment_n", "velocity_p", "velocity_tier",
+        "catalyst_flags", "catalyst_blocking", "iv_rank", "iv_percentile",
+        "iv_rv_ratio", "vrp_xsect_pct", "vol_oi_ratio", "oi_delta", "pcr_volume",
+        "short_interest", "days_to_cover", "news_at", "catalyst_at", "daily_at",
+        "flow_at",
+    )
+
+    def upsert_simmer_research(self, row: dict) -> None:
+        """Tier-1 research cache upsert (PK symbol). Keys not present in `row`
+        are written as NULL — pass the merged row, not a partial delta."""
+        conn = self.connect()
+        cols = ", ".join(self._SIMMER_RESEARCH_COLS)
+        ph = ", ".join("?" for _ in self._SIMMER_RESEARCH_COLS)
+        params = [row.get(c) for c in self._SIMMER_RESEARCH_COLS]
+        params[0] = str(row["symbol"]).upper()
+        with self._lock:
+            conn.execute(
+                f"INSERT OR REPLACE INTO simmer_research_cache ({cols}, updated_at) "
+                f"VALUES ({ph}, now())",
+                params,
+            )
+
+    def get_simmer_research(self, symbol: str) -> dict | None:
+        conn = self.connect()
+        cols = self._SIMMER_RESEARCH_COLS + ("updated_at",)
+        with self._lock:
+            cur = conn.execute(
+                f"SELECT {', '.join(cols)} FROM simmer_research_cache WHERE symbol = ?",
+                [str(symbol).upper()],
+            )
+            r = cur.fetchone()
+        return dict(zip(cols, r)) if r else None
+
+    _SIMMER_READINESS_COLS = (
+        "ts", "symbol", "expiration", "spot", "score", "vetoed", "veto_reasons",
+        "components", "regime", "structure", "short_strike", "long_strike",
+        "width", "credit_mid", "credit_fill", "max_loss", "pop_breakeven",
+        "expected_value", "alpha", "engine_version",
+    )
+
+    def insert_simmer_readiness(self, row: dict) -> int:
+        """Tier-2 readiness row (one per sweep per (symbol, expiration)).
+        Returns the new id so the paper-outcome evaluator can key on it."""
+        conn = self.connect()
+        cols = ", ".join(self._SIMMER_READINESS_COLS)
+        ph = ", ".join("?" for _ in self._SIMMER_READINESS_COLS)
+        with self._lock:
+            cur = conn.execute(
+                f"INSERT INTO simmer_readiness ({cols}) VALUES ({ph}) RETURNING id",
+                [row.get(c) for c in self._SIMMER_READINESS_COLS],
+            )
+            (new_id,) = cur.fetchone()
+            return int(new_id)
+
+    def latest_simmer_readiness(self, symbol: str, expiration) -> dict | None:
+        conn = self.connect()
+        cols = ("id",) + self._SIMMER_READINESS_COLS
+        with self._lock:
+            cur = conn.execute(
+                f"SELECT {', '.join(cols)} FROM simmer_readiness "
+                "WHERE symbol = ? AND expiration = ? ORDER BY ts DESC LIMIT 1",
+                [str(symbol).upper(), expiration],
+            )
+            r = cur.fetchone()
+        if not r:
+            return None
+        out = dict(zip(cols, r))
+        out["ts"] = _utc_iso(out.get("ts"))
+        return out
+
+    _SIMMER_IV_COLS = (
+        "session_date", "symbol", "atm_iv", "atm_iv_xern", "iv60", "iv90",
+        "rv20_yz", "rv20_cc", "open_px", "high_px", "low_px", "close_px",
+        "skew_25d",
+    )
+
+    def insert_simmer_iv_history(self, row: dict) -> None:
+        """One row per (session_date, symbol). INSERT OR REPLACE keeps the daily
+        job idempotent across restarts within the same session."""
+        conn = self.connect()
+        cols = ", ".join(self._SIMMER_IV_COLS)
+        ph = ", ".join("?" for _ in self._SIMMER_IV_COLS)
+        params = [row.get(c) for c in self._SIMMER_IV_COLS]
+        params[1] = str(row["symbol"]).upper()
+        with self._lock:
+            conn.execute(
+                f"INSERT OR REPLACE INTO simmer_iv_history ({cols}) VALUES ({ph})",
+                params,
+            )
+
+    def fetch_simmer_iv_history(self, symbol: str, days: int) -> list[dict]:
+        """Most recent `days` rows for `symbol`, returned OLDEST→NEWEST (the
+        order the RV estimators and IV-percentile history expect)."""
+        conn = self.connect()
+        with self._lock:
+            cur = conn.execute(
+                f"SELECT {', '.join(self._SIMMER_IV_COLS)} FROM simmer_iv_history "
+                "WHERE symbol = ? ORDER BY session_date DESC LIMIT ?",
+                [str(symbol).upper(), int(days)],
+            )
+            rows = cur.fetchall()
+        out = [dict(zip(self._SIMMER_IV_COLS, r)) for r in rows]
+        out.reverse()
+        return out
+
+    _SIMMER_OUTCOME_COLS = (
+        "readiness_id", "symbol", "expiration", "evaluated_at", "spot_at_expiry",
+        "short_strike", "held", "touched", "max_adverse_pct", "score_at_entry",
+        "components", "engine_version",
+    )
+
+    def insert_simmer_outcome(self, row: dict) -> None:
+        conn = self.connect()
+        cols = ", ".join(self._SIMMER_OUTCOME_COLS)
+        ph = ", ".join("?" for _ in self._SIMMER_OUTCOME_COLS)
+        with self._lock:
+            conn.execute(
+                f"INSERT OR REPLACE INTO simmer_outcomes ({cols}) VALUES ({ph})",
+                [row.get(c) for c in self._SIMMER_OUTCOME_COLS],
+            )
+
+    def fetch_pending_simmer_outcomes(self, as_of) -> list[dict]:
+        """Readiness rows whose expiration has passed (< `as_of`, a date) and
+        which have no outcome row yet.
+
+        One row per (symbol, expiration): the LATEST row that actually carried a
+        recommendation (short_strike NOT NULL) — the engine's final verdict
+        before expiry. Grading every 5-minute sweep row of the same expiry would
+        multiply the table ~78× per day for no additional information; earlier
+        rows of a graded expiry are deliberately never returned."""
+        conn = self.connect()
+        cols = ("id", "ts", "symbol", "expiration", "spot", "score", "structure",
+                "short_strike", "long_strike", "components", "engine_version")
+        with self._lock:
+            cur = conn.execute(
+                f"""
+                SELECT {', '.join(cols)} FROM (
+                    SELECT r.*, ROW_NUMBER() OVER (
+                        PARTITION BY r.symbol, r.expiration ORDER BY r.ts DESC
+                    ) AS rn
+                    FROM simmer_readiness r
+                    WHERE r.expiration < ? AND r.short_strike IS NOT NULL
+                )
+                WHERE rn = 1
+                  AND id NOT IN (SELECT readiness_id FROM simmer_outcomes)
+                ORDER BY expiration ASC, symbol ASC
+                """,
+                [as_of],
+            )
+            rows = cur.fetchall()
+        return [dict(zip(cols, r)) for r in rows]
+
+    def fetch_simmer_outcome_summary(self) -> dict:
+        """Aggregate paper-outcome stats — ENGINE verdicts only (outcome rows are
+        keyed to readiness rows the watcher wrote without user settings)."""
+        conn = self.connect()
+        with self._lock:
+            cur = conn.execute(
+                """
+                SELECT COALESCE(r.structure, 'unknown') AS structure,
+                       COUNT(*) AS n,
+                       SUM(CASE WHEN o.held THEN 1 ELSE 0 END) AS held,
+                       SUM(CASE WHEN o.touched THEN 1 ELSE 0 END) AS touched,
+                       AVG(o.score_at_entry) AS avg_score_at_entry
+                FROM simmer_outcomes o
+                LEFT JOIN simmer_readiness r ON r.id = o.readiness_id
+                GROUP BY 1 ORDER BY 1
+                """
+            )
+            rows = cur.fetchall()
+        by_structure: dict[str, dict] = {}
+        total_n = total_held = 0
+        for structure, n, held, touched, avg_score in rows:
+            n = int(n or 0)
+            held = int(held or 0)
+            by_structure[structure] = {
+                "n": n,
+                "held": held,
+                "held_pct": round(held / n * 100.0, 1) if n else None,
+                "touched": int(touched or 0),
+                "avg_score_at_entry": round(float(avg_score), 2) if avg_score is not None else None,
+            }
+            total_n += n
+            total_held += held
+        return {
+            "n": total_n,
+            "held": total_held,
+            "held_pct": round(total_held / total_n * 100.0, 1) if total_n else None,
+            "by_structure": by_structure,
+        }
 
     def upsert_daily_summary(self, row: dict) -> None:
         with self._lock:

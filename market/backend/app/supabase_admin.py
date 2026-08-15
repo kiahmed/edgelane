@@ -153,6 +153,94 @@ async def upload_object(bucket: str, path: str, content: bytes, content_type: st
         return False
 
 
+# ── Simmer additions (new helpers only — nothing above is modified) ─────────
+
+async def select_many(table: str, select: str = "*",
+                      filters: Optional[dict] = None,
+                      order: Optional[str] = None,
+                      limit: Optional[int] = None,
+                      offset: Optional[int] = None) -> Optional[list]:
+    """Read many rows via PostgREST with the service_role key (bypasses RLS).
+
+    `filters` values carry their PostgREST operator (e.g. {"active": "eq.true",
+    "symbol": "eq.NVDA"}). Returns the row list, or None when Supabase is not
+    configured / the read failed — callers must treat None as "unknown", never
+    as an empty table (the watcher falls back to config tickers on None).
+    """
+    settings = get_settings()
+    if not (settings.supabase_url and settings.supabase_service_key):
+        log.debug("[supabase] URL/service key not configured; skipping %s read", table)
+        return None
+    base, headers = _rest(settings)
+    params: dict = {"select": select}
+    for k, v in (filters or {}).items():
+        params[k] = v
+    if order:
+        params["order"] = order
+    if limit is not None:
+        params["limit"] = str(int(limit))
+    if offset is not None:
+        params["offset"] = str(int(offset))
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(f"{base}/{table}", headers=headers, params=params)
+            if r.status_code != 200:
+                log.error("[supabase] %s list failed (%s): %s", table, r.status_code, r.text[:200])
+                return None
+            rows = r.json()
+            return rows if isinstance(rows, list) else None
+    except Exception as exc:
+        log.error("[supabase] %s list error: %s", table, exc)
+        return None
+
+
+async def update_rows(table: str, filters: dict, values: dict) -> bool:
+    """PATCH rows matching `filters` (PostgREST operator syntax) via the
+    service_role key. Refuses to run without at least one filter — an
+    unfiltered PATCH would rewrite the whole table."""
+    settings = get_settings()
+    if not (settings.supabase_url and settings.supabase_service_key):
+        log.warning("[supabase] URL/service key not configured; cannot update %s", table)
+        return False
+    if not filters:
+        log.error("[supabase] update_rows(%s) refused: empty filter", table)
+        return False
+    base, headers = _rest(settings)
+    headers = {**headers, "Content-Type": "application/json", "Prefer": "return=minimal"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.patch(f"{base}/{table}", headers=headers, params=filters, json=values)
+            if r.status_code >= 300:
+                log.error("[supabase] update %s failed (%s): %s", table, r.status_code, r.text[:200])
+                return False
+            return True
+    except Exception as exc:
+        log.error("[supabase] update %s error: %s", table, exc)
+        return False
+
+
+async def upsert_row(table: str, row: dict, on_conflict: str) -> bool:
+    """Insert-or-merge one row via PostgREST upsert (service_role key)."""
+    settings = get_settings()
+    if not (settings.supabase_url and settings.supabase_service_key):
+        log.warning("[supabase] URL/service key not configured; cannot upsert into %s", table)
+        return False
+    base, headers = _rest(settings)
+    headers = {**headers, "Content-Type": "application/json",
+               "Prefer": "return=minimal,resolution=merge-duplicates"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(f"{base}/{table}", headers=headers,
+                             params={"on_conflict": on_conflict}, json=row)
+            if r.status_code >= 300:
+                log.error("[supabase] upsert %s failed (%s): %s", table, r.status_code, r.text[:200])
+                return False
+            return True
+    except Exception as exc:
+        log.error("[supabase] upsert %s error: %s", table, exc)
+        return False
+
+
 async def get_broker_config(user_id: str, config_id: Optional[str] = None) -> Optional[dict]:
     """Read a user's broker config with the token DECRYPTED (server-side only).
 

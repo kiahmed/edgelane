@@ -146,3 +146,17 @@ GEX_SOURCE=oi
 # The provider page the extension attaches to (served back via /extension/policy.json).
 # Also add this origin to CORS_ALLOW_ORIGINS so the extension can direct-POST.
 PROVIDER_TARGET_URL=
+
+# ── Simmer sweep data provider ──
+# Which market-data source the Simmer 5-minute watcher sweep uses for
+# quote / expirations / option chain / daily bars.
+#   tradier = default. Sweep shares Tradier's 120 req/min market-data budget
+#             with Matrix polling and Torque orders.
+#   yahoo   = sweep moves to Yahoo Finance's public v7 options / v8 chart
+#             endpoints, leaving the Tradier quota to Matrix/Torque. No API
+#             key needed. Greeks are computed analytically from Yahoo's
+#             per-contract IV; daily OHLC bars enable real Yang-Zhang RV and
+#             the outcome evaluator's `touched` column. NOTE: unofficial
+#             endpoint, personal-use posture — see app/simmer_data_provider.py
+#             before using this commercially.
+# SIMMER_DATA_PROVIDER=tradier

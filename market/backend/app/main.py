@@ -26,6 +26,7 @@ from .config import get_settings
 from .db import Database
 from .poller import poll_loop, state as poller_state
 from .evaluator import evaluator_loop, rehydrate_regime as evaluator_rehydrate_regime
+from .simmer_watcher import simmer_loop
 from .tradier_client import TradierClient
 from .mock_tradier import MockTradierClient
 from .external_gex import state as _external_gex_state
@@ -119,7 +120,7 @@ async def lifespan(app: FastAPI):
     # no-op when unconfigured or when Supabase isn't wired.
     for _uid in tcfg.operator_uids():
         try:
-            if await supabase_admin.grant_user_tools(_uid, ["market", "torque"]):
+            if await supabase_admin.grant_user_tools(_uid, ["market", "torque", "simmer"]):
                 log.info("  operator entitlements ensured for uid=%s", _uid)
         except Exception as e:
             log.warning("  operator seed failed for uid=%s: %s", _uid, e)
@@ -144,13 +145,19 @@ async def lifespan(app: FastAPI):
     )
     app.state.eval_task = eval_task
 
+    simmer_task = asyncio.create_task(
+        simmer_loop(client, db, runtime_settings),
+        name="edgelane.simmer_loop",
+    )
+    app.state.simmer_task = simmer_task
+
     try:
         yield
     finally:
         log.info("EdgeLane MARKET shutting down")
-        for t in (poll_task, eval_task):
+        for t in (poll_task, eval_task, simmer_task):
             t.cancel()
-        for t in (poll_task, eval_task):
+        for t in (poll_task, eval_task, simmer_task):
             try:
                 await t
             except (asyncio.CancelledError, Exception):
@@ -193,7 +200,7 @@ app.add_middleware(
 
 from .routes import (  # noqa: E402
     status, symbols, snapshot, accuracy, diag, orders, webhook, torque, session, broker, contact,
-    strike_profiles,
+    strike_profiles, simmer,
 )
 
 app.include_router(status.router)
@@ -204,6 +211,7 @@ app.include_router(diag.router)
 app.include_router(orders.router)
 app.include_router(webhook.router)
 app.include_router(torque.router)
+app.include_router(simmer.router)
 app.include_router(session.router)
 app.include_router(broker.router)
 app.include_router(contact.router)
