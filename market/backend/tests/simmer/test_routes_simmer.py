@@ -18,12 +18,15 @@ from .conftest import EXP, FakeSimmerTradier
 ADMIN = "test-admin-token"
 
 
-def _make_client(tradier=None, db=None) -> TestClient:
+def _make_client(tradier=None, db=None, user: dict | None = None) -> TestClient:
     app = FastAPI()
     app.include_router(sroute.router)
     app.state.tradier = tradier or FakeSimmerTradier()
     if db is not None:
         app.state.db = db
+    if user is not None:
+        from app.auth import get_current_user
+        app.dependency_overrides[get_current_user] = lambda: user
     return TestClient(app, raise_server_exceptions=False)
 
 
@@ -108,7 +111,8 @@ def test_every_data_route_is_gated(auth_on):
     for path in ("/simmer/config", "/simmer/status", "/simmer/watchlist",
                  "/simmer/analyze/NVDA", "/simmer/expirations/NVDA",
                  "/simmer/alerts", "/simmer/outcomes/summary",
-                 "/simmer/validate/NVDA", "/simmer/settings"):
+                 "/simmer/validate/NVDA", "/simmer/settings",
+                 "/simmer/news/NVDA"):
         assert c.get(path).status_code == 401, path
     assert c.post("/simmer/watchlist", json={"symbol": "NVDA"}).status_code == 401
     assert c.post("/simmer/alerts/ack", json={"ids": ["x"]}).status_code == 401
@@ -190,14 +194,35 @@ def test_validate_rejects_ineligible_index(auth_off):
     assert r.status_code == 422        # index products are Matrix's domain
 
 
-def test_watchlist_post_validates_but_never_writes(auth_off, monkeypatch):
+def test_watchlist_post_writes_for_real_user(auth_off, monkeypatch):
+    """API-first data plane: POST validates then upserts on behalf of the
+    VERIFIED user. The browser never writes Supabase tables directly."""
     wrote = []
-    async def fake_insert(table, row):
-        wrote.append((table, row))
+    async def fake_upsert(table, row, on_conflict):
+        wrote.append((table, row, on_conflict))
         return True
-    monkeypatch.setattr(supabase_admin, "insert_row", fake_insert)
-    c = _make_client()
+    monkeypatch.setattr(supabase_admin, "upsert_row", fake_upsert)
+    c = _make_client(user={"id": "11111111-2222-3333-4444-555555555555",
+                           "auth": "supabase"})
     r = c.post("/simmer/watchlist", json={"symbol": "NVDA", "expiration": EXP})
     assert r.status_code == 200
-    assert r.json()["write_model"] == "client_rls"
-    assert wrote == []                 # the frontend writes under RLS, not us
+    assert r.json()["written"] is True
+    assert wrote == [("simmer_watchlist",
+                      {"user_id": "11111111-2222-3333-4444-555555555555",
+                       "symbol": "NVDA", "active": True, "expiration": EXP},
+                      "user_id,symbol")]
+
+
+def test_watchlist_post_rejects_bypass_identities(auth_off, monkeypatch):
+    """admin/dev bypass identities own no watchlist rows — a write must 422
+    with a clear message, never silently attribute rows to 'admin'."""
+    called = []
+    async def fake_upsert(table, row, on_conflict):
+        called.append(row)
+        return True
+    monkeypatch.setattr(supabase_admin, "upsert_row", fake_upsert)
+    c = _make_client()                      # dev-local bypass identity
+    r = c.post("/simmer/watchlist", json={"symbol": "NVDA", "expiration": EXP})
+    assert r.status_code == 422
+    assert "signed-in" in r.json()["detail"]
+    assert called == []

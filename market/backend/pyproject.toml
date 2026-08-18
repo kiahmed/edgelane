@@ -18,6 +18,7 @@ dependencies = [
     # after install to override this dead-weight pin (so the auth backend keeps
     # modern crypto for PyJWT). Verified: SDK + option preview + ES256 all work.
     "webull-openapi-python-sdk>=2.0",
+    "defusedxml>=0.7",   # hardened XML parse for untrusted wire-RSS feeds
     "tzdata; sys_platform == 'win32'",
 ]
 

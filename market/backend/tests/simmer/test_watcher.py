@@ -65,7 +65,7 @@ def refresh_counters(monkeypatch):
         calls["catalysts"] += 1
         return {"catalyst_at": _naive_utc(), "_catalysts": []}
 
-    async def _daily(db, symbol, row):
+    async def _daily(db, symbol, row, provider=None):
         calls["daily"] += 1
         return {"daily_at": _naive_utc()}
 
@@ -81,10 +81,29 @@ async def test_fresh_cache_skips_every_refresh(fresh_db, refresh_counters):
         "news_at": _naive_utc(minutes=1),
         "catalyst_at": _naive_utc(minutes=5),
         "daily_at": _naive_utc(hours=1),
+        "rv20_yz": 0.25, "iv_history_json": "[0.3]",
     })
     row = await sw.load_research(fresh_db, "NVDA")
     assert refresh_counters == {"news": 0, "catalysts": 0, "daily": 0}
     assert row["_invalidated"] == []
+    # cache hit still hydrates the engine-facing transients from persisted twins
+    assert row["_rv_yz"] == 0.25
+    assert row["_iv_history"] == [0.3]
+
+
+async def test_pre_upgrade_row_forces_daily_refresh(fresh_db, refresh_counters):
+    """A fresh daily_at with NO persisted vol block is the pre-schema-upgrade
+    (and formerly live-broken) state: it must refresh, not serve an empty vol
+    block that vetoes every candidate with vrp_unavailable."""
+    fresh_db.upsert_simmer_research({
+        "symbol": "NVDA",
+        "news_at": _naive_utc(minutes=1),
+        "catalyst_at": _naive_utc(minutes=5),
+        "daily_at": _naive_utc(hours=1),        # fresh stamp, but...
+        # rv20_yz / iv_history_json absent
+    })
+    await sw.load_research(fresh_db, "NVDA")
+    assert refresh_counters["daily"] == 1
 
 
 async def test_expired_groups_refresh_independently(fresh_db, refresh_counters):
@@ -93,6 +112,9 @@ async def test_expired_groups_refresh_independently(fresh_db, refresh_counters):
         "news_at": _naive_utc(minutes=30),      # > 900s ticker_sentiment TTL
         "catalyst_at": _naive_utc(minutes=5),   # fresh (24h TTL)
         "daily_at": _naive_utc(hours=1),        # fresh (24h TTL)
+        # a genuinely-fresh daily group carries its persisted vol block; a
+        # fresh stamp WITHOUT it is the pre-upgrade/broken state and refreshes
+        "rv20_yz": 0.25, "iv_history_json": "[0.3]",
     })
     await sw.load_research(fresh_db, "NVDA")
     assert refresh_counters == {"news": 1, "catalysts": 0, "daily": 0}
@@ -244,3 +266,41 @@ async def test_regime_backwardation_from_term_structure():
     assert reg["state"] in ("backwardation", "stressed")
     assert reg["calm"] is False
     assert "bull_put" in reg["suppress"]
+
+
+# ── IV-history close-capture window ──────────────────────────────────────────
+from datetime import datetime as _dt
+from zoneinfo import ZoneInfo as _ZI
+
+_ET = _ZI("America/New_York")
+
+
+def test_capture_window_weekday_only_after_the_close():
+    # Monday 2026-08-17
+    assert sw._is_capture_window(now=_dt(2026, 8, 17, 16, 5, tzinfo=_ET)) is True
+    assert sw._is_capture_window(now=_dt(2026, 8, 17, 10, 0, tzinfo=_ET)) is False
+    assert sw._is_capture_window(now=_dt(2026, 8, 17, 8, 0, tzinfo=_ET)) is False
+
+
+def test_capture_window_weekend_captures_last_session():
+    assert sw._is_capture_window(now=_dt(2026, 8, 15, 11, 0, tzinfo=_ET)) is True  # Sat
+    assert sw._is_capture_window(now=_dt(2026, 8, 16, 20, 0, tzinfo=_ET)) is True  # Sun
+
+
+async def test_record_iv_history_skips_mid_session(fresh_db, monkeypatch):
+    monkeypatch.setattr(sw, "_is_capture_window", lambda *a, **k: False)
+    results = {f"NVDA|{EXP}": readiness_env("NVDA")}
+    n = await sw.record_iv_history(fresh_db, results)
+    assert n == 0
+    # NOT stamped mid-session → the same day still captures once it closes.
+    assert sw.state.last_iv_history_date is None
+    assert fresh_db.fetch_simmer_iv_history("NVDA", 5) == []
+
+
+async def test_record_iv_history_captures_after_close(fresh_db, monkeypatch):
+    monkeypatch.setattr(sw, "_is_capture_window", lambda *a, **k: True)
+    results = {f"NVDA|{EXP}": readiness_env("NVDA")}
+    n = await sw.record_iv_history(fresh_db, results)
+    assert n == 1
+    hist = fresh_db.fetch_simmer_iv_history("NVDA", 5)
+    assert len(hist) == 1 and hist[0]["symbol"] == "NVDA"

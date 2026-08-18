@@ -402,6 +402,76 @@ def cross_sectional_percentile(value: float, peers: Sequence[float]) -> float | 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Term structure + earnings VRP decomposition
+# ─────────────────────────────────────────────────────────────────────────────
+# `*_pp` fields are expressed in VOL POINTS (×100 of decimal IV): a 0.02 IV
+# difference reads as 2.0 pp. Chosen so "vol points" is literal; the sign-based
+# gates below are invariant to the scaling.
+_PP = 100.0
+
+
+def term_structure(iv_near: float | None, iv_far: float | None) -> dict[str, Any]:
+    """Single-name IV term structure from two ATM IVs.
+
+    `term_slope = iv_far / iv_near` — **> 1 is contango (upward-sloping), which
+    favours the premium seller**; < 1 is backwardation (front richer than back,
+    the market pricing near-term stress). `term_slope_pp = iv_near − iv_far` in
+    vol points, positive when the front is the richer leg."""
+    iv_near, iv_far = _num(iv_near), _num(iv_far)
+    if iv_near is None or iv_far is None or iv_near <= 0 or iv_far <= 0:
+        return {"term_slope": None, "term_slope_pp": None}
+    return {"term_slope": iv_far / iv_near,
+            "term_slope_pp": (iv_near - iv_far) * _PP}
+
+
+def earnings_vrp(iv_near: float | None, t_near: float | None,
+                 iv_far: float | None, t_far: float | None,
+                 rv: float | None, event_in_near: bool) -> dict[str, Any]:
+    """Decompose the volatility risk premium into an earnings-driven component
+    and an ex-earnings (baseline-regime) component — VolRadar's key idea: it
+    exposes when apparent premium is ENTIRELY the pending catalyst.
+
+        vrp_total_pp       = iv_near − rv                       (a second lens on
+                             VRP, in vol points, alongside the IV/RV ratio)
+        σ_event²           = max(0, iv_near² − iv_far²) · T_near   (event only in
+                             the near tenor — the far tenor is the clean baseline)
+        iv_near_exearn     = sqrt(max(0, iv_near² − σ_event²/T_near))
+        vrp_earnings_pp    = iv_near − iv_near_exearn
+        vrp_ex_earnings_pp = iv_near_exearn − rv
+
+    When no earnings sits in the near/far window, `vrp_earnings_pp = 0` and
+    `vrp_ex_earnings_pp = vrp_total_pp`.
+
+    The actionable read is the sign of `vrp_ex_earnings_pp`: a positive
+    `vrp_total_pp` with a NEGATIVE `vrp_ex_earnings_pp` means the premium is
+    positive ONLY because of the event — the baseline vol regime does not
+    support selling. `evaluate_readiness` turns that into a soft `avoid_if`
+    (the catalyst gate already hard-vetoes earnings actually inside the trade
+    tenor; this catches earnings sitting just outside it while still inflating
+    the front IV)."""
+    iv_near, iv_far = _num(iv_near), _num(iv_far)
+    t_near, rv = _num(t_near), _num(rv)
+    if iv_near is None or rv is None or rv <= 0:
+        return {"vrp_total_pp": None, "vrp_earnings_pp": None,
+                "vrp_ex_earnings_pp": None, "iv_near_exearn": None}
+    vrp_total_pp = (iv_near - rv) * _PP
+    if not (event_in_near and iv_far is not None and iv_far > 0
+            and t_near is not None and t_near > 0):
+        # No event in the window (or no clean far leg): the entire VRP is
+        # ex-earnings by construction.
+        return {"vrp_total_pp": vrp_total_pp, "vrp_earnings_pp": 0.0,
+                "vrp_ex_earnings_pp": vrp_total_pp, "iv_near_exearn": iv_near}
+    sigma_event_sq = max(0.0, iv_near * iv_near - iv_far * iv_far) * t_near
+    iv_near_exearn = math.sqrt(max(0.0, iv_near * iv_near - sigma_event_sq / t_near))
+    return {
+        "vrp_total_pp": vrp_total_pp,
+        "vrp_earnings_pp": (iv_near - iv_near_exearn) * _PP,
+        "vrp_ex_earnings_pp": (iv_near_exearn - rv) * _PP,
+        "iv_near_exearn": iv_near_exearn,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Chain helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _side(row: dict) -> str | None:
@@ -537,6 +607,46 @@ def rr25_put_minus_call(chain: Sequence[dict], spot: float, t: float,
     if ivp is None or ivc is None:
         return None
     return ivp - ivc
+
+
+def max_pain(chain: Sequence[dict], spot: float | None = None) -> float | None:
+    """Max-pain strike: the settlement price that minimizes total option-holder
+    payoff (equivalently, maximizes writer retention) across the listed chain.
+
+    For a candidate settle `K`, in-the-money value is
+    `Σ call_OI·(K − k)` over calls with `k < K` plus `Σ put_OI·(k − K)` over
+    puts with `k > K`; max pain is the `K` that minimizes it. Pure function over
+    the open interest already in the chain — a cheap corroboration alongside the
+    GEX walls, never a gate. Ties break toward `spot` when supplied, else the
+    lower strike (deterministic)."""
+    call_oi: dict[float, float] = {}
+    put_oi: dict[float, float] = {}
+    for row in chain or []:
+        side = _side(row)
+        k = _num(row.get("strike"))
+        if side is None or k is None:
+            continue
+        oi = _num(row.get("open_interest")) or 0.0
+        (call_oi if side == "call" else put_oi)[k] = \
+            (call_oi if side == "call" else put_oi).get(k, 0.0) + oi
+    strikes = sorted(set(call_oi) | set(put_oi))
+    if not strikes or (sum(call_oi.values()) + sum(put_oi.values())) <= 0:
+        return None
+    best_k: float | None = None
+    best_pain = float("inf")
+    for cand in strikes:
+        pain = 0.0
+        for k, oi in call_oi.items():
+            if k < cand:
+                pain += oi * (cand - k)
+        for k, oi in put_oi.items():
+            if k > cand:
+                pain += oi * (k - cand)
+        if pain < best_pain - 1e-9 or (
+                abs(pain - best_pain) <= 1e-9 and best_k is not None
+                and spot is not None and abs(cand - spot) < abs(best_k - spot)):
+            best_pain, best_k = pain, cand
+    return best_k
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1468,8 +1578,28 @@ def compute_metrics(ctx: dict, cfg: dict) -> dict[str, Any]:
 
     em = expected_move(spot, atm_iv(chain, spot) or iv, dte,
                        atm_straddle_mid(chain, spot), float(v["days_per_year"]))
+
+    # Per-ticker term structure: the watcher samples a far (~90d) expiry and
+    # passes term_slope + the raw far-expiry IV/tenor straight through. Fall
+    # back to computing the slope from those raw legs if only they are present.
+    atm = atm_iv(chain, spot)
+    iv_near = atm if atm is not None else iv
+    iv_far = _num(res.get("iv_far"))
+    t_far = _num(res.get("t_far"))
+    ts = _num(res.get("term_slope"))
+    ts_pp = _num(res.get("term_slope_pp"))
+    if ts is None and iv_near and iv_far:
+        _tsd = term_structure(iv_near, iv_far)
+        ts, ts_pp = _tsd["term_slope"], _tsd["term_slope_pp"]
+
+    # Earnings VRP decomposition (VolRadar): split VRP into the earnings-driven
+    # and ex-earnings components off the two-expiry IVs + the known earnings date
+    # (the watcher sets `earnings_vrp_event` when a catalyst falls in the window).
+    decomp = earnings_vrp(iv_near, t, iv_far, t_far, yz,
+                          bool(res.get("earnings_vrp_event")))
+
     return {
-        "atm_iv": atm_iv(chain, spot),
+        "atm_iv": atm,
         "iv30": iv,
         "iv_rank": ivr,                       # DISPLAY this
         "iv_percentile": ivp,                 # GATE on this
@@ -1482,7 +1612,12 @@ def compute_metrics(ctx: dict, cfg: dict) -> dict[str, Any]:
         "rv_agrees": agrees,
         "rv_forecast": _num(res.get("rv_forecast")) or yz,
         "vrp": vrp,
-        "term_slope": _num(res.get("term_slope")),
+        "term_slope": ts,
+        "term_slope_pp": ts_pp,
+        "vrp_total_pp": decomp["vrp_total_pp"],
+        "vrp_earnings_pp": decomp["vrp_earnings_pp"],
+        "vrp_ex_earnings_pp": decomp["vrp_ex_earnings_pp"],
+        "max_pain": max_pain(chain, spot),
         "rr25_put_minus_call": _num(res.get("rr25_put_minus_call"))
         if res.get("rr25_put_minus_call") is not None
         else rr25_put_minus_call(chain, spot, t, ctx["r"], ctx["q"]),
@@ -1732,6 +1867,16 @@ def evaluate_readiness(inputs: dict, cfg: dict | None = None) -> dict[str, Any]:
     if cand.get("pop_edge") is not None and cand["pop_edge"] <= 0:
         # Market-implied POP and forecast POP agree → no edge, by construction.
         avoid_if.append("no_forecast_edge_over_market_iv")
+    # Earnings VRP decomposition: positive total VRP but NEGATIVE ex-earnings VRP
+    # means the premium is entirely the pending catalyst — the baseline vol
+    # regime does not support selling. Soft, because the catalyst gate already
+    # hard-vetoes earnings actually inside the tenor; this catches earnings just
+    # OUTSIDE it that still inflate the front IV.
+    vrp_total_pp = ctx["metrics"].get("vrp_total_pp")
+    vrp_ex_pp = ctx["metrics"].get("vrp_ex_earnings_pp")
+    if vrp_total_pp is not None and vrp_ex_pp is not None \
+            and vrp_total_pp > 0 and vrp_ex_pp < 0:
+        avoid_if.append("premium_entirely_earnings_driven")
 
     bands = cfg["decision"]
     decision = "ready" if score >= float(bands["ready"]) \

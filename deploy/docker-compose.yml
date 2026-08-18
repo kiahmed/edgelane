@@ -71,6 +71,11 @@ services:
       # service_role write to app_config (the URL pointer). Server-only secret.
       SUPABASE_URL: ${SUPABASE_URL:-}
       SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY:-}
+      # Publish the rotated tunnel URL to Vercel Edge Config too, so the
+      # DEPLOYED SPA self-heals without a redeploy. Optional — skipped when unset.
+      VERCEL_API_TOKEN: ${VERCEL_API_TOKEN:-}
+      EDGE_CONFIG_ID: ${EDGE_CONFIG_ID:-}
+      VERCEL_TEAM_ID: ${VERCEL_TEAM_ID:-}
     depends_on:
       edgelane-backend:
         condition: service_started

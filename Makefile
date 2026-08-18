@@ -33,10 +33,12 @@ DATA_DUMP    = deploy/edgelane-data.tar.gz
         test test-e2e test-all \
         webhook-debug webhook-post ext-version ext-policy \
         ui \
-        deploy-be deploy-fe deploy-prod deploy-dry \
+        frontend-setup deploy-be deploy-fe deploy-prod deploy-dry \
         deploy-down deploy-be-down deploy-be-restart deploy-prune deploy-builder \
         db-push db-push-dry deploy-data-dump deploy-data-restore \
-        doctor vercel-setup check-tunnel
+        doctor vercel-setup check-tunnel \
+        simmer-ui-install simmer-ui-dev simmer-ui-build simmer-ui-check \
+        simmer-ui-test deploy-simmer-fe
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} \
@@ -151,6 +153,9 @@ ui: ## Open market/ui/index.html in a browser
 # Frontend (market UI) → Vercel; backend (FastAPI + Torque) → Docker container
 # behind a Cloudflare tunnel. See deploy.sh + deploy/ for config.
 
+frontend-setup: ## One-time: create/link the Matrix + Simmer Vercel projects + Edge Config
+	@$(DEPLOY_SH) --frontend-setup $(ARGS)
+
 deploy-be: deploy-builder ## Backend → Docker container + tunnel (DEPLOY=local_container)
 	@BUILDX_BUILDER=$(BUILDER) $(DEPLOY_SH) -b --target $(DEPLOY) $(ARGS)
 
@@ -236,6 +241,25 @@ check-tunnel: ## Verify the prod backend end-to-end (tunnel + CORS + auth)
 	@./tools/check_tunnel.sh $(ARGS)
 
 # ---- Simmer ----
-# Simmer targets land here once the product is built — see docs/simmer.md.
-# Planned: simmer-setup, simmer-dev, simmer-build, deploy-smr-fe, simmer-status.
-# Keep them under this heading so `make help` groups them automatically.
+# Simmer UI (simmer/ui — SvelteKit 5 SPA) + its Vercel deploy. Backend routes
+# (/simmer/*) ship inside the existing market image. See docs/simmer.md.
+
+SIMMER_UI = simmer/ui
+
+simmer-ui-install: ## Install Simmer UI deps (npm ci, simmer/ui)
+	@cd $(SIMMER_UI) && npm ci
+
+simmer-ui-dev: ## Vite dev server on :5173 (backend CORS already allows it)
+	@cd $(SIMMER_UI) && npm run dev
+
+simmer-ui-build: ## Production build (adapter-static → simmer/ui/build)
+	@cd $(SIMMER_UI) && npm run build
+
+simmer-ui-check: ## svelte-check — Svelte 5 runes + TS, must be 0 errors
+	@cd $(SIMMER_UI) && npm run check
+
+simmer-ui-test: ## Vitest unit tests (api pointer resolution, fmt)
+	@cd $(SIMMER_UI) && npm test
+
+deploy-simmer-fe: ## Simmer UI → Vercel project edgelane-simmer
+	@$(DEPLOY_SH) -s $(ARGS)

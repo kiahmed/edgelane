@@ -47,6 +47,14 @@ def _get_jwks_client():
     return _jwks_client
 
 
+# Clock-skew tolerance for iat/exp. Supabase (GoTrue) stamps iat at issue time;
+# a backend clock a few seconds behind — routine on WSL2/Docker-Desktop VMs after
+# sleep/resume, and normal across any distributed pair — otherwise rejects a
+# perfectly valid fresh token with ImmatureSignatureError ("not yet valid").
+# 30s is the conventional allowance and far below any token lifetime.
+_LEEWAY = 30
+
+
 def _decode(token: str) -> dict:
     """Verify a Supabase JWT, choosing HS256 vs ES256/RS256 from its header."""
     settings = get_settings()
@@ -56,7 +64,8 @@ def _decode(token: str) -> dict:
         if not settings.supabase_jwt_secret:
             raise HTTPException(500, "SUPABASE_JWT_SECRET is not configured")
         return jwt.decode(token, settings.supabase_jwt_secret,
-                          algorithms=["HS256"], audience=_AUDIENCE)
+                          algorithms=["HS256"], audience=_AUDIENCE,
+                          leeway=_LEEWAY)
 
     if alg in ("ES256", "RS256"):
         client = _get_jwks_client()
@@ -64,7 +73,8 @@ def _decode(token: str) -> dict:
             raise HTTPException(500, "SUPABASE_URL is not configured")
         signing_key = client.get_signing_key_from_jwt(token)
         return jwt.decode(token, signing_key.key,
-                          algorithms=["ES256", "RS256"], audience=_AUDIENCE)
+                          algorithms=["ES256", "RS256"], audience=_AUDIENCE,
+                          leeway=_LEEWAY)
 
     raise HTTPException(401, f"Unsupported token algorithm: {alg or 'none'}")
 

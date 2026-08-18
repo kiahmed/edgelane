@@ -4,13 +4,13 @@ Every endpoint sits behind the `ensure_tool(user, "simmer")` gate, follows the
 repo's no-prefix convention (full path in each decorator) and returns plain
 dicts.
 
-Watchlist write model (decided, and consistent everywhere): **the frontend
-writes `simmer_watchlist` directly under owner-scoped RLS** (the same pattern
-as `user_settings`); the backend only VALIDATES a symbol before the client
-writes it — `GET /simmer/validate/{symbol}` (and `POST /simmer/watchlist`,
-which runs the identical validation and never writes). Alerts are the
-opposite: there is deliberately NO RLS insert policy for users on
-`simmer_alerts` — only the watcher's service-role path writes them.
+Data plane (architecture decision 2026-08-16, superseding the Matrix
+client-RLS pattern): **this API is the browser's ONLY surface** — every data
+read and write goes through here with the verified JWT, and identity itself
+flows through /auth/* (see routes/auth_proxy.py). Watchlist writes are
+service-role upserts scoped to the caller's verified user id; the RLS policies
+on the Supabase tables remain purely as defense-in-depth that no client uses.
+Alerts stay backend-written only (watcher fan-out).
 
 `/simmer/analyze/{symbol}` calls `simmer_watcher.analyze_symbol` — the SAME
 function the sweep runs — with persist=False, so the on-demand and scheduled
@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 from ..auth import get_current_user
 from ..entitlements import ensure_tool
 from .. import simmer_config
+from .. import simmer_news
 from .. import simmer_watcher
 from .. import supabase_admin
 from ..simmer_engine import STRUCTURES
@@ -141,7 +142,7 @@ async def get_watchlist(request: Request,
                         user: dict = Depends(require_simmer_access)):
     rows = await supabase_admin.select_many(
         "simmer_watchlist",
-        "id,symbol,expiration,position,active,created_at,updated_at",
+        "id,symbol,expiration,position,active,overrides,created_at,updated_at",
         {"user_id": f"eq.{user['id']}", "active": "eq.true"},
         order="position.asc,symbol.asc")
     supabase_ok = rows is not None
@@ -156,7 +157,7 @@ async def get_watchlist(request: Request,
                 env = await asyncio.to_thread(db.latest_simmer_readiness, sym, exp)
         out.append({**r, "readiness": env})
     return {"watchlist": out, "supabase": supabase_ok,
-            "write_model": "client_rls",   # frontend writes under RLS; see module doc
+            "write_model": "api",   # ALL data writes via this API; Supabase in the browser is sign-in only
             "last_sweep_at": simmer_state.last_sweep_at}
 
 
@@ -193,16 +194,88 @@ async def validate_symbol(symbol: str, request: Request,
 
 
 class WatchlistAdd(BaseModel):
+    position: int | None = Field(default=None, ge=0, le=999)
     symbol: str
     expiration: str | None = None
 
 
-@router.post("/simmer/watchlist", dependencies=_GATE)
-async def post_watchlist(body: WatchlistAdd, request: Request):
-    """Validation ONLY (identical to /simmer/validate/{symbol}); the row itself
-    is written by the frontend under owner-scoped RLS. Kept as a POST so a
-    client can validate-then-write in one natural call sequence."""
-    return await _validate_symbol(request, body.symbol, body.expiration)
+@router.post("/simmer/watchlist")
+async def post_watchlist(body: WatchlistAdd, request: Request,
+                         user: dict = Depends(require_simmer_access)):
+    """Validate, then WRITE the row on behalf of the verified user
+    (service-role upsert on (user_id, symbol)). API-first data plane — the
+    browser never writes Supabase tables directly; Supabase in the client is
+    for SIGN-IN only (it is the identity provider issuing the JWT)."""
+    validated = await _validate_symbol(request, body.symbol, body.expiration)
+    validated.pop("write_model", None)   # GET's field; stale "client_rls" here
+    uid = str(user["id"])
+    if uid in ("admin", "dev-local"):
+        raise HTTPException(422, "watchlist rows belong to a signed-in user "
+                                 "account; the admin/dev bypass has none")
+    row = {"user_id": uid, "symbol": validated["symbol"], "active": True}
+    if body.position is not None:
+        row["position"] = int(body.position)
+    if body.expiration:
+        row["expiration"] = str(body.expiration)[:10]
+    ok = await supabase_admin.upsert_row(
+        "simmer_watchlist", row, on_conflict="user_id,symbol")
+    if not ok:
+        raise HTTPException(502, "watchlist write failed (Supabase unreachable "
+                                 "or unconfigured)")
+    return {**validated, "written": True}
+
+
+@router.delete("/simmer/watchlist/{symbol}")
+async def delete_watchlist(symbol: str,
+                           user: dict = Depends(require_simmer_access)):
+    """Remove a symbol from the caller's watchlist (service-role, scoped to the
+    verified user id — a user can only ever delete their own row)."""
+    sym = (symbol or "").strip().upper()
+    if not re.fullmatch(r"[A-Z.\-]{1,10}", sym):
+        raise HTTPException(422, f"invalid symbol {symbol!r}")
+    ok = await supabase_admin.delete_rows(
+        "simmer_watchlist",
+        {"user_id": f"eq.{user['id']}", "symbol": f"eq.{sym}"})
+    if not ok:
+        raise HTTPException(502, "watchlist delete failed")
+    return {"symbol": sym, "deleted": True}
+
+
+class WatchlistPatch(BaseModel):
+    # `model_fields_set` distinguishes an EXPLICIT null (clear the pin → back
+    # to engine auto-pick) from the field being absent — plain `is not None`
+    # cannot, and "back to auto" would 422.
+    expiration: str | None = Field(default=None, description="pin ONE expiry; explicit null clears")
+    active: bool | None = None
+    position: int | None = Field(default=None, ge=0, le=999)
+
+
+@router.patch("/simmer/watchlist/{symbol}")
+async def patch_watchlist(symbol: str, body: WatchlistPatch, request: Request,
+                          user: dict = Depends(require_simmer_access)):
+    """Update expiration pin / active / display position on the caller's row."""
+    sym = (symbol or "").strip().upper()
+    if not re.fullmatch(r"[A-Z.\-]{1,10}", sym):
+        raise HTTPException(422, f"invalid symbol {symbol!r}")
+    values: dict = {}
+    if "expiration" in body.model_fields_set:
+        if body.expiration is None:
+            values["expiration"] = None        # clear the pin → engine auto-picks
+        else:
+            await _validate_symbol(request, sym, body.expiration)  # 422 if unlisted
+            values["expiration"] = str(body.expiration)[:10]
+    if body.active is not None:
+        values["active"] = bool(body.active)
+    if body.position is not None:
+        values["position"] = int(body.position)
+    if not values:
+        raise HTTPException(422, "nothing to update")
+    ok = await supabase_admin.update_rows(
+        "simmer_watchlist",
+        {"user_id": f"eq.{user['id']}", "symbol": f"eq.{sym}"}, values)
+    if not ok:
+        raise HTTPException(502, "watchlist update failed")
+    return {"symbol": sym, "updated": sorted(values)}
 
 
 # ── Analyze / expirations ───────────────────────────────────────────────────
@@ -213,12 +286,18 @@ async def analyze(symbol: str, request: Request,
     """On-demand cook — the SAME function the watcher's sweep calls
     (`simmer_watcher.analyze_symbol`), with persist=False so an on-demand call
     never adds engine-verdict rows to the calibration tables."""
-    tradier = _tradier(request)
+    # Use the SWEEP's provider when the loop has published one — analyze must
+    # run on the same data source as the sweep (tradier fallback pre-loop).
+    source = simmer_state.provider or _tradier(request)
     db = _db(request)
     try:
         env = await simmer_watcher.analyze_symbol(
-            tradier, db, symbol, expiration,
-            regime=simmer_state.regime, persist=False)
+            source, db, symbol, expiration,
+            regime=simmer_state.regime,
+            # Same cross-sectional peers the sweep uses, so on-demand /analyze
+            # and the scheduled sweep agree (the cold-start VRP bootstrap).
+            peer_vrp=[v for v in simmer_state.peer_iv_rv.values() if v is not None],
+            persist=False)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except RuntimeError as e:
@@ -284,6 +363,67 @@ async def ack_alerts(body: AlertAck, user: dict = Depends(require_simmer_access)
     return {"acknowledged": ids if ok else [], "ok": ok}
 
 
+# ── News (Phase 3a — read-only view over simmer_news + research cache) ──────
+@router.get("/simmer/news/{symbol}", dependencies=_GATE)
+async def simmer_news_endpoint(symbol: str, request: Request):
+    """Last-24h scored news CLUSTERS for one symbol (deduped — one entry per
+    wire story, `breadth` = syndication count), plus the trailing sentiment
+    aggregate and velocity state from the tier-1 research cache. Read-only:
+    ingestion/scoring happens only in the watcher's news refresh."""
+    sym = (symbol or "").strip().upper()
+    if not sym or not re.fullmatch(r"[A-Z.\-]{1,10}", sym):
+        raise HTTPException(422, f"invalid symbol {symbol!r}")
+    db = _db(request)
+    if db is None:
+        raise HTTPException(500, "database not initialized")
+    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=24)
+    rows = await asyncio.to_thread(simmer_news.fetch_news_since, db, sym, since)
+
+    clusters: dict[str, dict] = {}
+    for r in rows:                                # rows arrive oldest-first
+        ck = r.get("cluster_key") or r.get("article_id")
+        c = clusters.get(ck)
+        if c is None:
+            c = clusters[ck] = {
+                "cluster_key": ck,
+                "headline": r.get("headline"),     # representative = earliest
+                "url": r.get("url"),
+                "source": r.get("source"),
+                "published_at": r.get("published_at"),
+                "breadth": 0,
+                "_scores": [],
+            }
+        c["breadth"] += 1
+        if r.get("sentiment") is not None:
+            c["_scores"].append(float(r["sentiment"]))
+    out_clusters = []
+    for c in sorted(clusters.values(),
+                    key=lambda c: str(c.get("published_at")), reverse=True):
+        scores = c.pop("_scores")
+        c["sentiment"] = round(sum(scores) / len(scores), 4) if scores else None
+        pub = c.get("published_at")
+        if isinstance(pub, datetime):
+            c["published_at"] = pub.replace(tzinfo=timezone.utc).isoformat() \
+                .replace("+00:00", "Z")
+        out_clusters.append(c)
+
+    research = await asyncio.to_thread(db.get_simmer_research, sym) or {}
+    news_at = research.get("news_at")
+    if isinstance(news_at, datetime):
+        news_at = news_at.replace(tzinfo=timezone.utc).isoformat() \
+            .replace("+00:00", "Z")
+    return {
+        "symbol": sym,
+        "window_hours": 24,
+        "clusters": out_clusters,
+        "aggregate": {"sentiment_score": research.get("sentiment_score"),
+                      "sentiment_n": research.get("sentiment_n"),
+                      "news_at": news_at},
+        "velocity": {"p": research.get("velocity_p"),
+                     "tier": research.get("velocity_tier")},
+    }
+
+
 # ── Outcomes ────────────────────────────────────────────────────────────────
 @router.get("/simmer/outcomes/summary", dependencies=_GATE)
 async def outcomes_summary(request: Request):
@@ -346,6 +486,11 @@ def sanitize_settings(payload: dict) -> dict:
         if rs not in _ALLOWED_STRICTNESS:
             raise HTTPException(422, f"regime_strictness must be one of {_ALLOWED_STRICTNESS}")
         out["regime_strictness"] = rs
+    if payload.get("risk_profile") is not None:
+        rp = str(payload["risk_profile"])
+        if rp not in ("conservative", "balanced", "aggressive"):
+            raise HTTPException(422, "risk_profile must be conservative|balanced|aggressive")
+        out["risk_profile"] = rp
     if payload.get("notify_email") is not None:
         out["notify_email"] = bool(payload["notify_email"])
     if payload.get("gate_overrides") is not None:

@@ -219,6 +219,28 @@ async def update_rows(table: str, filters: dict, values: dict) -> bool:
         return False
 
 
+async def delete_rows(table: str, filters: dict) -> bool:
+    """DELETE rows matching PostgREST filters (service_role). REFUSES an empty
+    filter — an unfiltered DELETE would wipe the table."""
+    if not filters:
+        log.error("[supabase] delete_rows(%s) called with no filters — refused", table)
+        return False
+    settings = get_settings()
+    if not (settings.supabase_url and settings.supabase_service_key):
+        log.warning("[supabase] URL/service key not configured; cannot delete from %s", table)
+        return False
+    base, headers = _rest(settings)
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.delete(f"{base}/{table}", headers=headers, params=filters)
+        if r.status_code in (200, 204):
+            return True
+        log.error("[supabase] %s delete failed (%s): %s", table, r.status_code, r.text[:300])
+    except Exception as e:
+        log.error("[supabase] %s delete error: %s", table, e)
+    return False
+
+
 async def upsert_row(table: str, row: dict, on_conflict: str) -> bool:
     """Insert-or-merge one row via PostgREST upsert (service_role key)."""
     settings = get_settings()

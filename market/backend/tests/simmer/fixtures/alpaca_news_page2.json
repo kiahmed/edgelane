@@ -1,0 +1,31 @@
+{
+  "news": [
+    {
+      "id": 24802710,
+      "headline": "AMD Faces Antitrust Probe Over Data-Center Chip Contracts",
+      "author": "Benzinga Newsdesk",
+      "created_at": "2026-08-15T09:41:20Z",
+      "updated_at": "2026-08-15T09:41:20Z",
+      "summary": "Regulators opened an inquiry.",
+      "content": "<p>BODY — never persisted.</p>",
+      "url": "https://www.benzinga.com/news/24802710",
+      "images": [],
+      "symbols": ["AMD"],
+      "source": "benzinga"
+    },
+    {
+      "id": 24801950,
+      "headline": "NVIDIA Partners With Automaker on Next-Gen Autonomous Platform",
+      "author": "Benzinga Newsdesk",
+      "created_at": "2026-08-15T08:12:00Z",
+      "updated_at": "2026-08-15T08:12:00Z",
+      "summary": "A distinct story from the earnings wave.",
+      "content": "",
+      "url": "https://www.benzinga.com/news/24801950",
+      "images": [],
+      "symbols": ["NVDA"],
+      "source": "benzinga"
+    }
+  ],
+  "next_page_token": null
+}

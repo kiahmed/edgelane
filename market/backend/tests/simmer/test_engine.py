@@ -655,3 +655,79 @@ def test_data_quality_degrades_with_missing_history():
     assert out["data_quality"]["iv_history"] < full["data_quality"]["iv_history"]
     assert out["confidence"] < full["confidence"]
     assert "iv_rank_provisional_short_history" in out["avoid_if"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Additive signals: max pain, per-ticker term structure, earnings-VRP split
+# ═══════════════════════════════════════════════════════════════════════════
+def _oi_book(rows):
+    """rows: (side, strike, open_interest) → chain dicts the OI helpers read."""
+    return [{"side": s, "strike": float(k), "open_interest": oi} for s, k, oi in rows]
+
+
+def test_max_pain_argmin_over_a_hand_built_oi_book():
+    # puts heavy at/below 100, calls heavy at 100 → total holder payoff is
+    # minimized at K=100 (worked out by hand: pain 6000/1000/3000/7000).
+    book = _oi_book([
+        ("put", 90, 100), ("put", 100, 400), ("put", 110, 100),
+        ("call", 100, 300), ("call", 110, 100), ("call", 120, 100),
+    ])
+    assert se.max_pain(book, spot=105.0) == 100.0
+
+
+def test_max_pain_none_without_open_interest():
+    assert se.max_pain(_oi_book([("put", 100, 0), ("call", 100, 0)])) is None
+    assert se.max_pain([]) is None
+
+
+def test_term_structure_contango_vs_backwardation_sign():
+    contango = se.term_structure(iv_near=0.30, iv_far=0.33)   # far richer
+    assert contango["term_slope"] > 1.0                       # good for sellers
+    assert contango["term_slope_pp"] < 0                      # iv_near − iv_far
+    backward = se.term_structure(iv_near=0.40, iv_far=0.30)   # front richer
+    assert backward["term_slope"] < 1.0
+    assert backward["term_slope_pp"] > 0
+    # Degenerate legs → None, never a fabricated slope.
+    assert se.term_structure(None, 0.30)["term_slope"] is None
+    assert se.term_structure(0.30, 0.0)["term_slope"] is None
+
+
+def test_earnings_vrp_decomposition_event_in_near():
+    d = se.earnings_vrp(iv_near=0.45, t_near=30 / 365, iv_far=0.30,
+                        t_far=90 / 365, rv=0.32, event_in_near=True)
+    # Event only in the near tenor → ex-earnings near IV collapses to the far
+    # (baseline) IV by the variance-removal identity.
+    assert d["iv_near_exearn"] == pytest.approx(0.30, abs=1e-9)
+    assert d["vrp_earnings_pp"] == pytest.approx((0.45 - 0.30) * 100.0)
+    assert d["vrp_ex_earnings_pp"] == pytest.approx((0.30 - 0.32) * 100.0)
+    assert d["vrp_total_pp"] == pytest.approx((0.45 - 0.32) * 100.0)
+    assert d["vrp_earnings_pp"] > 0 and d["vrp_ex_earnings_pp"] < 0
+
+
+def test_earnings_vrp_no_event_is_entirely_ex_earnings():
+    d = se.earnings_vrp(0.30, 30 / 365, 0.28, 90 / 365, 0.25, event_in_near=False)
+    assert d["vrp_earnings_pp"] == 0.0
+    assert d["vrp_ex_earnings_pp"] == pytest.approx(d["vrp_total_pp"])
+    assert d["vrp_total_pp"] == pytest.approx((0.30 - 0.25) * 100.0)
+
+
+def test_earnings_vrp_avoid_if_fires_when_premium_is_all_earnings():
+    from .conftest import mutate
+    # Front IV inflated by an event; the ex-earnings floor (≈ iv_far 0.22) sits
+    # BELOW realized (0.244) → positive total VRP, negative ex-earnings VRP.
+    out = se.evaluate_readiness(mutate(iv_far=0.22, t_far=0.25,
+                                       earnings_vrp_event=True))
+    assert out["veto_reasons"] == []                       # soft, not a hard veto
+    assert "premium_entirely_earnings_driven" in out["avoid_if"]
+    m = out["metrics"]
+    assert m["vrp_total_pp"] > 0 and m["vrp_ex_earnings_pp"] < 0
+    assert m["vrp_earnings_pp"] > 0
+
+
+def test_earnings_vrp_avoid_if_absent_without_event():
+    out = se.evaluate_readiness(clean_inputs())
+    assert "premium_entirely_earnings_driven" not in out["avoid_if"]
+    m = out["metrics"]
+    assert m["vrp_earnings_pp"] == 0.0
+    assert m["vrp_ex_earnings_pp"] == pytest.approx(m["vrp_total_pp"])
+    assert m["max_pain"] is not None                       # rides the envelope

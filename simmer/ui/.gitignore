@@ -1,0 +1,9 @@
+node_modules/
+build/
+.svelte-kit/
+.vercel/
+vite.config.ts.timestamp-*
+
+# real local config (example stays committed)
+static/edgelane.config.js
+.vercel

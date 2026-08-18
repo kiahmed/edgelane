@@ -647,6 +647,146 @@ or `make run-prod` (real). Full doc: `docs/torque.md`.
 4. **Orders panel** (bottom): working orders + armed closes — click a limit to
    modify, or cancel. Env badge **SANDBOX** (gold) / **PRODUCTION** (red).
 
+## Simmer — premium-selling readiness engine (live: backend + UI)
+
+Watches your ticker watchlist every 5 minutes and tells you **when a name is
+conditioned to sell a credit spread** — structure, strikes, credit, POP at the
+breakeven, payoff-integrated EV — gated hard on catalysts (SEC 8-K hard-blocks,
+earnings blackouts, macro calendar), liquidity, VRP, and the 0.20–0.35 short-delta
+band. Most names are **vetoed most of the time; the veto reasons are the
+product.** Full doc: `docs/simmer.md`.
+
+**Backend** (live — rides in the market service, no separate process):
+
+- Endpoints under `/simmer/*`, gated on the `simmer` entitlement
+  (`profiles.tools_enabled`); admin token works too:
+  `/simmer/status` (watcher health + regime), `/simmer/analyze/{sym}` (full
+  envelope), `/simmer/news/{sym}` (scored headline clusters + velocity),
+  `/simmer/watchlist`, `/simmer/alerts`, `/simmer/settings`,
+  `/simmer/outcomes/summary` (paper-outcome calibration).
+- **Watchlist writes are client-side under RLS** (frontend, when built); today
+  seed rows into `simmer_watchlist` via service role. Alerts are written only by
+  the backend and fan out per user with that user's own thresholds.
+- News: Alpaca (free paper-account keys) → dedup into clusters → Gemini scores
+  only never-seen headlines (~$0.25/mo at 20 tickers). No keys = clean no-op;
+  sentiment can only pick the side or veto, never promote a score.
+
+**Config check before any deploy** (all in `edgelane_market.config`):
+
+| Key | Check |
+|---|---|
+| `DEVMODE` | **`false` for prod.** The flag flips Tradier base+token+account AND the DuckDB file in one go — a prod container with `true` serves users sandbox quotes and writes history into the sandbox DB while looking perfectly alive. Local testing flips it `true`; always flip back. |
+| `SIMMER_DATA_PROVIDER` | `tradier` (default) or `yahoo` — Yahoo keeps the sweep off the 120 req/min Tradier budget Matrix/Torque share, and supplies the daily OHLC bars that IV-history/outcomes need. |
+| `SIMMER_NEWS_PROVIDER` | `alpaca` \| `rss` \| `off` |
+| `ALPACA_KEY_ID` / `ALPACA_SECRET_KEY` | From a free paper account (app.alpaca.markets → enable MFA first, or the API-keys widget stays hidden). |
+| `GEMINI_API_KEY` / `GEMINI_MODEL` | Same key the legacy frontend uses; default model `gemini-2.5-flash-lite`. |
+
+**Deploy (backend — the only Simmer surface today):**
+
+```bash
+# one-time per schema change
+make db-push                 # applies supabase/migrations (0010 = Simmer tables)
+
+# every code change
+sed -n 's/^DEVMODE=/&/p' edgelane_market.config   # eyeball it: must be false
+make deploy-be-restart       # rebuilds the container from the working tree
+```
+
+The config file is bind-mounted into the container, so key changes need only a
+container restart, not a rebuild. `make stop` is safe for the local dev server
+(SIGTERM + grace — a hard kill corrupts the DuckDB WAL and the next boot dies
+replaying it; if that happens: delete the `.wal` file next to the DB and reboot).
+
+**Frontend** (live): a SvelteKit 5 SPA (adapter-static, runes) at
+`https://edgelane-simmer.vercel.app`. Sign-in, watchlist/settings writes, and every
+read go through the backend API — the **browser never contacts Supabase directly**
+(auth flows through the backend `/auth/*` proxy; see `market/backend/app/routes/auth_proxy.py`).
+
+### The moving pieces (and how they find each other)
+
+| Piece | Lives on | How it's reached |
+|---|---|---|
+| Backend (market API + Torque + Simmer) | local Docker container `edgelane-backend` | Cloudflare **quick tunnel** — URL **rotates on every container restart** |
+| Cloudflared publisher | container `edgelane-cloudflared` | on start, writes the fresh tunnel URL to **both** Supabase `app_config.api_base` (Matrix) **and** Vercel Edge Config `api_base` (Simmer) |
+| Matrix UI | Vercel project `edgelane-matrix` | reads `app_config.api_base` from Supabase at boot |
+| Simmer UI | Vercel project `edgelane-simmer` | reads `GET /api/config` at boot → Vercel Edge Config `api_base` |
+| Edge Config store `edgelane-api-base` | Vercel | serverless `/api/config` reads it; cloudflared PATCHes it on rotation |
+
+Because there's no fixed domain, the tunnel URL rotates and the two frontends
+**self-heal** at boot from their pointers — no redeploy needed when only the tunnel
+moves, *provided* the publisher can write those pointers (see the token note below).
+
+### One-time setup — `make frontend-setup`
+
+Run once (and again whenever a Vercel project or the Edge Config is added/renamed).
+Idempotent; safe to re-run.
+
+```bash
+vercel login            # setup reads this CLI session for provisioning — no token to paste
+make frontend-setup     # 1) links/creates BOTH Vercel projects (Matrix + Simmer)
+                        # 2) creates the Edge Config store, connects it to the Simmer
+                        #    project (EDGE_CONFIG env), writes EDGE_CONFIG_ID → deploy/.env
+                        # 3) syncs Supabase Auth uri_allow_list with both origins
+```
+
+`deploy-fe` / `deploy-simmer-fe` **refuse** until the project is linked and point you
+here. Provisioning uses your Vercel CLI login (`~/.local/share/com.vercel.cli/auth.json`).
+
+**Container tunnel self-heal needs a PERMANENT token.** The cloudflared container
+can't read your host CLI login, so to let it PATCH Edge Config on rotation, put a
+**no-expiration** token in `deploy/.env`:
+
+```bash
+# Vercel → Account Settings → Tokens → Create (scope: your account, expiration: No Expiration)
+VERCEL_API_TOKEN=vcp_...        # deploy/.env  — setup never overwrites this
+```
+
+Without it: not an error — the container logs `skipping Edge Config`, and Simmer keeps
+its last-known tunnel URL until the token is set and the container republishes. `make
+frontend-setup` prints whether self-heal is enabled.
+
+### Deploy / update — what to run, in what order
+
+Do only the steps for what changed; the **sequence matters** (schema → backend →
+frontends), because the backend restart rotates the tunnel and republishes the pointers.
+
+1. **DB schema changed** → `make db-push` (applies `supabase/migrations`).
+2. **Backend / engine changed** → verify `DEVMODE=false`, then `make deploy-be`
+   (rebuild) or `make deploy-be-restart`. This **rotates the tunnel**; cloudflared
+   republishes `api_base` to Supabase **and** Edge Config on boot.
+   - Config-only change (keys in `edgelane_market.config`): the file is bind-mounted —
+     a container restart suffices, no rebuild.
+3. **Matrix UI changed** → `make deploy-fe` (also re-syncs Supabase `site_url` +
+   `uri_allow_list`, which is where the Simmer origin gets added if setup didn't).
+4. **Simmer UI changed** → `make deploy-simmer-fe`. (npm ci + `vite build` can take
+   >2 min; that's normal.)
+5. **Always finish with** → `make check-tunnel` — verifies container health, the
+   Supabase pointer, **the Edge Config pointer matches it**, tunnel `/status`, CORS for
+   the Vercel origin, and the Turnstile path.
+
+**Make sure, before/after:**
+
+- `DEVMODE=false` in `edgelane_market.config` before any prod backend deploy (it flips
+  Tradier token/base/account **and** the DuckDB file in one switch).
+- A permanent `VERCEL_API_TOKEN` is in `deploy/.env` if you want tunnel self-heal.
+- After a backend/tunnel restart, confirm the pointer landed —
+  `make check-tunnel` shows `✓ Vercel Edge Config api_base matches Supabase`, or watch
+  `docker compose -f deploy/docker-compose.yml logs -f edgelane-cloudflared` for
+  `published api_base -> Vercel Edge Config (HTTP 200)`.
+- The Simmer origin is in Supabase `uri_allow_list` (so confirmation/reset emails can
+  redirect back) — added by `make frontend-setup` or the next `make deploy-fe`.
+
+### Simmer UI internals worth knowing
+
+- **Deployed-vs-dev is a build-time constant** (`import.meta.env.PROD`), not baked
+  config. A production `vite build` always resolves the backend via `/api/config` and
+  locks the `?api=` override; it carries **no** Supabase creds or secrets in the
+  browser. `edgelane.config.js` is inert for detection.
+- **SPA routing on Vercel:** `simmer/ui/vercel.json` uses `rewrites: /(.*) → /index.html`
+  and **no `cleanUrls`**. Vercel's `source` is path-to-regexp — **no lookaheads**
+  (`(?!api)` silently matches nothing); `/api/*` stays safe because functions/static
+  files are matched before rewrites.
+
 ## Strike Profiles — debit strike picker config (admin)
 
 Admin-only page on the market backend for tuning **how the engine builds debit
@@ -703,3 +843,16 @@ the Cloudflare tunnel URL + the same path. Auth (same admin secret as Torque):
 | Spot price updated but bias narrative looks stale | Spot is decoupled from the bias pipeline. Click re-detect to refresh the narrative. |
 | Lookup cell says "intrinsic fallback" | At least one leg is missing IV data from the provider; that cell uses intrinsic value instead. |
 | Symbol fails after ~75 s with a timeout error | Provider didn't respond. Try again in a minute; if persistent, the symbol may need a wider timeout configuration. |
+
+### Simmer / deployment / tunnel
+
+| What you see | What's happening / fix |
+|---|---|
+| Simmer prod **login fails** or the app calls `edgelane-simmer.vercel.app/auth/...` (404) | The app isn't resolving the backend via `/api/config`. Confirm it's a **production build** (`import.meta.env.PROD`; a dev build hits localhost), that `GET /api/config` returns the tunnel URL, and that Edge Config has `api_base`. Historically caused by detecting "dev build" from baked config instead of `import.meta.env`. |
+| Simmer **subroutes 404** on direct load/refresh (`/settings`, `/news`) but `/` works | SPA fallback not firing. `simmer/ui/vercel.json` must have `rewrites: /(.*) → /index.html` and **no `cleanUrls`** (it conflicts with the rewrite target). Never use a lookahead in `source` — path-to-regexp silently no-ops it. Redeploy with `make deploy-simmer-fe`. |
+| After a backend/tunnel restart, Simmer can't reach the backend (Matrix is fine) | Edge Config `api_base` went stale — the container couldn't PATCH it. `deploy/.env` is missing a **permanent** `VERCEL_API_TOKEN`, or it expired. Check `docker compose … logs edgelane-cloudflared` for `skipping Edge Config` / non-200; set the token and restart the container. |
+| `make check-tunnel` says **"Edge Config not configured"** | `VERCEL_API_TOKEN` / `EDGE_CONFIG_ID` unset in `deploy/.env`. Run `make frontend-setup` (writes `EDGE_CONFIG_ID`) and add a permanent `VERCEL_API_TOKEN`. |
+| `make check-tunnel`: **Edge Config api_base differs from Supabase** | Mid-rotation (harmless, re-run in a few seconds) or a stale/expired token stopped the last publish. If it persists, refresh `VERCEL_API_TOKEN` and restart the container. |
+| Simmer email confirmation / password-reset link is **rejected on redirect** | The Simmer origin isn't in Supabase Auth `uri_allow_list`. Run `make frontend-setup` or `make deploy-fe` (both PATCH it), or add `https://edgelane-simmer.vercel.app/**` manually. |
+| `make frontend-setup` prints **"no Vercel token — skipping Edge Config"** | You're not logged in for provisioning. Run `vercel login`, then re-run. (This is separate from the permanent `VERCEL_API_TOKEN` the container needs.) |
+| Simmer prod `edgelane.config.js` shows `API_BASE = null` / "LOCAL DEV config" | Expected. Vercel rebuilds remotely and serves the `static/` file; it's **inert** — detection is `import.meta.env.PROD` and the API base comes from `/api/config`. Not a bug. |

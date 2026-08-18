@@ -27,16 +27,25 @@ _buckets: dict[str, tuple[int, float]] = {}
 _MAX_KEYS = 50_000  # safety cap; prune stale entries past this
 
 
+def _client_ip(request) -> str:
+    return request.headers.get("cf-connecting-ip") or (
+        request.client.host if request.client else "unknown")
+
+
 def _client_key(request) -> str:
+    # /auth/* is UNAUTHENTICATED (it IS the auth). Keying on the caller-supplied
+    # bearer would let a brute-forcer rotate a random token per request and dodge
+    # the limiter entirely, and DoS nothing but themselves. Key on IP so password
+    # guessing is actually bounded.
+    if request.url.path.startswith("/auth/"):
+        return "auth-ip:" + _client_ip(request)
     authz = request.headers.get("authorization") or ""
     if authz.lower().startswith("bearer "):
         return "u:" + hashlib.sha256(authz[7:].encode()).hexdigest()[:16]
     sess = request.headers.get("x-edgelane-session")
     if sess:
         return "s:" + hashlib.sha256(sess.encode()).hexdigest()[:16]
-    ip = request.headers.get("cf-connecting-ip") or (
-        request.client.host if request.client else "unknown")
-    return "ip:" + ip
+    return "ip:" + _client_ip(request)
 
 
 def _prune(now: float, window: int) -> None:
@@ -53,7 +62,9 @@ async def rate_limit_middleware(request, call_next):
     if not settings.auth_enabled or auth._admin_token_ok(request):
         return await call_next(request)
 
-    limit = settings.rate_limit_per_min
+    is_auth = request.url.path.startswith("/auth/")
+    limit = (settings.rate_limit_auth_per_min if is_auth
+             else settings.rate_limit_per_min)
     window = settings.rate_limit_window_sec
     now = time.monotonic()
     key = _client_key(request)

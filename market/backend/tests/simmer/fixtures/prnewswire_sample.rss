@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>PR Newswire: News Releases</title>
+    <link>https://www.prnewswire.com/news-releases/</link>
+    <description>Latest news releases</description>
+    <item>
+      <title>Wix Reports Second Quarter 2026 Results (NASDAQ: WIX)</title>
+      <link>https://www.prnewswire.com/news-releases/wix-q2-2026.html</link>
+      <guid isPermaLink="true">https://www.prnewswire.com/news-releases/wix-q2-2026.html</guid>
+      <pubDate>Fri, 15 Aug 2026 08:30:00 -0400</pubDate>
+      <description>Wix.com Ltd. (NASDAQ: WIX) today reported financial results for the second quarter.</description>
+    </item>
+    <item>
+      <title>Goldman Sachs Announces Strategic Partnership With Fintech Startup</title>
+      <link>https://www.prnewswire.com/news-releases/gs-partnership.html</link>
+      <guid isPermaLink="true">https://www.prnewswire.com/news-releases/gs-partnership.html</guid>
+      <pubDate>Fri, 15 Aug 2026 09:05:00 -0400</pubDate>
+      <description>The Goldman Sachs Group, Inc. (NYSE: GS) announced today a strategic partnership.</description>
+    </item>
+    <item>
+      <title>Local Charity Gala Raises Record Funds</title>
+      <link>https://www.prnewswire.com/news-releases/charity-gala.html</link>
+      <guid isPermaLink="true">https://www.prnewswire.com/news-releases/charity-gala.html</guid>
+      <pubDate>Fri, 15 Aug 2026 09:20:00 -0400</pubDate>
+      <description>No listed ticker appears anywhere in this release.</description>
+    </item>
+  </channel>
+</rss>

@@ -200,7 +200,7 @@ app.add_middleware(
 
 from .routes import (  # noqa: E402
     status, symbols, snapshot, accuracy, diag, orders, webhook, torque, session, broker, contact,
-    strike_profiles, simmer,
+    strike_profiles, simmer, auth_proxy,
 )
 
 app.include_router(status.router)
@@ -212,6 +212,7 @@ app.include_router(orders.router)
 app.include_router(webhook.router)
 app.include_router(torque.router)
 app.include_router(simmer.router)
+app.include_router(auth_proxy.router)
 app.include_router(session.router)
 app.include_router(broker.router)
 app.include_router(contact.router)

@@ -64,6 +64,28 @@ else
   echo; echo "Result: FRONTEND CANNOT DISCOVER BACKEND"; exit 1
 fi
 
+# 2b) Vercel Edge Config pointer — what the DEPLOYED Simmer SPA reads via
+#     /api/config (the Simmer browser never touches Supabase). cloudflared
+#     PATCHes this on every restart; it should match the Supabase value.
+if [ -n "${VERCEL_API_TOKEN:-}" ] && [ -n "${EDGE_CONFIG_ID:-}" ]; then
+  EURL=$(curl -s -m "$TIMEOUT" \
+    "https://api.vercel.com/v1/edge-config/${EDGE_CONFIG_ID}/items${VERCEL_TEAM_ID:+?teamId=${VERCEL_TEAM_ID}}" \
+    -H "Authorization: Bearer $VERCEL_API_TOKEN" \
+    | python3 -c "import sys,json;d=json.load(sys.stdin);L=d if isinstance(d,list) else [];print(next((i['value'] for i in L if i.get('key')=='api_base'),''))" 2>/dev/null)
+  if [ -z "$EURL" ]; then
+    fail "Edge Config has no api_base — deployed Simmer SPA can't discover the backend (cloudflared Edge Config publish failed?)"
+  elif [ "$EURL" = "$URL" ]; then
+    pass "Vercel Edge Config api_base matches Supabase"
+    info "$EURL"
+  else
+    warn "Edge Config api_base differs from Supabase (tunnel rotation in progress, or a stale token stopped the last publish)"
+    info "edge:     $EURL"
+    info "supabase: $URL"
+  fi
+else
+  warn "Edge Config not configured (VERCEL_API_TOKEN/EDGE_CONFIG_ID unset) — Simmer tunnel self-heal is OFF"
+fi
+
 # 3) Tunnel reaches the backend
 read -r code time < <(curl -s -m "$TIMEOUT" -o /dev/null -w "%{http_code} %{time_total}" "$URL/status")
 if [ "$code" = "200" ]; then pass "tunnel /status 200 (${time}s)"

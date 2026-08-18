@@ -249,6 +249,22 @@ def fresh_db(tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _pin_default_settings():
+    """The watcher's news refresh (Phase 3a) reads `config.get_settings()`
+    inside the sweep. Pin the cached Settings to pure defaults so a developer
+    machine's real edgelane_market.config — which may carry live Alpaca/Gemini
+    keys — can never leak network calls into this suite. Tests that need
+    specific settings still monkeypatch `config._cached` themselves (the
+    auth_on/auth_off pattern), which simply overrides this pin."""
+    from app import config
+
+    prev = config._cached
+    config._cached = config.Settings()
+    yield
+    config._cached = prev
+
+
+@pytest.fixture(autouse=True)
 def _reset_watcher_state():
     """The watcher state is a module-level singleton (routes hold a reference,
     so it is reset IN PLACE, never rebound)."""

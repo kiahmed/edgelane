@@ -160,3 +160,27 @@ PROVIDER_TARGET_URL=
 #             endpoint, personal-use posture — see app/simmer_data_provider.py
 #             before using this commercially.
 # SIMMER_DATA_PROVIDER=tradier
+
+# ── Simmer news + sentiment (Phase 3a) ──
+# News source for the Simmer watcher's 15-minute news refresh:
+#   alpaca = Alpaca Market Data news (Benzinga-sourced). FREE with a paper
+#            account — sign up at alpaca.markets (email only, no funding),
+#            then Dashboard → API Keys (paper). 200 req/min free tier.
+#   rss    = keyless wire-RSS fallback (PRNewswire firehose, regex ticker
+#            match). Weaker coverage; used automatically if Alpaca keeps
+#            failing.
+#   off    = disable news ingestion entirely.
+# With no keys configured the refresh is a clean no-op (sentiment fields stay
+# NULL with a data_quality note) — nothing else in Simmer is affected.
+# SIMMER_NEWS_PROVIDER=alpaca
+# ALPACA_KEY_ID=
+# ALPACA_SECRET_KEY=
+# Gemini headline sentiment scoring. Get a key at aistudio.google.com (free
+# tier is ample: only NEW headlines are ever scored — ~$0.22/mo at 20 tickers
+# on flash-lite). Without a key, headlines are still ingested and deduped but
+# never scored.
+# GEMINI_API_KEY=
+# Model for scoring. gemini-2.5-flash-lite (default) is the cheapest and the
+# only one with thinking OFF by default. Scores are not reproducible across
+# models; the model id is recorded on every scored row.
+# GEMINI_MODEL=gemini-2.5-flash-lite

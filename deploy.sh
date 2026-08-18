@@ -27,6 +27,7 @@ COMPOSE_FILE="$DEPLOY_DIR/docker-compose.yml"
 BACKEND_CONFIG="$ROOT_DIR/edgelane_market.config"
 UI_SRC="$ROOT_DIR/market/ui"
 DIST_DIR="$ROOT_DIR/dist"
+SIMMER_UI_SRC="$ROOT_DIR/simmer/ui"
 
 # Load deploy/.env if present (tunnel token, image, Vercel project, API base).
 if [ -f "$DEPLOY_ENV" ]; then
@@ -37,6 +38,9 @@ fi
 # behind a Cloudflare tunnel. 'cloud' is reserved for a future hosted target.
 DEPLOY_TARGET="${DEPLOY_TARGET:-local_container}"
 VERCEL_PROJECT="${VERCEL_PROJECT:-edgelane-matrix}"
+# ⚠ Simmer's hostname must keep matching the backend CORS regex
+# ^https://edgelane[a-z0-9-]*\.vercel\.app$ — see docs/simmer.md "Deployment".
+SIMMER_VERCEL_PROJECT="${SIMMER_VERCEL_PROJECT:-edgelane-simmer}"
 EDGELANE_API_BASE="${EDGELANE_API_BASE:-}"
 COMPOSE="docker compose -f $COMPOSE_FILE --env-file $DEPLOY_ENV"
 
@@ -44,7 +48,9 @@ COMPOSE="docker compose -f $COMPOSE_FILE --env-file $DEPLOY_ENV"
 # Flags
 # ----------------------------------------------------------------------------
 DO_FRONTEND=false
+DO_FRONTEND_SETUP=false
 DO_BACKEND=false
+DO_SIMMER=false
 DRY_RUN=false
 ASSUME_YES=false
 SKIP_DB=false
@@ -80,10 +86,12 @@ ${BOLD}deploy.sh${NC} — deploy EdgeLane (frontend → Vercel, backend → Dock
 ${BOLD}USAGE${NC}
   ./deploy.sh [targets] [options]
 
-${BOLD}TARGETS${NC} (default: both)
+${BOLD}TARGETS${NC} (default: frontend + backend)
   -f, --frontend          Deploy only the market UI (Vercel)
   -b, --backend           Deploy only the backend (Docker + tunnel)
-      (no target)         Deploy both
+  -S, --frontend-setup    One-time: create/link the Vercel projects + Edge Config
+  -s, --simmer            Deploy only the Simmer UI (Vercel, simmer/ui)
+      (no target)         Deploy frontend + backend (Simmer only with -s)
 
 ${BOLD}OPTIONS${NC}
   -t, --target <name>     Backend target: local_container (default) | cloud
@@ -118,7 +126,9 @@ EOF
 while [ $# -gt 0 ]; do
   case "$1" in
     -f|--frontend) DO_FRONTEND=true ;;
+    -S|--frontend-setup) DO_FRONTEND_SETUP=true ;;
     -b|--backend)  DO_BACKEND=true ;;
+    -s|--simmer)   DO_SIMMER=true ;;
     -t|--target)   shift; DEPLOY_TARGET="${1:-}"; [ -n "$DEPLOY_TARGET" ] || die "--target needs a value" ;;
     -n|--dry-run)  DRY_RUN=true ;;
     -y|--yes)      ASSUME_YES=true ;;
@@ -129,8 +139,54 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-# No explicit target => do both.
-if ! $DO_FRONTEND && ! $DO_BACKEND; then DO_FRONTEND=true; DO_BACKEND=true; fi
+# No explicit target => do both classic targets (Simmer stays opt-in via -s).
+if ! $DO_FRONTEND && ! $DO_BACKEND && ! $DO_SIMMER && ! $DO_FRONTEND_SETUP; then DO_FRONTEND=true; DO_BACKEND=true; fi
+
+# Idempotently set KEY=VALUE in deploy/.env (append or replace in place).
+_env_upsert() {
+  local key="$1" val="$2" f="$DEPLOY_ENV"
+  touch "$f"
+  if grep -q "^${key}=" "$f" 2>/dev/null; then
+    # portable in-place edit (BSD/GNU): rewrite via a temp file
+    grep -v "^${key}=" "$f" > "${f}.tmp" && printf '%s=%s\n' "$key" "$val" >> "${f}.tmp" && mv "${f}.tmp" "$f"
+  else
+    printf '%s=%s\n' "$key" "$val" >> "$f"
+  fi
+}
+
+# Extract a top-level JSON string field with python3 (jq is not assumed present).
+_json_get() { python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(sys.argv[1],"") or "")' "$1" 2>/dev/null; }
+
+# Resolve a Vercel REST API bearer token WITHOUT asking the user to manage one:
+#   1. $VERCEL_TOKEN      — explicit manual override, if exported
+#   2. the Vercel CLI login (~/.local/share/com.vercel.cli/auth.json) — the SAME
+#      credential `vercel deploy` uses, auto-refreshed by `vercel login`. A token
+#      past its expiresAt is treated as absent so the caller re-prompts login.
+#   3. $VERCEL_API_TOKEN  — the permanent token you set in deploy/.env for the
+#      cloudflared container (also a provisioning fallback if no CLI login)
+# Prints the token (empty string if none resolvable).
+_VERCEL_AUTH_JSON="${VERCEL_AUTH_JSON:-$HOME/.local/share/com.vercel.cli/auth.json}"
+_vercel_token() {
+  if [ -n "${VERCEL_TOKEN:-}" ]; then printf '%s' "$VERCEL_TOKEN"; return 0; fi
+  if [ -f "$_VERCEL_AUTH_JSON" ]; then
+    local t
+    t=$(python3 -c '
+import json,sys,time
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+tok=d.get("token") or ""
+exp=d.get("expiresAt")   # epoch — seconds or millis depending on CLI version
+if exp and exp > 1e12:   # 13-digit value ⇒ milliseconds; normalize to seconds
+    exp=exp/1000
+if tok and (not exp or exp > time.time()):   # a past token is treated as absent
+    sys.stdout.write(tok)
+' "$_VERCEL_AUTH_JSON" 2>/dev/null || true)
+    if [ -n "$t" ]; then printf '%s' "$t"; return 0; fi
+  fi
+  printf '%s' "${VERCEL_API_TOKEN:-}"
+}
 
 confirm() {
   $ASSUME_YES && return 0
@@ -194,6 +250,127 @@ deploy_backend() {
 # ----------------------------------------------------------------------------
 # Frontend: stage market/ui -> dist/, bake the backend URL, deploy to Vercel
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# CENTRALIZED FRONTEND SETUP — provisions everything the Vercel-hosted frontends
+# (Matrix + Simmer) need, ONCE, idempotently. Torque is backend-served and
+# intentionally not on Vercel, so it is untouched here.
+#   1. link/create both Vercel projects
+#   2. create the Edge Config store + read token, connect it to the Simmer
+#      project (injects the EDGE_CONFIG env its /api/config function reads)
+#   3. persist EDGE_CONFIG_ID + VERCEL_API_TOKEN to deploy/.env for cloudflared
+# Re-running is safe: each step no-ops when already done.
+# ----------------------------------------------------------------------------
+_link_project() {  # dir  project-name
+  local dir="$1" name="$2"
+  if [ -f "$dir/.vercel/project.json" ]; then
+    ok "  $name already linked ($dir/.vercel/project.json)"
+  else
+    info "  linking/creating Vercel project '$name' ($dir)"
+    run bash -c "cd '$dir' && vercel link --yes --project '$name'"
+  fi
+}
+
+frontend_setup() {
+  export VERCEL_TELEMETRY_DISABLED=1
+  # Edge Config provisioning is a raw REST call, so it needs a bearer token — but
+  # we source it from the SAME credential `vercel deploy` uses (the CLI login),
+  # so there is nothing to hand-manage. See _vercel_token.
+  local tok; tok="$(_vercel_token)"
+  if [ -z "$tok" ]; then
+    if $DRY_RUN; then
+      warn "dry-run: no Vercel token resolvable now — a real run needs 'vercel login'"
+    elif vercel whoami >/dev/null 2>&1; then
+      die "Vercel CLI session token is missing/expired — run 'vercel login', then re-run frontend-setup"
+    else
+      die "Vercel auth needed — run 'vercel login' (or export VERCEL_TOKEN=…), then re-run frontend-setup"
+    fi
+  else
+    ok "Vercel token resolved (from CLI login / env)"
+  fi
+
+  info "1/3  Vercel projects"
+  _link_project "$ROOT_DIR"      "$VERCEL_PROJECT"          # Matrix (repo root)
+  _link_project "$SIMMER_UI_SRC" "$SIMMER_VERCEL_PROJECT"   # Simmer (simmer/ui)
+
+  info "2/3  Edge Config (Simmer rotating-tunnel self-heal)"
+  if [ -z "$tok" ]; then
+    warn "  no Vercel token — skipping Edge Config. Simmer will use its baked URL"
+    warn "  (no self-heal on tunnel rotation). Run 'vercel login' and re-run to enable."
+  elif [ -n "${EDGE_CONFIG_ID:-}" ]; then
+    ok "  already provisioned (EDGE_CONFIG_ID=$EDGE_CONFIG_ID)"
+  else
+    local team_q="" ; [ -n "${VERCEL_TEAM_ID:-}" ] && team_q="?teamId=$VERCEL_TEAM_ID"
+    local ecid conn rtok
+    if $DRY_RUN; then
+      info "  [dry-run] find-or-create /v1/edge-config {slug:edgelane-api-base}"
+      ecid="ecfg_DRYRUN"
+    else
+      # Idempotent: reuse an existing store with our slug (so a re-run after a
+      # partial failure never spawns duplicate stores), else create one.
+      ecid=$(curl -sf "https://api.vercel.com/v1/edge-config${team_q}"         -H "Authorization: Bearer $tok"         | python3 -c 'import sys,json; d=json.load(sys.stdin); L=d if isinstance(d,list) else d.get("edgeConfigs",[]); print(next((x["id"] for x in L if x.get("slug")=="edgelane-api-base"),""))' 2>/dev/null)         || true
+      if [ -n "$ecid" ]; then
+        ok "  reusing existing store"
+      else
+        ecid=$(curl -sf -X POST "https://api.vercel.com/v1/edge-config${team_q}"           -H "Authorization: Bearer $tok" -H "Content-Type: application/json"           -d '{"slug":"edgelane-api-base"}' | _json_get id)           || die "Edge Config create failed (Vercel token rejected — try 'vercel login')"
+        [ -n "$ecid" ] || die "Edge Config create: no id in response"
+      fi
+    fi
+    ok "  store: $ecid"
+    if ! $DRY_RUN; then
+      # The token endpoint returns {token,id}; the EDGE_CONFIG connection string
+      # the SDK reads is built from the store id + that token.
+      rtok=$(curl -sf -X POST "https://api.vercel.com/v1/edge-config/${ecid}/token${team_q}"         -H "Authorization: Bearer $tok" -H "Content-Type: application/json"         -d '{"label":"simmer-read"}' | _json_get token)         || die "Edge Config read-token failed"
+      [ -n "$rtok" ] || die "no token from Edge Config token endpoint"
+      conn="https://edge-config.vercel.com/${ecid}?token=${rtok}"
+      # Inject as the Simmer project's EDGE_CONFIG env so /api/config reads it
+      # with zero config. Ignore 'already exists' — this step is idempotent.
+      curl -s -X POST "https://api.vercel.com/v10/projects/${SIMMER_VERCEL_PROJECT}/env${team_q}"         -H "Authorization: Bearer $tok" -H "Content-Type: application/json"         -d "{\"key\":\"EDGE_CONFIG\",\"value\":\"${conn}\",\"type\":\"encrypted\",\"target\":[\"production\",\"preview\"]}"         >/dev/null 2>&1 || true
+      ok "  connected EDGE_CONFIG env to project '$SIMMER_VERCEL_PROJECT'"
+      _env_upsert EDGE_CONFIG_ID "$ecid"
+      ok "  wrote EDGE_CONFIG_ID to deploy/.env"
+    fi
+  fi
+
+  # Container tunnel self-heal needs a PERMANENT token in deploy/.env: the
+  # cloudflared container PATCHes the rotating URL into Edge Config on every
+  # restart and can't read the host CLI login. We never auto-write the ephemeral
+  # CLI token (it expires → silent failure, and would clobber a permanent token).
+  # Report status whenever a store exists — on fresh provision AND on re-run.
+  if [ -n "$tok" ] && [ -n "${EDGE_CONFIG_ID:-${ecid:-}}" ]; then
+    if [ -n "${VERCEL_API_TOKEN:-}" ]; then
+      ok "  container tunnel self-heal enabled (VERCEL_API_TOKEN set)"
+    elif ! $DRY_RUN; then
+      warn "  container WON'T self-heal on tunnel rotation — set a PERMANENT VERCEL_API_TOKEN"
+      warn "  in deploy/.env (Vercel → Account Settings → Tokens, expiration: No Expiration)."
+    fi
+  fi
+
+  info "3/3  Supabase Auth redirect allow-list (Matrix + Simmer origins)"
+  _sync_auth_allow_list
+
+  ok "frontend setup complete. Now: make deploy-fe  and  make deploy-simmer-fe"
+  [ -n "${EDGE_CONFIG_ID:-${ecid:-}}" ] || warn "Edge Config not set — run 'vercel login' and re-run frontend-setup for tunnel self-heal."
+}
+
+# PATCH the Supabase Auth uri_allow_list so confirmation / reset emails may
+# redirect back to BOTH Vercel projects. Only the allow-list is touched (never
+# site_url — a live Matrix deploy owns that from its PROD_URL). Belongs in setup
+# because it changes only when a project is added/renamed, not per deploy.
+_sync_auth_allow_list() {
+  if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ] || [ -z "${SUPABASE_PROJECT_REF:-}" ]; then
+    warn "  SUPABASE_ACCESS_TOKEN/PROJECT_REF unset — skipping Auth allow-list sync"
+    return 0
+  fi
+  local allow="https://${VERCEL_PROJECT}.vercel.app/**,https://${VERCEL_PROJECT}-*.vercel.app/**,https://${SIMMER_VERCEL_PROJECT}.vercel.app/**,https://${SIMMER_VERCEL_PROJECT}-*.vercel.app/**,http://localhost:8080/**,http://localhost:8789/**,http://localhost:5173/**"
+  if $DRY_RUN; then
+    info "  [dry-run] PATCH Supabase Auth uri_allow_list (adds ${SIMMER_VERCEL_PROJECT} origins)"
+    return 0
+  fi
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X PATCH     "https://api.supabase.com/v1/projects/${SUPABASE_PROJECT_REF}/config/auth"     -H "Authorization: Bearer ${SUPABASE_ACCESS_TOKEN}"     -H "Content-Type: application/json"     -d "{\"uri_allow_list\":\"${allow}\"}")
+  [ "$code" = "200" ] && ok "  allow-list synced (Matrix + Simmer origins)"     || warn "  Auth allow-list sync got HTTP $code — PATCH manually if Simmer email redirects fail"
+}
+
 stage_frontend() {
   info "Staging market UI -> $DIST_DIR"
   run rm -rf "$DIST_DIR"
@@ -238,6 +415,12 @@ stage_frontend() {
   fi
 }
 
+_require_link() {  # dir  project-name  (die → point at frontend-setup)
+  [ -f "$1/.vercel/project.json" ] && return 0
+  $DRY_RUN && { warn "$2 not linked (ignored in dry-run) — run: make frontend-setup"; return 0; }
+  die "$2 is not set up yet. Run:  make frontend-setup   (creates/links the Vercel project + Edge Config), then re-run this deploy."
+}
+
 deploy_frontend() {
   need vercel "npm i -g vercel + run 'vercel login'"
   # Telemetry adds end-of-run network calls that can stall the CLI on exit.
@@ -249,6 +432,8 @@ deploy_frontend() {
     warn "skipping Vercel auth check (dry-run)"
   fi
 
+  _require_link "$ROOT_DIR" "$VERCEL_PROJECT"
+
   stage_frontend
 
   # Ensure this dir is linked to a Vercel project named '$VERCEL_PROJECT',
@@ -256,13 +441,6 @@ deploy_frontend() {
   # links to the existing project under the current scope, or creates a new one
   # with that name when none exists — so the public URL is always pinned to
   # https://$VERCEL_PROJECT.vercel.app. No-op once .vercel/project.json exists.
-  if [ -f "$ROOT_DIR/.vercel/project.json" ]; then
-    ok "Vercel project already linked (.vercel/project.json present)"
-  else
-    info "Linking Vercel project '$VERCEL_PROJECT' (auto-creates it if missing)"
-    confirm "Link/create Vercel project '$VERCEL_PROJECT'?" || die "aborted"
-    run vercel link --yes --project "$VERCEL_PROJECT"
-  fi
 
   info "Deploying market UI -> Vercel project '$VERCEL_PROJECT'"
   # --no-wait: the static build is ~2s and reliably reaches READY; without it the
@@ -288,6 +466,65 @@ deploy_frontend() {
   fi
 }
 
+# ----------------------------------------------------------------------------
+# Simmer UI: npm build in simmer/ui, bake runtime config, deploy to Vercel
+# ----------------------------------------------------------------------------
+stage_simmer() {
+  need npm "install Node 22 + npm"
+  [ -d "$SIMMER_UI_SRC" ] || die "missing $SIMMER_UI_SRC"
+
+  info "Building Simmer UI -> $SIMMER_UI_SRC/build"
+  run bash -c "cd '$SIMMER_UI_SRC' && npm ci && npm run build"
+
+  # Runtime config is written AFTER the npm build (never VITE_* env vars — they
+  # inline at build time and would freeze a rotating tunnel URL). Same globals
+  # as Matrix; EDGELANE_SIMMER_* variables override, falling back to the shared
+  # ones so a single deploy/.env keeps working.
+  EDGELANE_SIMMER_API_BASE="${EDGELANE_SIMMER_API_BASE:-$EDGELANE_API_BASE}"
+  EDGELANE_SIMMER_SUPABASE_URL="${EDGELANE_SIMMER_SUPABASE_URL:-${EDGELANE_SUPABASE_URL:-${SUPABASE_URL:-}}}"
+  EDGELANE_SIMMER_SUPABASE_ANON_KEY="${EDGELANE_SIMMER_SUPABASE_ANON_KEY:-${EDGELANE_SUPABASE_ANON_KEY:-${SUPABASE_ANON_KEY:-}}}"
+  EDGELANE_SIMMER_TURNSTILE_SITE_KEY="${EDGELANE_SIMMER_TURNSTILE_SITE_KEY:-${EDGELANE_TURNSTILE_SITE_KEY:-}}"
+  if [ -z "$EDGELANE_SIMMER_SUPABASE_URL" ] || [ -z "$EDGELANE_SIMMER_SUPABASE_ANON_KEY" ]; then
+    warn "Supabase URL/anon key unset — deployed Simmer UI will run in dev-bypass (no login gate)"
+  fi
+  _js() { [ -n "$1" ] && printf '"%s"' "$1" || printf 'null'; }
+  if $DRY_RUN; then
+    printf "${DIM}[dry-run]${NC} write %s (API base=%s, supabase=%s)\n" \
+      "$SIMMER_UI_SRC/build/edgelane.config.js" \
+      "${EDGELANE_SIMMER_API_BASE:-<unset>}" "${EDGELANE_SIMMER_SUPABASE_URL:-<unset>}"
+  else
+    {
+      printf 'window.__EDGELANE_API_BASE__ = %s;\n'           "$(_js "$EDGELANE_SIMMER_API_BASE")"
+      printf 'window.__EDGELANE_SUPABASE_URL__ = %s;\n'       "$(_js "$EDGELANE_SIMMER_SUPABASE_URL")"
+      printf 'window.__EDGELANE_SUPABASE_ANON_KEY__ = %s;\n'  "$(_js "$EDGELANE_SIMMER_SUPABASE_ANON_KEY")"
+      printf 'window.__EDGELANE_TURNSTILE_SITE_KEY__ = %s;\n' "$(_js "$EDGELANE_SIMMER_TURNSTILE_SITE_KEY")"
+    } > "$SIMMER_UI_SRC/build/edgelane.config.js"
+    ok "wrote simmer/ui/build/edgelane.config.js (API base: ${EDGELANE_SIMMER_API_BASE:-null}, auth: $([ -n "$EDGELANE_SIMMER_SUPABASE_URL" ] && echo configured || echo dev-bypass))"
+  fi
+}
+
+deploy_simmer() {
+  need vercel "npm i -g vercel + run 'vercel login'"
+  export VERCEL_TELEMETRY_DISABLED=1
+  if ! $DRY_RUN; then
+    vercel whoami >/dev/null 2>&1 && ok "Vercel auth OK ($(vercel whoami 2>/dev/null))" \
+      || die "not logged in to Vercel — run 'vercel login' or export VERCEL_TOKEN=..."
+  else
+    warn "skipping Vercel auth check (dry-run)"
+  fi
+
+  # Refuse before the (slow) build if the project isn't set up. Simmer keeps its
+  # OWN link under simmer/ui/.vercel; the repo-root one stays pinned to Matrix.
+  _require_link "$SIMMER_UI_SRC" "$SIMMER_VERCEL_PROJECT"
+
+  stage_simmer
+
+  info "Deploying Simmer UI -> Vercel project '$SIMMER_VERCEL_PROJECT'"
+  run bash -c "cd '$SIMMER_UI_SRC' && vercel deploy --prod --yes --no-wait"
+  ok "Simmer UI deployed -> https://$SIMMER_VERCEL_PROJECT.vercel.app"
+  warn "reminders: Supabase uri_allow_list picks up the Simmer origin on the next Matrix deploy (or PATCH manually); Turnstile allowed-domains is a manual dashboard step if the teaser is ever enabled"
+}
+
 # Point Supabase Auth at the *current* Vercel production URL so confirmation /
 # magic-link emails redirect back to the live site (default Site URL is
 # localhost:3000 → the link is dead). Never hardcoded: derived from PROD_URL on
@@ -302,7 +539,9 @@ sync_supabase_site_url() {
     warn "SUPABASE_ACCESS_TOKEN/SUPABASE_PROJECT_REF unset — skipping Auth site_url sync (set Site URL to $origin manually)"
     return 0
   fi
-  local allow="$origin/**,https://$VERCEL_PROJECT-*.vercel.app/**,http://localhost:8080/**,http://localhost:8789/**"
+  # Simmer origins ride along so magic-link/confirmation emails can redirect to
+  # either app (docs/simmer.md "Deployment" item 2).
+  local allow="$origin/**,https://$VERCEL_PROJECT-*.vercel.app/**,https://$SIMMER_VERCEL_PROJECT.vercel.app/**,https://$SIMMER_VERCEL_PROJECT-*.vercel.app/**,http://localhost:8080/**,http://localhost:8789/**,http://localhost:5173/**"
   if $DRY_RUN; then
     info "would PATCH Supabase Auth site_url=$origin (dry-run)"
     return 0
@@ -341,6 +580,8 @@ $DRY_RUN && warn "DRY RUN — no commands will execute"
 
 # Full deploy (both FE + BE) migrates the shared DB first — schema before the
 # code that depends on it. Single-service deploys (-b / -f) stay DB-free; push
+if $DO_FRONTEND_SETUP; then frontend_setup; ok "all done"; exit 0; fi
+
 # the DB explicitly with `make db-push`. Opt out of the auto-push with --skip-db.
 if $DO_BACKEND && $DO_FRONTEND && ! $SKIP_DB; then
   deploy_db
@@ -348,5 +589,6 @@ fi
 
 $DO_BACKEND  && deploy_backend
 $DO_FRONTEND && deploy_frontend
+$DO_SIMMER   && deploy_simmer
 
 ok "all done"

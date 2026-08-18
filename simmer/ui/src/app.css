@@ -1,0 +1,529 @@
+/* Simmer design system — ported from the Matrix UI's hand-written <style>
+   block (market/ui/index.html:21–236) into Tailwind v4's CSS-first config.
+   Matrix is the source of truth for the visual language: same ground color,
+   same card/pill/badge/gate vocabulary. Keep class names identical so markup
+   ports near-verbatim. */
+@import 'tailwindcss';
+
+@theme {
+	--color-ground: #07090d;
+	--font-sans:
+		ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+		sans-serif;
+}
+
+:root {
+	color-scheme: dark;
+}
+html,
+body {
+	background: #07090d;
+}
+body {
+	font-family: var(--font-sans);
+}
+/* Global busy cursor for long-running async actions. */
+body.busy,
+body.busy * {
+	cursor: progress !important;
+}
+
+@layer components {
+	.neon {
+		text-shadow: 0 0 8px rgba(120, 255, 180, 0.45);
+	}
+	.pill {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+		padding: 0.25rem 0.65rem;
+		border-radius: 9999px;
+		font-size: 0.72rem;
+		font-weight: 600;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+	}
+	.dot {
+		width: 0.5rem;
+		height: 0.5rem;
+		border-radius: 9999px;
+		display: inline-block;
+	}
+	.dot-pulse {
+		box-shadow: 0 0 0 0 currentColor;
+		animation: pulse 1.6s infinite;
+	}
+	.card {
+		background: linear-gradient(180deg, rgba(20, 28, 40, 0.85), rgba(12, 18, 28, 0.85));
+		border: 1px solid rgba(60, 80, 110, 0.35);
+		border-radius: 14px;
+	}
+	.stripe-bull {
+		background: linear-gradient(90deg, rgba(34, 197, 94, 0.18), transparent 60%);
+	}
+	.stripe-bear {
+		background: linear-gradient(90deg, rgba(244, 63, 94, 0.18), transparent 60%);
+	}
+	.stripe-neutral {
+		background: linear-gradient(90deg, rgba(148, 163, 184, 0.16), transparent 60%);
+	}
+	.badge-healthy {
+		background: rgba(34, 197, 94, 0.18);
+		color: #86efac;
+	}
+	.badge-thin {
+		background: rgba(234, 179, 8, 0.18);
+		color: #fde68a;
+	}
+	.badge-directional {
+		background: rgba(56, 189, 248, 0.18);
+		color: #7dd3fc;
+	}
+	.badge-broken,
+	.badge-capital_trap {
+		background: rgba(244, 63, 94, 0.2);
+		color: #fda4af;
+	}
+	.liq-high {
+		background: rgba(34, 197, 94, 0.18);
+		color: #86efac;
+	}
+	.liq-mid {
+		background: rgba(234, 179, 8, 0.18);
+		color: #fde68a;
+	}
+	.liq-low {
+		background: rgba(244, 63, 94, 0.18);
+		color: #fda4af;
+	}
+	.composite-good {
+		color: #86efac;
+	}
+	.composite-meh {
+		color: #fde68a;
+	}
+	.composite-bad {
+		color: #fda4af;
+	}
+	.recommended-glow {
+		box-shadow:
+			0 0 0 1px rgba(120, 255, 180, 0.45),
+			0 0 18px rgba(120, 255, 180, 0.18);
+	}
+	.toast {
+		position: fixed;
+		bottom: 1rem;
+		left: 50%;
+		transform: translateX(-50%);
+		background: #0f172a;
+		border: 1px solid rgba(120, 255, 180, 0.35);
+		padding: 0.6rem 1rem;
+		border-radius: 8px;
+		color: #d1fae5;
+		font-size: 0.85rem;
+		opacity: 0;
+		transition: opacity 0.3s;
+		z-index: 50;
+		pointer-events: none;
+	}
+	.toast.show {
+		opacity: 1;
+	}
+	button.btn {
+		background: #1e293b;
+		border: 1px solid rgba(120, 140, 170, 0.3);
+		padding: 0.35rem 0.7rem;
+		border-radius: 6px;
+		font-size: 0.72rem;
+		color: #e2e8f0;
+		cursor: pointer;
+		transition: all 0.15s;
+	}
+	button.btn:hover {
+		background: #334155;
+		border-color: rgba(120, 255, 180, 0.4);
+	}
+	button.btn:disabled {
+		opacity: 0.45;
+		cursor: not-allowed;
+	}
+	button.btn-primary {
+		background: rgba(34, 197, 94, 0.18);
+		border-color: rgba(34, 197, 94, 0.45);
+		color: #bbf7d0;
+	}
+	button.btn-primary:hover {
+		background: rgba(34, 197, 94, 0.28);
+	}
+	button.btn-danger {
+		background: rgba(244, 63, 94, 0.12);
+		border-color: rgba(244, 63, 94, 0.4);
+		color: #fda4af;
+	}
+	button.btn-danger:hover {
+		background: rgba(244, 63, 94, 0.22);
+		border-color: rgba(244, 63, 94, 0.6);
+	}
+	select {
+		background: #0f172a;
+		border: 1px solid rgba(120, 140, 170, 0.3);
+		color: #e2e8f0;
+		padding: 0.35rem 0.7rem;
+		border-radius: 6px;
+		font-size: 0.85rem;
+	}
+	code.kv {
+		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+		font-size: 0.78rem;
+		color: #cbd5e1;
+	}
+	/* Modal ---------------------------------------------------------------- */
+	.modal-mask {
+		position: fixed;
+		inset: 0;
+		background: rgba(0, 0, 0, 0.65);
+		display: none;
+		align-items: center;
+		justify-content: center;
+		z-index: 60;
+	}
+	.modal-mask.show {
+		display: flex;
+	}
+	.modal-card {
+		width: min(560px, calc(100vw - 2rem));
+		max-height: calc(100vh - 2rem);
+		overflow: auto;
+		background: linear-gradient(180deg, #11182a, #0a0f1c);
+		border: 1px solid rgba(120, 140, 170, 0.35);
+		border-radius: 14px;
+		padding: 1.25rem;
+		box-shadow: 0 24px 80px rgba(0, 0, 0, 0.7);
+	}
+	.modal-card h3 {
+		font-size: 1rem;
+		font-weight: 700;
+		letter-spacing: 0.02em;
+	}
+	.modal-card input,
+	.modal-card select {
+		background: #0f172a;
+		border: 1px solid rgba(120, 140, 170, 0.3);
+		color: #e2e8f0;
+		padding: 0.35rem 0.55rem;
+		border-radius: 6px;
+		font-size: 0.85rem;
+		width: 100%;
+	}
+	.modal-card label {
+		font-size: 0.68rem;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: #94a3b8;
+	}
+	/* Tooltip helper — dotted underline cue + native title fallback. */
+	.tt {
+		cursor: help;
+		border-bottom: 1px dotted rgba(148, 163, 184, 0.5);
+	}
+	/* Tabs */
+	.tab-btn {
+		padding: 0.5rem 1rem;
+		font-size: 0.8rem;
+		font-weight: 600;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		color: #94a3b8;
+		background: transparent;
+		border: none;
+		border-bottom: 2px solid transparent;
+		cursor: pointer;
+		transition:
+			color 0.15s,
+			border-color 0.15s;
+	}
+	.tab-btn:hover {
+		color: #cbd5e1;
+	}
+	.tab-btn.active {
+		color: #86efac;
+		border-bottom-color: #22c55e;
+	}
+	/* Profile circle + settings panel */
+	.avatar-btn {
+		width: 2.25rem;
+		height: 2.25rem;
+		border-radius: 9999px;
+		background: #0f766e;
+		color: #ecfeff;
+		font-weight: 700;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		border: 1px solid rgba(34, 197, 94, 0.5);
+		cursor: pointer;
+		transition: background 0.15s;
+	}
+	.avatar-btn:hover {
+		background: #0d9488;
+	}
+	.settings-panel {
+		position: absolute;
+		right: 0;
+		top: calc(100% + 0.5rem);
+		width: 360px;
+		max-height: 80vh;
+		overflow-y: auto;
+		background: #0f172a;
+		border: 1px solid rgba(120, 140, 170, 0.35);
+		border-radius: 10px;
+		box-shadow: 0 24px 80px rgba(0, 0, 0, 0.7);
+		padding: 1rem;
+		z-index: 55;
+	}
+	.settings-panel h3 {
+		font-size: 0.7rem;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+		color: #64748b;
+		font-weight: 700;
+		margin-bottom: 0.5rem;
+	}
+	.settings-section {
+		padding: 0.65rem 0;
+		border-bottom: 1px solid rgba(60, 80, 110, 0.3);
+	}
+	.settings-section:last-child {
+		border-bottom: none;
+	}
+	.radio-row {
+		display: flex;
+		gap: 0.75rem;
+		font-size: 0.8rem;
+	}
+	.radio-row label {
+		display: flex;
+		align-items: center;
+		gap: 0.3rem;
+		cursor: pointer;
+	}
+	.toggle-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		font-size: 0.78rem;
+		color: #cbd5e1;
+		padding: 0.3rem 0;
+	}
+
+	/* ── Auth gate: blocking overlay + card (ported verbatim from Matrix) ── */
+	.locked-blur {
+		filter: blur(7px);
+		pointer-events: none;
+		user-select: none;
+		opacity: 0.55;
+		transition:
+			filter 0.2s,
+			opacity 0.2s;
+	}
+	.gate-mask {
+		position: fixed;
+		inset: 0;
+		z-index: 70;
+		display: none;
+		align-items: flex-start;
+		justify-content: center;
+		background:
+			linear-gradient(rgba(7, 9, 13, 0.55), rgba(7, 9, 13, 0.62)),
+			radial-gradient(900px 500px at 50% 120%, rgba(16, 185, 129, 0.08), transparent 60%);
+		padding: 1rem;
+		overflow-y: auto;
+		pointer-events: auto;
+	}
+	.gate-mask.show {
+		display: flex;
+	}
+	.gate-card {
+		width: min(440px, calc(100vw - 2rem));
+		position: relative;
+		margin-top: 12vh;
+		pointer-events: auto;
+		background: linear-gradient(180deg, rgba(17, 24, 42, 0.97), rgba(7, 11, 20, 0.98));
+		border: 1px solid rgba(34, 197, 94, 0.25);
+		border-radius: 22px;
+		padding: 2rem;
+		box-shadow:
+			0 30px 90px rgba(0, 0, 0, 0.7),
+			0 0 60px -20px rgba(16, 185, 129, 0.35);
+	}
+	.gate-card .glow-orb {
+		position: absolute;
+		right: -3rem;
+		top: -3rem;
+		width: 11rem;
+		height: 11rem;
+		border-radius: 9999px;
+		background: rgba(16, 185, 129, 0.12);
+		filter: blur(48px);
+		pointer-events: none;
+	}
+	.gate-logo {
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+	}
+	.gate-logo .mark {
+		width: 2.5rem;
+		height: 2.5rem;
+		border-radius: 0.7rem;
+		display: grid;
+		place-items: center;
+		background: linear-gradient(135deg, #34d399, #0d9488);
+	}
+	.gate-eyebrow {
+		font-size: 0.65rem;
+		font-weight: 700;
+		letter-spacing: 0.25em;
+		text-transform: uppercase;
+		color: rgba(110, 231, 183, 0.8);
+	}
+	.gate-input {
+		width: 100%;
+		margin-top: 0.5rem;
+		border-radius: 0.9rem;
+		border: 1px solid rgba(71, 85, 105, 0.7);
+		background: #040810;
+		padding: 0.7rem 0.9rem;
+		color: #e2e8f0;
+		outline: none;
+		font-size: 0.9rem;
+		transition: border-color 0.15s;
+	}
+	.gate-input:focus {
+		border-color: #34d399;
+	}
+	.gate-btn {
+		width: 100%;
+		margin-top: 0.25rem;
+		border-radius: 0.9rem;
+		padding: 0.7rem 1rem;
+		font-size: 0.85rem;
+		font-weight: 700;
+		color: #022c22;
+		cursor: pointer;
+		background: linear-gradient(90deg, #34d399, #22d3ee);
+		border: none;
+		transition: opacity 0.15s;
+	}
+	.gate-btn:hover:not(:disabled) {
+		opacity: 0.9;
+	}
+	.gate-btn:disabled {
+		opacity: 0.55;
+		cursor: not-allowed;
+	}
+	.gate-tab {
+		flex: 1;
+		text-align: center;
+		padding: 0.5rem;
+		font-size: 0.78rem;
+		font-weight: 600;
+		color: #94a3b8;
+		cursor: pointer;
+		border-bottom: 2px solid transparent;
+	}
+	.gate-tab.active {
+		color: #6ee7b7;
+		border-bottom-color: #34d399;
+	}
+	.gate-link {
+		color: #6ee7b7;
+		cursor: pointer;
+		font-weight: 600;
+	}
+	.gate-link:hover {
+		color: #a7f3d0;
+	}
+	.footer-link {
+		color: #64748b;
+		cursor: pointer;
+		background: none;
+		border: none;
+		font-size: inherit;
+		padding: 0;
+	}
+	.footer-link:hover {
+		color: #86efac;
+		text-decoration: underline;
+	}
+
+	/* ── Simmer-specific: gate checklist + score bar ─────────────────────── */
+	/* Refusal-first: the checklist is the card's lead element, the score a
+	   supporting horizontal bar (radar charts explicitly rejected in docs). */
+	.gate-row {
+		display: flex;
+		align-items: baseline;
+		gap: 0.5rem;
+		padding: 0.22rem 0.3rem;
+		border-radius: 5px;
+		font-size: 0.78rem;
+	}
+	.gate-row:nth-child(odd) {
+		background: rgba(15, 23, 42, 0.45);
+	}
+	.gate-pass {
+		color: #86efac;
+	}
+	.gate-fail {
+		color: #fda4af;
+	}
+	.gate-unknown {
+		color: #94a3b8;
+	}
+	.gate-off {
+		color: #fbbf24;
+	}
+	.scorebar-track {
+		height: 0.5rem;
+		border-radius: 9999px;
+		background: rgba(51, 65, 85, 0.55);
+		overflow: hidden;
+	}
+	.scorebar-fill {
+		height: 100%;
+		border-radius: 9999px;
+		transition: width 0.4s ease;
+	}
+	.scorebar-good {
+		background: linear-gradient(90deg, #16a34a, #34d399);
+	}
+	.scorebar-meh {
+		background: linear-gradient(90deg, #ca8a04, #fde047);
+	}
+	.scorebar-bad {
+		background: linear-gradient(90deg, #be123c, #fb7185);
+	}
+	.override-warn {
+		display: flex;
+		align-items: baseline;
+		gap: 0.4rem;
+		font-size: 0.75rem;
+		color: #fbbf24;
+		background: rgba(234, 179, 8, 0.1);
+		border: 1px solid rgba(234, 179, 8, 0.3);
+		border-radius: 6px;
+		padding: 0.35rem 0.55rem;
+	}
+}
+
+@keyframes pulse {
+	0% {
+		box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.55);
+	}
+	70% {
+		box-shadow: 0 0 0 8px rgba(34, 197, 94, 0);
+	}
+	100% {
+		box-shadow: 0 0 0 0 rgba(34, 197, 94, 0);
+	}
+}

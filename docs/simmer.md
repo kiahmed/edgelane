@@ -2098,7 +2098,7 @@ presence alone, Simmer must additionally check `tools_enabled ∋ 'simmer'`.
 New Vercel project **`edgelane-simmer`**, deployed from `simmer/ui/`, built with
 `adapter-static` (pure static — no serverless cost).
 
-### `deploy-smr-fe`
+### `deploy-simmer-fe`
 
 `deploy.sh` already has the right seams: `stage_frontend()` (:197),
 `deploy_frontend()` (:241), `sync_supabase_site_url()` (:297). Add a
@@ -2106,7 +2106,7 @@ New Vercel project **`edgelane-simmer`**, deployed from `simmer/ui/`, built with
 rather than a second script, then in the root `Makefile`:
 
 ```make
-deploy-smr-fe:
+deploy-simmer-fe:
 	./deploy.sh -s $(ARGS)
 ```
 
@@ -2415,7 +2415,7 @@ building any UI.**
 
 27. Scaffold `simmer/ui` (SvelteKit 5 + TS + Tailwind v4 + `adapter-static`);
     port `app.css` from Matrix; deploy an empty shell to validate the pipeline.
-28. `deploy-smr-fe`; CORS, Turnstile and Supabase allow-list updates.
+28. `deploy-simmer-fe`; CORS, Turnstile and Supabase allow-list updates.
 29. AuthGate → ProductGate → AppShell → WatchlistManager → ReadinessCard.
 30. SSO ticket hand-off — **update Matrix in the same PR**; SSO is symmetric and
     half of it is useless.

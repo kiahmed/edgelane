@@ -228,6 +228,12 @@ VELOCITY: dict[str, Any] = {
     "hysteresis_polls": 3,
     "dispersion_min_phi": 3.0,  # expected NB dispersion range on 5-min buckets;
     "dispersion_max_phi": 10.0, # MEASURE it on our own feed before trusting a threshold
+    # Empirical-Bayes prior strength: pseudo-window count of the pooled Gamma
+    # prior (and the fallback strength when the cross-section shows no
+    # dispersion beyond Poisson noise, v <= m). Small vs the 20 baseline
+    # windows a dense ticker carries — sparse tickers get pulled to the pooled
+    # rate, dense ones barely move.
+    "eb_prior_weight":  5.0,
 }
 
 # ── Sentiment (Heston & Sinha asymmetry) ───────────────────────────────────
@@ -241,6 +247,7 @@ SENTIMENT: dict[str, Any] = {
     "index_halflife_days": 1,    # index-level sentiment is a 1-day impulse with reversal
     "day0_discount":      0.25,  # day-0 is contemporaneous impact + reversal, not predictive
     "trailing_days":      5,     # feed sentiment averaged over 5 trailing days
+    "recency_halflife_days": 2.0, # exponential recency weight inside the trailing window
     "negative_veto":     -0.35,  # fresh negative below this blocks bull_put
     "negative_penalty":  -0.10,  # softer: suppress rather than block
     "velocity_suppression": 0.50, # score multiplier on the sentiment component during a burst

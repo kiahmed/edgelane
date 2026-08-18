@@ -485,6 +485,9 @@ async def test_iv_history_gets_real_ohlc_and_yang_zhang_from_provider_bars(
     provider = FakeYahooProvider()
     monkeypatch.setattr(sw, "watchlist_union",
                         lambda: _union([("NVDA", None)]))
+    # IV history now captures only at/after the close; force the window so this
+    # OHLC test is deterministic regardless of when the suite runs.
+    monkeypatch.setattr(sw, "_is_capture_window", lambda *a, **k: True)
     await sw.sweep(provider, fresh_db)
     hist = fresh_db.fetch_simmer_iv_history("NVDA", 5)
     assert len(hist) == 1
@@ -503,6 +506,7 @@ async def test_iv_history_keeps_close_to_close_fallback_without_bars(
     byte-for-byte: NULL OHL, sweep-spot close, NULL Yang-Zhang."""
     monkeypatch.setattr(sw, "watchlist_union",
                         lambda: _union([("NVDA", None)]))
+    monkeypatch.setattr(sw, "_is_capture_window", lambda *a, **k: True)
     await sw.sweep(FakeSimmerTradier(), fresh_db)
     hist = fresh_db.fetch_simmer_iv_history("NVDA", 5)
     assert len(hist) == 1

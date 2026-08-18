@@ -145,6 +145,9 @@ class Settings(BaseModel):
     admin_api_token: str = Field(default="")
     # Per-session (authed user / anon session / IP) request budget.
     rate_limit_per_min: int = Field(default=120)
+    # Tighter bound on /auth/* (login/signup/resend) — password brute-force, not
+    # normal API traffic. Per client IP.
+    rate_limit_auth_per_min: int = Field(default=10)
     rate_limit_window_sec: int = Field(default=60)
 
     # --- Support / contact form (Resend email) ---
@@ -187,6 +190,22 @@ class Settings(BaseModel):
     # (Matrix + Torque keep it) onto Yahoo's public endpoints — unofficial,
     # personal-use posture; see app/simmer_data_provider.py. Needs no key.
     simmer_data_provider: str = Field(default="tradier")
+
+    # --- Simmer news + sentiment (Phase 3a — see app/simmer_news.py) ---
+    # Alpaca Market Data news (free with a paper account at alpaca.markets).
+    # Both keys blank → the news refresh is a clean no-op with a data_quality
+    # note (nothing breaks; sentiment fields stay NULL).
+    alpaca_key_id: str = Field(default="")
+    alpaca_secret_key: str = Field(default="")
+    # Gemini headline scoring (aistudio.google.com). No key → headlines are
+    # still ingested/deduped, just never scored (sentiment stays NULL, noted).
+    gemini_api_key: str = Field(default="")
+    # Scores are NOT reproducible across models — the model id is recorded on
+    # every scored row. flash-lite is the cheapest with thinking off by default.
+    gemini_model: str = Field(default="gemini-2.5-flash-lite")
+    # News source: alpaca (default; needs the keys above), rss (keyless wire
+    # firehose, regex ticker match, weaker coverage), off.
+    simmer_news_provider: str = Field(default="alpaca")
 
     # External GEX override (private GEX provider extension webhook)
     use_external_gex: bool = Field(default=True)         # prefer extension data over Tradier-OI walls when fresh
@@ -332,6 +351,7 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
     if "ANON_SESSION_TTL_SEC" in raw:        out["anon_session_ttl_sec"] = int(raw["ANON_SESSION_TTL_SEC"])
     if "ADMIN_API_TOKEN" in raw:             out["admin_api_token"] = raw["ADMIN_API_TOKEN"].strip()
     if "RATE_LIMIT_PER_MIN" in raw:          out["rate_limit_per_min"] = int(raw["RATE_LIMIT_PER_MIN"])
+    if "RATE_LIMIT_AUTH_PER_MIN" in raw:     out["rate_limit_auth_per_min"] = int(raw["RATE_LIMIT_AUTH_PER_MIN"])
     if "RATE_LIMIT_WINDOW_SEC" in raw:       out["rate_limit_window_sec"] = int(raw["RATE_LIMIT_WINDOW_SEC"])
 
     if "SUPPORT_EMAIL" in raw:               out["support_email"] = raw["SUPPORT_EMAIL"].strip()
@@ -360,6 +380,17 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
     if "SIMMER_DATA_PROVIDER" in raw:
         v = raw["SIMMER_DATA_PROVIDER"].strip().lower()
         out["simmer_data_provider"] = v if v in ("tradier", "yahoo") else "tradier"
+
+    if "ALPACA_KEY_ID" in raw:               out["alpaca_key_id"] = raw["ALPACA_KEY_ID"].strip()
+    if "ALPACA_SECRET_KEY" in raw:           out["alpaca_secret_key"] = raw["ALPACA_SECRET_KEY"].strip()
+    if "GEMINI_API_KEY" in raw:              out["gemini_api_key"] = raw["GEMINI_API_KEY"].strip()
+    if "GEMINI_MODEL" in raw:
+        v = raw["GEMINI_MODEL"].strip()
+        if v:
+            out["gemini_model"] = v
+    if "SIMMER_NEWS_PROVIDER" in raw:
+        v = raw["SIMMER_NEWS_PROVIDER"].strip().lower()
+        out["simmer_news_provider"] = v if v in ("alpaca", "rss", "off") else "alpaca"
 
     if "USE_EXTERNAL_GEX" in raw:
         out["use_external_gex"] = raw["USE_EXTERNAL_GEX"].strip().lower() in ("true", "1", "yes", "on")

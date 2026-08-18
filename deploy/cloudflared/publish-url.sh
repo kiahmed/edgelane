@@ -46,7 +46,24 @@ else
     done
     [ "$n" -ge 5 ] && echo "[publish] ERROR: gave up publishing api_base after 5 attempts" >&2
   else
-    echo "[publish] SUPABASE_URL / SUPABASE_SERVICE_KEY not set; skipping publish (frontend must use a baked URL)" >&2
+    echo "[publish] SUPABASE_URL / SUPABASE_SERVICE_KEY not set; skipping Supabase publish" >&2
+  fi
+
+  # Also publish to Vercel Edge Config so the DEPLOYED SPA self-heals a rotated
+  # quick-tunnel URL WITHOUT a redeploy (the UI reads /api/config → Edge Config
+  # at boot). Same idea as the Supabase write, aimed at the frontend host.
+  if [ -n "${VERCEL_API_TOKEN:-}" ] && [ -n "${EDGE_CONFIG_ID:-}" ]; then
+    n=0
+    while [ "$n" -lt 5 ]; do
+      code=$(curl -s -o /dev/null -w '%{http_code}' -X PATCH         "https://api.vercel.com/v1/edge-config/${EDGE_CONFIG_ID}/items${VERCEL_TEAM_ID:+?teamId=${VERCEL_TEAM_ID}}"         -H "Authorization: Bearer ${VERCEL_API_TOKEN}"         -H "Content-Type: application/json"         -d "{\"items\":[{\"operation\":\"upsert\",\"key\":\"api_base\",\"value\":\"${URL}\"}]}" 2>/dev/null || echo 000)
+      case "$code" in
+        2*) echo "[publish] published api_base -> Vercel Edge Config (HTTP ${code})" >&2; break ;;
+        *)  n=$((n + 1)); echo "[publish] edge-config attempt ${n} failed (HTTP ${code}); retrying in 3s" >&2; sleep 3 ;;
+      esac
+    done
+    [ "$n" -ge 5 ] && echo "[publish] ERROR: gave up publishing to Edge Config after 5 attempts" >&2
+  else
+    echo "[publish] VERCEL_API_TOKEN / EDGE_CONFIG_ID not set; skipping Edge Config publish" >&2
   fi
 fi
 

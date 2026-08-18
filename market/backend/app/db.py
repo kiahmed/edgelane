@@ -239,6 +239,16 @@ CREATE TABLE IF NOT EXISTS simmer_research_cache (
     updated_at         TIMESTAMP
 );
 
+-- The engine's vol inputs must SURVIVE the cache round-trip: transient
+-- underscore keys are stripped before upsert, so RV and the IV-history series
+-- are persisted here and re-hydrated on read (found live: every cache-hit
+-- sweep fed the engine an empty vol block and vetoed vrp_unavailable).
+ALTER TABLE simmer_research_cache ADD COLUMN IF NOT EXISTS rv20_yz         DOUBLE;
+ALTER TABLE simmer_research_cache ADD COLUMN IF NOT EXISTS rv20_cc         DOUBLE;
+ALTER TABLE simmer_research_cache ADD COLUMN IF NOT EXISTS iv_history_json VARCHAR;
+ALTER TABLE simmer_research_cache ADD COLUMN IF NOT EXISTS ohlc_json       VARCHAR;
+ALTER TABLE simmer_research_cache ADD COLUMN IF NOT EXISTS closes_json     VARCHAR;
+
 -- Tier-2 readiness: keyed (symbol, expiration, ts). Recomputed EVERY sweep and
 -- never served from cache across sweeps -- the chain moves, and a stale "ready"
 -- would recommend a spread whose credit has since collapsed.
@@ -657,7 +667,8 @@ class Database:
         "catalyst_flags", "catalyst_blocking", "iv_rank", "iv_percentile",
         "iv_rv_ratio", "vrp_xsect_pct", "vol_oi_ratio", "oi_delta", "pcr_volume",
         "short_interest", "days_to_cover", "news_at", "catalyst_at", "daily_at",
-        "flow_at",
+        "flow_at", "rv20_yz", "rv20_cc", "iv_history_json", "ohlc_json",
+        "closes_json",
     )
 
     def upsert_simmer_research(self, row: dict) -> None:
@@ -706,6 +717,28 @@ class Database:
             )
             (new_id,) = cur.fetchone()
             return int(new_id)
+
+    def latest_simmer_readiness_all(self) -> list[dict]:
+        """Newest readiness row per (symbol, expiration) — the watcher's startup
+        rehydration source. A restart or a market-closed idle period must NOT
+        hide results that are sitting on disk: signed-in users see their
+        tickers' last computed analysis regardless of process lifetime."""
+        conn = self.connect()
+        cols = ("id",) + self._SIMMER_READINESS_COLS
+        with self._lock:
+            cur = conn.execute(
+                f"SELECT {', '.join(cols)} FROM simmer_readiness r "
+                "WHERE ts = (SELECT max(ts) FROM simmer_readiness r2 "
+                "            WHERE r2.symbol = r.symbol AND r2.expiration = r.expiration) "
+                "ORDER BY symbol, expiration",
+            )
+            rows = cur.fetchall()
+        out = []
+        for r in rows:
+            d = dict(zip(cols, r))
+            d["ts"] = _utc_iso(d.get("ts"))
+            out.append(d)
+        return out
 
     def latest_simmer_readiness(self, symbol: str, expiration) -> dict | None:
         conn = self.connect()

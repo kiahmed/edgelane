@@ -126,8 +126,14 @@ run-bg: _check_config clean
 stop:
 	@PID=$$(lsof -t -i:$(PORT) 2>/dev/null); \
 	if [ -n "$$PID" ]; then \
-	  echo ">>> killing pid $$PID"; \
-	  kill -9 $$PID; \
+	  echo ">>> stopping pid $$PID (SIGTERM)"; \
+	  kill $$PID; \
+	  for i in 1 2 3 4 5 6 7 8 9 10; do \
+	    kill -0 $$PID 2>/dev/null || break; sleep 1; \
+	  done; \
+	  if kill -0 $$PID 2>/dev/null; then \
+	    echo ">>> still up after 10s — SIGKILL"; kill -9 $$PID; \
+	  fi; \
 	else \
 	  echo ">>> nothing running on port $(PORT)"; \
 	fi

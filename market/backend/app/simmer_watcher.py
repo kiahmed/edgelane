@@ -107,6 +107,16 @@ class SimmerState:
         self.last_outcome_run_ts: float | None = None
         self.outcomes_recorded: int = 0
         self.last_iv_history_date: str | None = None
+        # Cross-sectional VRP bootstrap (docs/simmer.md "cold start"): each
+        # symbol's live IV/RV ratio, harvested from the previous sweep. iv_rv is
+        # a per-(symbol,expiration) quantity known only AFTER analyze runs the
+        # chain, so it can't come from tier-1 research — this persistent cache is
+        # how peers reach the next sweep and the cross-sectional percentile fills
+        # in when there's no time-series IV history yet (day one / weekend).
+        self.peer_iv_rv: dict[str, float] = {}
+        # The sweep's data provider (set by simmer_loop) — routes reuse it so
+        # /simmer/analyze runs on the same source as the sweep.
+        self.provider = None
 
 
 # Module-level singleton — routes import this directly.
@@ -147,6 +157,30 @@ def _prev_close(quote: dict | None) -> float | None:
         if f and f > 0:
             return f
     return None
+
+
+def _is_capture_window(tz: ZoneInfo = _EASTERN, now: datetime | None = None) -> bool:
+    """Is it the right moment to snapshot IV history for the day?
+
+    IV Rank is an END-OF-DAY quantity — ORATS/VolRadar snapshot the ~6 PM ET
+    close, not whenever a process happened to boot. So capture once per day but
+    ONLY at/after the close:
+
+      * a WEEKDAY at/after 16:00 ET → True (today's settle is in);
+      * a WEEKEND (or, by the same 16:00 rule, a holiday evening) → True: the
+        market is closed and Yahoo still returns the most recent COMPLETED
+        session's close (e.g. Friday's over the weekend), so a weekend/holiday
+        first-run still captures it;
+      * during market hours / a weekday morning before the close → False (wait).
+
+    The "only if no row yet for the latest completed session" clause is enforced
+    by `record_iv_history`'s existing once-per-day `state.last_iv_history_date`
+    guard, so this stays a pure clock predicate (testable with an injected
+    `now`)."""
+    et = now.astimezone(tz) if now is not None else datetime.now(tz)
+    if et.weekday() >= 5:               # Saturday/Sunday — capture Fri's close
+        return True
+    return et.hour >= 16                # weekday: only after the 16:00 ET close
 
 
 def _iso_date(v: Any) -> str | None:
@@ -336,10 +370,32 @@ def _latest_earnings_date(cats: Sequence[dict]) -> str | None:
 
 
 async def _refresh_news(db, symbol: str, row: dict) -> dict:
-    """Phase 3 fills this with Alpaca + Gemini; the mechanism ships now so news
-    lands INTO the cache instead of growing a parallel path. Stamps `news_at`
-    so the TTL machinery is exercised from day one."""
-    return {"news_at": _now_naive_utc()}
+    """News group (Phase 3a): Alpaca/RSS ingest + Gemini scoring + trailing
+    sentiment/velocity aggregates, all via `simmer_news.refresh_news` — the
+    same entry point an operator call uses. Runs on the existing
+    `ticker_sentiment` TTL (15 min, simmer_config.TTL).
+
+    The updates carry `velocity_tier`, which `load_research` persists to the
+    research row — the exact field `_mandatory_invalidation` reads for the
+    `velocity_burst` invalidator, so an "alert" tier voids every tier-1 TTL on
+    the NEXT sweep by construction.
+
+    Missing config keys → simmer_news returns a clean no-op (None fields +
+    note); any failure here is swallowed so a news problem NEVER kills the
+    sweep. news_at is always stamped so the TTL machinery keeps cycling."""
+    from . import simmer_news
+    from .config import get_settings
+    try:
+        out = await simmer_news.refresh_news(
+            db, [symbol], get_settings(), persist_research=False)
+        updates = out.get(str(symbol).upper()) or {}
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning("news refresh failed for %s: %s", symbol, e)
+        updates = {"_news_notes": [f"news:refresh_failed:{type(e).__name__}"]}
+    updates.setdefault("news_at", _now_naive_utc())
+    return updates
 
 
 async def _refresh_catalysts(db, symbol: str, row: dict) -> dict:
@@ -391,10 +447,22 @@ async def _refresh_catalysts(db, symbol: str, row: dict) -> dict:
     }
 
 
-async def _refresh_daily(db, symbol: str, row: dict) -> dict:
+async def _refresh_daily(db, symbol: str, row: dict, provider=None) -> dict:
     """Daily group: IV rank/percentile + RV off `simmer_iv_history`. It is a
     rank over DAILY history — recomputing it intraday is meaningless, hence
-    the until-next-close TTL."""
+    the until-next-close TTL.
+
+    COLD START (the day-one path from docs/simmer.md): the history table only
+    accrues one row per session, so on a fresh deploy RV would be None for ~20
+    sessions and every candidate would veto `vrp_unavailable`. When the table
+    can't supply RV and the provider has real daily bars (Yahoo), compute
+    Yang-Zhang + close-to-close DIRECTLY from the bars — the cross-sectional
+    VRP percentile then works from the very first sweep. Found live: the first
+    sweep also ran before the IV-history job wrote its row, then the
+    until-next-close TTL hid that row all day, so the veto never lifted.
+    Hence: `daily_at` is only stamped when the group actually produced
+    something — an empty result retries next sweep instead of going blind
+    for 24h."""
     v = simmer_config.vol()
     try:
         hist = await asyncio.to_thread(
@@ -411,9 +479,37 @@ async def _refresh_daily(db, symbol: str, row: dict) -> dict:
     ohlc = [{"open": r.get("open_px"), "high": r.get("high_px"),
              "low": r.get("low_px"), "close": r.get("close_px")}
             for r in hist if r.get("close_px") is not None]
-    out: dict[str, Any] = {"daily_at": _now_naive_utc(),
-                           "_iv_history": ivs, "_rv_yz": yz, "_rv_cc": cc,
-                           "_ohlc": ohlc, "_closes": [r.get("close_px") for r in hist]}
+    closes = [r.get("close_px") for r in hist]
+    # Tradier structurally has no history endpoint — its daily_bars is a
+    # guaranteed [] plus a data_quality note, so don't burn the call (and the
+    # default-path envelope stays byte-identical, which a test pins).
+    _bars_capable = (provider is not None and hasattr(provider, "daily_bars")
+                     and getattr(provider, "provider_name", "") != "tradier")
+    if yz is None and _bars_capable:
+        try:
+            bars = await provider.daily_bars(symbol, 30)
+        except Exception as e:
+            log.warning("cold-start daily_bars failed for %s: %s", symbol, e)
+            bars = []
+        if bars:
+            yz = simmer_engine.yang_zhang_rv(bars)
+            cc = cc if cc is not None else simmer_engine.close_to_close_rv(bars)
+            ohlc = [{"open": b.get("open"), "high": b.get("high"),
+                     "low": b.get("low"), "close": b.get("close")} for b in bars]
+            closes = [b.get("close") for b in bars]
+    out: dict[str, Any] = {"_iv_history": ivs, "_rv_yz": yz, "_rv_cc": cc,
+                           "_ohlc": ohlc, "_closes": closes,
+                           # Persisted twins of the transients: underscore keys
+                           # are stripped before the cache upsert, so without
+                           # these every CACHE-HIT sweep would feed the engine
+                           # an empty vol block and veto vrp_unavailable
+                           # (found live). Hydrated back in load_research.
+                           "rv20_yz": yz, "rv20_cc": cc,
+                           "iv_history_json": json.dumps(ivs) if ivs else None,
+                           "ohlc_json": json.dumps(ohlc) if ohlc else None,
+                           "closes_json": json.dumps([c for c in closes if c is not None]) if closes else None}
+    if ivs or yz is not None:
+        out["daily_at"] = _now_naive_utc()
     if ivs:
         out["iv_rank"] = simmer_engine.iv_rank(ivs[-1], min(ivs), max(ivs))
         out["iv_percentile"] = simmer_engine.iv_percentile(ivs[-1], ivs[:-1] or ivs)
@@ -425,7 +521,7 @@ def _persistable(row: dict) -> dict:
     return {k: v for k, v in row.items() if not str(k).startswith("_")}
 
 
-async def load_research(db, symbol: str) -> dict:
+async def load_research(db, symbol: str, provider=None) -> dict:
     """The single tier-1 accessor: cache read + per-group TTL refresh +
     mandatory invalidation, enforced in ONE place rather than at call sites."""
     symbol = symbol.upper()
@@ -443,8 +539,27 @@ async def load_research(db, symbol: str) -> dict:
         updates.update(await _refresh_news(db, symbol, row))
     if invalidated or _group_expired(row, "catalyst_at", int(ttls.get("catalysts", 86_400)), now):
         updates.update(await _refresh_catalysts(db, symbol, row))
-    if invalidated or _group_expired(row, "daily_at", int(ttls.get("iv_rank", 86_400)), now):
-        updates.update(await _refresh_daily(db, symbol, row))
+    _pre_upgrade_row = (row.get("daily_at") is not None
+                        and row.get("rv20_yz") is None
+                        and row.get("iv_history_json") is None)
+    if invalidated or _pre_upgrade_row or _group_expired(
+            row, "daily_at", int(ttls.get("iv_rank", 86_400)), now):
+        updates.update(await _refresh_daily(db, symbol, row, provider))
+    else:
+        # Cache hit: rebuild the engine-facing transients from their persisted
+        # twins (underscore keys never survive the DB round-trip).
+        try:
+            hyd: dict[str, Any] = {
+                "_rv_yz": _num(row.get("rv20_yz")),
+                "_rv_cc": _num(row.get("rv20_cc")),
+                "_iv_history": json.loads(row["iv_history_json"]) if row.get("iv_history_json") else [],
+                "_ohlc": json.loads(row["ohlc_json"]) if row.get("ohlc_json") else [],
+                "_closes": json.loads(row["closes_json"]) if row.get("closes_json") else [],
+            }
+            updates.update(hyd)
+        except (ValueError, TypeError) as e:
+            log.warning("research hydrate failed for %s: %s — refreshing", symbol, e)
+            updates.update(await _refresh_daily(db, symbol, row, provider))
     if updates:
         merged = {**row, **updates, "symbol": symbol}
         try:
@@ -543,12 +658,68 @@ def _macro_valid_dte() -> float | None:
 
 
 def _earnings_inside_tenor(research: dict, dte: float) -> bool:
+    return _earnings_within_days(research, dte)
+
+
+def _earnings_within_days(research: dict, days: float | None) -> bool:
+    """Any confirmed earnings catalyst falling within `days` from now."""
+    if days is None:
+        return False
     for c in research.get("_catalysts") or []:
         if str(c.get("type")) == "earnings":
             d = _num(c.get("days"))
-            if d is not None and 0 <= d <= dte:
+            if d is not None and 0 <= d <= days:
                 return True
     return False
+
+
+# ── Per-ticker term structure (single-name ~30d vs ~90d slope) ──────────────
+TERM_FAR_DTE_TARGET = 90.0      # sample the listed expiry nearest this DTE ...
+TERM_FAR_DTE_MIN = 60.0         # ... but never nearer than this (else no signal)
+
+
+def _nearest_dte(exps: Sequence[str], target: float,
+                 min_dte: float | None = None) -> str | None:
+    """Listed expiration whose DTE is closest to `target`, optionally floored at
+    `min_dte`. Returns None when nothing qualifies (→ term_slope stays None)."""
+    listed = sorted({str(e)[:10] for e in exps or [] if e})
+    cands = [e for e in listed
+             if _dte_days(e) >= (min_dte if min_dte is not None else 0.0)]
+    if not cands:
+        return None
+    return min(cands, key=lambda e: abs(_dte_days(e) - target))
+
+
+async def _term_structure_inputs(provider, symbol: str, exps: Sequence[str],
+                                  near_exp: str, spot: float,
+                                  iv_near: float | None) -> dict:
+    """Fetch a far (~90 DTE) chain and derive the single-name term slope plus the
+    far-expiry ATM IV/tenor the earnings-VRP decomposition reuses. One extra
+    provider.chain call per symbol per sweep; skips gracefully (term_slope stays
+    None, with a note) when no listed expiry ≥ ~60 DTE exists or the fetch fails.
+
+    Returns a dict to merge into the engine's `research` block:
+    term_slope / term_slope_pp / iv_far / t_far, plus `_term_note` when skipped."""
+    near_dte = _dte_days(near_exp)
+    far_exp = _nearest_dte(exps, TERM_FAR_DTE_TARGET, TERM_FAR_DTE_MIN)
+    if far_exp is None or far_exp == near_exp:
+        return {"_term_note": "no_far_expiry_ge_60dte"}
+    try:
+        far_chain = await provider.chain(symbol, far_exp)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning("term-structure far chain failed for %s@%s: %s",
+                    symbol, far_exp, e)
+        return {"_term_note": f"far_chain_failed:{type(e).__name__}"}
+    iv_far = simmer_engine.atm_iv(far_chain or [], spot)
+    if iv_near is None or iv_far is None:
+        return {"_term_note": "far_atm_iv_unavailable"}
+    ts = simmer_engine.term_structure(iv_near, iv_far)
+    t_far = _dte_days(far_exp) / 365.0
+    return {"term_slope": ts["term_slope"], "term_slope_pp": ts["term_slope_pp"],
+            "iv_far": iv_far, "t_far": t_far, "far_expiration": far_exp,
+            "_near_dte": near_dte}
 
 
 def _persist_readiness(db, env: dict) -> int:
@@ -570,7 +741,9 @@ def _persist_readiness(db, env: dict) -> int:
         "data_quality": env.get("data_quality") or {},
         "metrics": {k: env.get("metrics", {}).get(k) for k in
                     ("iv_rank", "iv_percentile", "iv_percentile_effective",
-                     "vrp", "em_1sd", "atm_iv")},
+                     "vrp", "em_1sd", "atm_iv",
+                     "term_slope", "term_slope_pp", "max_pain",
+                     "vrp_total_pp", "vrp_earnings_pp", "vrp_ex_earnings_pp")},
     }, default=str)
     return db.insert_simmer_readiness({
         "ts": _now_naive_utc(),
@@ -621,7 +794,7 @@ async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None
     provider = as_provider(tradier)
     cfg = simmer_config.resolved(symbol)
     if research is None:
-        research = await load_research(db, symbol)
+        research = await load_research(db, symbol, provider)
     if regime is None:
         regime = state.regime or {}
 
@@ -638,6 +811,19 @@ async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None
     walls = _compute_walls(contracts, spot, chosen_exp)
     flow = _flow_aggregates(contracts)
 
+    # Per-ticker term structure + earnings-VRP inputs: sample a far (~90 DTE)
+    # chain for the single-name slope, replacing the market-only VIX slope for
+    # this signal. The far-expiry ATM IV feeds the earnings VRP decomposition.
+    iv_near = simmer_engine.atm_iv(contracts, spot)
+    term = await _term_structure_inputs(provider, symbol, exps, chosen_exp,
+                                        spot, iv_near)
+    # Earnings inside the ~90d window (but the catalyst gate hard-vetoes those
+    # inside the trade tenor) makes the front IV carry event premium — flag it
+    # so the decomposition attributes it and the soft avoid_if can fire.
+    far_window = _num(term.get("t_far"))
+    earnings_vrp_event = _earnings_within_days(
+        research, far_window * 365.0 if far_window else None)
+
     inputs: dict[str, Any] = {
         "symbol": symbol,
         "spot": spot,
@@ -653,6 +839,14 @@ async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None
             "rv_close_to_close": research.get("_rv_cc"),
             "ohlc": research.get("_ohlc") or [],
             "peer_vrp_ratios": list(peer_vrp or []),
+            # Per-ticker term structure (real single-name slope, not the index
+            # VIX/VIX3M overlay) + the far-expiry legs the earnings-VRP
+            # decomposition reuses. Absent keys → term_slope stays None.
+            "term_slope": term.get("term_slope"),
+            "term_slope_pp": term.get("term_slope_pp"),
+            "iv_far": term.get("iv_far"),
+            "t_far": term.get("t_far"),
+            "earnings_vrp_event": earnings_vrp_event,
             "walls": walls,
             "catalysts": research.get("_catalysts") or [],
             "macro_valid_through_dte": _macro_valid_dte(),
@@ -670,7 +864,19 @@ async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None
 
     env = simmer_engine.evaluate_readiness(inputs, cfg)
     env["computed_at"] = _utc_iso()
+    # Market state at compute time — lets the UI stamp a closed-hours result
+    # "as of last session" and show a check-back hint that clears when live.
+    env["market_open"] = bool(state.market_open)
+    env["market_reason"] = state.market_reason
     env["flow"] = flow
+    # Surface WHY the single-name term slope is absent (no far expiry, fetch
+    # failure) rather than leaving a silent None. Attached only when skipped, so
+    # the healthy path's envelope shape is unchanged.
+    if term.get("_term_note"):
+        dq0 = env.get("data_quality")
+        if not isinstance(dq0, dict):
+            dq0 = env["data_quality"] = {}
+        dq0["term_structure"] = term["_term_note"]
     # Provider-level data-quality notes (Yahoo chain rejects, crumb failures,
     # …) ride the engine's own data_quality dict so they persist with the row.
     # Attached only when non-empty: the default Tradier path emits none, so
@@ -874,7 +1080,8 @@ async def process_alerts(results: dict[str, dict], regime: dict | None) -> None:
 # Daily IV-history job
 # ─────────────────────────────────────────────────────────────────────────────
 async def record_iv_history(db, results: dict[str, dict], provider=None) -> int:
-    """First sweep of a session: append one `simmer_iv_history` row per symbol.
+    """Once per day, at/after the close (`_is_capture_window`): append one
+    `simmer_iv_history` row per symbol — IV Rank is an end-of-day quantity.
 
     When the sweep's data provider supplies real daily OHLC (`daily_bars`,
     e.g. Yahoo), the row gets genuine open/high/low/close and a real
@@ -890,6 +1097,13 @@ async def record_iv_history(db, results: dict[str, dict], provider=None) -> int:
         return 0
     today = date.today().isoformat()
     if state.last_iv_history_date == today:
+        return 0
+    # IV Rank is an END-OF-DAY quantity: only snapshot at/after the close (or on
+    # a weekend/holiday off the last completed session), never mid-session — so
+    # an off-hours boot no longer freezes IV history at whatever time the process
+    # started. During market hours this returns without stamping the guard, so
+    # the capture still happens once the session closes.
+    if not _is_capture_window():
         return 0
     ann = int(simmer_config.vol()["annualization_days"])
     written = 0
@@ -1148,7 +1362,7 @@ async def sweep(tradier, db, edgar=None) -> dict[str, dict]:
     research_by_sym: dict[str, dict] = {}
     for sym in symbols:
         try:
-            research_by_sym[sym] = await load_research(db, sym)
+            research_by_sym[sym] = await load_research(db, sym, provider)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1156,9 +1370,10 @@ async def sweep(tradier, db, edgar=None) -> dict[str, dict]:
             state.last_error_by_symbol[sym] = f"{type(e).__name__}: {e}"
             research_by_sym[sym] = {"symbol": sym}
 
-    # Cross-sectional peers: IV/RV ratios cached by the previous sweeps.
-    peer_vrp = [r.get("iv_rv_ratio") for r in research_by_sym.values()
-                if _num(r.get("iv_rv_ratio")) is not None]
+    # Cross-sectional peers: each symbol's live IV/RV from the PREVIOUS sweep
+    # (see SimmerState.peer_iv_rv). Empty only on the very first sweep of a
+    # fresh deploy; converges the sweep after.
+    peer_vrp = [v for v in state.peer_iv_rv.values() if _num(v) is not None]
 
     results: dict[str, dict] = {}
     for sym, exp in pairs:
@@ -1167,6 +1382,9 @@ async def sweep(tradier, db, edgar=None) -> dict[str, dict]:
                 provider, db, sym, exp, regime=regime,
                 research=research_by_sym.get(sym), peer_vrp=peer_vrp,
                 persist=True)
+            _ivrv = _num((env.get("metrics") or {}).get("vrp"))
+            if _ivrv is not None:
+                state.peer_iv_rv[sym.upper()] = _ivrv
             key = _key(sym, env.get("expiration"))
             results[key] = env
             state.latest_by_key[key] = env
@@ -1213,21 +1431,127 @@ async def sweep(tradier, db, edgar=None) -> dict[str, dict]:
     return results
 
 
+def _row_to_envelope(row: dict) -> dict:
+    """Reconstruct a serviceable envelope from a persisted `simmer_readiness`
+    row, for startup rehydration and DB-fallback reads. Not byte-identical to a
+    live envelope (the full candidate set isn't persisted), but carries
+    everything the UI renders — decision, score, veto reasons, components,
+    strikes, credits, POP/EV/alpha — and is marked `rehydrated` so the client
+    can show its age instead of implying a fresh sweep."""
+    bands = simmer_config.decision_bands()
+    score = _num(row.get("score"))
+    if row.get("vetoed"):
+        decision = "vetoed"
+    elif score is None:
+        decision = "unknown"
+    elif score >= float(bands.get("ready", 70)):
+        decision = "ready"
+    elif score >= float(bands.get("watch", 50)):
+        decision = "watch"
+    else:
+        decision = "avoid"
+
+    def _j(key):
+        v = row.get(key)
+        if not v:
+            return [] if key == "veto_reasons" else {}
+        try:
+            return json.loads(v) if isinstance(v, str) else v
+        except (ValueError, TypeError):
+            return [] if key == "veto_reasons" else {}
+
+    env = {
+        "symbol": row.get("symbol"),
+        "expiration": _iso_date(row.get("expiration")),
+        "computed_at": row.get("ts"),
+        "rehydrated": True,
+        "market_open": False,   # rehydrated rows are by definition not from this instant
+
+        "decision": decision,
+        "score": score,
+        "vetoed": bool(row.get("vetoed")),
+        "veto_reasons": _j("veto_reasons"),
+        "components": _j("components"),
+        "regime": row.get("regime"),
+        "structure": row.get("structure"),
+        "spot": _num(row.get("spot")),
+        "strikes": ({"short": _num(row.get("short_strike")),
+                     "long": _num(row.get("long_strike")),
+                     "width": _num(row.get("width"))}
+                    if row.get("short_strike") is not None else None),
+        "credit_mid": _num(row.get("credit_mid")),
+        "credit_fill": _num(row.get("credit_fill")),
+        "max_loss": _num(row.get("max_loss")),
+        "pop_breakeven": _num(row.get("pop_breakeven")),
+        "expected_value": _num(row.get("expected_value")),
+        "alpha": _num(row.get("alpha")),
+        "engine_version": row.get("engine_version"),
+    }
+    return env
+
+
+def rehydrate_readiness(db) -> int:
+    """Load the newest persisted readiness per (symbol, expiration) into
+    `state.latest_by_key` BEFORE the loop's first sweep. A restart or a
+    market-closed idle period must never hide results sitting on disk — a
+    signed-in user sees their tickers' last analysis immediately, stamped
+    `rehydrated` with its original timestamp. Mirrors evaluator's
+    rehydrate_regime precedent."""
+    if db is None:
+        return 0
+    try:
+        rows = db.latest_simmer_readiness_all()
+    except Exception as e:
+        log.warning("readiness rehydrate failed: %s", e)
+        return 0
+    n = 0
+    for row in rows:
+        env = _row_to_envelope(row)
+        key = _key(env["symbol"], env["expiration"])
+        state.latest_by_key.setdefault(key, env)
+        n += 1
+    if n:
+        log.info("rehydrated %d readiness entries from DuckDB", n)
+    return n
+
+
 async def simmer_loop(tradier_client, db, settings) -> None:
     """Started by main.py lifespan as `edgelane.simmer_loop`, alongside
     poll_task and eval_task. Market-hours gated via poller._is_market_open;
     honours the same poll-when-closed policy the poller resolves upstream."""
     state.is_running = True
+    try:
+        await asyncio.to_thread(rehydrate_readiness, db)
+    except Exception as e:
+        log.warning("rehydrate skipped: %s", e)
     # The sweep's market-data source is a config switch (SIMMER_DATA_PROVIDER):
     # "tradier" (default — identical to the pre-abstraction behavior) or
     # "yahoo" (keeps the sweep off Tradier's 120 req/min budget). Constructed
     # ONCE here, sweep-level, so per-provider caches/sessions persist.
-    provider = get_simmer_provider(settings, tradier_client)
+    #
+    # ⚠️ `settings` here is main.py's `_settings_view()` SimpleNamespace — the
+    # poller's duck-typed COPY, which does NOT carry simmer_data_provider (a
+    # getattr default would silently pin the provider to tradier forever, which
+    # is exactly what happened in live testing). Read the real Settings for
+    # provider selection; keep the passed-in view for the poll-cadence fields
+    # it does carry.
+    from .config import get_settings as _real_settings
+    provider = get_simmer_provider(_real_settings(), tradier_client)
+    # Publish for the routes: /simmer/analyze must run on the SAME provider as
+    # the sweep, or on-demand and scheduled results diverge (e.g. Tradier has no
+    # daily bars → no RV → veto, while the yahoo sweep scores normally).
+    state.provider = provider
     log.info("simmer data provider: %s", provider.provider_name)
     tz_name = getattr(settings, "market_hours_tz", "America/New_York")
     poll_when_closed = bool(getattr(settings, "should_poll_when_closed",
                                     getattr(settings, "force_poll_when_closed", False)))
     interval = max(30, int(simmer_config.cadence().get("sweep_seconds", 300)))
+    # Simmer is a MULTI-DAY premium tool on Yahoo data (no Tradier quota to
+    # protect), so unlike the intraday 0DTE poller it ALSO sweeps off-hours —
+    # from the last session's closing chain, which is the correct basis for a
+    # spread you would open next session. Off-hours it just sweeps slowly.
+    closed_interval = max(300, int(simmer_config.cadence().get(
+        "closed_sweep_seconds", 3600)))
     edgar = None
     try:
         from .simmer_catalysts import EdgarClient
@@ -1242,9 +1566,10 @@ async def simmer_loop(tradier_client, db, settings) -> None:
                 open_, reason = _is_market_open(tz_name)
                 state.market_open = open_
                 state.market_reason = reason
-                if not open_ and not poll_when_closed:
-                    await asyncio.sleep(300)
-                    continue
+                # Sweep in BOTH states — closed just uses last-session data and
+                # a slower cadence. A user who adds a ticker on a weekend still
+                # gets a readiness card (stamped last-session), instead of an
+                # indefinite "pending".
                 await sweep(provider, db, edgar=edgar)
                 now = time.time()
                 if state.last_outcome_run_ts is None \
@@ -1258,7 +1583,7 @@ async def simmer_loop(tradier_client, db, settings) -> None:
                     except Exception:
                         log.exception("paper-outcome sweep failed")
                         state.last_outcome_run_ts = time.time()
-                await asyncio.sleep(interval)
+                await asyncio.sleep(interval if state.market_open else closed_interval)
             except asyncio.CancelledError:
                 raise
             except Exception as e:

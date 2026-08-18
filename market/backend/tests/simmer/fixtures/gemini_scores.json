@@ -1,0 +1,22 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "text": "[{\"id\": \"a1\", \"score\": 0.62, \"confidence\": 0.85, \"reason\": \"earnings\"}, {\"id\": \"a2\", \"score\": 1.7, \"confidence\": 1.4, \"reason\": \"guidance\"}, {\"id\": \"a3\", \"score\": -3.0, \"confidence\": -0.2, \"reason\": \"made_up_reason\"}, {\"id\": \"a4\", \"score\": \"not-a-number\", \"confidence\": 0.5, \"reason\": \"other\"}]"
+          }
+        ],
+        "role": "model"
+      },
+      "finishReason": "STOP",
+      "index": 0
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 412,
+    "candidatesTokenCount": 96,
+    "totalTokenCount": 508
+  },
+  "modelVersion": "gemini-2.5-flash-lite"
+}
