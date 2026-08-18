@@ -42,6 +42,16 @@ def _settings_columns() -> set[str]:
         type_tok = parts[1].lower().rstrip(",").split("(")[0] if len(parts) >= 2 else ""
         if type_tok in _SQL_TYPES and re.fullmatch(r"[a-z_][a-z0-9_]*", parts[0]):
             cols.add(parts[0])
+    # Later migrations extend the table via ALTER ... ADD COLUMN (e.g. 0011 adds
+    # sweep_interval). Fold those in so the oracle tracks the LIVE schema, not
+    # just the original CREATE.
+    for f in sorted(_MIGRATION.parent.glob("0*.sql")):
+        for m2 in re.finditer(
+            r"alter\s+table\s+(?:public\.)?simmer_settings\s+add\s+column\s+"
+            r"(?:if\s+not\s+exists\s+)?([a-z_][a-z0-9_]*)",
+            f.read_text(encoding="utf-8"), re.I,
+        ):
+            cols.add(m2.group(1))
     assert "user_id" in cols and len(cols) > 5, f"suspicious parse: {sorted(cols)}"
     return cols
 
@@ -55,6 +65,7 @@ _FULL_PAYLOAD = {
     "min_dte": 10,
     "max_dte": 40,
     "max_concurrent": 3,
+    "sweep_interval": 3,
     "structures_enabled": ["bull_put"],
     "regime_strictness": "strict",
     "notify_email": True,

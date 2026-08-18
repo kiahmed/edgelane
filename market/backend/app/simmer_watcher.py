@@ -1515,6 +1515,24 @@ def rehydrate_readiness(db) -> int:
     return n
 
 
+async def _resolve_sweep_seconds() -> int:
+    """Open-market sweep cadence in seconds.
+
+    A UI/CLI-set simmer_settings.sweep_interval (MINUTES, migration 0011) drives
+    it — the sweep is ONE global loop, so the MIN across all rows wins (the
+    tightest cadence any user asked for) — falling back to the config default
+    (simmer_config CADENCE.sweep_seconds) when Supabase is unconfigured or no row
+    sets it. Read straight from Supabase (no DuckDB mirror), so a change applies
+    on the next sweep and a container restart picks it up on the first cycle."""
+    cfg_default = max(30, int(simmer_config.cadence().get("sweep_seconds", 300)))
+    rows = await supabase_admin.select_many("simmer_settings", "sweep_interval")
+    if not rows:                       # None = Supabase off; [] = no rows
+        return cfg_default
+    mins = [int(r["sweep_interval"]) for r in rows
+            if r.get("sweep_interval") is not None]
+    return max(60, min(mins) * 60) if mins else cfg_default
+
+
 async def simmer_loop(tradier_client, db, settings) -> None:
     """Started by main.py lifespan as `edgelane.simmer_loop`, alongside
     poll_task and eval_task. Market-hours gated via poller._is_market_open;
@@ -1545,7 +1563,10 @@ async def simmer_loop(tradier_client, db, settings) -> None:
     tz_name = getattr(settings, "market_hours_tz", "America/New_York")
     poll_when_closed = bool(getattr(settings, "should_poll_when_closed",
                                     getattr(settings, "force_poll_when_closed", False)))
-    interval = max(30, int(simmer_config.cadence().get("sweep_seconds", 300)))
+    # Open-market cadence: UI/CLI-set sweep_interval (minutes) overrides the
+    # config default. Re-read each cycle below — a restart applies it on the
+    # first pass, and a later change applies on the next sweep, no restart.
+    interval = await _resolve_sweep_seconds()
     # Simmer is a MULTI-DAY premium tool on Yahoo data (no Tradier quota to
     # protect), so unlike the intraday 0DTE poller it ALSO sweeps off-hours —
     # from the last session's closing chain, which is the correct basis for a
@@ -1583,6 +1604,9 @@ async def simmer_loop(tradier_client, db, settings) -> None:
                     except Exception:
                         log.exception("paper-outcome sweep failed")
                         state.last_outcome_run_ts = time.time()
+                # Re-resolve each cycle so a UI/CLI sweep_interval change lands
+                # on the next sweep without a restart (falls back to config).
+                interval = await _resolve_sweep_seconds()
                 await asyncio.sleep(interval if state.market_open else closed_interval)
             except asyncio.CancelledError:
                 raise

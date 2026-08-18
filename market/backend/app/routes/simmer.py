@@ -473,6 +473,14 @@ def sanitize_settings(payload: dict) -> dict:
             out["max_concurrent"] = max(1, min(50, int(payload["max_concurrent"])))
         except (TypeError, ValueError):
             raise HTTPException(422, "max_concurrent must be an integer")
+    # Watcher sweep cadence, in MINUTES (migration 0011). Range mirrors the DB
+    # CHECK (1–60) so the upsert never bounces on a constraint. The watcher reads
+    # the min across users as the global open-market cadence.
+    if payload.get("sweep_interval") is not None:
+        try:
+            out["sweep_interval"] = max(1, min(60, int(payload["sweep_interval"])))
+        except (TypeError, ValueError):
+            raise HTTPException(422, "sweep_interval must be an integer (minutes)")
     if payload.get("structures_enabled") is not None:
         structs = payload["structures_enabled"]
         if not isinstance(structs, (list, tuple)) or \
@@ -530,7 +538,7 @@ async def get_settings_endpoint(user: dict = Depends(require_simmer_access)):
         "simmer_settings", "user_id", str(user["id"]),
         "min_score,min_iv_percentile,min_dte,max_dte,short_delta_min,"
         "short_delta_max,notify_email,risk_profile,structures_enabled,"
-        "gate_overrides,regime_strictness,max_concurrent,prefs")
+        "gate_overrides,regime_strictness,max_concurrent,sweep_interval,prefs")
     return {"settings": row or {}, "defaults": {
         "min_score": simmer_config.decision_bands()["ready"],
         "structures_enabled": list(STRUCTURES),

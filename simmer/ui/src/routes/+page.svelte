@@ -7,16 +7,27 @@
 	import AlertFeed from '$lib/components/AlertFeed.svelte';
 	import { watchlist } from '$lib/stores/watchlist.svelte';
 	import { settingsStore } from '$lib/stores/settings.svelte';
-	import { resolve } from '$app/paths';
 	import type { WatchlistRow } from '$lib/types';
 
 	let selected = $state<string | null>(null);
 
 	const withEnv = $derived(watchlist.rows.filter((r) => r.readiness));
 	const readyCount = $derived(withEnv.filter((r) => r.readiness!.decision === 'ready').length);
-	const shown = $derived(
-		selected ? watchlist.rows.filter((r) => r.symbol === selected) : watchlist.rows
-	);
+	// Nearest expiry first; rows without an evaluated expiry sink to the bottom.
+	// Expirations are ISO YYYY-MM-DD, so a string compare is chronological.
+	const shown = $derived.by(() => {
+		const list = selected
+			? watchlist.rows.filter((r) => r.symbol === selected)
+			: watchlist.rows.slice();
+		return list.sort((a, b) => {
+			const ax = a.readiness?.expiration ?? null;
+			const bx = b.readiness?.expiration ?? null;
+			if (ax && bx) return ax < bx ? -1 : ax > bx ? 1 : 0;
+			if (ax) return -1;
+			if (bx) return 1;
+			return 0;
+		});
+	});
 	const bands = $derived({
 		ready: settingsStore.config?.decision.ready ?? 70,
 		watch: settingsStore.config?.decision.watch ?? 50
@@ -33,7 +44,7 @@
 		<AlertFeed />
 	</div>
 
-	<div class="space-y-4">
+	<div class="space-y-2">
 		{#if watchlist.rows.length}
 			<div class="flex items-baseline gap-2 px-1 text-sm">
 				{#if withEnv.length === 0}
@@ -66,12 +77,6 @@
 					activeOverrides={settingsStore.activeGateOverrides}
 					pinnedExpiration={row.expiration}
 				/>
-				<div class="-mt-2 px-1 text-right">
-					<a
-						class="footer-link text-[0.7rem]"
-						href={resolve(`/news/${row.symbol}`)}>news & sentiment for {row.symbol} →</a
-					>
-				</div>
 			{:else}
 				<div class="card p-4 text-sm text-slate-500">
 					{row.symbol}: <span class="text-amber-300/90">no analysis yet</span> — first sweep is

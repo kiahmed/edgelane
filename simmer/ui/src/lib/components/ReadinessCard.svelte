@@ -5,6 +5,8 @@
 	// ADVERTISED — the gap is the fill-slippage honesty the docs demand.
 	import GateChecklist from './GateChecklist.svelte';
 	import ScoreBar from './ScoreBar.svelte';
+	import { gateChecklist } from '$lib/gates';
+	import { resolve } from '$app/paths';
 	import {
 		ago,
 		decisionBadgeClass,
@@ -35,6 +37,11 @@
 		pinnedExpiration?: string | null;
 	} = $props();
 
+	// Cards start collapsed — the watchlist can grow long, and the header's
+	// summary chip already carries the one thing that matters at a glance (the
+	// sell target, or the veto count). Expand to see the full evaluation.
+	let expanded = $state(false);
+
 	const isReady = $derived(env.decision === 'ready');
 	const condor = $derived(
 		env.strikes && 'put' in env.strikes ? (env.strikes as StrikesCondor) : null
@@ -42,6 +49,19 @@
 	const vertical = $derived(
 		env.strikes && 'short' in env.strikes ? (env.strikes as StrikesVertical) : null
 	);
+
+	// Header summary: the short strike(s) you'd sell (the "target"), else how
+	// many of the 10 gates vetoed. x/10 uses the gate checklist, not the raw
+	// reason tokens (one gate can raise several reasons).
+	const checklist = $derived(gateChecklist(env));
+	const failedGates = $derived(checklist.filter((c) => c.state === 'fail').length);
+	const totalGates = $derived(checklist.length);
+	const sellTarget = $derived.by(() => {
+		if (!isReady) return null;
+		if (vertical) return `${strike(vertical.short)} / ${strike(vertical.long)}`;
+		if (condor) return `${strike(condor.put.short)}P / ${strike(condor.call.short)}C`;
+		return null;
+	});
 	const popForecast = $derived(
 		(env.candidate?.pop_breakeven_forecast as number | null | undefined) ?? null
 	);
@@ -55,33 +75,74 @@
 </script>
 
 <div class="card p-4" class:recommended-glow={isReady}>
-	<!-- Header -->
-	<div class="mb-3 flex flex-wrap items-baseline gap-x-3 gap-y-1">
+	<!-- Header (always visible; carries the summary chip + collapse toggle) -->
+	<div class="flex flex-wrap items-center gap-x-3 gap-y-1" class:mb-3={expanded}>
 		<span class="text-lg font-black tracking-tight">{env.symbol}</span>
 		<span class="pill {decisionBadgeClass(env.decision)}">{DECISION_LABEL[env.decision] ?? env.decision}</span>
 		<span class="text-xs text-slate-400">
 			{env.expiration ?? '—'} · {sigInt(env.dte)} DTE
 			{#if pinnedExpiration}<span class="text-sky-300" title="Expiration pinned by you — the engine is not auto-picking">📌 pinned</span>{/if}
 		</span>
-		<span class="ml-auto text-[0.68rem] text-slate-500" title={env.computed_at ?? ''}>
-			underlying {strike(env.spot)} ·
-			{#if env.rehydrated}
-				<span
-					class="text-amber-300/90"
-					title="Served from the last persisted sweep (backend restart / market closed) — not a live evaluation"
-					>as of {etDateTime(env.computed_at)}</span>
-			{:else}
-				{ago(env.computed_at)}
+
+		<!-- Summary chip (the white box): the sell target when ready, else the veto count -->
+		{#if isReady && sellTarget}
+			<span class="summary-chip summary-chip--sell" title="Short/long strikes to sell — expand for credit, POP, EV, management">
+				<span class="summary-chip__lead">SELL</span>{sellTarget}
+			</span>
+		{:else if env.decision === 'vetoed'}
+			<span class="summary-chip summary-chip--veto" title="No sellable spread — expand for the gate checklist">
+				No sellable spread · {failedGates}/{totalGates} vetoed
+			</span>
+		{:else}
+			<span class="summary-chip summary-chip--veto" title="Score below the ready band — the engine is holding, not selling">
+				No sellable spread · below band
+			</span>
+		{/if}
+
+		<!-- Right group: timestamp (expanded only) + collapse toggle -->
+		<div class="ml-auto flex items-center gap-2">
+			{#if expanded}
+				<span class="text-[0.68rem] text-slate-500" title={env.computed_at ?? ''}>
+					underlying {strike(env.spot)} ·
+					{#if env.rehydrated}
+						<span
+							class="text-amber-300/90"
+							title="Served from the last persisted sweep (backend restart / market closed) — not a live evaluation"
+							>as of {etDateTime(env.computed_at)}</span>
+					{:else}
+						{ago(env.computed_at)}
+					{/if}
+					{#if env.market_open === false}
+						<span
+							class="text-amber-300/90"
+							title="Market is closed — computed from the last session's closing chain. Refreshes live during market hours (09:30–16:00 ET)."
+							>· last session (check back next session)</span>
+					{/if}
+				</span>
 			{/if}
-			{#if env.market_open === false}
-				<span
-					class="text-amber-300/90"
-					title="Market is closed — computed from the last session's closing chain. Refreshes live during market hours (09:30–16:00 ET)."
-					>· last session (check back next session)</span>
-			{/if}
-		</span>
+			<button
+				type="button"
+				class="collapse-btn"
+				aria-expanded={expanded}
+				aria-label={expanded ? 'Collapse card' : 'Expand card'}
+				title={expanded ? 'Collapse' : 'Expand'}
+				onclick={() => (expanded = !expanded)}
+			>
+				<svg
+					viewBox="0 0 24 24"
+					class="chevron"
+					class:chevron--open={expanded}
+					fill="none"
+					stroke="currentColor"
+					stroke-width="2.5"
+					stroke-linecap="round"
+					stroke-linejoin="round"
+					aria-hidden="true"><path d="M6 9l6 6 6-6" /></svg>
+			</button>
+		</div>
 	</div>
 
+	{#if expanded}
 	<!-- Active override warnings — a guard is down; say so where the user looks -->
 	{#each activeOverrides as ov (ov)}
 		<div class="override-warn mb-2">
@@ -167,7 +228,7 @@
 		<div class="mt-3 rounded-lg border border-slate-600/30 bg-slate-800/30 p-3 text-[0.8rem] text-slate-400">
 			<span class="text-slate-300">No sellable spread.</span>
 			{#if env.decision === 'vetoed'}
-				Blocked by {(env.veto_reasons ?? []).length} gate{(env.veto_reasons ?? []).length === 1 ? '' : 's'}
+				Blocked by {failedGates} of {totalGates} gate{failedGates === 1 ? '' : 's'}
 				— see the checklist above. Strikes are chosen (delta 0.20–0.35, beyond the
 				expected move &amp; wall) only when a name passes.
 			{:else}
@@ -184,4 +245,83 @@
 			{/each}
 		</div>
 	{/if}
+	{/if}
+
+	<!-- Footer: per-symbol news link, anchored to the card bottom (visible while
+	     collapsed too, so it lives inside the chip rather than in the gap below). -->
+	<div class="mt-2 text-right">
+		<a class="card-news-link" href={resolve(`/news/${env.symbol}`)}
+			>news &amp; sentiment for {env.symbol} →</a>
+	</div>
 </div>
+
+<style>
+	/* Summary chip — the "white box" in the header. Reads at a glance whether
+	   there's a target to sell or how many gates vetoed, even while collapsed. */
+	.summary-chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3rem;
+		border-radius: 0.375rem;
+		border: 1px solid;
+		padding: 0.1rem 0.45rem;
+		font-size: 0.72rem;
+		line-height: 1.1rem;
+		white-space: nowrap;
+	}
+	.summary-chip--sell {
+		background: #ffffff;
+		border-color: rgba(16, 185, 129, 0.55); /* emerald */
+		color: #0f172a; /* slate-900 */
+		font-weight: 700;
+		font-variant-numeric: tabular-nums;
+	}
+	.summary-chip__lead {
+		font-size: 0.6rem;
+		font-weight: 800;
+		letter-spacing: 0.05em;
+		color: #047857; /* emerald-700 */
+	}
+	.summary-chip--veto {
+		background: rgba(226, 232, 240, 0.92); /* slate-200 — a light box */
+		border-color: rgba(100, 116, 139, 0.5);
+		color: #334155; /* slate-700 */
+	}
+
+	/* Collapse / expand chip (top-right). */
+	.collapse-btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		height: 1.5rem;
+		width: 1.5rem;
+		flex: none;
+		border-radius: 0.375rem;
+		border: 1px solid rgba(71, 85, 105, 0.4);
+		color: rgb(148, 163, 184);
+		transition: background-color 0.15s, color 0.15s;
+	}
+	.collapse-btn:hover {
+		background: rgba(51, 65, 85, 0.45);
+		color: rgb(226, 232, 240);
+	}
+	.chevron {
+		height: 0.85rem;
+		width: 0.85rem;
+		transition: transform 0.2s ease;
+	}
+	.chevron--open {
+		transform: rotate(180deg);
+	}
+
+	/* Per-symbol news link, now living inside the card footer. */
+	.card-news-link {
+		font-size: 0.68rem;
+		color: #94a3b8; /* slate-400 — clearer than the old muted slate-500 */
+		transition: color 0.15s;
+	}
+	.card-news-link:hover {
+		color: #7dd3fc; /* sky-300 */
+		text-decoration: underline;
+	}
+</style>
