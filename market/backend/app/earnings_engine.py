@@ -134,6 +134,16 @@ class EarningsBiasAnalyzer:
         self._gt = gemini_transport
         self._lookback = lookback_days
 
+    async def aclose(self) -> None:
+        """Close the Alpaca client's httpx session. The route builds one analyzer
+        per request, so this must be called (the Gemini call closes its own
+        client via `async with`)."""
+        if self._alpaca is not None:
+            try:
+                await self._alpaca.close()
+            except Exception:
+                pass
+
     async def _headlines(self, symbol: str, now: datetime) -> list[str]:
         if not self._alpaca:
             return []
@@ -196,7 +206,14 @@ class EarningsBiasAnalyzer:
             "headline_count": len(headlines),
             "reasons": verdict["_reasons"],
             "source": "news",
-            "computed_at": now,
+            # Naive UTC on purpose: this lands in a DuckDB TIMESTAMP column, and
+            # binding a tz-AWARE datetime there converts it to the session's LOCAL
+            # zone and drops the offset — so the reader (which reasonably treats a
+            # naive stamp as UTC) sees a row born `utcoffset` seconds old. On
+            # US/Eastern that turned the 6h bias TTL into ~2h; on US/Pacific the
+            # row was stale on arrival, re-billing Gemini on every request. `now`
+            # stays aware above because the headline lookback window needs it.
+            "computed_at": now.astimezone(timezone.utc).replace(tzinfo=None),
         }
 
 

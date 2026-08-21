@@ -315,7 +315,14 @@ async def analyze(symbol: str, request: Request,
 def _bias_stale(row: dict | None, ttl: float) -> bool:
     if not row:
         return True
-    ts = row.get("updated_at") or row.get("computed_at")
+    # Use computed_at, NOT updated_at: updated_at is DuckDB now(), which lands in
+    # a TIMESTAMP column in the session's LOCAL tz. Reading either as UTC below
+    # would shrink the TTL by the host's UTC offset (6h cache → ~2h on US/Eastern;
+    # always-stale on US/Pacific, re-billing Gemini every request).
+    # This is only correct because the writer stamps computed_at as NAIVE UTC —
+    # see earnings_engine.analyze(). Binding an aware datetime there silently
+    # reintroduces the bug, so keep the two sides in step.
+    ts = row.get("computed_at")
     if isinstance(ts, str):
         try:
             ts = datetime.fromisoformat(ts)
@@ -333,10 +340,18 @@ async def refresh_research(symbol: str, request: Request,
                            user: dict = Depends(require_simmer_access)):
     """Force a tier-1 research re-pull for a symbol (bypasses TTLs) — e.g. to
     populate the next-earnings date right after enabling the feed, instead of
-    waiting for the 24h catalyst TTL. Returns the resolved earnings date."""
+    waiting for the 24h catalyst TTL. Returns the resolved earnings date.
+
+    ADMIN-ONLY: it bypasses every cache TTL and re-hits Alpaca/Yahoo/Gemini, so
+    it is an operator tool, not something a regular consumer may hammer."""
+    if str(user.get("id")) not in ("admin", "dev-local"):
+        raise HTTPException(403, "admin only")
+    sym = symbol.upper()
+    if not re.fullmatch(r"[A-Z.\-]{1,10}", sym):
+        raise HTTPException(422, "invalid symbol")
     db = _db(request)
     provider = simmer_state.provider or _tradier(request)
-    research = await simmer_watcher.load_research(db, symbol.upper(), provider, force=True)
+    research = await simmer_watcher.load_research(db, sym, provider, force=True)
     return {
         "symbol": symbol.upper(),
         "earnings_date": simmer_watcher._earnings_date_from_research(research),
@@ -363,7 +378,10 @@ async def earnings_bias(symbol: str, request: Request,
     ttl = float(simmer_config.earnings().get("bias_ttl_seconds", 21600))
     if refresh or _bias_stale(row, ttl):
         analyzer = build_earnings_analyzer(get_settings())
-        verdict = await analyzer.analyze(symbol, edate)
+        try:
+            verdict = await analyzer.analyze(symbol, edate)
+        finally:
+            await analyzer.aclose()          # don't leak the Alpaca httpx client
         await asyncio.to_thread(db.upsert_simmer_earnings_bias, {
             **verdict, "reasons": json.dumps(verdict.get("reasons") or [])})
         row = await asyncio.to_thread(db.get_simmer_earnings_bias, symbol, edate)

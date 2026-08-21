@@ -6,12 +6,30 @@ asyncio_mode=auto, so async tests run without a marker.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
 from app import earnings_engine as ee
 from app import simmer_news as sn
+from app.routes.simmer import _bias_stale
+
+
+def _utc_naive(mins_ago: int) -> datetime:
+    """A naive-UTC timestamp `mins_ago` in the past — how DuckDB hands back
+    computed_at (aware-UTC stored → read back naive, still UTC wall-clock)."""
+    return (datetime.now(timezone.utc) - timedelta(minutes=mins_ago)).replace(tzinfo=None)
+
+
+def test_bias_stale_uses_computed_at_not_updated_at():
+    ttl = 21600  # 6h
+    assert _bias_stale(None, ttl) is True
+    assert _bias_stale({}, ttl) is True
+    # 3h-old computed_at is fresh — even if updated_at (DB-local now()) looks 8h
+    # old. The old bug preferred updated_at and mislabeled it UTC, shrinking the
+    # TTL by the host's offset.
+    assert _bias_stale({"computed_at": _utc_naive(180), "updated_at": _utc_naive(500)}, ttl) is False
+    assert _bias_stale({"computed_at": _utc_naive(420)}, ttl) is True  # 7h → stale
 
 NOW = datetime(2026, 8, 10, tzinfo=timezone.utc)
 
@@ -105,3 +123,40 @@ def test_db_roundtrip(fresh_db):
     # case-insensitive read; toggle-off then back on hits the same cached row
     assert fresh_db.get_simmer_earnings_bias("nvda", "2026-08-27")["confidence"] == 0.7
     assert fresh_db.get_simmer_earnings_bias("NVDA", "2099-01-01") is None
+
+
+async def test_computed_at_is_naive_utc_so_a_non_utc_host_keeps_its_ttl():
+    """The WRITER must stamp computed_at naive-UTC — not merely aware-UTC.
+
+    `_bias_stale` reads a naive stamp as UTC. Binding a tz-AWARE datetime into a
+    DuckDB TIMESTAMP column converts it to the session's LOCAL zone and drops the
+    offset, so the row reads back `utcoffset` seconds old the moment it is
+    written: on US/Eastern the 6h bias TTL collapsed to ~2h, and on US/Pacific
+    the row was stale on arrival, re-billing Gemini on every single request.
+
+    test_bias_stale_uses_computed_at_not_updated_at above fabricates naive
+    stamps, so it exercises only the READER and cannot catch a regression here.
+    """
+    import duckdb
+
+    a = ee.EarningsBiasAnalyzer(_alpaca(["h1"]), "gm", gemini_transport=_gemini(
+        {"direction": "bullish", "confidence": 0.5, "go": True, "rationale": "r"}))
+    out = await a.analyze("nvda", "2026-08-27", now=NOW)
+
+    stamp = out["computed_at"]
+    assert stamp.tzinfo is None, "computed_at must be naive (DuckDB TIMESTAMP)"
+    assert stamp == NOW.replace(tzinfo=None), "…and still the UTC wall clock"
+
+    # Full roundtrip on a deliberately non-UTC session: a row written now must
+    # not read back as already-expired. Bind an aware stamp instead and this
+    # assertion fails — which is exactly the regression being pinned.
+    conn = duckdb.connect(":memory:")
+    conn.execute("SET TimeZone='America/Los_Angeles'")
+    conn.execute("CREATE TABLE b (computed_at TIMESTAMP)")
+    fresh = await ee.EarningsBiasAnalyzer(
+        _alpaca(["h1"]), "gm", gemini_transport=_gemini(
+            {"direction": "bullish", "confidence": 0.5, "go": True, "rationale": "r"})
+    ).analyze("nvda", "2026-08-27")          # real clock, not NOW
+    conn.execute("INSERT INTO b VALUES (?)", [fresh["computed_at"]])
+    row = {"computed_at": conn.execute("SELECT computed_at FROM b").fetchone()[0]}
+    assert _bias_stale(row, 21600.0) is False

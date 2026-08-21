@@ -826,7 +826,7 @@ async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None
                          regime: dict | None = None,
                          research: dict | None = None,
                          peer_vrp: Sequence[float] | None = None,
-                         earnings_mode: bool = True,
+                         earnings_mode: bool = False,
                          persist: bool = True) -> dict:
     """THE single evaluation path. The sweep calls it per (symbol, expiration)
     with persist=True; `/simmer/analyze/{symbol}` calls it with persist=False.
@@ -918,8 +918,12 @@ async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None
     # Earnings mode: when the chosen expiry sits in an earnings window, pass the
     # CACHED bias (computed on demand by /simmer/earnings) into the engine so it
     # skips the earnings veto and folds the bias into the score. The sweep never
-    # calls Gemini here — it reads the cache only; a missing verdict just means
-    # no lift yet (the name scores on its base VRP).
+    # calls Gemini here — it reads the cache only.
+    #
+    # SAFETY: earnings_mode defaults False, so the SWEEP (persist=True) and the
+    # alerts it fans out KEEP the earnings veto — nothing auto-recommends selling
+    # THROUGH earnings. Only an explicit on-demand toggle (`?earnings=on`, the
+    # card's Earnings panel) sets it True to preview the folded score.
     if inputs["research"].get("earnings_inside_tenor"):
         _erow = None
         _edate = _earnings_date_from_research(research)
@@ -1074,21 +1078,16 @@ def update_alert_state(key: str, env: dict, threshold: float,
 
 
 def _passes_user_filters(env: dict, user_settings: dict, regime: dict | None) -> bool:
-    """EACH user's own thresholds, applied at WRITE time. The shared readiness
-    row is the engine's verdict; this is the per-user view over it."""
+    """EACH user's ALERT bar over the shared verdict, applied at WRITE time.
+
+    Only `min_score` is user-controlled now — the alert-strictness preset. The
+    old per-user `structures_enabled` / `regime_strictness` filters were removed
+    from the UI (engine behavior is admin-global), so they are NOT applied here:
+    a leftover value in a row must not silently filter alerts a user can no
+    longer see or clear. `regime` is kept in the signature for callers."""
     score = float(env.get("score") or 0.0)
     ms = _num(user_settings.get("min_score"))
     if ms is not None and score < simmer_config.clamp_setting("min_score", ms):
-        return False
-    structs = user_settings.get("structures_enabled")
-    if isinstance(structs, (list, tuple)) and structs \
-            and env.get("structure") not in structs:
-        return False
-    strictness = str(user_settings.get("regime_strictness") or "balanced")
-    reg_state = (regime or {}).get("state") or "calm"
-    if strictness == "strict" and reg_state not in ("calm", "contango"):
-        return False
-    if strictness == "balanced" and reg_state == "stressed":
         return False
     return True
 

@@ -8,9 +8,19 @@ Structures forced to bull_put so the alignment sign is deterministic.
 """
 from __future__ import annotations
 
+import inspect
+
 from app import simmer_engine as se
+from app import simmer_watcher as sw
 
 from .conftest import clean_inputs, mutate, reason_kinds
+
+
+def test_sweep_default_keeps_earnings_veto():
+    # analyze_symbol's default (what the sweep uses) MUST be False, so persisted
+    # verdicts and the alerts they fan out keep the earnings veto — nothing
+    # auto-recommends selling through earnings. On-demand /analyze passes it True.
+    assert inspect.signature(sw.analyze_symbol).parameters["earnings_mode"].default is False
 
 # earnings 5 days out — inside the 30-DTE clean_inputs tenor
 EARN = {"type": "earnings", "days": 5, "confirmed": True}

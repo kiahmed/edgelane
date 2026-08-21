@@ -111,24 +111,27 @@ def supabase_stub(monkeypatch):
     return inserts
 
 
-async def test_fanout_applies_each_users_own_settings(supabase_stub):
+async def test_fanout_applies_each_users_min_score(supabase_stub):
     env = readiness_env(score=75.0, structure="bull_put")
     written = await sw.fanout_alert(env, {"state": "contango", "calm": True})
     got = {r["user_id"] for r in supabase_stub}
-    # u-high filtered by min_score 90; u-calls-only filtered by structure;
-    # u-strict passes because the regime IS calm
-    assert got == {"u-low", "u-strict"}
-    assert written == 2
+    # ONLY min_score filters now — structures_enabled / regime_strictness were
+    # removed as per-user filters (engine behavior is admin-global). So u-high
+    # (min_score 90) is the only one filtered; the rest (60) all pass, including
+    # u-calls-only (structure no longer filters).
+    assert got == {"u-low", "u-calls-only", "u-strict"}
+    assert written == 3
     payload = supabase_stub[0]["payload"]
     assert payload["symbol"] == "NVDA" and "components" in payload  # full envelope
 
 
-async def test_fanout_strictness_blocks_in_risk_off(supabase_stub):
+async def test_fanout_regime_strictness_no_longer_filters(supabase_stub):
+    # A stressed regime must NOT block a "strict" user any more — that filter was
+    # removed and a leftover value must not silently drop alerts.
     env = readiness_env(score=95.0, structure="bull_put")
     await sw.fanout_alert(env, {"state": "backwardation", "calm": False})
     got = {r["user_id"] for r in supabase_stub}
-    assert "u-strict" not in got          # strict users alert only in calm
-    assert "u-low" in got                 # balanced users still do (not stressed)
+    assert got == {"u-low", "u-high", "u-calls-only", "u-strict"}  # all pass min_score 95
 
 
 async def test_fanout_respects_pinned_expiration(monkeypatch):
