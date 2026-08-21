@@ -398,7 +398,34 @@ async def _refresh_news(db, symbol: str, row: dict) -> dict:
     return updates
 
 
-async def _refresh_catalysts(db, symbol: str, row: dict) -> dict:
+async def _fetch_next_earnings(symbol: str, provider) -> dict | None:
+    """The NEXT earnings as {date, days, confirmed}, from the configured
+    SIMMER_EARNINGS_PROVIDER (yahoo). None when off / unavailable / not upcoming
+    within a sane horizon. The SEC feed only confirms PAST earnings — this is
+    what surfaces the upcoming event."""
+    from .config import get_settings
+    if getattr(get_settings(), "simmer_earnings_provider", "off") != "yahoo":
+        return None
+    fn = getattr(provider, "next_earnings", None)
+    if fn is None:
+        return None
+    try:
+        r = await fn(symbol)
+    except Exception as e:
+        log.debug("next_earnings failed for %s: %s", symbol, e)
+        return None
+    if not r or not r.get("date"):
+        return None
+    try:
+        days = (date.fromisoformat(str(r["date"])) - date.today()).days
+    except ValueError:
+        return None
+    if days < 0 or days > 120:          # only upcoming, within ~4 months
+        return None
+    return {"date": str(r["date"]), "days": days, "confirmed": bool(r.get("confirmed"))}
+
+
+async def _refresh_catalysts(db, symbol: str, row: dict, provider=None) -> dict:
     """Catalyst group: read `simmer_catalysts` (populated by the EDGAR sweep)
     and derive the flags the engine consumes. Rows carry ET acceptance
     timestamps; the engine wants days-from-now, computed here because the
@@ -436,10 +463,19 @@ async def _refresh_catalysts(db, symbol: str, row: dict) -> dict:
             "days": days,
             "confirmed": bool(c.get("confirmed", True)),
         })
+    # Next earnings DATE from the configured provider (Yahoo). The SEC feed above
+    # only confirms PAST earnings; this makes the upcoming event visible to the
+    # gate, the earnings window, and the card toggle.
+    earnings_date = _latest_earnings_date(cats)
+    fut = await _fetch_next_earnings(symbol, provider)
+    if fut:
+        engine_cats.append({"type": "earnings", "days": fut["days"],
+                            "confirmed": fut["confirmed"]})
+        earnings_date = fut["date"]      # prefer the upcoming date for the UI
     return {
         "catalyst_flags": json.dumps({
             "events": engine_cats,
-            "earnings_date": _latest_earnings_date(cats),
+            "earnings_date": earnings_date,
         }, default=str),
         "catalyst_blocking": blocking_any,
         "catalyst_at": _now_naive_utc(),
@@ -521,9 +557,10 @@ def _persistable(row: dict) -> dict:
     return {k: v for k, v in row.items() if not str(k).startswith("_")}
 
 
-async def load_research(db, symbol: str, provider=None) -> dict:
+async def load_research(db, symbol: str, provider=None, force: bool = False) -> dict:
     """The single tier-1 accessor: cache read + per-group TTL refresh +
-    mandatory invalidation, enforced in ONE place rather than at call sites."""
+    mandatory invalidation, enforced in ONE place rather than at call sites.
+    `force` refreshes every group regardless of TTL (operator re-pull)."""
     symbol = symbol.upper()
     if db is None:
         return {"symbol": symbol}
@@ -531,6 +568,8 @@ async def load_research(db, symbol: str, provider=None) -> dict:
     ttls = simmer_config.ttls()
     now = _now_naive_utc()
     invalidated = await _mandatory_invalidation(db, symbol, row)
+    if force:
+        invalidated = list(invalidated or []) + ["forced"]
     if invalidated:
         log.info("tier-1 cache for %s invalidated (%s) — refreshing all groups",
                  symbol, ",".join(invalidated))
@@ -538,7 +577,7 @@ async def load_research(db, symbol: str, provider=None) -> dict:
     if invalidated or _group_expired(row, "news_at", int(ttls.get("ticker_sentiment", 900)), now):
         updates.update(await _refresh_news(db, symbol, row))
     if invalidated or _group_expired(row, "catalyst_at", int(ttls.get("catalysts", 86_400)), now):
-        updates.update(await _refresh_catalysts(db, symbol, row))
+        updates.update(await _refresh_catalysts(db, symbol, row, provider))
     _pre_upgrade_row = (row.get("daily_at") is not None
                         and row.get("rv20_yz") is None
                         and row.get("iv_history_json") is None)
@@ -655,6 +694,19 @@ def _macro_valid_dte() -> float | None:
     except Exception as e:
         log.warning("macro calendar unavailable: %s", e)
         return None      # engine turns this into a visible macro veto
+
+
+def _earnings_date_from_research(research: dict) -> str | None:
+    """The resolved earnings ISO date, from the persisted catalyst_flags blob."""
+    cf = (research or {}).get("catalyst_flags")
+    if isinstance(cf, str):
+        try:
+            cf = json.loads(cf)
+        except Exception:
+            cf = None
+    if isinstance(cf, dict) and cf.get("earnings_date"):
+        return str(cf["earnings_date"])
+    return None
 
 
 def _earnings_inside_tenor(research: dict, dte: float) -> bool:
@@ -774,6 +826,7 @@ async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None
                          regime: dict | None = None,
                          research: dict | None = None,
                          peer_vrp: Sequence[float] | None = None,
+                         earnings_mode: bool = True,
                          persist: bool = True) -> dict:
     """THE single evaluation path. The sweep calls it per (symbol, expiration)
     with persist=True; `/simmer/analyze/{symbol}` calls it with persist=False.
@@ -861,6 +914,30 @@ async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None
     }
     if user_settings:
         inputs["settings"] = user_settings
+
+    # Earnings mode: when the chosen expiry sits in an earnings window, pass the
+    # CACHED bias (computed on demand by /simmer/earnings) into the engine so it
+    # skips the earnings veto and folds the bias into the score. The sweep never
+    # calls Gemini here — it reads the cache only; a missing verdict just means
+    # no lift yet (the name scores on its base VRP).
+    if inputs["research"].get("earnings_inside_tenor"):
+        _erow = None
+        _edate = _earnings_date_from_research(research)
+        if _edate and db is not None:
+            try:
+                _erow = await asyncio.to_thread(
+                    db.get_simmer_earnings_bias, symbol, _edate)
+            except Exception as e:
+                log.debug("earnings bias read failed for %s: %s", symbol, e)
+        inputs["earnings"] = {
+            "mode": bool(earnings_mode),
+            "in_window": True,
+            "earnings_date": _edate,
+            "direction": (_erow or {}).get("direction"),
+            "confidence": (_erow or {}).get("confidence"),
+            "go": bool((_erow or {}).get("go")) if _erow else False,
+            "rationale": (_erow or {}).get("rationale"),
+        }
 
     env = simmer_engine.evaluate_readiness(inputs, cfg)
     env["computed_at"] = _utc_iso()

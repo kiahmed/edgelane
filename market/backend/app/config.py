@@ -206,6 +206,12 @@ class Settings(BaseModel):
     # News source: alpaca (default; needs the keys above), rss (keyless wire
     # firehose, regex ticker match, weaker coverage), off.
     simmer_news_provider: str = Field(default="alpaca")
+    # Future-earnings-DATE source (the SEC feed only confirms PAST earnings).
+    # yahoo (reuses the Simmer data provider's crumb session, no key), nasdaq
+    # (free but undocumented/grey-ToS and often blocked), off (default —
+    # earnings mode stays dormant). Powers the card's earnings toggle + the
+    # catalyst window.
+    simmer_earnings_provider: str = Field(default="off")
 
     # External GEX override (private GEX provider extension webhook)
     use_external_gex: bool = Field(default=True)         # prefer extension data over Tradier-OI walls when fresh
@@ -391,6 +397,9 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
     if "SIMMER_NEWS_PROVIDER" in raw:
         v = raw["SIMMER_NEWS_PROVIDER"].strip().lower()
         out["simmer_news_provider"] = v if v in ("alpaca", "rss", "off") else "alpaca"
+    if "SIMMER_EARNINGS_PROVIDER" in raw:
+        v = raw["SIMMER_EARNINGS_PROVIDER"].strip().lower()
+        out["simmer_earnings_provider"] = v if v in ("off", "yahoo", "nasdaq") else "off"
 
     if "USE_EXTERNAL_GEX" in raw:
         out["use_external_gex"] = raw["USE_EXTERNAL_GEX"].strip().lower() in ("true", "1", "yes", "on")

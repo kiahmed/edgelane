@@ -2,6 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Response style (ALWAYS)
+
+Answer short, high-level, executive takeaways. Lead with the outcome or decision;
+state what changed / what's needed in a sentence or a few bullets. No technical
+ranting, no walls of detail, no step-by-step narration of the work. If deeper
+detail exists, offer it ("want the details?") instead of dumping it. Skip preamble
+and restating the question. This governs the final answer to the user — internal
+tool use and verification stay as thorough as the task needs.
+
 ## What This Is
 
 EdgeLane is a hybrid (single-file frontend + optional FastAPI backend) options spread optimizer. It finds and ranks multi-leg options spreads by a composite tradeability score (EV, structural health, liquidity, limit-order feasibility, probability of profit). Data comes from Tradier, with Gemini Flash providing prose narrative synthesis.

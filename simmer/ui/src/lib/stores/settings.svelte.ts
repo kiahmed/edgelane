@@ -12,33 +12,22 @@ export type Preset = 'conservative' | 'balanced' | 'aggressive';
 /** Preset knob values. `balanced` mirrors the migration-0010 column defaults;
  *  the other two shift every tunable knob in the obvious direction while
  *  staying inside the server clamps (USER_CLAMPS in simmer_config.py). */
+// Presets are ALERT-STRICTNESS only — a post-filter on the shared engine's
+// output (min score + min IV%). Engine behavior (DTE, delta band, structures,
+// regime) is admin-global (simmer_tickers.json), never per user, so it is not
+// part of a preset.
 export const PRESETS: Record<Preset, SimmerSettings> = {
 	conservative: {
 		min_score: 80,
-		min_iv_percentile: 50,
-		min_dte: 14,
-		max_dte: 45,
-		short_delta_min: 0.15,
-		short_delta_max: 0.25,
-		regime_strictness: 'strict'
+		min_iv_percentile: 50
 	},
 	balanced: {
 		min_score: 70,
-		min_iv_percentile: 40,
-		min_dte: 7,
-		max_dte: 45,
-		short_delta_min: 0.2,
-		short_delta_max: 0.35,
-		regime_strictness: 'balanced'
+		min_iv_percentile: 40
 	},
 	aggressive: {
 		min_score: 60,
-		min_iv_percentile: 30,
-		min_dte: 5,
-		max_dte: 60,
-		short_delta_min: 0.25,
-		short_delta_max: 0.4,
-		regime_strictness: 'relaxed'
+		min_iv_percentile: 30
 	}
 };
 

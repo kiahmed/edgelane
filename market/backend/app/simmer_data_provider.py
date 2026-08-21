@@ -348,6 +348,31 @@ class YahooDataProvider(_NotesMixin):
             await self._client.aclose()
             self._client = None
 
+    async def next_earnings(self, symbol: str) -> dict | None:
+        """The NEXT scheduled earnings date from Yahoo `calendarEvents`.
+
+        Returns {"date": "YYYY-MM-DD", "confirmed": bool} — confirmed = Yahoo is
+        NOT flagging it an estimate (maps to the calendar's day-vs-week block) —
+        or None when unavailable. Reuses the same cookie/crumb session as the
+        chain/OHLC calls; the SEC feed only confirms PAST earnings, so this is
+        the "next earnings" source."""
+        url = f"{_YAHOO_BASE}/v10/finance/quoteSummary/{symbol.upper()}"
+        try:
+            j = await self._get_json(url, {"modules": "calendarEvents"})
+        except Exception:
+            self._note("yahoo:earnings_unavailable")
+            return None
+        res = (((j or {}).get("quoteSummary") or {}).get("result") or [{}])[0]
+        earn = (res.get("calendarEvents") or {}).get("earnings") or {}
+        # earningsDate can be a single date or a [start, end] range — take the
+        # earliest listed day.
+        fmts = sorted(d.get("fmt") for d in (earn.get("earningsDate") or [])
+                      if isinstance(d, dict) and d.get("fmt"))
+        if not fmts:
+            return None
+        return {"date": fmts[0],
+                "confirmed": not bool(earn.get("isEarningsDateEstimate", True))}
+
     async def _bootstrap_session(self) -> None:
         """Cookie from fc.yahoo.com (the response body is irrelevant — the
         point is Set-Cookie on the shared client), then the crumb. Both are

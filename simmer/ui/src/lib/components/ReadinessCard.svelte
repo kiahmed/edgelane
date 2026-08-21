@@ -5,6 +5,7 @@
 	// ADVERTISED — the gap is the fill-slippage honesty the docs demand.
 	import GateChecklist from './GateChecklist.svelte';
 	import ScoreBar from './ScoreBar.svelte';
+	import EarningsPanel from './EarningsPanel.svelte';
 	import { gateChecklist } from '$lib/gates';
 	import { resolve } from '$app/paths';
 	import {
@@ -236,6 +237,9 @@
 			{/if}
 		</div>
 	{/if}
+
+	<!-- Earnings mode — self-hides unless the expiry is in an earnings window -->
+	<EarningsPanel symbol={env.symbol} expiration={env.expiration} baseScore={env.score} />
 
 	<!-- 4. Soft warnings (avoid_if) — inform, never veto -->
 	{#if env.avoid_if?.length}

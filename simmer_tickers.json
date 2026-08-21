@@ -1,0 +1,11 @@
+{
+  "_note": "Admin-global Simmer engine overrides, deep-merged over the code defaults in market/backend/app/simmer_config.py. This is the ONE place to tune engine behavior for EVERYONE (there is no per-user engine). Edit + restart the backend (make deploy-be-restart). Every value below mirrors the code default EXCEPT dte_min, deliberately 0 (vs the code's conservative 7) so same-day/0DTE expirations are eligible. JSON has no comments, hence this _note key (ignored by the loader).",
+  "gates": {
+    "dte_min": 0,
+    "dte_max": 45,
+    "short_delta_min": 0.20,
+    "short_delta_max": 0.35,
+    "iv_percentile_floor": 40.0,
+    "vrp_ratio_floor": 1.15
+  }
+}

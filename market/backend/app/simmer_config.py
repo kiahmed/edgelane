@@ -152,6 +152,15 @@ TARGETS: dict[str, float] = {
 # Decision bands over the 0–100 composite.
 DECISION: dict[str, float] = {"ready": 70.0, "watch": 50.0}
 
+# Earnings mode (opt-in). `max_lift` = how many points the CACHED, aligned
+# earnings bias may add to (or, when opposed, subtract from) the score; the
+# earnings event stops hard-vetoing while the mode is on. `bias_ttl_seconds` =
+# how long the on-demand route reuses a cached verdict before recomputing.
+EARNINGS: dict[str, float] = {
+    "max_lift":          15.0,
+    "bias_ttl_seconds":  21600.0,   # 6h — earnings news evolves daily, not intraday
+}
+
 # Position management, surfaced with every suggestion so the user knows the exit
 # before entering. Simmer never places orders (that's Torque) — it records the
 # targets in the payload so the hand-off carries them.
@@ -375,6 +384,10 @@ def decision_bands() -> dict[str, float]:
     return _merged("decision", DECISION)
 
 
+def earnings() -> dict[str, float]:
+    return _merged("earnings", EARNINGS)
+
+
 def management() -> dict[str, float]:
     return _merged("management", MANAGEMENT)
 
@@ -489,6 +502,7 @@ def resolved(symbol: str | None = None) -> dict[str, Any]:
         "gates":          gates(),
         "targets":        targets(),
         "decision":       decision_bands(),
+        "earnings":       earnings(),
         "management":     management(),
         "vol":            vol(),
         "cadence":        cadence(),

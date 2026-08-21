@@ -43,6 +43,28 @@ export interface Regime {
 
 /** evaluate_readiness() envelope (simmer_engine.py:1579), plus the fields the
  *  watcher adds before caching/persisting (computed_at, flow). */
+export interface EarningsBlock {
+	in_window: boolean;
+	mode?: boolean;
+	applied?: boolean;
+	direction: 'bullish' | 'bearish' | 'neutral';
+	confidence: number;
+	go: boolean;
+	lift?: number;
+	earnings_date?: string | null;
+	rationale?: string | null;
+	headline_count?: number;
+	reasons?: string[];
+	source?: string;
+}
+
+export interface EarningsResp {
+	symbol: string;
+	in_window: boolean;
+	earnings_date: string | null;
+	bias: EarningsBlock | null;
+}
+
 export interface ReadinessEnvelope {
 	symbol: string;
 	expiration: string | null;
@@ -80,6 +102,9 @@ export interface ReadinessEnvelope {
 	rejected?: string[];
 	computed_at?: string;
 	flow?: Record<string, unknown>;
+	/** Earnings-mode block — present only when the expiry is in an earnings
+	 *  window. `applied` = the bias lift was folded into the score. */
+	earnings?: EarningsBlock | null;
 	/** true when served from the last persisted sweep (restart/weekend) rather
 	 *  than a live evaluation — render "as of computed_at", not "live". */
 	rehydrated?: boolean;

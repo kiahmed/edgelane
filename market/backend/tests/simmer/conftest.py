@@ -265,6 +265,21 @@ def _pin_default_settings():
 
 
 @pytest.fixture(autouse=True)
+def _pin_default_engine_config():
+    """Same guard as above, for the ENGINE knobs: `simmer_config` deep-merges an
+    optional `simmer_tickers.json` discovered by walking parent dirs, so the
+    repo-root admin override file retunes the engine mid-suite (e.g. dte_min=0
+    to allow 0DTE) and a gate test then passes or fails purely on how this
+    deployment happens to be tuned. Pin the overrides to empty so these tests
+    always assert the CODE defaults — the override file is deployment config,
+    not code. A test that wants override behavior can patch this back."""
+    prev = simmer_config._load_overrides_file
+    simmer_config._load_overrides_file = lambda: {}
+    yield
+    simmer_config._load_overrides_file = prev
+
+
+@pytest.fixture(autouse=True)
 def _reset_watcher_state():
     """The watcher state is a module-level singleton (routes hold a reference,
     so it is reset IN PLACE, never rebound)."""

@@ -279,6 +279,26 @@ CREATE TABLE IF NOT EXISTS simmer_readiness (
 CREATE INDEX IF NOT EXISTS idx_simmer_readiness_lookup
     ON simmer_readiness (symbol, expiration, ts);
 
+-- Earnings-bias cache (Simmer's opt-in "earnings mode"). Written by the
+-- standalone earnings analyzer (app/earnings_engine.py) only when an expiry
+-- falls in an earnings window; keyed (symbol, earnings_date) so a card toggle-off
+-- never loses the work and toggle-on is instant. News-driven in phase 1. This is
+-- a VERDICT store (bias/direction/confidence) — it holds no options data.
+CREATE TABLE IF NOT EXISTS simmer_earnings_bias (
+    symbol          VARCHAR NOT NULL,
+    earnings_date   VARCHAR NOT NULL,   -- ISO date of the resolved earnings event
+    direction       VARCHAR,            -- bullish | bearish | neutral
+    confidence      DOUBLE,             -- 0..1
+    go              BOOLEAN,            -- analyzer's "worth selling into" verdict
+    rationale       VARCHAR,            -- short prose (Gemini)
+    headline_count  INTEGER,
+    reasons         VARCHAR,            -- JSON array of degrade reasons (no keys, thin news…)
+    source          VARCHAR,            -- news (phase 1) | news+fundamentals (later)
+    computed_at     TIMESTAMP,
+    updated_at      TIMESTAMP,
+    PRIMARY KEY (symbol, earnings_date)
+);
+
 -- Scored headlines, deduped by cluster. Cache by article id so the same wire
 -- story is never re-scored -- this is the main LLM cost control.
 CREATE TABLE IF NOT EXISTS simmer_news (
@@ -693,6 +713,38 @@ class Database:
             cur = conn.execute(
                 f"SELECT {', '.join(cols)} FROM simmer_research_cache WHERE symbol = ?",
                 [str(symbol).upper()],
+            )
+            r = cur.fetchone()
+        return dict(zip(cols, r)) if r else None
+
+    _SIMMER_EARNINGS_COLS = (
+        "symbol", "earnings_date", "direction", "confidence", "go", "rationale",
+        "headline_count", "reasons", "source", "computed_at",
+    )
+
+    def upsert_simmer_earnings_bias(self, row: dict) -> None:
+        """Earnings-bias cache upsert (PK symbol+earnings_date). `reasons` is a
+        JSON string; pass the whole row, not a partial delta."""
+        conn = self.connect()
+        cols = ", ".join(self._SIMMER_EARNINGS_COLS)
+        ph = ", ".join("?" for _ in self._SIMMER_EARNINGS_COLS)
+        params = [row.get(c) for c in self._SIMMER_EARNINGS_COLS]
+        params[0] = str(row["symbol"]).upper()
+        with self._lock:
+            conn.execute(
+                f"INSERT OR REPLACE INTO simmer_earnings_bias ({cols}, updated_at) "
+                f"VALUES ({ph}, now())",
+                params,
+            )
+
+    def get_simmer_earnings_bias(self, symbol: str, earnings_date: str) -> dict | None:
+        conn = self.connect()
+        cols = self._SIMMER_EARNINGS_COLS + ("updated_at",)
+        with self._lock:
+            cur = conn.execute(
+                f"SELECT {', '.join(cols)} FROM simmer_earnings_bias "
+                f"WHERE symbol = ? AND earnings_date = ?",
+                [str(symbol).upper(), str(earnings_date)],
             )
             r = cur.fetchone()
         return dict(zip(cols, r)) if r else None

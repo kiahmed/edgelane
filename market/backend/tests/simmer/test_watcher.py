@@ -61,7 +61,7 @@ def refresh_counters(monkeypatch):
         calls["news"] += 1
         return {"news_at": _naive_utc()}
 
-    async def _cats(db, symbol, row):
+    async def _cats(db, symbol, row, provider=None):
         calls["catalysts"] += 1
         return {"catalyst_at": _naive_utc(), "_catalysts": []}
 

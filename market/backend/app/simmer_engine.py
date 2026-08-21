@@ -1032,12 +1032,18 @@ def global_gates(ctx: dict, cfg: dict) -> list[str]:
     # ── Catalyst lockout ────────────────────────────────────────────────────
     if g.get("catalyst_lockout", True):
         block_days = float(g.get("unconfirmed_earnings_block_days", 7))
+        earnings_mode = bool(ctx.get("earnings_mode"))
         for cat in ctx["research"].get("catalysts") or []:
             days = _to_days(cat)
             kind = str(cat.get("type") or cat.get("event_type") or "event") \
                 if isinstance(cat, dict) else "event"
             confirmed = bool(cat.get("confirmed", True)) if isinstance(cat, dict) else True
             if days is None or days < 0:
+                continue
+            if kind == "earnings" and earnings_mode:
+                # Earnings mode: the event no longer hard-vetoes — it is folded
+                # into the score as a directional bias instead. 8-K and other
+                # confirmed binaries still veto.
                 continue
             if confirmed and days <= dte:
                 out.append(f"catalyst:{kind}_in_tenor")
@@ -1711,6 +1717,13 @@ def evaluate_readiness(inputs: dict, cfg: dict | None = None) -> dict[str, Any]:
         "r": float(v["risk_free_rate"]), "q": float(v["dividend_yield"]),
         "chain": chain, "research": research, "rule": rule, "settings": settings,
     }
+    # Earnings mode (opt-in): the caller passes an `earnings` block when the
+    # expiry sits in an earnings window. mode on ⇒ the earnings catalyst stops
+    # hard-vetoing (8-K/macro unaffected) and its cached bias is folded into the
+    # score below. Default absent ⇒ legacy behavior (earnings vetoes).
+    earn_in = inputs.get("earnings") or {}
+    ctx["earnings"] = earn_in
+    ctx["earnings_mode"] = bool(earn_in.get("mode")) and bool(earn_in.get("in_window"))
     envelope: dict[str, Any] = {
         "symbol": symbol,
         "expiration": inputs.get("expiration"),
@@ -1734,6 +1747,7 @@ def evaluate_readiness(inputs: dict, cfg: dict | None = None) -> dict[str, Any]:
         "avoid_if": [],
         "data_quality": {},
         "metrics": {},
+        "earnings": None,
         "management": dict(cfg["management"]),
     }
 
@@ -1878,6 +1892,39 @@ def evaluate_readiness(inputs: dict, cfg: dict | None = None) -> dict[str, Any]:
             and vrp_total_pp > 0 and vrp_ex_pp < 0:
         avoid_if.append("premium_entirely_earnings_driven")
 
+    # ── Earnings mode: fold the cached directional bias into the score ────────
+    # Aligned bias + go → lift (scaled by confidence, capped at max_lift);
+    # opposed → symmetric penalty; neutral bias favors the neutral structure.
+    # Toggle off (mode false) leaves the base score untouched but still reports
+    # the bias for the card. Bounded so it can nudge across a band, not dominate.
+    earn_block = None
+    _earn = ctx.get("earnings") or {}
+    if _earn.get("in_window"):
+        _dir = str(_earn.get("direction") or "neutral")
+        _conf = _num(_earn.get("confidence")) or 0.0
+        _go = bool(_earn.get("go"))
+        _applied = bool(ctx.get("earnings_mode")) and _go
+        _lift = 0.0
+        if _applied:
+            _sign = {"bullish": 1.0, "bearish": -1.0}.get(_dir, 0.0)
+            _lean = {"bull_put": 1.0, "bear_call": -1.0}.get(cand["structure"], 0.0)
+            _align = _lean * _sign
+            if _dir == "neutral" and cand["structure"] == "iron_condor":
+                _align = 1.0
+            _lift = round(_align * _conf * float(cfg.get("earnings", {}).get("max_lift", 15.0)), 2)
+            score = max(0.0, min(100.0, score + _lift))
+        earn_block = {
+            "in_window": True,
+            "mode": bool(ctx.get("earnings_mode")),
+            "applied": _applied,
+            "direction": _dir,
+            "confidence": round(_conf, 3),
+            "go": _go,
+            "lift": _lift,
+            "earnings_date": _earn.get("earnings_date"),
+            "rationale": _earn.get("rationale"),
+        }
+
     bands = cfg["decision"]
     decision = "ready" if score >= float(bands["ready"]) \
         else "watch" if score >= float(bands["watch"]) else "avoid"
@@ -1901,6 +1948,7 @@ def evaluate_readiness(inputs: dict, cfg: dict | None = None) -> dict[str, Any]:
         "veto_reasons": [],
         "avoid_if": avoid_if,
         "data_quality": dq,
+        "earnings": earn_block,
         "candidate": cand,
         "rejected": sorted(set(all_reasons)),
     })

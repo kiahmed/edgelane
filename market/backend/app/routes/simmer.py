@@ -25,6 +25,7 @@ silent ignore.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
@@ -33,6 +34,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from ..auth import get_current_user
+from ..config import get_settings
+from ..earnings_engine import build_earnings_analyzer
 from ..entitlements import ensure_tool
 from .. import simmer_config
 from .. import simmer_news
@@ -282,6 +285,7 @@ async def patch_watchlist(symbol: str, body: WatchlistPatch, request: Request,
 @router.get("/simmer/analyze/{symbol}")
 async def analyze(symbol: str, request: Request,
                   expiration: str | None = Query(default=None),
+                  earnings: str = Query(default="on"),
                   user: dict = Depends(require_simmer_access)):
     """On-demand cook — the SAME function the watcher's sweep calls
     (`simmer_watcher.analyze_symbol`), with persist=False so an on-demand call
@@ -297,12 +301,79 @@ async def analyze(symbol: str, request: Request,
             # Same cross-sectional peers the sweep uses, so on-demand /analyze
             # and the scheduled sweep agree (the cold-start VRP bootstrap).
             peer_vrp=[v for v in simmer_state.peer_iv_rv.values() if v is not None],
+            # ?earnings=off recomputes the score WITHOUT the earnings fold, so a
+            # card's toggle can compare; on (default) folds the cached bias in.
+            earnings_mode=(earnings.lower() != "off"),
             persist=False)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except RuntimeError as e:
         raise HTTPException(404, str(e))
     return env
+
+
+def _bias_stale(row: dict | None, ttl: float) -> bool:
+    if not row:
+        return True
+    ts = row.get("updated_at") or row.get("computed_at")
+    if isinstance(ts, str):
+        try:
+            ts = datetime.fromisoformat(ts)
+        except ValueError:
+            return True
+    if not isinstance(ts, datetime):
+        return True
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts).total_seconds() > ttl
+
+
+@router.post("/simmer/research/{symbol}/refresh")
+async def refresh_research(symbol: str, request: Request,
+                           user: dict = Depends(require_simmer_access)):
+    """Force a tier-1 research re-pull for a symbol (bypasses TTLs) — e.g. to
+    populate the next-earnings date right after enabling the feed, instead of
+    waiting for the 24h catalyst TTL. Returns the resolved earnings date."""
+    db = _db(request)
+    provider = simmer_state.provider or _tradier(request)
+    research = await simmer_watcher.load_research(db, symbol.upper(), provider, force=True)
+    return {
+        "symbol": symbol.upper(),
+        "earnings_date": simmer_watcher._earnings_date_from_research(research),
+        "catalysts": research.get("_catalysts"),
+    }
+
+
+@router.get("/simmer/earnings/{symbol}")
+async def earnings_bias(symbol: str, request: Request,
+                        refresh: bool = Query(default=False),
+                        user: dict = Depends(require_simmer_access)):
+    """The earnings-mode verdict for a symbol's next earnings window. Reads the
+    cache; computes on demand (Alpaca news → Gemini bias) when missing/stale or
+    ?refresh=1. This is the ONLY place Gemini is called for earnings — the sweep
+    reads the cache only. Returns {in_window, earnings_date, bias}."""
+    symbol = symbol.upper()
+    db = _db(request)
+    research = await asyncio.to_thread(db.get_simmer_research, symbol)
+    edate = simmer_watcher._earnings_date_from_research(research or {})
+    if not edate:
+        return {"symbol": symbol, "in_window": False, "earnings_date": None, "bias": None}
+
+    row = await asyncio.to_thread(db.get_simmer_earnings_bias, symbol, edate)
+    ttl = float(simmer_config.earnings().get("bias_ttl_seconds", 21600))
+    if refresh or _bias_stale(row, ttl):
+        analyzer = build_earnings_analyzer(get_settings())
+        verdict = await analyzer.analyze(symbol, edate)
+        await asyncio.to_thread(db.upsert_simmer_earnings_bias, {
+            **verdict, "reasons": json.dumps(verdict.get("reasons") or [])})
+        row = await asyncio.to_thread(db.get_simmer_earnings_bias, symbol, edate)
+
+    if row and isinstance(row.get("reasons"), str):
+        try:
+            row["reasons"] = json.loads(row["reasons"])
+        except ValueError:
+            row["reasons"] = []
+    return {"symbol": symbol, "in_window": True, "earnings_date": edate, "bias": row}
 
 
 @router.get("/simmer/expirations/{symbol}", dependencies=_GATE)
