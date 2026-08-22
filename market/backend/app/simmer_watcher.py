@@ -232,6 +232,70 @@ async def watchlist_union() -> list[tuple[str, str | None]]:
     return out
 
 
+async def roll_expired_watchlist(provider) -> int:
+    """Bump any PINNED watchlist expiration that has already passed to the next
+    available listed expiration, so the engine NEVER runs on an expired date and
+    a pinned ticker keeps rolling forward on its own until the user removes it.
+
+    Deduplicates: if the rolled-to date already exists for that user+symbol, the
+    expired row is DELETED instead of creating a duplicate. Auto-pick rows
+    (expiration NULL) never expire and are left alone. Returns rows changed.
+    Runs at the top of each sweep, before watchlist_union re-reads the corrected
+    list. Best-effort — a provider/Supabase hiccup just leaves rows as-is."""
+    rows = await supabase_admin.select_many(
+        "simmer_watchlist", "id,user_id,symbol,expiration,active",
+        {"active": "eq.true"})
+    if not rows:
+        return 0
+    today = date.today()
+
+    def _passed(exp: str | None) -> bool:
+        if not exp:
+            return False
+        try:
+            return date.fromisoformat(exp) < today
+        except ValueError:
+            return False
+
+    # (user, symbol) → set of active expirations, for dedupe.
+    existing: dict[tuple[str, str], set[str]] = {}
+    for r in rows:
+        existing.setdefault(
+            (str(r.get("user_id")), str(r.get("symbol")).upper()), set()
+        ).add(_iso_date(r.get("expiration")) or "")
+
+    exp_cache: dict[str, list[str]] = {}
+    changed = 0
+    for r in rows:
+        exp = _iso_date(r.get("expiration"))
+        if not _passed(exp):
+            continue
+        sym = str(r.get("symbol")).upper()
+        uid = str(r.get("user_id"))
+        if sym not in exp_cache:
+            try:
+                lst = await provider.expirations(sym)
+            except Exception as e:
+                log.warning("roll: expirations fetch failed for %s: %s", sym, e)
+                lst = []
+            exp_cache[sym] = sorted({str(x)[:10] for x in (lst or []) if x
+                                     if not _passed(str(x)[:10])})
+        nxt = exp_cache[sym][0] if exp_cache[sym] else None
+        if not nxt:
+            continue                         # nothing listed to roll to; sweep skips it
+        rid = f"eq.{r['id']}"
+        if nxt in existing.get((uid, sym), set()):
+            await supabase_admin.delete_rows("simmer_watchlist", {"id": rid})
+            log.info("roll: %s %s expired → %s already present, removed dup", sym, exp, nxt)
+        else:
+            await supabase_admin.update_rows("simmer_watchlist", {"id": rid},
+                                             {"expiration": nxt})
+            existing.setdefault((uid, sym), set()).add(nxt)
+            log.info("roll: %s expired %s → %s", sym, exp, nxt)
+        changed += 1
+    return changed
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Market regime — once per sweep, index level
 # ─────────────────────────────────────────────────────────────────────────────
@@ -826,7 +890,7 @@ async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None
                          regime: dict | None = None,
                          research: dict | None = None,
                          peer_vrp: Sequence[float] | None = None,
-                         earnings_mode: bool = False,
+                         earnings_view: str = "consider",
                          persist: bool = True) -> dict:
     """THE single evaluation path. The sweep calls it per (symbol, expiration)
     with persist=True; `/simmer/analyze/{symbol}` calls it with persist=False.
@@ -917,14 +981,17 @@ async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None
 
     # Earnings mode: when the chosen expiry sits in an earnings window, pass the
     # CACHED bias (computed on demand by /simmer/earnings) into the engine so it
-    # skips the earnings veto and folds the bias into the score. The sweep never
-    # calls Gemini here — it reads the cache only.
+    # skips the hard earnings veto and folds the cached bias into the score. The
+    # sweep never calls Gemini here — it reads the cache only.
     #
-    # SAFETY: earnings_mode defaults False, so the SWEEP (persist=True) and the
-    # alerts it fans out KEEP the earnings veto — nothing auto-recommends selling
-    # THROUGH earnings. Only an explicit on-demand toggle (`?earnings=on`, the
-    # card's Earnings panel) sets it True to preview the folded score.
-    if inputs["research"].get("earnings_inside_tenor"):
+    # The card DISPLAYS the "consider" verdict by default (earnings folded, a
+    # no-go held back — never a hard catalyst veto). We ALSO compute the "ignore"
+    # verdict (pure ex-earnings) and attach it as `earnings_alt`, so the card's
+    # toggle switches views with ZERO re-analysis — pure display swap. Alerts key
+    # off the consider view (a no-go can't be "ready", so nothing auto-fires a
+    # sell-through-earnings alert).
+    _in_earnings = bool(inputs["research"].get("earnings_inside_tenor"))
+    if _in_earnings:
         _erow = None
         _edate = _earnings_date_from_research(research)
         if _edate and db is not None:
@@ -933,8 +1000,7 @@ async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None
                     db.get_simmer_earnings_bias, symbol, _edate)
             except Exception as e:
                 log.debug("earnings bias read failed for %s: %s", symbol, e)
-        inputs["earnings"] = {
-            "mode": bool(earnings_mode),
+        _ebase = {
             "in_window": True,
             "earnings_date": _edate,
             "direction": (_erow or {}).get("direction"),
@@ -942,8 +1008,27 @@ async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None
             "go": bool((_erow or {}).get("go")) if _erow else False,
             "rationale": (_erow or {}).get("rationale"),
         }
+        inputs["earnings"] = {**_ebase, "view": earnings_view}
 
     env = simmer_engine.evaluate_readiness(inputs, cfg)
+    if _in_earnings:
+        # Compute the OTHER view once (cheap pure math; same inputs) so the UI can
+        # switch consider↔ignore instantly without another analyze.
+        _alt_view = "ignore" if earnings_view != "ignore" else "consider"
+        _alt_inputs = {**inputs, "earnings": {**inputs["earnings"], "view": _alt_view}}
+        _alt = simmer_engine.evaluate_readiness(_alt_inputs, cfg)
+        env["earnings_alt"] = {
+            "view": _alt_view,
+            "decision": _alt.get("decision"),
+            "score": _alt.get("score"),
+            "structure": _alt.get("structure"),
+            "strikes": _alt.get("strikes"),
+            "veto_reasons": _alt.get("veto_reasons"),
+            "credit_fill": _alt.get("credit_fill"),
+            "pop_breakeven": _alt.get("pop_breakeven"),
+            "expected_value": _alt.get("expected_value"),
+            "alpha": _alt.get("alpha"),
+        }
     env["computed_at"] = _utc_iso()
     # Market state at compute time — lets the UI stamp a closed-hours result
     # "as of last session" and show a check-back hint that clears when live.
@@ -1427,7 +1512,28 @@ async def sweep(tradier, db, edgar=None) -> dict[str, dict]:
         except Exception as e:
             log.warning("EDGAR sweep failed (continuing): %s", e)
 
+    # Roll any expired pinned expirations forward FIRST, so the union below reads
+    # the corrected list and the engine never runs on a dead date.
+    try:
+        await roll_expired_watchlist(provider)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning("watchlist roll failed (continuing): %s", e)
+
     pairs = await watchlist_union()
+    # Belt-and-suspenders: drop any pair still pinned to a passed date (e.g. the
+    # roll found no listed expirations) — never analyze an expired contract.
+    _today = date.today()
+
+    def _still_expired(exp: str | None) -> bool:
+        if not exp:
+            return False
+        try:
+            return date.fromisoformat(str(exp)[:10]) < _today
+        except ValueError:
+            return False
+    pairs = [(s, e) for s, e in pairs if not _still_expired(e)]
     symbols = sorted({s for s, _ in pairs})
     state.watched_count = len(symbols)
 

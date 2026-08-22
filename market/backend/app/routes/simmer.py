@@ -301,9 +301,10 @@ async def analyze(symbol: str, request: Request,
             # Same cross-sectional peers the sweep uses, so on-demand /analyze
             # and the scheduled sweep agree (the cold-start VRP bootstrap).
             peer_vrp=[v for v in simmer_state.peer_iv_rv.values() if v is not None],
-            # ?earnings=off recomputes the score WITHOUT the earnings fold, so a
-            # card's toggle can compare; on (default) folds the cached bias in.
-            earnings_mode=(earnings.lower() != "off"),
+            # ?earnings=off → "ignore" view (pure ex-earnings decision); on/default
+            # → "consider" (fold the bias; a no-go holds the name back). Neither
+            # shows a hard earnings veto — both verdicts also ride on env.earnings_alt.
+            earnings_view=("ignore" if earnings.lower() == "off" else "consider"),
             persist=False)
     except ValueError as e:
         raise HTTPException(422, str(e))
@@ -337,13 +338,19 @@ def _bias_stale(row: dict | None, ttl: float) -> bool:
 
 @router.post("/simmer/research/{symbol}/refresh")
 async def refresh_research(symbol: str, request: Request,
+                           expiration: str | None = Query(default=None),
                            user: dict = Depends(require_simmer_access)):
     """Force a tier-1 research re-pull for a symbol (bypasses TTLs) — e.g. to
     populate the next-earnings date right after enabling the feed, instead of
     waiting for the 24h catalyst TTL. Returns the resolved earnings date.
 
-    ADMIN-ONLY: it bypasses every cache TTL and re-hits Alpaca/Yahoo/Gemini, so
-    it is an operator tool, not something a regular consumer may hammer."""
+    With `?expiration=YYYY-MM-DD`, ALSO persists a readiness row for that
+    (symbol, expiration) so a freshly-added / pinned card stops showing
+    "pending" without waiting for the next sweep.
+
+    ADMIN-ONLY: it bypasses every cache TTL, re-hits Alpaca/Yahoo/Gemini, and
+    (with expiration) writes a calibration row — an operator tool, not something
+    a regular consumer may hammer."""
     if str(user.get("id")) not in ("admin", "dev-local"):
         raise HTTPException(403, "admin only")
     sym = symbol.upper()
@@ -352,11 +359,21 @@ async def refresh_research(symbol: str, request: Request,
     db = _db(request)
     provider = simmer_state.provider or _tradier(request)
     research = await simmer_watcher.load_research(db, sym, provider, force=True)
-    return {
-        "symbol": symbol.upper(),
+    result: dict = {
+        "symbol": sym,
         "earnings_date": simmer_watcher._earnings_date_from_research(research),
         "catalysts": research.get("_catalysts"),
     }
+    if expiration:
+        env = await simmer_watcher.analyze_symbol(
+            provider, db, sym, expiration, regime=simmer_state.regime,
+            peer_vrp=[v for v in simmer_state.peer_iv_rv.values() if v is not None],
+            persist=True)   # persist so the card fills in immediately
+        result["persisted_expiration"] = expiration
+        result["decision"] = env.get("decision")
+        result["score"] = env.get("score")
+        result["veto_reasons"] = env.get("veto_reasons")
+    return result
 
 
 @router.get("/simmer/earnings/{symbol}")

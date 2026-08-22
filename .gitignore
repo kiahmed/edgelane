@@ -106,3 +106,7 @@ supabase/.temp/
 docs/djx_vs_dia.txt
 # Competitive strategy analysis — keep out of git history (local planning only)
 docs/simmer_competitive_gap.md
+# Dated Simmer engine-output dumps (analysis runs + demo runs with lowered
+# floors). Generated scratch, stale the next session — not source.
+simmer_analysis_*.json
+simmer_demo_*.json

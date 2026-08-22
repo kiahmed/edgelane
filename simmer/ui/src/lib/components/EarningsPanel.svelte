@@ -1,83 +1,119 @@
 <script lang="ts">
-	// Earnings mode — auto-appears in a card ONLY when the expiry is in an
-	// earnings window. Shows the cached directional bias and a toggle that
-	// re-scores with / without the earnings fold so you can compare. The
-	// backend caches the (expensive) bias, so toggling only re-scores.
-	import { getEarnings, analyzeEarnings, errorMessage } from '$lib/api';
+	// Earnings panel — appears only when the viewed expiry is in an earnings
+	// window. Earnings is a FOLDED FACTOR, never a hard veto: the card's decision
+	// already reflects the "consider" view (bias folded, a no-go held back). This
+	// panel shows the bias and a toggle that switches the DISPLAYED verdict
+	// between consider (earnings folded) and ignore (pure ex-earnings) — a pure
+	// display swap using both verdicts already on the envelope (env.earnings /
+	// env.earnings_alt). No re-analysis on toggle. The choice persists per symbol
+	// in localStorage, so it survives a refresh.
+	import { getEarnings, errorMessage } from '$lib/api';
 	import type { EarningsResp, ReadinessEnvelope } from '$lib/types';
 
-	let { symbol, expiration, baseScore }: {
-		symbol: string;
-		expiration: string | null;
-		baseScore: number;
-	} = $props();
+	let { env }: { env: ReadinessEnvelope } = $props();
 
-	let resp = $state<EarningsResp | null>(null);
-	let loading = $state(true);
+	const symbol = $derived(env.symbol);
+	const earn = $derived(env.earnings ?? null);
+	const alt = $derived(env.earnings_alt ?? null);
+
+	// Relevant only when earnings sits on/before the viewed expiry.
+	const relevant = $derived(
+		!!earn?.in_window &&
+			!!earn.earnings_date &&
+			!!env.expiration &&
+			earn.earnings_date.slice(0, 10) <= env.expiration.slice(0, 10)
+	);
+
+	const KEY = $derived(`simmer_earnings_view_${symbol}`);
+	// 'consider' shows the card's own decision; 'ignore' shows the alt verdict.
+	let view = $state<'consider' | 'ignore'>('consider');
+	$effect(() => {
+		try {
+			const v = localStorage.getItem(KEY);
+			view = v === 'ignore' ? 'ignore' : 'consider';
+		} catch {
+			view = 'consider';
+		}
+	});
+
+	function toggle() {
+		view = view === 'consider' ? 'ignore' : 'consider';
+		try {
+			localStorage.setItem(KEY, view);
+		} catch {
+			/* storage unavailable — session-only */
+		}
+	}
+
+	// The bias may not be computed yet at sweep time (cache cold). Fetch once to
+	// populate it; the panel still renders from env in the meantime.
+	let fetchedFor = '';
+	let fetching = $state(false);
 	let err = $state<string | null>(null);
-	let on = $state(true); // earnings mode default ON (matches the sweep)
-	let altScore = $state<number | null>(null);
-	let switching = $state(false);
-
-	// Fetch once per symbol (the panel only mounts when the card is expanded).
+	let fetchedBias = $state<EarningsResp['bias'] | null>(null);
 	$effect(() => {
 		const sym = symbol;
-		loading = true;
-		err = null;
+		if (!relevant || sym === fetchedFor) return;
+		fetchedFor = sym;
+		if (earn?.direction) return; // already have a bias on the envelope
+		fetching = true;
 		getEarnings<EarningsResp>(sym)
 			.then((r) => {
-				resp = r;
+				fetchedBias = r.bias;
 			})
 			.catch((e) => {
 				err = errorMessage(e);
 			})
 			.finally(() => {
-				loading = false;
+				fetching = false;
 			});
 	});
 
-	async function toggle() {
-		on = !on;
-		switching = true;
-		try {
-			const env = await analyzeEarnings<ReadinessEnvelope>(symbol, expiration, on);
-			altScore = env.score;
-		} catch (e) {
-			err = errorMessage(e);
-		} finally {
-			switching = false;
-		}
-	}
-
+	const bias = $derived(earn?.direction ? earn : fetchedBias);
+	const shownScore = $derived(
+		view === 'ignore' && alt ? Math.round(alt.score) : Math.round(env.score)
+	);
+	const shownDecision = $derived(view === 'ignore' && alt ? alt.decision : env.decision);
 	const DIR: Record<string, string> = { bullish: '▲', bearish: '▼', neutral: '◆' };
-	const shownScore = $derived(Math.round(altScore ?? baseScore));
 </script>
 
-{#if !loading && resp?.in_window}
+{#if relevant}
 	<div class="earn">
 		<div class="earn-head">
-			<span class="earn-title">Earnings mode</span>
-			{#if resp.earnings_date}<span class="earn-date">{resp.earnings_date}</span>{/if}
+			<span class="earn-title">Earnings</span>
+			{#if earn?.earnings_date}<span class="earn-date">{earn.earnings_date}</span>{/if}
+			<span class="view-label">{view === 'consider' ? 'considered' : 'ignored'}</span>
 			<button
 				class="earn-toggle"
-				class:on={on}
+				class:on={view === 'consider'}
 				type="button"
 				onclick={toggle}
-				disabled={switching}
-				aria-pressed={on}
-				title="Fold the earnings bias into the score, or compare without it"
-				>{switching ? '…' : on ? 'ON' : 'OFF'}</button>
+				aria-pressed={view === 'consider'}
+				title="Switch between the earnings-considered decision and the pure ex-earnings one"
+				>{view === 'consider' ? 'CONSIDER' : 'IGNORE'}</button>
 		</div>
 
-		{#if resp.bias}
+		{#if bias}
 			<div class="earn-row">
-				<span class="dir dir--{resp.bias.direction}">{DIR[resp.bias.direction] ?? '◆'} {resp.bias.direction}</span>
-				<span class="muted">conf {Math.round((resp.bias.confidence ?? 0) * 100)}%</span>
-				<span class="tag {resp.bias.go ? 'go' : 'nogo'}">{resp.bias.go ? 'go' : 'no-go'}</span>
-				<span class="score">score {on ? 'with' : 'without'}: <b>{shownScore}</b></span>
+				<span class="dir dir--{bias.direction}">{DIR[bias.direction] ?? '◆'} {bias.direction}</span>
+				<span class="muted">conf {Math.round((bias.confidence ?? 0) * 100)}%</span>
+				<span class="tag {bias.go ? 'go' : 'nogo'}">{bias.go ? 'go' : 'no-go'}</span>
+				<span class="score">{shownDecision} · <b>{shownScore}</b></span>
 			</div>
-			{#if resp.bias.rationale}<div class="earn-why">{resp.bias.rationale}</div>{/if}
-			<div class="earn-note">News-driven bias — not a veto. Aligned + go lifts the score (±15), mixed stays flagged.</div>
+
+			{#if earn?.held_back}
+				<div class="earn-flag hold">⚠ No-go read — held back below “ready” (earnings cuts both ways).</div>
+			{:else if earn?.close_before_print}
+				<div class="earn-flag close">↩ Run-up play — <b>close BEFORE the print</b>, never hold through earnings.</div>
+			{/if}
+
+			{#if bias.rationale}<div class="earn-why">{bias.rationale}</div>{/if}
+			<div class="earn-note">
+				Earnings is a folded factor, not a veto. Consider = bias in (go lifts ±15, no-go holds back);
+				Ignore = pure ex-earnings decision.
+			</div>
+		{:else if fetching}
+			<div class="earn-why muted">Analyzing earnings headlines…</div>
 		{:else}
 			<div class="earn-why muted">No bias computed yet for this window.</div>
 		{/if}
@@ -104,21 +140,27 @@
 	.earn-title {
 		font-weight: 700;
 		color: #d97706;
-		letter-spacing: 0.01em;
 	}
 	.earn-date {
 		font-size: 0.68rem;
 		color: rgb(148, 163, 184);
 	}
+	.view-label {
+		font-size: 0.62rem;
+		color: rgb(148, 163, 184);
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+	}
 	.earn-toggle {
 		margin-left: auto;
-		min-width: 2.6rem;
+		min-width: 4.4rem;
 		border-radius: 0.4rem;
 		border: 1px solid rgba(100, 116, 139, 0.5);
 		background: rgba(100, 116, 139, 0.15);
 		color: rgb(148, 163, 184);
 		font-weight: 800;
-		font-size: 0.66rem;
+		font-size: 0.62rem;
+		letter-spacing: 0.03em;
 		padding: 0.12rem 0.5rem;
 		cursor: pointer;
 	}
@@ -126,10 +168,6 @@
 		border-color: rgba(217, 119, 6, 0.6);
 		background: rgba(217, 119, 6, 0.2);
 		color: #f59e0b;
-	}
-	.earn-toggle:disabled {
-		opacity: 0.6;
-		cursor: default;
 	}
 	.earn-row {
 		display: flex;
@@ -172,6 +210,21 @@
 	.score {
 		margin-left: auto;
 		color: rgb(203, 213, 225);
+		text-transform: capitalize;
+	}
+	.earn-flag {
+		margin-top: 0.4rem;
+		font-size: 0.68rem;
+		border-radius: 0.35rem;
+		padding: 0.25rem 0.45rem;
+	}
+	.earn-flag.hold {
+		color: #fca5a5;
+		background: rgba(248, 113, 113, 0.1);
+	}
+	.earn-flag.close {
+		color: #fcd34d;
+		background: rgba(217, 119, 6, 0.12);
 	}
 	.earn-why {
 		margin-top: 0.35rem;

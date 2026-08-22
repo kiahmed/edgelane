@@ -256,16 +256,11 @@ export function errorMessage(e: unknown): string {
 
 export const getJSON = <T>(path: string): Promise<T> => request<T>(path);
 
-/** Earnings-mode verdict for a symbol's next earnings window (cached; computes
- *  on demand server-side). Type imported lazily to keep this file store-free. */
+/** Earnings verdict for a symbol's next earnings window (cached; computes the
+ *  news→bias on demand server-side). The card's consider↔ignore toggle is a pure
+ *  display swap over env.earnings / env.earnings_alt, so no per-toggle call. */
 export const getEarnings = <T>(symbol: string, refresh = false): Promise<T> =>
 	request<T>(`/simmer/earnings/${encodeURIComponent(symbol)}${refresh ? '?refresh=1' : ''}`);
-
-/** Re-analyze with the earnings fold on/off — powers the card's compare toggle. */
-export const analyzeEarnings = <T>(symbol: string, expiration: string | null, on: boolean): Promise<T> => {
-	const exp = expiration ? `&expiration=${encodeURIComponent(expiration)}` : '';
-	return request<T>(`/simmer/analyze/${encodeURIComponent(symbol)}?earnings=${on ? 'on' : 'off'}${exp}`);
-};
 
 export const postJSON = <T>(path: string, body: unknown): Promise<T> =>
 	request<T>(path, { method: 'POST', body: JSON.stringify(body) });

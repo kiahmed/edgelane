@@ -1032,7 +1032,9 @@ def global_gates(ctx: dict, cfg: dict) -> list[str]:
     # ── Catalyst lockout ────────────────────────────────────────────────────
     if g.get("catalyst_lockout", True):
         block_days = float(g.get("unconfirmed_earnings_block_days", 7))
-        earnings_mode = bool(ctx.get("earnings_mode"))
+        # Earnings hard-vetoes ONLY in the legacy "veto" view; under "consider"
+        # (default) and "ignore" it is a folded factor, so the gate skips it.
+        earnings_soft = ctx.get("earnings_view") in ("consider", "ignore")
         for cat in ctx["research"].get("catalysts") or []:
             days = _to_days(cat)
             kind = str(cat.get("type") or cat.get("event_type") or "event") \
@@ -1040,10 +1042,9 @@ def global_gates(ctx: dict, cfg: dict) -> list[str]:
             confirmed = bool(cat.get("confirmed", True)) if isinstance(cat, dict) else True
             if days is None or days < 0:
                 continue
-            if kind == "earnings" and earnings_mode:
-                # Earnings mode: the event no longer hard-vetoes — it is folded
-                # into the score as a directional bias instead. 8-K and other
-                # confirmed binaries still veto.
+            if kind == "earnings" and earnings_soft:
+                # Earnings is folded into the score (or ignored), not a veto here.
+                # 8-K and other confirmed binaries still veto.
                 continue
             if confirmed and days <= dte:
                 out.append(f"catalyst:{kind}_in_tenor")
@@ -1717,13 +1718,24 @@ def evaluate_readiness(inputs: dict, cfg: dict | None = None) -> dict[str, Any]:
         "r": float(v["risk_free_rate"]), "q": float(v["dividend_yield"]),
         "chain": chain, "research": research, "rule": rule, "settings": settings,
     }
-    # Earnings mode (opt-in): the caller passes an `earnings` block when the
-    # expiry sits in an earnings window. mode on ⇒ the earnings catalyst stops
-    # hard-vetoing (8-K/macro unaffected) and its cached bias is folded into the
-    # score below. Default absent ⇒ legacy behavior (earnings vetoes).
+    # Earnings handling. The caller passes an `earnings` block when the expiry
+    # sits in an earnings window. Earnings is a FACTOR folded into the score, not
+    # a hard veto (8-K/macro are unaffected and still veto). Three views:
+    #   "consider" (default) — fold the analyzer bias: a `go`+aligned read LIFTS,
+    #                          opposed penalizes, and a `no-go` HOLDS THE NAME
+    #                          BACK (it can never reach "ready" — earnings cuts
+    #                          both ways). No hard earnings veto.
+    #   "ignore"            — treat earnings as absent: no veto, no fold (the pure
+    #                          ex-earnings structural/VRP decision — "what if
+    #                          earnings weren't happening"). Powers the toggle-off.
+    #   "veto"              — legacy hard veto (kept for explicit conservative use).
+    # Back-compat: bool mode True→"consider", False→"veto".
     earn_in = inputs.get("earnings") or {}
     ctx["earnings"] = earn_in
-    ctx["earnings_mode"] = bool(earn_in.get("mode")) and bool(earn_in.get("in_window"))
+    _view = earn_in.get("view")
+    if _view not in ("consider", "ignore", "veto"):
+        _view = "consider" if earn_in.get("mode") else "veto"
+    ctx["earnings_view"] = _view if earn_in.get("in_window") else None
     envelope: dict[str, Any] = {
         "symbol": symbol,
         "expiration": inputs.get("expiration"),
@@ -1893,39 +1905,53 @@ def evaluate_readiness(inputs: dict, cfg: dict | None = None) -> dict[str, Any]:
         avoid_if.append("premium_entirely_earnings_driven")
 
     # ── Earnings mode: fold the cached directional bias into the score ────────
-    # Aligned bias + go → lift (scaled by confidence, capped at max_lift);
-    # opposed → symmetric penalty; neutral bias favors the neutral structure.
-    # Toggle off (mode false) leaves the base score untouched but still reports
-    # the bias for the card. Bounded so it can nudge across a band, not dominate.
+    # Fold the earnings bias per the view (see the ctx block above).
+    #   consider + go   : aligned LIFTS (conf-scaled, ±max_lift); opposed penalizes.
+    #   consider + no-go: HOLDS THE NAME BACK — negative pressure AND a hard cap
+    #                     below the ready band, so a no-go earnings read can never
+    #                     show "ready" even if the structure otherwise clears.
+    #   ignore          : no fold — the pure ex-earnings score stands.
+    bands = cfg["decision"]
     earn_block = None
     _earn = ctx.get("earnings") or {}
+    _view = ctx.get("earnings_view")
     if _earn.get("in_window"):
         _dir = str(_earn.get("direction") or "neutral")
         _conf = _num(_earn.get("confidence")) or 0.0
         _go = bool(_earn.get("go"))
-        _applied = bool(ctx.get("earnings_mode")) and _go
+        _max_lift = float(cfg.get("earnings", {}).get("max_lift", 15.0))
         _lift = 0.0
-        if _applied:
+        _held_back = False
+        if _view == "consider":
             _sign = {"bullish": 1.0, "bearish": -1.0}.get(_dir, 0.0)
             _lean = {"bull_put": 1.0, "bear_call": -1.0}.get(cand["structure"], 0.0)
             _align = _lean * _sign
             if _dir == "neutral" and cand["structure"] == "iron_condor":
                 _align = 1.0
-            _lift = round(_align * _conf * float(cfg.get("earnings", {}).get("max_lift", 15.0)), 2)
+            if _go:
+                _lift = round(_align * _conf * _max_lift, 2)
+            else:
+                _lift = round(-abs(_conf) * _max_lift, 2)
+                _held_back = True
             score = max(0.0, min(100.0, score + _lift))
+            if _held_back:
+                score = min(score, float(bands["ready"]) - 0.01)   # never "ready" on a no-go
         earn_block = {
             "in_window": True,
-            "mode": bool(ctx.get("earnings_mode")),
-            "applied": _applied,
+            "view": _view,
+            "applied": _view == "consider",
+            "held_back": _held_back,
             "direction": _dir,
             "confidence": round(_conf, 3),
             "go": _go,
             "lift": _lift,
+            # A ready earnings name under a go read is a "sell the run-up, CLOSE
+            # BEFORE the print" play — never a hold-through. Surfaced for the UI.
+            "close_before_print": _view == "consider" and _go,
             "earnings_date": _earn.get("earnings_date"),
             "rationale": _earn.get("rationale"),
         }
 
-    bands = cfg["decision"]
     decision = "ready" if score >= float(bands["ready"]) \
         else "watch" if score >= float(bands["watch"]) else "avoid"
 

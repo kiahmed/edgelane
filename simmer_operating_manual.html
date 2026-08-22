@@ -353,12 +353,14 @@
 
     <div class="gate locked">
       <div class="top"><span class="num">1</span><span class="name">Catalyst lockout</span><span class="badge lock">Locked</span></div>
-      <p class="plain">Blocks the trade if a confirmed binary event — earnings or a material SEC filing —
-      falls inside the option's life, or an unconfirmed earnings sits within the coming week.</p>
-      <p class="detail">A confirmed catalyst whose event is ≤ DTE away vetoes; an unconfirmed one vetoes if it
-      lands within <code>max(DTE, 7)</code> days. The 7-day pad is why a name with earnings "sometime next
-      week" is blocked even on a short-dated expiry.</p>
-      <p class="tokens">Tokens: <code>catalyst:{kind}_in_tenor</code>, <code>catalyst:unconfirmed_{kind}</code></p>
+      <p class="plain">Hard-blocks the trade if a material <strong>SEC filing (8-K)</strong> falls inside the
+      option's life. <strong>Earnings is different</strong> — it's a <em>folded factor</em>, not a veto (see
+      <a href="#catalysts">Earnings mode</a>).</p>
+      <p class="detail">A confirmed 8-K/binary ≤ DTE away vetoes; an unconfirmed one within <code>max(DTE, 7)</code>
+      days. Earnings, when the expiry is in its window, does <strong>not</strong> raise
+      <code>catalyst:earnings_in_tenor</code> under the default "consider" view — its news bias is folded into
+      the score instead, and a no-go read holds the name back. (Only the legacy "veto" view hard-blocks earnings.)</p>
+      <p class="tokens">Tokens: <code>catalyst:{kind}_in_tenor</code> (8-K etc.), <code>catalyst:unconfirmed_{kind}</code></p>
     </div>
 
     <div class="gate locked">
@@ -503,6 +505,35 @@
       <code>avoid_if</code>, not a veto).</p>
     </div>
 
+    <h3 id="earnings-mode">Earnings mode — a folded factor, not a veto</h3>
+    <p>When the viewed expiry sits in an earnings window, Simmer does <strong>not</strong> hard-veto. It runs the
+    standalone earnings analyzer (Alpaca news → Gemini bias, cached) and folds that read into the score. Source:
+    <code>SIMMER_EARNINGS_PROVIDER=yahoo</code> supplies the next earnings date (SEC only confirms <em>past</em>
+    earnings). Three <strong>views</strong>:</p>
+    <table>
+      <tr><th>View</th><th>What it does</th></tr>
+      <tr><td><strong>consider</strong> (default — what the card shows)</td><td>Bias folded: a <code>go</code> + aligned read <strong>lifts</strong> the score (±15, confidence-scaled); opposed penalizes; a <strong>no-go holds the name back</strong> — it can never reach "ready" (earnings cuts both ways). No hard earnings veto.</td></tr>
+      <tr><td><strong>ignore</strong></td><td>Earnings treated as absent — no veto, no fold. The pure ex-earnings structural/VRP decision ("what would this be if earnings weren't happening").</td></tr>
+      <tr><td><strong>veto</strong></td><td>Legacy hard block. Not used by the card; available for explicit conservative runs.</td></tr>
+    </table>
+    <div class="callout warn">
+      <p class="h">The card toggle (CONSIDER ↔ IGNORE)</p>
+      <p style="margin:0" class="small">The engine attaches <em>both</em> verdicts to the envelope
+      (<code>earnings</code> + <code>earnings_alt</code>), so the toggle is a <strong>pure display swap — no
+      re-analysis, no engine retrigger</strong>. The choice persists per symbol in the browser's
+      <code>localStorage</code> (survives refresh; per-device, not synced). Bias (direction/confidence/go) is
+      computed on demand once via <code>/simmer/earnings/{sym}</code> and cached ~6h.</p>
+    </div>
+    <div class="callout">
+      <p class="h">Direction is for the RUN-UP, not the gap</p>
+      <p style="margin:0" class="small">The analyzer's news bias forecasts pre-print <em>drift</em>, not the
+      post-earnings gap (bullish news is often already priced → "sell the news"). So a ready earnings name flags
+      <code>close_before_print</code>: it's a <strong>sell-the-run-up, close BEFORE the announcement</strong>
+      play — never hold a credit spread through the print. The analyzer's real value is the <strong>no-go</strong>
+      (avoid selling into a guidance-cut / scandal narrative), and side selection (bullish → bull put, bearish →
+      bear call). Simmer is not a direction forecaster — see <code>docs/simmer_earnings.md</code> for the phased plan.</p>
+    </div>
+
     <h3><code>macro_calendar.json</code></h3>
     <p>A deliberately <strong>hand-maintained table</strong> of scheduled macro events (no live macro feed —
     it's a small, auditable file). It sits at <code>market/backend/app/macro_calendar.json</code>; override
@@ -587,8 +618,14 @@
           <td>The provider returned a one-sided chain (no puts or no calls) — a <em>data</em> veto, not a market signal. Usually transient; clears next sweep. If it persists for one name, the provider is returning a bad chain for it.</td></tr>
       <tr><td>Everything is vetoed / a very quiet board</td>
           <td>Expected. Simmer is refusal-first; premium is only sellable in specific conditions. The chips' <code>x/10</code> tell you which gates.</td></tr>
-      <tr><td>A freshly added ticker shows "no analysis yet"</td>
-          <td>The first sweep hasn't reached it yet (a few minutes; off-hours it uses last session's data).</td></tr>
+      <tr><td>A freshly added ticker shows "no analysis yet" / "pending"</td>
+          <td>The first sweep hasn't persisted a row yet (a few minutes; off-hours it uses last session's data). On-demand <code>/simmer/analyze</code> does <em>not</em> persist — to fill a card immediately, admin <code>POST /simmer/research/{sym}/refresh?expiration=YYYY-MM-DD</code> (writes a readiness row).</td></tr>
+      <tr><td>Earnings toggle "doesn't do anything" / resets on refresh</td>
+          <td>By design the card already shows the <strong>consider</strong> view (earnings folded, no catalyst-lockout veto). The CONSIDER↔IGNORE toggle swaps the displayed verdict (both are on the envelope) and persists per symbol in <code>localStorage</code> — per browser, so a different device won't see it. It never re-runs the engine.</td></tr>
+      <tr><td>An in-earnings name still shows <code>catalyst · earnings in tenor</code></td>
+          <td>Stale persisted row from before earnings mode, or the sweep hasn't re-run. Earnings no longer hard-vetoes under "consider"; force it with the admin research-refresh above, or wait for the next sweep.</td></tr>
+      <tr><td>A pinned expiry passed — does the card die?</td>
+          <td>No. At the top of each sweep, <strong>expired pinned expirations auto-roll</strong> to the next listed date (de-duped — if you already watch that date, the expired row is removed). A pinned ticker keeps rolling forward until you remove it; the engine never runs on a dead contract.</td></tr>
       <tr><td>Simmer prod <strong>login fails</strong> / calls its own origin</td>
           <td>The app isn't resolving the backend via <code>/api/config</code>. Confirm it's a production build, that <code>/api/config</code> returns the tunnel URL, and Edge Config has <code>api_base</code>.</td></tr>
       <tr><td>Simmer <strong>subroutes 404</strong> on refresh (<code>/settings</code>, <code>/news</code>)</td>

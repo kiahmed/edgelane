@@ -238,8 +238,8 @@
 		</div>
 	{/if}
 
-	<!-- Earnings mode — self-hides unless the expiry is in an earnings window -->
-	<EarningsPanel symbol={env.symbol} expiration={env.expiration} baseScore={env.score} />
+	<!-- Earnings — self-hides unless the expiry is in an earnings window -->
+	<EarningsPanel {env} />
 
 	<!-- 4. Soft warnings (avoid_if) — inform, never veto -->
 	{#if env.avoid_if?.length}

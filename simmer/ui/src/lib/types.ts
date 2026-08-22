@@ -45,17 +45,34 @@ export interface Regime {
  *  watcher adds before caching/persisting (computed_at, flow). */
 export interface EarningsBlock {
 	in_window: boolean;
-	mode?: boolean;
+	view?: 'consider' | 'ignore' | 'veto';
 	applied?: boolean;
+	held_back?: boolean;
 	direction: 'bullish' | 'bearish' | 'neutral';
 	confidence: number;
 	go: boolean;
 	lift?: number;
+	close_before_print?: boolean;
 	earnings_date?: string | null;
 	rationale?: string | null;
 	headline_count?: number;
 	reasons?: string[];
 	source?: string;
+}
+
+/** The other-view verdict the engine attaches so the card can switch
+ *  consider↔ignore with no re-analysis. */
+export interface EarningsAlt {
+	view: 'consider' | 'ignore';
+	decision: Decision;
+	score: number;
+	structure: string | null;
+	strikes: Strikes | null;
+	veto_reasons: string[];
+	credit_fill: number | null;
+	pop_breakeven: number | null;
+	expected_value: number | null;
+	alpha: number | null;
 }
 
 export interface EarningsResp {
@@ -102,9 +119,12 @@ export interface ReadinessEnvelope {
 	rejected?: string[];
 	computed_at?: string;
 	flow?: Record<string, unknown>;
-	/** Earnings-mode block — present only when the expiry is in an earnings
-	 *  window. `applied` = the bias lift was folded into the score. */
+	/** Earnings block — present only when the expiry is in an earnings window.
+	 *  The card's decision already reflects the "consider" view (folded, no hard
+	 *  veto). `earnings_alt` carries the "ignore" (pure ex-earnings) verdict so
+	 *  the toggle switches views with no re-analysis. */
 	earnings?: EarningsBlock | null;
+	earnings_alt?: EarningsAlt | null;
 	/** true when served from the last persisted sweep (restart/weekend) rather
 	 *  than a live evaluation — render "as of computed_at", not "live". */
 	rehydrated?: boolean;

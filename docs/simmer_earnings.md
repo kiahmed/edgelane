@@ -67,14 +67,51 @@ An **"Earnings" toggle auto-appears only** when the expiry is in an earnings win
 - **Off** → plain ex-earnings VRP score, so you can compare.
 - Flipping back is instant (cached), no rerun.
 
+## Division of labor (important — Simmer is NOT a direction forecaster)
+
+Simmer decides **WHEN** a name is conditioned to sell premium, picks the **structure
+from dealer positioning** (GEX/put-call walls, expected move, regime) and manages the
+trade. It does **not** forecast fundamental direction, and it must not become a
+signal/analysis terminal — that is edgelane-matrix's job.
+
+So the *directional bias* for the earnings play comes from a **dedicated source**, not
+Simmer inventing it:
+- **The earnings analyzer** (this doc) supplies the news/sentiment/fundamental read.
+- **Future option:** leverage **edgelane-matrix's bias engine** (its dealer-GEX +
+  confidence scoring is more developed) rather than duplicating it in Simmer.
+
+Simmer then maps that bias onto side + strikes + timing + guardrails. Symmetric by
+design: **bullish read → bull put; bearish read (miss / guidance-cut narrative) →
+bear call;** murky → no play.
+
 ## Phasing
 
-1. **Analyzer module + cache table** — news + sentiment bias only. Standalone, testable
-   in isolation (no Simmer changes yet).
-2. **Integration** — score hook + card toggle.
-3. **Fundamentals (later)** — add consensus estimates / guidance for a stronger read.
+1. **Analyzer module + cache table** — news + sentiment bias only. ✅ shipped.
+2. **Integration** — score hook + card toggle (opt-in, on-demand). ✅ shipped.
+   Sweep/alerts keep the earnings veto (safe); the toggle is explore-only.
+3. **Fundamentals (later)** — add consensus estimates / guidance / price targets for a
+   stronger read (the `source` field distinguishes news vs news+fundamentals).
+4. **Earnings run-up mode — "sell the drift, close before the print"** (future; the real
+   payoff of the analyzer). A NEW structure/management mode, not a change to the
+   hold-through veto (which stays correct):
+   - **Enter T-1 / morning of earnings → force-close BEFORE the announcement.** Never
+     hold the binary gap; the analyzer's *direction* is edge for the pre-print drift, not
+     the post-print gap (sell-the-news makes the gap ~unedgeable).
+   - **Bias source** = analyzer (or matrix), cross-checked against price/velocity/GEX so a
+     bullish *narrative* on a chart already rolling over into the event does NOT fire.
+   - **Guardrails (the whole point — avoid getting run over):**
+     1. defined-risk vertical only (capped loss = width − credit; never naked);
+     2. short strike far OTM, below support / the put-GEX wall AND outside the implied move;
+     3. hard time-exit before the bell — no exceptions;
+     4. stop while held (~2× credit, or short-strike delta breaching ~0.45);
+     5. skip names already de-risking into the event (bullish fundamentals + bearish tape).
+   - **Step-zero before any code:** the go/no-go **score threshold must be
+     paper-calibrated** via the simmer_outcomes harness (win-rate/EV by score bucket) —
+     no guessed cutoff to real money. It's a compound gate: analyzer confidence + `go` +
+     signal consistency + Simmer's structural score, not one dial.
 
 ## Open decisions (before any build)
 
-1. **Default toggle On or Off?**
-2. **Phase 1 news-only, or wait and include estimates?**
+1. **Default toggle On or Off?** (Phase 2 shipped as On, on-demand only.)
+2. Phase 4: **own earnings-bias analyzer, or call edgelane-matrix for the bias/structure?**
+3. Phase 4: **the paper-calibration run** to set the score threshold — the prerequisite.
