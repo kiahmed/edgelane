@@ -1864,8 +1864,12 @@ def evaluate_readiness(inputs: dict, cfg: dict | None = None) -> dict[str, Any]:
         raw = sum(w.get(k, 0.0) * val for k, val in vals.items())
         score = 100.0 * raw * float(reg["multiplier"])
         # `score` last so a detail key of the same name can never shadow it.
+        # `weight` is the RESOLVED composite weight (after simmer_tickers.json
+        # overrides + normalization) so the UI attributes points from live
+        # config instead of hardcoding the weights — they must never diverge.
         for k in comps:
-            comps[k] = {**(comps[k] or {}), "score": round(vals[k], 6)}
+            comps[k] = {**(comps[k] or {}), "score": round(vals[k], 6),
+                        "weight": round(float(w.get(k, 0.0)), 6)}
         scored.append((score, cand, comps, reasons))
 
     if not scored:

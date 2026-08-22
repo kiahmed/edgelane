@@ -4,6 +4,7 @@
 	// engine says "ready". credit_fill is labeled ACHIEVABLE vs credit_mid's
 	// ADVERTISED — the gap is the fill-slippage honesty the docs demand.
 	import GateChecklist from './GateChecklist.svelte';
+	import ScoreMatrix from './ScoreMatrix.svelte';
 	import ScoreBar from './ScoreBar.svelte';
 	import EarningsPanel from './EarningsPanel.svelte';
 	import { gateChecklist } from '$lib/gates';
@@ -152,8 +153,13 @@
 		</div>
 	{/each}
 
-	<!-- 1. Gate checklist (leads) -->
-	<GateChecklist {env} />
+	<!-- 1. Gate checklist (leads) + score matrix — the two halves of the verdict:
+	     WHY it's un/vetoed (left) and WHERE the number comes from (right). Stacks
+	     on narrow, side-by-side once there's room. -->
+	<div class="grid gap-x-6 gap-y-3 md:grid-cols-2">
+		<GateChecklist {env} />
+		<ScoreMatrix {env} />
+	</div>
 
 	<!-- 2. Score bar -->
 	<div class="mt-3">
