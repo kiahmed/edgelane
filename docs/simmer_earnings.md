@@ -87,8 +87,14 @@ bear call;** murky → no play.
 ## Phasing
 
 1. **Analyzer module + cache table** — news + sentiment bias only. ✅ shipped.
-2. **Integration** — score hook + card toggle (opt-in, on-demand). ✅ shipped.
-   Sweep/alerts keep the earnings veto (safe); the toggle is explore-only.
+2. **Integration — earnings as a folded factor** ✅ shipped. The sweep runs the
+   `consider` view by default (bias folds, no hard earnings veto); a `no-go` /
+   cold-cache read HOLDS the name back so it can't reach "ready". The card shows
+   both verdicts (`consider` + `ignore` via `earnings_alt`) and the toggle is a
+   pure display swap persisted in localStorage — no re-analysis. **Safety: the
+   alert fan-out SKIPS any earnings-window name** (`process_alerts`), so a shared
+   bias row folding a name to "ready" never pushes a notification — the run-up
+   play is opt-in, card-view-only. Post-earnings it alerts normally again.
 3. **Fundamentals (later)** — add consensus estimates / guidance / price targets for a
    stronger read (the `source` field distinguishes news vs news+fundamentals).
 4. **Earnings run-up mode — "sell the drift, close before the print"** (future; the real

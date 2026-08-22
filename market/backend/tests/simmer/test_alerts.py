@@ -211,3 +211,32 @@ def test_sanitize_is_pure_and_reusable():
     assert out["min_score"] == 100.0
     with pytest.raises(HTTPException):
         sroute.sanitize_settings({"gate_overrides": {"liquidity": False}})
+
+
+async def test_earnings_window_names_never_auto_alert(monkeypatch):
+    # Cross-user safety: a shared bias row can fold an earnings name to "ready",
+    # but the alert fan-out must SKIP earnings-window names — no push to watchers
+    # who never opted in. Post-earnings (no window) it alerts normally.
+    fired = {"n": 0}
+    advanced: list[str] = []
+
+    async def _fake_fanout(env, regime):
+        fired["n"] += 1
+        return 1
+
+    def _fake_state(key, env, threshold):
+        advanced.append(key)                    # state machine still runs
+        return True                             # would alert
+
+    monkeypatch.setattr(sw, "fanout_alert", _fake_fanout)
+    monkeypatch.setattr(sw, "update_alert_state", _fake_state)
+
+    in_window = {"NVDA|X": {"symbol": "NVDA", "decision": "ready", "score": 85.0,
+                            "earnings": {"in_window": True}}}
+    await sw.process_alerts(in_window, {"state": "contango"})
+    assert fired["n"] == 0                      # earnings-window name skipped
+    assert advanced == ["NVDA|X"]              # ...but its state still advanced
+
+    no_window = {"MU|X": {"symbol": "MU", "decision": "ready", "score": 85.0}}
+    await sw.process_alerts(no_window, {"state": "contango"})
+    assert fired["n"] == 1                      # non-earnings name still alerts

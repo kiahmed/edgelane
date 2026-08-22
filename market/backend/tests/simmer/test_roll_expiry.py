@@ -70,6 +70,24 @@ async def test_dedupe_deletes_expired_when_target_exists(monkeypatch):
     assert calls["update"] == []
 
 
+async def test_malformed_symbol_never_hits_provider(monkeypatch):
+    # A crafted watchlist row must NOT be interpolated into the outbound provider
+    # request (the roll runs before watchlist_union's validation).
+    rows = [{"id": "bad", "user_id": "u1", "symbol": "TSLA/../x?a=1",
+             "expiration": YESTERDAY, "active": True}]
+    calls = _wire(monkeypatch, rows, [NEXT])
+    hit = {"n": 0}
+
+    class _Guarded:
+        async def expirations(self, symbol):
+            hit["n"] += 1
+            return [NEXT]
+
+    assert await sw.roll_expired_watchlist(_Guarded()) == 0
+    assert hit["n"] == 0                       # provider never called with a bad symbol
+    assert calls["update"] == [] and calls["delete"] == []
+
+
 async def test_no_listed_expirations_leaves_row(monkeypatch):
     rows = [{"id": "r1", "user_id": "u1", "symbol": "TSLA", "expiration": YESTERDAY, "active": True}]
     calls = _wire(monkeypatch, rows, [])

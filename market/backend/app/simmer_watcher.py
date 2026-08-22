@@ -270,7 +270,13 @@ async def roll_expired_watchlist(provider) -> int:
         exp = _iso_date(r.get("expiration"))
         if not _passed(exp):
             continue
-        sym = str(r.get("symbol")).upper()
+        sym = str(r.get("symbol") or "").strip().upper()
+        # Same guard the union applies — the roll runs BEFORE watchlist_union, so
+        # without it a crafted watchlist row would inject path/query into the
+        # outbound provider request (fixed host + JSON-only, but still injection).
+        if not re.fullmatch(r"[A-Z.\-]{1,10}", sym):
+            log.warning("roll: skipped malformed symbol %r", r.get("symbol"))
+            continue
         uid = str(r.get("user_id"))
         if sym not in exp_cache:
             try:
@@ -1229,7 +1235,21 @@ async def process_alerts(results: dict[str, dict], regime: dict | None) -> None:
     threshold = float(simmer_config.decision_bands()["ready"])
     for key, env in results.items():
         try:
-            if update_alert_state(key, env, threshold):
+            # Advance the state machine for EVERY name first, so an in-window
+            # name doesn't freeze and then resume from a stale state when it
+            # leaves the window (that would risk one spurious/suppressed
+            # transition per name).
+            fired = update_alert_state(key, env, threshold)
+            # Earnings-window names NEVER auto-alert — only the push is
+            # suppressed. The run-up play is an opt-in, actively-managed "close
+            # before the print" trade you view on the card, not a notification.
+            # This also closes the cross-user leak: the shared bias row (no
+            # user_id) can fold a name to "ready" and, without this, would notify
+            # every watcher including users who never opted into earnings mode.
+            # Post-earnings (out of the window) it alerts normally again.
+            if (env.get("earnings") or {}).get("in_window"):
+                continue
+            if fired:
                 await fanout_alert(env, regime)
         except asyncio.CancelledError:
             raise

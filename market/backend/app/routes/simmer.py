@@ -365,10 +365,17 @@ async def refresh_research(symbol: str, request: Request,
         "catalysts": research.get("_catalysts"),
     }
     if expiration:
-        env = await simmer_watcher.analyze_symbol(
-            provider, db, sym, expiration, regime=simmer_state.regime,
-            peer_vrp=[v for v in simmer_state.peer_iv_rv.values() if v is not None],
-            persist=True)   # persist so the card fills in immediately
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", expiration):
+            raise HTTPException(422, "expiration must be YYYY-MM-DD")
+        try:
+            env = await simmer_watcher.analyze_symbol(
+                provider, db, sym, expiration, regime=simmer_state.regime,
+                peer_vrp=[v for v in simmer_state.peer_iv_rv.values() if v is not None],
+                persist=True)   # persist so the card fills in immediately
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        except RuntimeError as e:
+            raise HTTPException(404, str(e))
         result["persisted_expiration"] = expiration
         result["decision"] = env.get("decision")
         result["score"] = env.get("score")

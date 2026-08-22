@@ -91,6 +91,22 @@ def test_no_go_holds_the_name_back_never_ready():
     assert out["earnings"]["close_before_print"] is False
 
 
+def test_missing_bias_holds_back_fail_safe():
+    # Cold cache: the sweep found an earnings window but no bias is computed yet
+    # (no direction/go). go defaults False → the name is HELD BACK, never "ready".
+    # This is the alert fail-safe that replaces the old hard-veto default — a
+    # sell-through-earnings can't auto-fire before the analyzer has spoken.
+    inp = mutate(catalysts=[EARN])
+    inp["settings"] = {"structures_enabled": ["bull_put"]}
+    inp["earnings"] = {"view": "consider", "in_window": True,
+                       "earnings_date": "2026-09-15"}   # no direction/confidence/go
+    out = se.evaluate_readiness(inp)
+    assert out["decision"] != "vetoed"        # not a hard veto
+    assert out["decision"] != "ready"         # but held back
+    assert out["earnings"]["held_back"] is True
+    assert out["earnings"]["go"] is False
+
+
 def test_eight_k_still_vetoes_under_consider():
     inp = _inp("consider")
     inp["research"]["catalysts"] = [EARN, {"type": "8k_material", "days": 3, "confirmed": True}]
