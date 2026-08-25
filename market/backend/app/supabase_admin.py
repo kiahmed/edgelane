@@ -71,6 +71,32 @@ async def get_profile_plan(user_id: str) -> Optional[str]:
     return row.get("plan") if row else None
 
 
+async def get_user_email(user_id: str) -> Optional[str]:
+    """Authoritative email for a user via the GoTrue admin API (auth.users is
+    not exposed through PostgREST). Service-role only. Returns None on any
+    failure / missing config so callers degrade to 'not emailed'."""
+    settings = get_settings()
+    if not (settings.supabase_url and settings.supabase_service_key):
+        return None
+    url = settings.supabase_url.rstrip("/") + f"/auth/v1/admin/users/{user_id}"
+    headers = {
+        "apikey": settings.supabase_service_key,
+        "Authorization": f"Bearer {settings.supabase_service_key}",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(url, headers=headers)
+            if r.status_code != 200:
+                log.error("[supabase] admin user read failed (%s): %s",
+                          r.status_code, r.text[:200])
+                return None
+            email = (r.json() or {}).get("email")
+            return email or None
+    except Exception as exc:
+        log.error("[supabase] admin user read error for %s: %s", user_id, exc)
+        return None
+
+
 async def get_user_tools(user_id: str) -> list[str]:
     """Tool keys this user is entitled to (public.profiles.tools_enabled),
     authoritative server-side read. Returns [] if none / not found."""

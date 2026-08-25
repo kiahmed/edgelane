@@ -60,9 +60,12 @@ from datetime import date, datetime, timezone
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
+from . import emailer
 from . import simmer_config
+from . import simmer_email
 from . import simmer_engine
 from . import supabase_admin
+from .config import get_settings
 from .dealer_exposures import compute_dealer_exposures
 from .poller import _is_market_open
 from .simmer_data_provider import as_provider, get_simmer_provider
@@ -1187,6 +1190,41 @@ def _json_safe(obj: Any) -> Any:
     return json.loads(json.dumps(obj, default=str))
 
 
+async def _has_open_alert(user_id: str, symbol: str, expiration: str | None) -> bool:
+    """True if this user already has an UNACKNOWLEDGED alert for symbol+expiry.
+    Persistent dedup so a watcher restart (which clears in-memory hysteresis)
+    can't stack a duplicate alert / re-send its email. On a Supabase read error
+    returns False (fail-open: better a rare duplicate than a silently dropped
+    alert)."""
+    filters = {"user_id": f"eq.{user_id}", "symbol": f"eq.{symbol}",
+               "acknowledged": "eq.false"}
+    if expiration:
+        filters["expiration"] = f"eq.{expiration}"
+    rows = await supabase_admin.select_many("simmer_alerts", "id", filters, limit=1)
+    return bool(rows)
+
+
+async def _email_readiness_alert(user_id: str, env: dict) -> bool:
+    """Best-effort readiness email to one opted-in user. Never raises — an email
+    outage must not break the alert fan-out. Returns True only if actually sent."""
+    try:
+        email = await supabase_admin.get_user_email(user_id)
+        if not email:
+            log.info("[alert-email] no email for user %s — skipping", user_id)
+            return False
+        settings = get_settings()
+        subject, html = simmer_email.render_readiness_email(
+            env, app_url=settings.simmer_app_url)
+        sent = await emailer.send_email(
+            email, subject, html, from_email=settings.simmer_alert_from_email)
+        if sent:
+            log.info("[alert-email] sent %s readiness to %s", env.get("symbol"), user_id)
+        return sent
+    except Exception:
+        log.exception("[alert-email] failed for user %s", user_id)
+        return False
+
+
 async def fanout_alert(env: dict, regime: dict | None) -> int:
     """Write `simmer_alerts` rows via the service-role key (deliberately no RLS
     insert policy for users — only the backend writes alerts), one row per user
@@ -1214,8 +1252,15 @@ async def fanout_alert(env: dict, regime: dict | None) -> int:
             continue
         settings_row = await supabase_admin._select_one(
             "simmer_settings", "user_id", str(uid),
-            "min_score,structures_enabled,regime_strictness,gate_overrides") or {}
+            "min_score,structures_enabled,regime_strictness,gate_overrides,notify_email") or {}
         if not _passes_user_filters(env, settings_row, regime):
+            continue
+        # Durable one-per-open-alert dedup. update_alert_state's hysteresis fires
+        # once per transition, but it's IN-MEMORY: a watcher restart resets it and
+        # the next ready sweep would re-fire. So skip if this user already has an
+        # UNACKNOWLEDGED alert for this symbol+expiry — no duplicate row, no repeat
+        # email, until they acknowledge (which re-arms the next genuine transition).
+        if await _has_open_alert(str(uid), symbol, expiration):
             continue
         ok = await supabase_admin.insert_row("simmer_alerts", {
             "user_id": uid,
@@ -1227,6 +1272,11 @@ async def fanout_alert(env: dict, regime: dict | None) -> int:
             "payload": payload,
         })
         written += 1 if ok else 0
+        # Opt-in per user (notify_email), best-effort — never let it break fanout.
+        # Dedup is inherited from the open-alert guard above: exactly one email per
+        # outstanding alert, even if the user never acknowledges.
+        if ok and settings_row.get("notify_email"):
+            await _email_readiness_alert(str(uid), env)
     state.alerts_fired += 1
     return written
 

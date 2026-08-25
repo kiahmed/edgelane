@@ -48,29 +48,33 @@ async def send_email(
     *,
     reply_to: Optional[str] = None,
     attachment: Optional[tuple[str, bytes]] = None,
+    from_email: Optional[str] = None,
 ) -> bool:
     """Send one email. attachment = (filename, raw_bytes) or None.
+    from_email overrides the default contact sender (e.g. the product-specific
+    Simmer alert sender); it must stay on the authenticated sending domain.
     Returns True on success, False on any failure / missing config (logged)."""
     settings = get_settings()
     if not to_email:
         log.warning("[email] no recipient (SUPPORT_EMAIL unset) — skipping: %s", subject)
         return False
 
+    sender = from_email or settings.contact_from_email
     provider = _provider(settings)
     if provider == "smtp":
         return await asyncio.to_thread(
-            _send_smtp, settings, to_email, subject, html, reply_to, attachment)
+            _send_smtp, settings, to_email, subject, html, reply_to, attachment, sender)
     if provider == "resend":
-        return await _send_resend(settings, to_email, subject, html, reply_to, attachment)
+        return await _send_resend(settings, to_email, subject, html, reply_to, attachment, sender)
     log.warning("[email] no transport configured (set SMTP_HOST or RESEND_API_KEY) — "
                 "would email %s: %s", to_email, subject)
     return False
 
 
-def _send_smtp(settings, to_email, subject, html, reply_to, attachment) -> bool:
+def _send_smtp(settings, to_email, subject, html, reply_to, attachment, sender) -> bool:
     """Blocking SMTP send via stdlib smtplib (run in a thread)."""
     msg = EmailMessage()
-    msg["From"] = settings.contact_from_email
+    msg["From"] = sender
     msg["To"] = to_email
     msg["Subject"] = subject
     if reply_to:
@@ -82,7 +86,7 @@ def _send_smtp(settings, to_email, subject, html, reply_to, attachment) -> bool:
         msg.add_attachment(content, maintype="application", subtype="octet-stream",
                            filename=filename)
     # envelope sender = the bare address out of "Name <addr>"
-    envelope_from = parseaddr(settings.contact_from_email)[1] or settings.smtp_user
+    envelope_from = parseaddr(sender)[1] or settings.smtp_user
     try:
         if settings.smtp_use_ssl:
             server = smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=20)
@@ -103,9 +107,9 @@ def _send_smtp(settings, to_email, subject, html, reply_to, attachment) -> bool:
         return False
 
 
-async def _send_resend(settings, to_email, subject, html, reply_to, attachment) -> bool:
+async def _send_resend(settings, to_email, subject, html, reply_to, attachment, sender) -> bool:
     payload: dict = {
-        "from": settings.contact_from_email,
+        "from": sender,
         "to": [to_email],
         "subject": subject,
         "html": html,

@@ -93,6 +93,8 @@ def supabase_stub(monkeypatch):
     }
 
     async def fake_select_many(table, select="*", filters=None, **kw):
+        if table == "simmer_alerts":
+            return []                       # no outstanding alert (dedup probe)
         assert table == "simmer_watchlist"
         return [{"user_id": uid, "expiration": None} for uid in settings_by_uid]
 
@@ -138,6 +140,8 @@ async def test_fanout_respects_pinned_expiration(monkeypatch):
     inserts: list[dict] = []
 
     async def fake_select_many(table, select="*", filters=None, **kw):
+        if table == "simmer_alerts":
+            return []                       # no outstanding alert (dedup probe)
         return [{"user_id": "u1", "expiration": "2026-10-16"},   # other expiry
                 {"user_id": "u2", "expiration": EXP}]
 

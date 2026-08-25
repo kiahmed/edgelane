@@ -172,6 +172,12 @@ class Settings(BaseModel):
     smtp_use_ssl: bool = Field(default=False)   # implicit TLS on 465
     # Resend (HTTP API) — used when SMTP isn't configured.
     resend_api_key: str = Field(default="")
+    # Product-specific sender for Simmer readiness-alert emails (must be on the
+    # authenticated sending domain — solutionjet.net for the Workspace relay).
+    simmer_alert_from_email: str = Field(
+        default="Simmer <noreply-edgelane-simmer@solutionjet.net>")
+    # Base URL of the Simmer UI, for the "open in Simmer" link in alert emails.
+    simmer_app_url: str = Field(default="https://edgelane-simmer.vercel.app")
 
     # Dev override: keep polling even when market is closed (mock-mode dev)
     force_poll_when_closed: bool = Field(default=False)
@@ -375,6 +381,8 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
     if "SMTP_USE_SSL" in raw:
         out["smtp_use_ssl"] = raw["SMTP_USE_SSL"].strip().lower() in ("true", "1", "yes", "on")
     if "RESEND_API_KEY" in raw:              out["resend_api_key"] = raw["RESEND_API_KEY"].strip()
+    if "SIMMER_ALERT_FROM_EMAIL" in raw:     out["simmer_alert_from_email"] = raw["SIMMER_ALERT_FROM_EMAIL"].strip()
+    if "SIMMER_APP_URL" in raw:              out["simmer_app_url"] = raw["SIMMER_APP_URL"].strip().rstrip("/")
 
     if "FORCE_POLL_WHEN_CLOSED" in raw:
         out["force_poll_when_closed"] = raw["FORCE_POLL_WHEN_CLOSED"].strip().lower() in ("true", "1", "yes", "on")
