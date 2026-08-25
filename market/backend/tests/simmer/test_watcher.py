@@ -52,6 +52,39 @@ async def test_sweep_persists_readiness_rows(fresh_db, monkeypatch):
     assert row["score"] is None
 
 
+async def test_closed_sweep_freezes_existing_and_skips_alerts(fresh_db, monkeypatch):
+    """Market CLOSED: a ticker with a stored readiness is NOT recomputed (frozen
+    to its last verdict), and alerts do not fire off frozen/after-hours data."""
+    frozen = readiness_env(score=88.0)          # would be "ready" if alerts ran
+    frozen.update(symbol="NVDA", expiration=EXP, decision="ready")
+    sw.state.latest_by_key[f"NVDA|{EXP}"] = frozen
+    sw.state.market_open = False                # (already the default; explicit)
+
+    async def boom(*a, **k):
+        raise AssertionError("frozen ticker must not recompute when closed")
+
+    fired = {"n": 0}
+    async def count_alerts(results, regime):
+        fired["n"] += 1
+
+    monkeypatch.setattr(sw, "watchlist_union", lambda: _union([("NVDA", EXP)]))
+    monkeypatch.setattr(sw, "analyze_symbol", boom)
+    monkeypatch.setattr(sw, "process_alerts", count_alerts)
+    results = await sw.sweep(FakeSimmerTradier(), fresh_db)
+
+    assert results[f"NVDA|{EXP}"]["score"] == 88.0   # served frozen, not recomputed
+    assert fired["n"] == 0                            # no alert path when closed
+
+
+async def test_closed_sweep_computes_novel_ticker_once(fresh_db, monkeypatch):
+    """Market CLOSED but a ROLLED/ADDED ticker has no stored readiness → it is
+    computed once (persisted) so it doesn't hang blank."""
+    sw.state.market_open = False
+    monkeypatch.setattr(sw, "watchlist_union", lambda: _union([("NVDA", None)]))
+    await sw.sweep(FakeSimmerTradier(), fresh_db)
+    assert fresh_db.latest_simmer_readiness("NVDA", EXP) is not None   # computed once
+
+
 # ── Tier-1 cache TTLs ───────────────────────────────────────────────────────
 @pytest.fixture()
 def refresh_counters(monkeypatch):

@@ -302,6 +302,7 @@ def _reset_watcher_state():
         sw.state.last_outcome_run_ts = None
         sw.state.outcomes_recorded = 0
         sw.state.last_iv_history_date = None
+        sw.state.market_open = False
 
     _reset()
     yield

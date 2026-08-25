@@ -1564,6 +1564,31 @@ async def evaluate_paper_outcomes(tradier, db, as_of: date | None = None) -> int
 # ─────────────────────────────────────────────────────────────────────────────
 # The sweep + loop
 # ─────────────────────────────────────────────────────────────────────────────
+def _frozen_readiness(db, sym: str, exp: str | None) -> dict | None:
+    """The last STORED readiness for (sym, exp) — cache first, then DuckDB.
+    exp None (auto-pick) → the newest cached entry for the symbol. Returns None
+    when nothing is stored (a freshly rolled / newly added name). Used by the
+    market-closed freeze so an existing card never recomputes off dead
+    after-hours quotes."""
+    sym_u = sym.upper()
+    if exp:
+        env = state.latest_by_key.get(_key(sym, exp))
+        if env is not None:
+            return env
+        if db is not None:
+            try:
+                return db.latest_simmer_readiness(sym_u, exp)
+            except Exception:
+                return None
+        return None
+    best = None
+    for k, e in state.latest_by_key.items():
+        if k.startswith(f"{sym_u}|") and (
+                best is None or str(e.get("computed_at")) > str(best.get("computed_at"))):
+            best = e
+    return best
+
+
 async def sweep(tradier, db, edgar=None) -> dict[str, dict]:
     """One full pass. Returns the {key: envelope} it computed (tests read it
     directly; production reads state.latest_by_key).
@@ -1630,6 +1655,20 @@ async def sweep(tradier, db, edgar=None) -> dict[str, dict]:
     results: dict[str, dict] = {}
     for sym, exp in pairs:
         try:
+            # Market-closed freeze: everything stays exactly as it was at the
+            # close. Only a (symbol, expiration) with NO stored readiness — a
+            # freshly ROLLED expiry or a newly ADDED name that would otherwise
+            # hang blank — is computed here (off last-session data), and it then
+            # freezes too. This stops a card flickering across the ready band on
+            # dead after-hours quotes and keeps the closed sweep from manufacturing
+            # phantom transitions. Reopens to live recompute at the next open.
+            if not state.market_open:
+                frozen = _frozen_readiness(db, sym, exp)
+                if frozen is not None:
+                    fkey = _key(sym, frozen.get("expiration") or exp)
+                    results[fkey] = frozen
+                    state.latest_by_key.setdefault(fkey, frozen)
+                    continue
             env = await analyze_symbol(
                 provider, db, sym, exp, regime=regime,
                 research=research_by_sym.get(sym), peer_vrp=peer_vrp,
@@ -1659,8 +1698,13 @@ async def sweep(tradier, db, edgar=None) -> dict[str, dict]:
         log.exception("iv-history job failed")
 
     # Sector-dispersion check, then alerts over the (possibly suppressed) set.
+    # Alerts fire only during market hours: a closed sweep serves frozen verdicts
+    # (plus at most a one-time rolled/added compute off after-hours data), and an
+    # alert you can't act on — or one manufactured from stale quotes — is noise.
+    # The next open sweep recomputes live and fires any genuine new transition.
     apply_dispersion(results, regime)
-    await process_alerts(results, regime)
+    if state.market_open:
+        await process_alerts(results, regime)
 
     # Prune per-key state for pairs no longer WATCHED — without this,
     # latest_by_key / alert_states / the error map grow forever as users add

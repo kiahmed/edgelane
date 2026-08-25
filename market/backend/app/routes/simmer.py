@@ -13,8 +13,12 @@ on the Supabase tables remain purely as defense-in-depth that no client uses.
 Alerts stay backend-written only (watcher fan-out).
 
 `/simmer/analyze/{symbol}` calls `simmer_watcher.analyze_symbol` — the SAME
-function the sweep runs — with persist=False, so the on-demand and scheduled
-paths can never diverge and an on-demand call never pollutes calibration.
+function the sweep runs — always with persist=False, so the on-demand and
+scheduled paths can never diverge and an on-demand call never pollutes
+calibration. Engine-verdict rows come ONLY from the sweep. When the market is
+closed the route serves the last stored (frozen) verdict instead of recomputing;
+if nothing is stored it returns a provisional, unpersisted compute so the card
+doesn't hang (the sweep owns both the expiry roll and its one-time persist).
 
 Settings enforcement is server-side and authoritative: bounded knobs are
 clamped through `simmer_config.clamp_setting` (short-delta band hard-clamped
@@ -294,6 +298,29 @@ async def analyze(symbol: str, request: Request,
     # run on the same data source as the sweep (tradier fallback pre-loop).
     source = simmer_state.provider or _tradier(request)
     db = _db(request)
+
+    # ── Market-closed freeze ────────────────────────────────────────────────
+    # When the market is closed, readiness must NOT recompute off dead
+    # after-hours quotes (that flickers a card across the ready band and can't
+    # produce an alert). Serve the last stored verdict instead — the card shows
+    # exactly what it showed at the close.
+    #
+    # If nothing is stored for this (symbol, expiration) — a freshly rolled/added
+    # name, or an ad-hoc expiration a user typed — we still return a computed
+    # envelope so the card doesn't hang, but with persist=False: this route NEVER
+    # writes engine-verdict rows (that stays the sweep's job — it owns the roll
+    # AND the one-time persist, in the same pass). Otherwise a user walking a
+    # symbol's listed expirations while closed would seed the shared readiness
+    # table — that calibration_grades — with dead-quote rows.
+    if not simmer_state.market_open:
+        last = _readiness_for(symbol.upper(), expiration)
+        if last is None and expiration and db is not None:
+            last = await asyncio.to_thread(
+                db.latest_simmer_readiness, symbol.upper(), expiration)
+        if last is not None:
+            return last                    # frozen: last in-hours verdict stands
+        # else: no stored row → fall through to a provisional (unpersisted) compute.
+
     try:
         env = await simmer_watcher.analyze_symbol(
             source, db, symbol, expiration,
@@ -305,6 +332,7 @@ async def analyze(symbol: str, request: Request,
             # → "consider" (fold the bias; a no-go holds the name back). Neither
             # shows a hard earnings veto — both verdicts also ride on env.earnings_alt.
             earnings_view=("ignore" if earnings.lower() == "off" else "consider"),
+            # On-demand NEVER persists — calibration rows come only from the sweep.
             persist=False)
     except ValueError as e:
         raise HTTPException(422, str(e))

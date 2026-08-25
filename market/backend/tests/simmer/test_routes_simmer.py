@@ -128,8 +128,9 @@ def auth_off(monkeypatch):
 
 
 def test_analyze_route_calls_the_watcher_function(auth_off, monkeypatch):
-    """The route MUST delegate to simmer_watcher.analyze_symbol (the sweep's
-    own function) with persist=False — the paths can never diverge."""
+    """During MARKET HOURS the route MUST delegate to analyze_symbol with
+    persist=False (on-demand, no engine-verdict rows) — the paths can't diverge."""
+    monkeypatch.setattr(sw.state, "market_open", True)
     calls = {}
 
     async def fake_analyze(tradier, db, symbol, expiration=None, **kw):
@@ -145,9 +146,10 @@ def test_analyze_route_calls_the_watcher_function(auth_off, monkeypatch):
     assert calls == {"symbol": "nvda", "expiration": EXP, "persist": False}
 
 
-async def test_analyze_route_matches_direct_watcher_call(auth_off, fresh_db):
-    """End-to-end equivalence on the REAL engine: the route's envelope must
-    equal a direct analyze_symbol(...) call on every decision-bearing field."""
+async def test_analyze_route_matches_direct_watcher_call(auth_off, fresh_db, monkeypatch):
+    """End-to-end equivalence on the REAL engine (market hours): the route's
+    envelope must equal a direct analyze_symbol(...) call on every field."""
+    monkeypatch.setattr(sw.state, "market_open", True)
     tradier = FakeSimmerTradier()
     direct = await sw.analyze_symbol(tradier, fresh_db, "NVDA", EXP,
                                      regime=None, persist=False)
@@ -160,6 +162,41 @@ async def test_analyze_route_matches_direct_watcher_call(auth_off, fresh_db):
         assert routed[k] == direct[k], k
     # on-demand analysis must not write engine-verdict rows
     assert fresh_db.latest_simmer_readiness("NVDA", EXP) is None
+
+
+def test_analyze_route_frozen_when_market_closed(auth_off, monkeypatch):
+    """Market CLOSED with an existing readiness → serve the frozen verdict; never
+    recompute off dead after-hours quotes."""
+    monkeypatch.setattr(sw.state, "market_open", False)
+    frozen = {"symbol": "NVDA", "expiration": EXP, "decision": "watch",
+              "score": 55.0, "rehydrated": True}
+    monkeypatch.setattr(sw.state, "latest_by_key", {f"NVDA|{EXP}": frozen})
+
+    async def boom(*a, **k):
+        raise AssertionError("must not recompute when frozen")
+
+    monkeypatch.setattr(sw, "analyze_symbol", boom)
+    r = _make_client().get("/simmer/analyze/NVDA", params={"expiration": EXP})
+    assert r.status_code == 200
+    assert r.json()["score"] == 55.0 and r.json()["rehydrated"] is True
+
+
+def test_analyze_route_never_persists_even_when_closed(auth_off, monkeypatch):
+    """Market CLOSED with NO stored readiness → return a PROVISIONAL compute so
+    the card doesn't hang, but the route NEVER persists (no calibration pollution
+    from walking listed expirations off-hours). Persistence is the sweep's job."""
+    monkeypatch.setattr(sw.state, "market_open", False)
+    monkeypatch.setattr(sw.state, "latest_by_key", {})
+    calls = {}
+
+    async def fake_analyze(tradier, db, symbol, expiration=None, **kw):
+        calls.update(symbol=symbol, persist=kw.get("persist"))
+        return {"symbol": symbol.upper(), "expiration": expiration, "decision": "ready"}
+
+    monkeypatch.setattr(sw, "analyze_symbol", fake_analyze)
+    r = _make_client().get("/simmer/analyze/NVDA", params={"expiration": EXP})
+    assert r.status_code == 200
+    assert calls == {"symbol": "NVDA", "persist": False}   # provisional, unpersisted
 
 
 def test_analyze_unknown_expiration_is_422(auth_off):
