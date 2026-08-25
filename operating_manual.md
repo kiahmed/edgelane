@@ -729,7 +729,7 @@ make frontend-setup     # 1) links/creates BOTH Vercel projects (Matrix + Simmer
                         # 3) syncs Supabase Auth uri_allow_list with both origins
 ```
 
-`deploy-fe` / `deploy-simmer-fe` **refuse** until the project is linked and point you
+`deploy-fe` / `deploy-simmer` **refuse** until the project is linked and point you
 here. Provisioning uses your Vercel CLI login (`~/.local/share/com.vercel.cli/auth.json`).
 
 **Container tunnel self-heal needs a PERMANENT token.** The cloudflared container
@@ -758,7 +758,7 @@ frontends), because the backend restart rotates the tunnel and republishes the p
      a container restart suffices, no rebuild.
 3. **Matrix UI changed** → `make deploy-fe` (also re-syncs Supabase `site_url` +
    `uri_allow_list`, which is where the Simmer origin gets added if setup didn't).
-4. **Simmer UI changed** → `make deploy-simmer-fe`. (npm ci + `vite build` can take
+4. **Simmer UI changed** → `make deploy-simmer`. (npm ci + `vite build` can take
    >2 min; that's normal.)
 5. **Always finish with** → `make check-tunnel` — verifies container health, the
    Supabase pointer, **the Edge Config pointer matches it**, tunnel `/status`, CORS for
@@ -849,7 +849,7 @@ the Cloudflare tunnel URL + the same path. Auth (same admin secret as Torque):
 | What you see | What's happening / fix |
 |---|---|
 | Simmer prod **login fails** or the app calls `edgelane-simmer.vercel.app/auth/...` (404) | The app isn't resolving the backend via `/api/config`. Confirm it's a **production build** (`import.meta.env.PROD`; a dev build hits localhost), that `GET /api/config` returns the tunnel URL, and that Edge Config has `api_base`. Historically caused by detecting "dev build" from baked config instead of `import.meta.env`. |
-| Simmer **subroutes 404** on direct load/refresh (`/settings`, `/news`) but `/` works | SPA fallback not firing. `simmer/ui/vercel.json` must have `rewrites: /(.*) → /index.html` and **no `cleanUrls`** (it conflicts with the rewrite target). Never use a lookahead in `source` — path-to-regexp silently no-ops it. Redeploy with `make deploy-simmer-fe`. |
+| Simmer **subroutes 404** on direct load/refresh (`/settings`, `/news`) but `/` works | SPA fallback not firing. `simmer/ui/vercel.json` must have `rewrites: /(.*) → /index.html` and **no `cleanUrls`** (it conflicts with the rewrite target). Never use a lookahead in `source` — path-to-regexp silently no-ops it. Redeploy with `make deploy-simmer`. |
 | After a backend/tunnel restart, Simmer can't reach the backend (Matrix is fine) | Edge Config `api_base` went stale — the container couldn't PATCH it. `deploy/.env` is missing a **permanent** `VERCEL_API_TOKEN`, or it expired. Check `docker compose … logs edgelane-cloudflared` for `skipping Edge Config` / non-200; set the token and restart the container. |
 | `make check-tunnel` says **"Edge Config not configured"** | `VERCEL_API_TOKEN` / `EDGE_CONFIG_ID` unset in `deploy/.env`. Run `make frontend-setup` (writes `EDGE_CONFIG_ID`) and add a permanent `VERCEL_API_TOKEN`. |
 | `make check-tunnel`: **Edge Config api_base differs from Supabase** | Mid-rotation (harmless, re-run in a few seconds) or a stale/expired token stopped the last publish. If it persists, refresh `VERCEL_API_TOKEN` and restart the container. |

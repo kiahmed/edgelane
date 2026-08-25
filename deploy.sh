@@ -348,7 +348,7 @@ frontend_setup() {
   info "3/3  Supabase Auth redirect allow-list (Matrix + Simmer origins)"
   _sync_auth_allow_list
 
-  ok "frontend setup complete. Now: make deploy-fe  and  make deploy-simmer-fe"
+  ok "frontend setup complete. Now: make deploy-fe  and  make deploy-simmer"
   [ -n "${EDGE_CONFIG_ID:-${ecid:-}}" ] || warn "Edge Config not set — run 'vercel login' and re-run frontend-setup for tunnel self-heal."
 }
 

@@ -599,7 +599,7 @@
         needs a restart (the file is bind-mounted).</li>
       <li><strong>Matrix UI changed</strong> → <code>make deploy-fe</code> (also re-syncs Supabase
         <code>site_url</code> + redirect allow-list).</li>
-      <li><strong>Simmer UI changed</strong> → <code>make deploy-simmer-fe</code> (npm ci + build can take &gt; 2 min).</li>
+      <li><strong>Simmer UI changed</strong> → <code>make deploy-simmer</code> (npm ci + build can take &gt; 2 min).</li>
       <li><strong>Always finish</strong> → <code>make check-tunnel</code> — container health, the Supabase
         pointer, the Edge Config pointer matching it, tunnel <code>/status</code>, CORS, and the auth path.</li>
     </ol>

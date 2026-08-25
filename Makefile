@@ -38,7 +38,7 @@ DATA_DUMP    = deploy/edgelane-data.tar.gz
         db-push db-push-dry deploy-data-dump deploy-data-restore \
         doctor vercel-setup check-tunnel \
         simmer-ui-install simmer-ui-dev simmer-ui-build simmer-ui-check \
-        simmer-ui-test deploy-simmer-fe
+        simmer-ui-test deploy-simmer
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} \
@@ -261,5 +261,5 @@ simmer-ui-check: ## svelte-check — Svelte 5 runes + TS, must be 0 errors
 simmer-ui-test: ## Vitest unit tests (api pointer resolution, fmt)
 	@cd $(SIMMER_UI) && npm test
 
-deploy-simmer-fe: ## Simmer UI → Vercel project edgelane-simmer
+deploy-simmer: ## Simmer UI → Vercel project edgelane-simmer
 	@$(DEPLOY_SH) -s $(ARGS)
