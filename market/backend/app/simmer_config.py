@@ -170,6 +170,27 @@ MANAGEMENT: dict[str, float] = {
     "stop_credit_multiple": 2.0, # stop at 2× credit received
 }
 
+# ── Social / sharing (frontend chips; display-only, no secrets) ─────────────
+# Served to the browser via GET /simmer/config so the UI reads it at runtime:
+# change these in simmer_tickers.json (the SAME override file as the gates) and
+# restart the backend to publish — no frontend rebuild.
+#
+# Chips default HIDDEN (enabled False, empty URLs): linking to an unregistered
+# handle would send users to a page a squatter could claim. Fill the real URLs +
+# set enabled True once the accounts exist. The snapshot Share button is
+# independent (share_enabled) — it posts from the USER's own account, so it needs
+# no product handle and is on by default.
+SOCIAL: dict[str, Any] = {
+    "enabled":            False,   # master switch for the X / LinkedIn profile chips
+    "handle":             "",      # display/title only, e.g. "@edgelane_simmer"
+    "x_url":              "",      # product page,  e.g. "https://x.com/edgelane_simmer"
+    "linkedin_url":       "",      # product page,  e.g. "https://www.linkedin.com/company/edgelane"
+    "share_enabled":      True,    # the snapshot Share button
+    # Composer URLs the Share button opens (image-paste target); rarely changed.
+    "x_share_url":        "https://x.com/compose/post",
+    "linkedin_share_url": "https://www.linkedin.com/feed/?shareActive=true",
+}
+
 # ── Volatility estimation ──────────────────────────────────────────────────
 VOL: dict[str, Any] = {
     "annualization_days":   252,   # trading days
@@ -390,6 +411,12 @@ def earnings() -> dict[str, float]:
 
 def management() -> dict[str, float]:
     return _merged("management", MANAGEMENT)
+
+
+def social() -> dict[str, Any]:
+    """Frontend social/share config (display-only). Overridable in
+    simmer_tickers.json under "social"; see SOCIAL for the shape."""
+    return _merged("social", SOCIAL)
 
 
 def vol() -> dict[str, Any]:

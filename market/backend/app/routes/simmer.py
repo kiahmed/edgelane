@@ -94,6 +94,7 @@ async def simmer_config_endpoint():
         "tickers": simmer_config.tickers(),
         "blocked_tickers": sorted(simmer_config.blocked_tickers()),
         "structures": list(STRUCTURES),
+        "social": simmer_config.social(),
         "locked_gates": list(simmer_config.LOCKED_GATES),
         "toggleable_gates": list(simmer_config.TOGGLEABLE_GATES),
         "user_clamps": {k: list(v) for k, v in simmer_config.user_clamps().items()},

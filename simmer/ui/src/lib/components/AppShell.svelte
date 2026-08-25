@@ -3,6 +3,8 @@
 	// pills cluster wraps internally, avatar pinned right).
 	import type { Snippet } from 'svelte';
 	import StatusPills from './StatusPills.svelte';
+	import SocialShare from './SocialShare.svelte';
+	import { CAPTURE_ID } from '$lib/social';
 	import { auth } from '$lib/stores/auth.svelte';
 	import { watchlist } from '$lib/stores/watchlist.svelte';
 	import { page } from '$app/state';
@@ -57,14 +59,22 @@
 		</div>
 	</header>
 
-	<nav class="flex border-b border-slate-700/50">
+	<nav class="flex items-center border-b border-slate-700/50">
 		<a class="tab-btn" class:active={path === resolve('/')} href={resolve('/')}>Dashboard</a>
 		<a class="tab-btn" class:active={path.startsWith(resolve('/settings'))} href={resolve('/settings')}>
 			Settings
 		</a>
+		<!-- Social cluster, pinned right (Matrix layout) -->
+		<div class="ml-auto pb-1.5">
+			<SocialShare />
+		</div>
 	</nav>
 
-	{@render children()}
+	<!-- Capture target for Share: the board only (no header/nav/footer), so the
+	     snapshot is the center content with no empty side margins. -->
+	<div id={CAPTURE_ID}>
+		{@render children()}
+	</div>
 
 	<footer class="pt-4 text-center text-[0.68rem] text-slate-600">
 		Research tool, not investment advice. Engine verdicts are calibrated on paper outcomes.
