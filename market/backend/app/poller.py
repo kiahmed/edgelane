@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -64,6 +64,35 @@ def _is_market_open(tz_name: str = "America/New_York", now: datetime | None = No
     if t >= time(16, 0):
         return False, "after_hours"
     return True, "open"
+
+
+def _seconds_until_open(tz_name: str = "America/New_York",
+                        now: datetime | None = None) -> float:
+    """Seconds from `now` to the NEXT regular open (09:30 ET, weekdays). Mirrors
+    `_is_market_open`'s simple schedule (no holiday calendar), so a closed sweep
+    can sleep exactly until the bell instead of polling. During market hours it
+    returns the delta to the *next* session's open (the only caller is on the
+    closed branch, so that never matters).
+
+    Day arithmetic is done on the naive `date`, 09:30 is re-anchored in the zone
+    via `datetime.combine(..., tzinfo=tz)`, and the final delta is taken IN UTC.
+    Both steps matter across a DST boundary: subtracting two datetimes that share
+    the same tzinfo instance does *naive wall-clock* subtraction (a CPython
+    shortcut) and would drop the DST hour — converting to UTC first forces the
+    true elapsed time."""
+    tz = ZoneInfo(tz_name)
+    n = now or datetime.now(tz)
+    open_t = time(9, 30)
+    day = n.date()
+    # If today's open hasn't passed and it's a weekday, target is today;
+    # otherwise roll to the next day, then skip weekends.
+    if not (n.time() < open_t and n.weekday() < 5):
+        day = day + timedelta(days=1)
+    while day.weekday() >= 5:
+        day = day + timedelta(days=1)
+    cand = datetime.combine(day, open_t, tzinfo=tz)
+    delta = cand.astimezone(timezone.utc) - n.astimezone(timezone.utc)
+    return max(0.0, delta.total_seconds())
 
 
 def _utc_iso() -> str:

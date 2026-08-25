@@ -76,6 +76,31 @@ async def test_closed_sweep_freezes_existing_and_skips_alerts(fresh_db, monkeypa
     assert fired["n"] == 0                            # no alert path when closed
 
 
+def test_seconds_until_open_computes_next_bell():
+    """The closed-hours wait sleeps exactly to the next 09:30 ET — same day if
+    before the bell, else the next weekday, skipping the weekend."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from app.poller import _seconds_until_open
+    et = ZoneInfo("America/New_York")
+
+    # Wed 08:30 ET → opens in 1h
+    assert _seconds_until_open(now=datetime(2026, 8, 26, 8, 30, tzinfo=et)) == 3600.0
+    # Wed 10:00 ET (open) → target is Thu 09:30 → 23.5h
+    assert _seconds_until_open(now=datetime(2026, 8, 26, 10, 0, tzinfo=et)) == 23.5 * 3600
+    # Fri 17:00 ET → skips the weekend to Mon 09:30
+    fri = _seconds_until_open(now=datetime(2026, 8, 28, 17, 0, tzinfo=et))
+    assert fri == (2 * 24 + 16.5) * 3600      # 2 days + 16.5h → Mon 09:30
+    # Sat noon → Mon 09:30
+    sat = _seconds_until_open(now=datetime(2026, 8, 29, 12, 0, tzinfo=et))
+    assert sat == (24 + 21.5) * 3600
+    # DST boundary: Fri 2026-03-06 17:00 EST → Mon 2026-03-09 09:30 EDT. Clocks
+    # spring forward Sun 03-08 (lose 1h), so real elapsed is 63.5h, NOT the
+    # wall-clock 64.5h — proves 09:30 is re-anchored in-zone, not offset-carried.
+    dst = _seconds_until_open(now=datetime(2026, 3, 6, 17, 0, tzinfo=et))
+    assert dst == 63.5 * 3600
+
+
 async def test_closed_sweep_computes_novel_ticker_once(fresh_db, monkeypatch):
     """Market CLOSED but a ROLLED/ADDED ticker has no stored readiness → it is
     computed once (persisted) so it doesn't hang blank."""

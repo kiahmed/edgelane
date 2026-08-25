@@ -67,7 +67,7 @@ from . import simmer_engine
 from . import supabase_admin
 from .config import get_settings
 from .dealer_exposures import compute_dealer_exposures
-from .poller import _is_market_open
+from .poller import _is_market_open, _seconds_until_open
 from .simmer_data_provider import as_provider, get_simmer_provider
 from .simmer_calendar import load_macro_calendar
 from .simmer_catalysts import fetch_recent_catalysts, sweep_current_filings
@@ -1903,7 +1903,17 @@ async def simmer_loop(tradier_client, db, settings) -> None:
                 # Re-resolve each cycle so a UI/CLI sweep_interval change lands
                 # on the next sweep without a restart (falls back to config).
                 interval = await _resolve_sweep_seconds()
-                await asyncio.sleep(interval if state.market_open else closed_interval)
+                if state.market_open:
+                    await asyncio.sleep(interval)
+                else:
+                    # Closed: sleep EXACTLY until the next open (capped at the
+                    # closed cadence, so a long weekend still gets periodic
+                    # last-session sweeps). One timed sleep, no polling — the last
+                    # pre-open sweep already knows when the bell is, so the first
+                    # live sweep fires right at 09:30 ET instead of up to a full
+                    # closed_interval late.
+                    wait = min(float(closed_interval), _seconds_until_open(tz_name) + 1.0)
+                    await asyncio.sleep(max(1.0, wait))
             except asyncio.CancelledError:
                 raise
             except Exception as e:

@@ -7,5 +7,12 @@
     "short_delta_max": 0.35,
     "iv_percentile_floor": 40.0,
     "vrp_ratio_floor": 1.15
-  }
+  },
+
+"social": {
+  "enabled": true,
+  "handle": "@edgelane_simmer",
+  "x_url": "https://x.com/edgelane_simmer",
+  "linkedin_url": "https://www.linkedin.com/company/edgelane-simmer"
+}
 }
