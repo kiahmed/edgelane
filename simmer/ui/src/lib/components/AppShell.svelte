@@ -30,7 +30,7 @@
 				EDGELANE <span class="text-emerald-400">SIMMER</span>
 			</h1>
 			<p class="mt-0.5 text-[13px] text-slate-200 italic">
-				Sell premium only when the market pays you to. Most days it doesn't.
+				Let your targets simmer — we'll ring the bell when the premium's ready to sell.
 			</p>
 		</div>
 		<div class="ml-auto min-w-0">
