@@ -41,6 +41,11 @@
 
 	const stateClass = (s: string) =>
 		s === 'ready' ? 'badge-healthy' : s === 'cooling' ? 'badge-thin' : 'badge-broken';
+
+	// An earnings-window "ready" is a run-up play — flag it so it's never mistaken
+	// for a plain hold-through sell.
+	const isEarningsRunup = (a: SimmerAlert) =>
+		!!(a.payload?.earnings as { in_window?: boolean } | undefined)?.in_window;
 </script>
 
 <div class="card p-4">
@@ -67,6 +72,14 @@
 					<span class="text-[0.7rem] text-slate-400">{a.expiration}</span>
 					{#if a.structure}
 						<span class="text-[0.7rem] text-slate-400">{structureName(a.structure)}</span>
+					{/if}
+					{#if isEarningsRunup(a)}
+						<span
+							class="rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[0.62rem] font-semibold text-amber-300"
+							title="Earnings run-up play — sell the drift, CLOSE BEFORE THE PRINT. Never hold through earnings."
+						>
+							⚡ earnings · close before print
+						</span>
 					{/if}
 					<span class="ml-auto font-mono text-xs {scoreClass(a.score)}">{money(a.score, 0)}</span>
 					<span class="text-[0.65rem] text-slate-600">{ago(a.created_at)}</span>

@@ -1285,21 +1285,14 @@ async def process_alerts(results: dict[str, dict], regime: dict | None) -> None:
     threshold = float(simmer_config.decision_bands()["ready"])
     for key, env in results.items():
         try:
-            # Advance the state machine for EVERY name first, so an in-window
-            # name doesn't freeze and then resume from a stale state when it
-            # leaves the window (that would risk one spurious/suppressed
-            # transition per name).
-            fired = update_alert_state(key, env, threshold)
-            # Earnings-window names NEVER auto-alert — only the push is
-            # suppressed. The run-up play is an opt-in, actively-managed "close
-            # before the print" trade you view on the card, not a notification.
-            # This also closes the cross-user leak: the shared bias row (no
-            # user_id) can fold a name to "ready" and, without this, would notify
-            # every watcher including users who never opted into earnings mode.
-            # Post-earnings (out of the window) it alerts normally again.
-            if (env.get("earnings") or {}).get("in_window"):
-                continue
-            if fired:
+            # Fire on a genuine transition into "ready". Earnings-window names
+            # ARE alerted (per product decision): an earnings "ready" is only ever
+            # a consider+go run-up play — a no-go / cold-cache read is capped below
+            # the ready band by the engine (held_back), so it can't reach here.
+            # The alert + email carry the "close before the print" label so a
+            # run-up play is never mistaken for a hold-through (see the earnings
+            # banner in simmer_email and the earnings block in the payload).
+            if update_alert_state(key, env, threshold):
                 await fanout_alert(env, regime)
         except asyncio.CancelledError:
             raise

@@ -217,30 +217,25 @@ def test_sanitize_is_pure_and_reusable():
         sroute.sanitize_settings({"gate_overrides": {"liquidity": False}})
 
 
-async def test_earnings_window_names_never_auto_alert(monkeypatch):
-    # Cross-user safety: a shared bias row can fold an earnings name to "ready",
-    # but the alert fan-out must SKIP earnings-window names — no push to watchers
-    # who never opted in. Post-earnings (no window) it alerts normally.
+async def test_earnings_window_ready_names_do_alert(monkeypatch):
+    # Product decision: an earnings-window name that genuinely reaches "ready"
+    # (a consider+go run-up play) DOES fire an alert — the email/payload carry the
+    # close-before-the-print label. A no-go read can't reach here (the engine caps
+    # it below the ready band), so update_alert_state gates the safety.
     fired = {"n": 0}
-    advanced: list[str] = []
 
     async def _fake_fanout(env, regime):
         fired["n"] += 1
         return 1
 
-    def _fake_state(key, env, threshold):
-        advanced.append(key)                    # state machine still runs
-        return True                             # would alert
-
     monkeypatch.setattr(sw, "fanout_alert", _fake_fanout)
-    monkeypatch.setattr(sw, "update_alert_state", _fake_state)
+    monkeypatch.setattr(sw, "update_alert_state", lambda k, e, t: True)  # ready transition
 
     in_window = {"NVDA|X": {"symbol": "NVDA", "decision": "ready", "score": 85.0,
-                            "earnings": {"in_window": True}}}
+                            "earnings": {"in_window": True, "go": True}}}
     await sw.process_alerts(in_window, {"state": "contango"})
-    assert fired["n"] == 0                      # earnings-window name skipped
-    assert advanced == ["NVDA|X"]              # ...but its state still advanced
+    assert fired["n"] == 1                      # earnings run-up play alerts
 
     no_window = {"MU|X": {"symbol": "MU", "decision": "ready", "score": 85.0}}
     await sw.process_alerts(no_window, {"state": "contango"})
-    assert fired["n"] == 1                      # non-earnings name still alerts
+    assert fired["n"] == 2                      # non-earnings name alerts too

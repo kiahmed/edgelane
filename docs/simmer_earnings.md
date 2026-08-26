@@ -91,10 +91,14 @@ bear call;** murky → no play.
    `consider` view by default (bias folds, no hard earnings veto); a `no-go` /
    cold-cache read HOLDS the name back so it can't reach "ready". The card shows
    both verdicts (`consider` + `ignore` via `earnings_alt`) and the toggle is a
-   pure display swap persisted in localStorage — no re-analysis. **Safety: the
-   alert fan-out SKIPS any earnings-window name** (`process_alerts`), so a shared
-   bias row folding a name to "ready" never pushes a notification — the run-up
-   play is opt-in, card-view-only. Post-earnings it alerts normally again.
+   pure display swap persisted in localStorage — no re-analysis. **Alerts: an
+   earnings-window name that genuinely reaches "ready" (a consider+go run-up play)
+   DOES fire an alert + email** (`process_alerts`), carrying the "close before the
+   print" label so it's never mistaken for a hold-through. The `held_back` cap is
+   the safety: a no-go / cold-cache read stays below the ready band, so only a
+   deliberate go read can notify. (Earlier this path skipped all earnings-window
+   names; that starved an earnings-heavy watchlist of alerts, so it was changed to
+   alert-with-label.)
 3. **Fundamentals (later)** — add consensus estimates / guidance / price targets for a
    stronger read (the `source` field distinguishes news vs news+fundamentals).
 4. **Earnings run-up mode — "sell the drift, close before the print"** (future; the real
