@@ -110,3 +110,5 @@ docs/simmer_competitive_gap.md
 # floors). Generated scratch, stale the next session — not source.
 simmer_analysis_*.json
 simmer_demo_*.json
+# Drafted social posts + their board snapshots — local marketing scratch.
+simmer/posts/
