@@ -17,6 +17,18 @@ def test_all_strategies_present():
     assert len(keys) == 10
 
 
+def test_every_directional_strategy_has_a_dir():
+    # Regression: long_call/long_put/call_fly/put_fly originally had no "dir",
+    # so the frontend's Counter Read confirms/diverging check (sdef.dir/cdef.dir)
+    # silently never fired for those pairs — including long_call, the DEFAULT
+    # strategy. iron_condor/iron_fly are exempt: the frontend self-splits their
+    # own legs (put wing/call wing) and hardcodes bull/bear there, no "dir" needed.
+    for s in tc.strategy_list():
+        if s["key"] in ("iron_condor", "iron_fly"):
+            continue
+        assert s.get("dir") in ("bull", "bear"), s["key"]
+
+
 def test_default_ticker_and_strategy():
     assert tc.tickers()[0] == "NDX"
     assert tc.default_strategy() == "bull_call"

@@ -523,22 +523,58 @@ flip-timer pattern as Session Flow's `held`, adapted to a continuous value inste
 of window-counting:
 - **± 8 points of 50%** (42–58%) → **contested**, amber & pulsing — too close to
   center to trust a side.
-- **outside that band, held < 60s** → **building**, amber steady — leaning, not
+- **outside that band, held < 20s** → **building**, amber steady — leaning, not
   yet trusted.
-- **outside that band, held ≥ 60s** → **committed**, solid — colored by **option
+- **outside that band, held ≥ 20s** → **committed**, solid — colored by **option
   side**, the same call=green/put=red convention used everywhere else in Torque
   (leg badges, the skew tile) — *not* a bullish/bearish framing, since a credit
   side's side-label (e.g. Bull Put is a *put* structure) doesn't always match its
   directional bias.
 - Resets on ticker/strategy change, same as the other flow state.
 
-**Reading it.** Caption reads `leaning {side} · {state}` (+ `held Nm` once
-committed, via the same `fmtHeld` helper as Session Flow). This is a **relative-value
-lean, not a forecast** — it tells you where premium is currently being bid between
-the two structures, not which way price will go. A counter side that's richening
-and **committed** while you're about to send the other side is the exact
-"don't-enter-blind" case this was built for; use it to adjust strikes/distance, not
-as a standalone signal.
+> **Why 20s, not 60s.** The threshold started at 60s and was shortened after a live
+> observation: a real richness lean was validated by an actual price move roughly
+> **15–20 seconds** later, but the lean itself had already washed back to center
+> (still "building," never reached "committed") before that 60s clock ran out — so
+> the state meant to signal *trustworthy* was arriving systematically *after* the
+> window where the signal was actionable. One live case isn't a rigorous
+> calibration, but 20s at least stops the commit threshold from being slower than
+> the lead time it's trying to validate.
+
+**Confirms / diverging — checked against REAL price, not Lean.** Whichever side the
+band currently favors carries its own **structural** bull/bear bias (definitional,
+not measured — a bull put spread wins if price holds up, full stop; same for every
+other strategy). Torque compares that bias to the underlying's **actual spot
+movement** over the same ~20s window as the EMA (a plain rolling buffer of the live
+`spot` value already arriving every tick — `up`/`down`/`flat` with a small ~0.04%
+deadband to ignore tick noise). Bias matches the trend → **confirms**; bias
+contradicts it → **diverging**; spot hasn't moved enough yet → no tag.
+
+**This is deliberately *not* checked against Lean.** Lean is itself `40% volume P/C +
+30% premium skew + 30% OI-magnet` — built entirely from the **options chain**, the
+same universe of data richness already comes from. Confirming richness against Lean
+would just be cross-referencing two flavors of the same premium/OI data, not
+validating against price. Spot is the one number on the page that's genuinely
+independent of all of it — the actual underlying quote, not anything derived from
+options activity.
+
+**Reading it.** Caption reads `leaning {side} · {state}` (+ `confirms`/`diverging`
+when spot has moved enough to check, + `held Nm` once committed, via the same
+`fmtHeld` helper as Session Flow). This is a **relative-value lean, not a
+forecast** — it tells you where premium is currently being bid between the two
+structures and whether real price agrees yet, not which way price will go from
+here. A counter side that's richening, **committed**, and **confirmed by price**
+while you're about to send the other side is the exact "don't-enter-blind" case
+this was built for; use it to adjust strikes/distance, not as a standalone signal.
+
+> **Note — an earlier version of this section warned "selling the richer side might
+> be riskier" for credit pairs.** That framing was dropped: it only holds when the
+> richness is being driven by real, adverse price movement, and richness can just as
+> easily be rising because price is moving *favorably* for that side (elevated but
+> aligned with the trend) — in which case "riskier" was backwards, and in one
+> observed case actively talked a good, price-confirmed entry out of being taken.
+> Confirms/diverging (above) replaces it — a neutral read of agreement, not an
+> instruction to avoid anything.
 
 **Placement.** The band sits in the previously-empty space beside the Limit
 Price/Qty/TIF/auto-close controls and the Send row, inside the order-builder panel

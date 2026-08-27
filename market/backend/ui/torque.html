@@ -278,6 +278,7 @@ function App(){
   const counterEmaRef=useRef(null);                 // smoothed ratio 0..1, null until first sample
   const counterTsRef=useRef(0);                     // ms timestamp of the last EMA update
   const counterHoldRef=useRef({side:0,since:0});    // +1 leaning current / -1 leaning counter / 0 contested
+  const spotBufRef=useRef([]);                      // {t,spot} samples, pruned to TREND_WINDOW_MS — real price, not premium
   const [counterRead,setCounterRead]=useState(null);
   const [limit,setLimit]=useState('');
   const [userLimit,setUserLimit]=useState(false);
@@ -343,10 +344,24 @@ function App(){
         // Counter Read: piggybacks on this same 3s tick — no separate poll. A time-based
         // EMA (tau=15s) smooths bid/ask jitter on the ratio; the hold-timer (mirrors
         // sessionFlow's flipRef pattern) tracks how long it's stayed off-center for color.
+        // Commit threshold is 20s, not the original 60s: observed live, a real richness
+        // lean can be validated by price in ~15-20s — a 60s hold meant "committed" (the
+        // trustworthy, solid state) routinely arrived AFTER the move it was flagging,
+        // leaving the actionable signal stuck looking tentative ("building") the whole
+        // time it mattered.
         const sides=cfg?counterSides(strategy,cfg.strategies,b):null;
+        const now=Date.now();
+        // Real spot-price trend — independent of any premium/OI/volume data (unlike
+        // Lean), same ~20s window as the EMA, so the two are describing the same
+        // moment. Pruned every tick regardless of whether `sides` resolved, so the
+        // buffer stays live even on a tick where Counter Read itself can't compute.
+        if(b.spot>0){
+          const buf=spotBufRef.current.filter(s=>now-s.t<TREND_WINDOW_MS);
+          buf.push({t:now,spot:b.spot});
+          spotBufRef.current=buf;
+        }
         if(sides){
           const ratio=sides.aRichness/(sides.aRichness+sides.bRichness);
-          const now=Date.now();
           const prevEma=counterEmaRef.current;
           const prevTs=counterTsRef.current;
           const ema=(prevEma==null)?ratio:prevEma+(ratio-prevEma)*(1-Math.exp(-(now-prevTs)/15000));
@@ -354,8 +369,10 @@ function App(){
           const sd=ema>0.58?1:ema<0.42?-1:0;
           if(sd!==counterHoldRef.current.side)counterHoldRef.current={side:sd,since:now};
           const heldMs=sd!==0?now-counterHoldRef.current.since:0;
-          const state=sd===0?'contested':heldMs>=60000?'committed':'building';
-          setCounterRead({...sides,ratio:ema,side:sd,state,heldMs});
+          const state=sd===0?'contested':heldMs>=20000?'committed':'building';
+          const dir=sd>0?sides.aDir:sd<0?sides.bDir:null;
+          const tag=priceTag(dir,spotTrend(spotBufRef.current));
+          setCounterRead({...sides,ratio:ema,side:sd,state,heldMs,tag});
         }
       })
       .catch(e=>{setErr('build: '+e.message);setBuild(null)});
@@ -410,7 +427,8 @@ function App(){
 
   // reset the flow windows on ticker change ONLY — not when the market closes, so
   // the session flow freezes in place at the close instead of getting wiped.
-  useEffect(()=>{flowBuf.current=[];prevRaw.current=null;flipRef.current={side:0,since:0};setFlow(null);setSess(null);},[ticker]);
+  useEffect(()=>{flowBuf.current=[];prevRaw.current=null;flipRef.current={side:0,since:0};setFlow(null);setSess(null);
+    spotBufRef.current=[];},[ticker]);   // spot trend is a ticker property, not a strategy one — don't wipe it on a strategy switch
 
   // analysis poll 5s — paused outside market hours (options data stops after 4pm ET)
   useEffect(()=>{
@@ -646,7 +664,8 @@ function App(){
             </div>
           </div>
           {counterRead&&<div className={"counterband "+counterRead.state+(counterRead.state==='committed'?(' c-'+(counterRead.side>0?counterRead.aSide:counterRead.bSide)):'')}
-            title="Counter Read — relative richness vs the opposite structure, priced from the same chain/spot. A rich, committed counter side is a cue to adjust strikes/distance before you send — this is a relative-value lean, not a forecast.">
+            title="Counter Read — relative richness vs the opposite structure, priced from the same chain/spot. 'confirms (price)' means real spot movement over the last ~20s agrees with the richness lean; 'diverging (price)' means it doesn't (yet) — spot, not Lean, since Lean is itself built from options-chain data, not price. A rich, committed counter side is a cue to adjust strikes/distance before you send — this is a relative-value lean, not a forecast.">
+
             <div className="cband-row">
               <span className={"cband-lab "+counterRead.aSide}>{counterRead.aLabel}</span>
               <span className={"cband-lab "+counterRead.bSide} style={{textAlign:'right'}}>{counterRead.bLabel}</span>
@@ -656,21 +675,32 @@ function App(){
                 pulls the dot LEFT toward aLabel, low ratio (B richer) pushes it RIGHT
                 toward bLabel. ratio*100 directly was backwards — dot landed next to
                 the label with LESS richness. */}
+            {/* The on-dot number must equal the SAME value driving `left` — showing
+                "dominance %" (always >=50, whichever side is winning) instead made
+                the text and the position disagree: a 64% dominance number could sit
+                at either end depending on which side won, so a high number visually
+                looked like it was "coming from the right" even when the dot was near
+                the LEFT (aLabel) side. Showing the position itself means the number
+                always matches where the dot sits: low = toward aLabel, high = toward
+                bLabel, ~50 = center/contested — read the caption text for WHICH side
+                that is, the number is purely "how far across from A to B." */}
             <div className="cband-bar"><i style={{left:((1-counterRead.ratio)*100)+'%'}}>
-              {Math.round((counterRead.ratio>=0.5?counterRead.ratio:1-counterRead.ratio)*100)}%</i></div>
+              {Math.round((1-counterRead.ratio)*100)}%</i></div>
             <div className="cband-row muted" style={{fontSize:10,marginTop:3}}>
               <span>{fmt(counterRead.aMid)}</span>
               <span style={{marginLeft:'auto'}}>{fmt(counterRead.bMid)}</span>
             </div>
             <div className="muted" style={{fontSize:10,marginTop:3}}>
               leaning {counterRead.side===0?'neither':(counterRead.side>0?counterRead.aLabel:counterRead.bLabel)} · {counterRead.state}
-              {/* Credit pairs (Bull Put/Bear Call, and the IC/Iron-Fly wing split — both
-                  are credit too): the richer side is where premium is dangerous to SELL
-                  into, not a cue to sell it — flag that, since it's the opposite reading
-                  from a debit pair (there, the richer side IS the trade). No warning while
-                  contested (side===0, no lean to warn about) or on debit pairs. */}
-              {counterRead.isCredit&&counterRead.side!==0&&
-                <span style={{color:'var(--warn)'}}> (selling {(counterRead.side>0?counterRead.aLabel:counterRead.bLabel).toLowerCase()} might be riskier)</span>}
+              {/* Whichever side richness favors has its own structural bull/bear bias
+                  (definitional — e.g. a bull put spread wins if price stays up; not
+                  measured from any data). Compare that to REAL spot movement (not Lean,
+                  which is itself options-chain-derived, not price) over the same ~20s
+                  window as the EMA. Same confirms/diverging words as the Positioning
+                  panel's flow tag, applied here instead. No tag while contested (no lean
+                  to check) or while spot hasn't moved enough to call a trend yet. */}
+              {counterRead.tag&&<span style={{color:counterRead.tag==='confirms'?'var(--good)':'var(--warn)'}}>
+                {' · '+counterRead.tag+' (price)'}</span>}
               {counterRead.state==='committed'?' · held '+fmtHeld(counterRead.heldMs):''}
             </div>
           </div>}
@@ -1023,18 +1053,46 @@ function counterSides(strategyKey,strategies,b){
     if(putLegs.length<2||callLegs.length<2)return null;
     const aR=_richness(putLegs), bR=_richness(callLegs);
     if(aR==null||bR==null||(aR+bR)<=0)return null;
-    return {aLabel:'Put side',aSide:'put',aMid:_sideMid(putLegs),
-            bLabel:'Call side',bSide:'call',bMid:_sideMid(callLegs),aRichness:aR,bRichness:bR,
-            isCredit:sdef.type==='credit'};
+    // Put wing profits if price holds ABOVE it (bull-aligned, same as Bull Put);
+    // call wing profits if price holds BELOW it (bear-aligned, same as Bear Call).
+    return {aLabel:'Put side',aSide:'put',aMid:_sideMid(putLegs),aDir:'bull',
+            bLabel:'Call side',bSide:'call',bMid:_sideMid(callLegs),bDir:'bear',
+            aRichness:aR,bRichness:bR};
   }
   if(!b.counter||!b.counter.price||!b.counter.price.complete)return null;
   const cdef=strategies.find(s=>s.key===b.counter.strategy);
   if(!cdef)return null;
   const aR=_richness(b.price.legs), bR=_richness(b.counter.price.legs);
   if(aR==null||bR==null||(aR+bR)<=0)return null;
-  return {aLabel:sdef.short||sdef.name,aSide:sdef.side,aMid:b.price.abs_mid,
-          bLabel:cdef.short||cdef.name,bSide:cdef.side,bMid:b.counter.price.abs_mid,
-          aRichness:aR,bRichness:bR,isCredit:sdef.type==='credit'};
+  return {aLabel:sdef.short||sdef.name,aSide:sdef.side,aMid:b.price.abs_mid,aDir:sdef.dir,
+          bLabel:cdef.short||cdef.name,bSide:cdef.side,bMid:b.counter.price.abs_mid,bDir:cdef.dir,
+          aRichness:aR,bRichness:bR};
+}
+// Real, independent check on the richness lean: is the underlying's OWN price
+// actually moving the way that lean implies? `spotBuf` is a plain array of
+// {t,spot} samples (already pruned to the trend window by the caller) — this
+// is the raw Yahoo/parity spot, NOT derived from any option premium/OI/volume,
+// so comparing against it is a genuine price-action check, unlike Lean (which
+// is itself 40% volume + 30% skew + 30% OI — all options-chain data, not price).
+// DEADBAND filters tick-to-tick spot noise from being read as a "trend."
+const TREND_WINDOW_MS=20000;          // same ballpark as the richness EMA's 15s tau
+const TREND_DEADBAND_PCT=0.0004;      // ~0.04% of spot over the window
+function spotTrend(spotBuf){
+  if(!spotBuf||spotBuf.length<2)return 'flat';
+  const oldest=spotBuf[0].spot, newest=spotBuf[spotBuf.length-1].spot;
+  if(!(oldest>0))return 'flat';
+  const pct=(newest-oldest)/oldest;
+  return pct>TREND_DEADBAND_PCT?'up':pct<-TREND_DEADBAND_PCT?'down':'flat';
+}
+// Confirms/diverging between the richness lean and REAL price movement — same
+// vocabulary as the Positioning panel's flow tag, applied here to the counter
+// band instead. `dir` is the leaning side's own bull/bear bias (structural —
+// see counterSides); `trend` is `spotTrend()`'s output. No tag while flat
+// (nothing to confirm/diverge from yet) or while the band itself is contested.
+function priceTag(dir,trend){
+  if(trend==='flat'||!dir)return null;
+  const bull=trend==='up', matches=(dir==='bull')===bull;
+  return matches?'confirms':'diverging';
 }
 // snapshot → playable structure (simple map, not a conviction engine). Balanced
 // splits on the magnet: tight near-spot OI pin → iron fly, otherwise iron condor.

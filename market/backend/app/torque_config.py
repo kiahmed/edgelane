@@ -28,16 +28,22 @@ from typing import Any
 # ── Strategy registry ──────────────────────────────────────────────────────
 # Order here is the display order in the strategy selector. Default = bull_call.
 STRATEGY_DEFS: dict[str, dict[str, Any]] = {
-    "long_call":   {"name": "Long Call",   "short": "Long Call",   "kind": "single",    "type": "debit",  "side": "call", "legs": 1},
-    "long_put":    {"name": "Long Put",    "short": "Long Put",    "kind": "single",    "type": "debit",  "side": "put",  "legs": 1},
+    # "dir" (bull/bear) is the strategy's OWN structural bias — used by the frontend's
+    # Counter Read confirms/diverging check (compared against real spot trend, not
+    # data-derived). Every strategy needs it, not just the verticals: a long call is
+    # just as structurally bullish as a bull call spread, it just used to be missing
+    # here — leaving Counter Read's tag silently dark on Long Call (the DEFAULT
+    # strategy), Long Put, Call Fly, and Put Fly.
+    "long_call":   {"name": "Long Call",   "short": "Long Call",   "kind": "single",    "type": "debit",  "side": "call", "dir": "bull", "legs": 1},
+    "long_put":    {"name": "Long Put",    "short": "Long Put",    "kind": "single",    "type": "debit",  "side": "put",  "dir": "bear", "legs": 1},
     "bull_call":   {"name": "Bull Call",   "short": "Bull Call",   "kind": "vertical",  "type": "debit",  "side": "call", "dir": "bull", "legs": 2},
     "bear_put":    {"name": "Bear Put",    "short": "Bear Put",    "kind": "vertical",  "type": "debit",  "side": "put",  "dir": "bear", "legs": 2},
     "bull_put":    {"name": "Bull Put",    "short": "Bull Put",    "kind": "vertical",  "type": "credit", "side": "put",  "dir": "bull", "legs": 2},
     "bear_call":   {"name": "Bear Call",   "short": "Bear Call",   "kind": "vertical",  "type": "credit", "side": "call", "dir": "bear", "legs": 2},
     "iron_condor": {"name": "Iron Condor", "short": "Iron Condor", "kind": "condor",    "type": "credit", "side": "both", "legs": 4},
     "iron_fly":    {"name": "Iron Fly",    "short": "Iron Fly",    "kind": "iron_fly",  "type": "credit", "side": "both", "legs": 4},
-    "call_fly":    {"name": "Call Butterfly", "short": "Call Fly", "kind": "butterfly", "type": "debit",  "side": "call", "legs": 3},
-    "put_fly":     {"name": "Put Butterfly",  "short": "Put Fly",  "kind": "butterfly", "type": "debit",  "side": "put",  "legs": 3},
+    "call_fly":    {"name": "Call Butterfly", "short": "Call Fly", "kind": "butterfly", "type": "debit",  "side": "call", "dir": "bull", "legs": 3},
+    "put_fly":     {"name": "Put Butterfly",  "short": "Put Fly",  "kind": "butterfly", "type": "debit",  "side": "put",  "dir": "bear", "legs": 3},
 }
 
 # Each directional single/vertical/butterfly strategy has a natural opposite —
