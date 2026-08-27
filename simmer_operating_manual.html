@@ -150,6 +150,7 @@
     </li>
     <li><a href="#score">The tradeability score</a></li>
     <li><a href="#catalysts">Catalysts: earnings &amp; macro</a></li>
+    <li><a href="#news-page">Reading the news &amp; sentiment page</a></li>
     <li><a href="#config">Configuration</a></li>
     <li><a href="#deploy">Deploy &amp; update</a></li>
     <li><a href="#trouble">Troubleshooting</a></li>
@@ -532,6 +533,42 @@
       play — never hold a credit spread through the print. The analyzer's real value is the <strong>no-go</strong>
       (avoid selling into a guidance-cut / scandal narrative), and side selection (bullish → bull put, bearish →
       bear call). Simmer is not a direction forecaster — see <code>docs/simmer_earnings.md</code> for the phased plan.</p>
+    </div>
+
+    <h3 id="news-page">News &amp; Sentiment page — how to read it</h3>
+    <p>Reached from the <em>“news &amp; sentiment for {SYM}”</em> link on any card. It is a <strong>read-only view</strong>
+    of already-scored data — opening it makes <strong>no new Gemini call</strong>. Headlines link out to the publisher;
+    bodies are never republished (we score, we don't reprint).</p>
+    <table>
+      <tr><th>Element</th><th>What it is</th></tr>
+      <tr><td><strong>Per-article score</strong> (signed, right of each headline, e.g. <code>+0.62</code>)</td>
+        <td>Gemini's sentiment for <strong>this named symbol</strong> on that one headline, <code>−1.00 … +1.00</code>
+        (entity-aware: a story bullish for one company can be neutral for another it merely mentions). Green &gt; +0.15,
+        rose &lt; −0.15, else slate; <code>—</code> = unscored. The coloured dot on the left is just the sign of the
+        same number. Scored <strong>once at ingestion</strong> and cached by article id — never re-scored.</td></tr>
+      <tr><td><strong>×N breadth badge</strong></td><td>How many outlets carried the same wire story (deduped into one
+        cluster). Breadth is the signal, repetition is not; the article score shown is the mean across those N outlets.</td></tr>
+      <tr><td><strong>Top NET pill</strong> (e.g. <code>+0.43 POSITIVE&nbsp;n=65</code>)</td>
+        <td>A <strong>separate, broader trailing aggregate</strong> from the research cache over the whole scored set
+        (<code>n</code> = article count), <strong>not</strong> the mean of the rows on screen (different sample and
+        weighting) — so the visible numbers won't average to it.</td></tr>
+      <tr><td><strong>velocity chip</strong></td><td>News-flow burst test vs <em>this name's own</em> baseline
+        (negative-binomial). <code>alert</code>/<code>warn</code> = unusually heavy flow — unpriced uncertainty, which
+        suppresses the sentiment component regardless of direction.</td></tr>
+    </table>
+    <div class="callout">
+      <p class="h">When does the NET move?</p>
+      <p class="small" style="margin:0">Only when the <strong>scored set changes</strong> — a new article gets scored,
+      or old ones age out of the trailing 24h window. No new/expiring stories → the number holds, even across sweeps.
+      The refresh is gated by the news TTL (~15&nbsp;min), independent of the readiness sweep cadence. And <strong>“no
+      news” is not neutral</strong> — an empty window is its own signal, shown distinctly from a balanced 0.0.</p>
+    </div>
+    <div class="callout warn">
+      <p class="h">Sentiment never <em>promotes</em></p>
+      <p class="small" style="margin:0">However positive, sentiment cannot lift a name to “ready” — it only picks a side
+      (bullish → bull put, bearish → bear call) or <strong>suppresses/vetoes</strong>. It's the smallest composite
+      weight (<code>0.05</code>, the <code>sentiment_lean</code> component). Use this page to understand <em>why</em> a
+      name leans, not as a buy signal on its own.</p>
     </div>
 
     <h3><code>macro_calendar.json</code></h3>

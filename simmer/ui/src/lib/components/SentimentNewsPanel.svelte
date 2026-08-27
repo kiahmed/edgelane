@@ -44,6 +44,14 @@
 
 	const sentDot = (s: number | null) =>
 		s == null ? 'bg-slate-500' : s > 0.15 ? 'bg-emerald-400' : s < -0.15 ? 'bg-rose-400' : 'bg-slate-400';
+
+	// Per-article LLM score, surfaced as a signed number so the mechanics are
+	// visible (the top NET is a separate trailing aggregate, not the mean of
+	// these). Colour by sign; en-dash for a genuine negative sign.
+	const scoreClass = (s: number | null) =>
+		s == null ? 'text-slate-600' : s > 0.15 ? 'text-emerald-300' : s < -0.15 ? 'text-rose-300' : 'text-slate-400';
+	const fmtSigned = (s: number | null) =>
+		s == null ? '—' : (s >= 0 ? '+' : '−') + Math.abs(s).toFixed(2);
 </script>
 
 <div class="card p-4">
@@ -97,6 +105,13 @@
 							>×{c.breadth}</span
 						>
 					{/if}
+					<span
+						class="shrink-0 w-11 text-right font-mono text-[0.7rem] {scoreClass(c.sentiment)}"
+						title={c.sentiment == null
+							? 'unscored'
+							: `LLM article sentiment ${c.sentiment.toFixed(2)} (−1 … +1)${c.breadth > 1 ? ' · mean across ' + c.breadth + ' outlets' : ''}`}
+						>{fmtSigned(c.sentiment)}</span
+					>
 					<span class="shrink-0 text-[0.65rem] text-slate-500">{c.source ?? ''}</span>
 					<span class="shrink-0 text-[0.65rem] text-slate-600">{ago(c.published_at)}</span>
 				</div>
