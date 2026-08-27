@@ -465,6 +465,86 @@ so the tool stays testable off-hours (mirrors the backend's DEVMODE gating). Not
 Torque is **stateless** — none of this is persisted; it holds no DuckDB, unlike the
 market poller/evaluator.
 
+### Layer 4 — Counter Read (relative richness vs the opposite structure)
+
+Everything above reads the market. **Counter Read reads the *other side of your own
+trade*** — a live band, in the order-builder panel itself, showing whether premium
+is leaning toward the structure you're building or its natural opposite, so a
+richening counter-side shows up **before** you send, not after you're already in
+the wrong one.
+
+**Why this isn't redundant with put-call parity.** A vertical and its mirror at the
+*identical* strikes are locked together by conversion arbitrage — one side richening
+necessarily cheapens the other by the same amount, so comparing them would carry no
+information beyond what one side's mid already tells you. Torque's counter side
+uses its **own independently-configured strikes** (call-side and put-side offsets
+are configured separately per ticker), so the two sides are priced off genuinely
+separate parts of the chain — this is a live, delta-matched **risk-reversal** read
+(the same skew concept behind the Premium skew tile), not an identity.
+
+**Pairing** — every strategy has exactly one counter, same "shape," opposite side.
+Iron Condor / Iron Fly have no separate counter build — both wings are already in
+the structure, so the comparison is *within* the trade, not against another one:
+
+| Current | Counter |
+|---|---|
+| Long Call | Long Put |
+| Bull Call | Bear Put |
+| Bull Put | Bear Call |
+| Call Fly | Put Fly |
+| Iron Condor | *(self)* bear-call wing vs bull-put wing |
+| Iron Fly | *(self)* call wing vs put wing |
+
+**Data source — no separate poll.** `POST /torque/build` returns a `counter` field
+alongside the primary structure: the opposite strategy's `legs` + `price`, built
+from the **same already-fetched chain and the same anchor spot** as the primary
+build (`null` for Iron Condor/Fly, where both wings are already in `legs`). Counter
+Read piggybacks on the **existing 3s rebuild** — it is not a new timer, new request,
+or new poll cadence; it just reads one more field off the response that already
+arrives every tick.
+
+**Richness (per side).** For a 2+-leg side: `abs(Σ signed leg mids) / width` — width
+is the strike distance within that side (near↔far, or wing body↔wing), which makes
+a $2 mid on a 10-pt spread and $18 on a 100-pt spread comparable. For a single-leg
+side (Long Call vs Long Put): richness is just that leg's raw mid — nothing to
+normalize against. A side with a missing/incomplete leg quote or zero width skips
+that tick and holds its last good reading (same "never show a partial number"
+convention as the net price card).
+
+**Band position — an instant ratio, lightly smoothed.** `ratio = richness(current) /
+(richness(current) + richness(counter))`, 0.5 = balanced. This is a **level**, not
+an accumulation — the mid prices behind it don't carry the print-spike noise volume
+flow does — so it does **not** use the Session Flow's 3-minute bucket scheme. It
+uses a short time-based EMA (**τ ≈ 15s**) to kill bid/ask jitter, giving a slider
+that's near-live without dancing on every tick.
+
+**Color — a continuous hold-timer since the ratio last crossed center**, the same
+flip-timer pattern as Session Flow's `held`, adapted to a continuous value instead
+of window-counting:
+- **± 8 points of 50%** (42–58%) → **contested**, amber & pulsing — too close to
+  center to trust a side.
+- **outside that band, held < 60s** → **building**, amber steady — leaning, not
+  yet trusted.
+- **outside that band, held ≥ 60s** → **committed**, solid — colored by **option
+  side**, the same call=green/put=red convention used everywhere else in Torque
+  (leg badges, the skew tile) — *not* a bullish/bearish framing, since a credit
+  side's side-label (e.g. Bull Put is a *put* structure) doesn't always match its
+  directional bias.
+- Resets on ticker/strategy change, same as the other flow state.
+
+**Reading it.** Caption reads `leaning {side} · {state}` (+ `held Nm` once
+committed, via the same `fmtHeld` helper as Session Flow). This is a **relative-value
+lean, not a forecast** — it tells you where premium is currently being bid between
+the two structures, not which way price will go. A counter side that's richening
+and **committed** while you're about to send the other side is the exact
+"don't-enter-blind" case this was built for; use it to adjust strikes/distance, not
+as a standalone signal.
+
+**Placement.** The band sits in the previously-empty space beside the Limit
+Price/Qty/TIF/auto-close controls and the Send row, inside the order-builder panel
+— it does not add a row, does not resize or reflow the existing controls, and is
+hidden below a narrow-viewport breakpoint rather than wrapping underneath them.
+
 ### The other tiles & levels
 
 - **Session flow replaced the `Volume P/C` + `OI P/C` tiles.** `OI P/C` was
@@ -587,7 +667,7 @@ Anchoring model (points from spot, snapped to the chain grid):
 | `GET /torque/config` | tickers + strategy registry + env/mode |
 | `GET /torque/clock` | `{market_state, open}` from Yahoo `marketState` (holiday/early-close aware; cached ~30s success / ~8s failure so an outage doesn't re-hit each poll) — gates the pause |
 | `GET /torque/analyze/{sym}` | spot + positioning snapshot (poll ~5s) |
-| `POST /torque/build` | auto-filled legs for (ticker, strategy, step adjustments); optional `anchor_spot` freezes the strikes (Lock Strikes) |
+| `POST /torque/build` | auto-filled legs for (ticker, strategy, step adjustments); optional `anchor_spot` freezes the strikes (Lock Strikes); also returns `counter` — the opposite structure's legs+price from the same chain/spot, `null` for Iron Condor/Fly (see [Counter Read](#layer-4--counter-read-relative-richness-vs-the-opposite-structure)) |
 | `POST /torque/price` | live net bid/mid/ask for a set of legs (poll ~2.5s) |
 | `POST /torque/place` | submit entry; arm background fill-watch + auto-close (`confirm:true`) |
 | `GET /torque/order/{id}` | single order status |

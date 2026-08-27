@@ -40,6 +40,20 @@ STRATEGY_DEFS: dict[str, dict[str, Any]] = {
     "put_fly":     {"name": "Put Butterfly",  "short": "Put Fly",  "kind": "butterfly", "type": "debit",  "side": "put",  "legs": 3},
 }
 
+# Each directional single/vertical/butterfly strategy has a natural opposite —
+# same "shape" (single/vertical/butterfly), independently-configured strikes on
+# the other side (NOT a mirror at the same strikes, which would be arbitrage-
+# locked by put-call parity and carry no separate signal). Used by /torque/build
+# to also return the counter structure's pricing for a live relative-richness
+# read. Iron Condor/Iron Fly have no entry — both wings are already in their own
+# `legs`, so that comparison is done client-side from the single response.
+COUNTER_STRATEGY: dict[str, str] = {
+    "long_call": "long_put", "long_put": "long_call",
+    "bull_call": "bear_put", "bear_put": "bull_call",
+    "bull_put": "bear_call", "bear_call": "bull_put",
+    "call_fly": "put_fly",   "put_fly": "call_fly",
+}
+
 DEFAULT_STRATEGY = "bull_call"
 
 # ── Per-ticker offsets ─────────────────────────────────────────────────────

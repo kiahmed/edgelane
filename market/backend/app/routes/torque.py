@@ -425,12 +425,31 @@ async def torque_build(req: BuildRequest, request: Request):
     for lg in struct["legs"]:
         lg["grid"] = _grid_neighbors(contracts, lg["side"], lg["strike"])
     missing = [lg["role"] for lg in struct["legs"] if not lg.get("symbol")]
+    # Relative-richness read: also price the natural opposite structure (own
+    # independently-configured strikes, not a mirror at the same strikes — see
+    # COUNTER_STRATEGY) off this SAME already-fetched chain/anchor, so both
+    # sides are guaranteed from one consistent snapshot instead of two calls
+    # that could straddle a spot tick. Best-effort: any failure here must never
+    # break the primary build the user is actually trying to place.
+    counter = None
+    counter_key = tcfg.COUNTER_STRATEGY.get(req.strategy)
+    if counter_key:
+        try:
+            c_struct = teng.build_structure(anchor, contracts, req.symbol, counter_key, {})
+            c_price = teng.price_structure(c_struct["legs"], px_map)
+            counter = {
+                "strategy": counter_key, "name": c_struct["name"], "type": c_struct["type"],
+                "legs": c_struct["legs"], "price": c_price,
+            }
+        except Exception:
+            log.warning("counter build failed for %s -> %s", req.strategy, counter_key, exc_info=True)
     return {
         "symbol": req.symbol.upper(), "expiration": exp, "spot": spot,
         "strategy": req.strategy, "name": struct["name"], "type": struct["type"],
         "legs": struct["legs"], "price": price, "tick": tick,
         "suggested_limit": teng.suggested_limit(price, tick),
         "missing_legs": missing,
+        "counter": counter,
     }
 
 

@@ -112,6 +112,47 @@ async def test_build_rejects_unknown_strategy():
     assert e.value.status_code == 400
 
 
+async def test_build_returns_priced_counter_for_directional_strategies():
+    # bull_call's natural opposite is bear_put — own independently-configured
+    # strikes (not a mirror at the same strikes), priced off the SAME chain/spot
+    # as the primary build so both sides read from one consistent snapshot.
+    b = await torque_build(BuildRequest(symbol="NDX", strategy="bull_call"), FakeRequest(FakeTradier()))
+    assert b["counter"] is not None
+    assert b["counter"]["strategy"] == "bear_put"
+    assert len(b["counter"]["legs"]) == 2 and all(l["symbol"] for l in b["counter"]["legs"])
+    assert b["counter"]["price"]["complete"] is True
+    # primary build is untouched by the counter's presence
+    assert b["strategy"] == "bull_call" and b["missing_legs"] == []
+
+
+async def test_build_counter_mapping_is_symmetric_both_directions():
+    fwd = await torque_build(BuildRequest(symbol="NDX", strategy="bear_call"), FakeRequest(FakeTradier()))
+    back = await torque_build(BuildRequest(symbol="NDX", strategy="bull_put"), FakeRequest(FakeTradier()))
+    assert fwd["counter"]["strategy"] == "bull_put"
+    assert back["counter"]["strategy"] == "bear_call"
+
+
+async def test_build_counter_absent_for_iron_condor_and_iron_fly():
+    # both wings already live in `legs` for these — no separate counter build.
+    ic = await torque_build(BuildRequest(symbol="NDX", strategy="iron_condor"), FakeRequest(FakeTradier()))
+    fly = await torque_build(BuildRequest(symbol="NDX", strategy="iron_fly"), FakeRequest(FakeTradier()))
+    assert ic["counter"] is None and fly["counter"] is None
+
+
+async def test_build_counter_failure_does_not_break_primary_build(monkeypatch):
+    # a broken counter build must degrade to counter=None, never take down the
+    # primary structure the user is actually trying to place.
+    real_build = troute.teng.build_structure
+    def _boom(spot, contracts, symbol, strategy, adjustments=None):
+        if strategy == "bear_put":
+            raise RuntimeError("boom")
+        return real_build(spot, contracts, symbol, strategy, adjustments)
+    monkeypatch.setattr(troute.teng, "build_structure", _boom)
+    b = await torque_build(BuildRequest(symbol="NDX", strategy="bull_call"), FakeRequest(FakeTradier()))
+    assert b["counter"] is None
+    assert b["strategy"] == "bull_call" and b["missing_legs"] == [] and b["price"]["complete"] is True
+
+
 async def test_price_endpoint():
     legs, _ = await _build_legs(FakeTradier(), "NDX", "bull_call")
     p = await torque_price(PriceRequest(legs=legs), FakeRequest(FakeTradier()))
