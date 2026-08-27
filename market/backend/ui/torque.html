@@ -105,8 +105,10 @@
   .counterband .cband-row{display:flex;justify-content:space-between;gap:8px;font-size:11px;font-weight:700}
   .counterband .cband-lab.call{color:var(--call)}
   .counterband .cband-lab.put{color:var(--put)}
-  .cband-bar{position:relative;height:6px;border-radius:3px;background:var(--line2);margin-top:6px}
-  .cband-bar i{position:absolute;top:-3px;width:12px;height:12px;border-radius:50%;background:var(--dim);
+  .cband-bar{position:relative;height:6px;border-radius:3px;background:var(--line2);margin-top:10px;margin-bottom:10px}
+  .cband-bar i{position:absolute;top:-9px;width:24px;height:24px;border-radius:50%;background:var(--dim);
+    display:flex;align-items:center;justify-content:center;font-style:normal;font-size:8.5px;font-weight:800;
+    letter-spacing:-.3px;color:#0a0e14;line-height:1;box-shadow:0 0 0 2px var(--panel2);
     transform:translateX(-50%);transition:left .4s,background .4s}
   .counterband.contested .cband-bar i{background:var(--warn);animation:pulse 1.1s infinite}
   .counterband.building .cband-bar i{background:var(--warn)}
@@ -649,13 +651,26 @@ function App(){
               <span className={"cband-lab "+counterRead.aSide}>{counterRead.aLabel}</span>
               <span className={"cband-lab "+counterRead.bSide} style={{textAlign:'right'}}>{counterRead.bLabel}</span>
             </div>
-            <div className="cband-bar"><i style={{left:(counterRead.ratio*100)+'%'}}></i></div>
+            {/* aLabel sits left, bLabel sits right (row above) — dot must move toward
+                whichever side is richer, so it's (1-ratio): high ratio (A richer)
+                pulls the dot LEFT toward aLabel, low ratio (B richer) pushes it RIGHT
+                toward bLabel. ratio*100 directly was backwards — dot landed next to
+                the label with LESS richness. */}
+            <div className="cband-bar"><i style={{left:((1-counterRead.ratio)*100)+'%'}}>
+              {Math.round((counterRead.ratio>=0.5?counterRead.ratio:1-counterRead.ratio)*100)}%</i></div>
             <div className="cband-row muted" style={{fontSize:10,marginTop:3}}>
               <span>{fmt(counterRead.aMid)}</span>
               <span style={{marginLeft:'auto'}}>{fmt(counterRead.bMid)}</span>
             </div>
             <div className="muted" style={{fontSize:10,marginTop:3}}>
               leaning {counterRead.side===0?'neither':(counterRead.side>0?counterRead.aLabel:counterRead.bLabel)} · {counterRead.state}
+              {/* Credit pairs (Bull Put/Bear Call, and the IC/Iron-Fly wing split — both
+                  are credit too): the richer side is where premium is dangerous to SELL
+                  into, not a cue to sell it — flag that, since it's the opposite reading
+                  from a debit pair (there, the richer side IS the trade). No warning while
+                  contested (side===0, no lean to warn about) or on debit pairs. */}
+              {counterRead.isCredit&&counterRead.side!==0&&
+                <span style={{color:'var(--warn)'}}> (selling {(counterRead.side>0?counterRead.aLabel:counterRead.bLabel).toLowerCase()} might be riskier)</span>}
               {counterRead.state==='committed'?' · held '+fmtHeld(counterRead.heldMs):''}
             </div>
           </div>}
@@ -1009,7 +1024,8 @@ function counterSides(strategyKey,strategies,b){
     const aR=_richness(putLegs), bR=_richness(callLegs);
     if(aR==null||bR==null||(aR+bR)<=0)return null;
     return {aLabel:'Put side',aSide:'put',aMid:_sideMid(putLegs),
-            bLabel:'Call side',bSide:'call',bMid:_sideMid(callLegs),aRichness:aR,bRichness:bR};
+            bLabel:'Call side',bSide:'call',bMid:_sideMid(callLegs),aRichness:aR,bRichness:bR,
+            isCredit:sdef.type==='credit'};
   }
   if(!b.counter||!b.counter.price||!b.counter.price.complete)return null;
   const cdef=strategies.find(s=>s.key===b.counter.strategy);
@@ -1018,7 +1034,7 @@ function counterSides(strategyKey,strategies,b){
   if(aR==null||bR==null||(aR+bR)<=0)return null;
   return {aLabel:sdef.short||sdef.name,aSide:sdef.side,aMid:b.price.abs_mid,
           bLabel:cdef.short||cdef.name,bSide:cdef.side,bMid:b.counter.price.abs_mid,
-          aRichness:aR,bRichness:bR};
+          aRichness:aR,bRichness:bR,isCredit:sdef.type==='credit'};
 }
 // snapshot → playable structure (simple map, not a conviction engine). Balanced
 // splits on the magnet: tight near-spot OI pin → iron fly, otherwise iron condor.
