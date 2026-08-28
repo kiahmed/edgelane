@@ -102,18 +102,14 @@
   .sendrow{display:flex;gap:10px;align-items:flex-end;margin-top:16px;flex-wrap:wrap}
   .counterband{flex:1 1 160px;min-width:0;overflow:hidden;align-self:stretch;
     background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
-  .counterband .cband-row{display:flex;justify-content:space-between;gap:8px;font-size:11px;font-weight:700}
-  .counterband .cband-lab.call{color:var(--call)}
-  .counterband .cband-lab.put{color:var(--put)}
-  .cband-bar{position:relative;height:6px;border-radius:3px;background:var(--line2);margin-top:10px;margin-bottom:10px}
-  .cband-bar i{position:absolute;top:-9px;width:24px;height:24px;border-radius:50%;background:var(--dim);
-    display:flex;align-items:center;justify-content:center;font-style:normal;font-size:8.5px;font-weight:800;
-    letter-spacing:-.3px;color:#0a0e14;line-height:1;box-shadow:0 0 0 2px var(--panel2);
-    transform:translateX(-50%);transition:left .4s,background .4s}
-  .counterband.contested .cband-bar i{background:var(--warn);animation:pulse 1.1s infinite}
-  .counterband.building .cband-bar i{background:var(--warn)}
-  .counterband.committed.c-call .cband-bar i{background:var(--call)}
-  .counterband.committed.c-put .cband-bar i{background:var(--put)}
+  .cband-name{font-size:13px;font-weight:800;line-height:1.3}
+  .cband-bar2{position:relative;height:8px;border-radius:4px;background:var(--line2);margin-top:8px;overflow:visible}
+  .cband-bar2 i{position:absolute;left:0;top:0;height:100%;border-radius:4px;background:var(--dim);
+    transition:width .4s,background .4s}
+  .cband-bar2 i.green{background:var(--call)}
+  .cband-bar2 i.red{background:var(--put)}
+  .cband-bar2 i.grey{background:var(--warn);animation:pulse 1.1s infinite}
+  .cband-tick{position:absolute;top:-2px;width:1px;height:12px;background:var(--dim2);opacity:.6}
   @media(max-width:900px){.counterband{display:none}}
   .toggle{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--dim);cursor:pointer;user-select:none}
   .toggle .sw{width:36px;height:20px;border-radius:11px;background:var(--line2);position:relative;transition:.15s}
@@ -274,7 +270,7 @@ function App(){
   const autoStratRef=useRef(null);                // ticker we've auto-landed a strategy for
   const flipRef=useRef({side:0,since:0});          // session-flow: side (+1 call / -1 put) + ms-ts of last zero-cross
   // Counter Read: relative-richness lean between the current structure and its
-  // natural opposite (see COUNTER_STRATEGY on the backend / docs/torque.md Layer 4).
+  // natural opposite (see COUNTER_STRATEGY on the backend / docs/torque_operating_manual.html#counter).
   const counterEmaRef=useRef(null);                 // smoothed ratio 0..1, null until first sample
   const counterTsRef=useRef(0);                     // ms timestamp of the last EMA update
   const counterHoldRef=useRef({side:0,since:0});    // +1 leaning current / -1 leaning counter / 0 contested
@@ -663,47 +659,36 @@ function App(){
               {placing&&<span className="spin" style={{alignSelf:'center'}}>working…</span>}
             </div>
           </div>
-          {counterRead&&<div className={"counterband "+counterRead.state+(counterRead.state==='committed'?(' c-'+(counterRead.side>0?counterRead.aSide:counterRead.bSide)):'')}
-            title="Counter Read — relative richness vs the opposite structure, priced from the same chain/spot. 'confirms (price)' means real spot movement over the last ~20s agrees with the richness lean; 'diverging (price)' means it doesn't (yet) — spot, not Lean, since Lean is itself built from options-chain data, not price. A rich, committed counter side is a cue to adjust strikes/distance before you send — this is a relative-value lean, not a forecast.">
-
-            <div className="cband-row">
-              <span className={"cband-lab "+counterRead.aSide}>{counterRead.aLabel}</span>
-              <span className={"cband-lab "+counterRead.bSide} style={{textAlign:'right'}}>{counterRead.bLabel}</span>
-            </div>
-            {/* aLabel sits left, bLabel sits right (row above) — dot must move toward
-                whichever side is richer, so it's (1-ratio): high ratio (A richer)
-                pulls the dot LEFT toward aLabel, low ratio (B richer) pushes it RIGHT
-                toward bLabel. ratio*100 directly was backwards — dot landed next to
-                the label with LESS richness. */}
-            {/* The on-dot number must equal the SAME value driving `left` — showing
-                "dominance %" (always >=50, whichever side is winning) instead made
-                the text and the position disagree: a 64% dominance number could sit
-                at either end depending on which side won, so a high number visually
-                looked like it was "coming from the right" even when the dot was near
-                the LEFT (aLabel) side. Showing the position itself means the number
-                always matches where the dot sits: low = toward aLabel, high = toward
-                bLabel, ~50 = center/contested — read the caption text for WHICH side
-                that is, the number is purely "how far across from A to B." */}
-            <div className="cband-bar"><i style={{left:((1-counterRead.ratio)*100)+'%'}}>
-              {Math.round((1-counterRead.ratio)*100)}%</i></div>
-            <div className="cband-row muted" style={{fontSize:10,marginTop:3}}>
-              <span>{fmt(counterRead.aMid)}</span>
-              <span style={{marginLeft:'auto'}}>{fmt(counterRead.bMid)}</span>
-            </div>
-            <div className="muted" style={{fontSize:10,marginTop:3}}>
-              leaning {counterRead.side===0?'neither':(counterRead.side>0?counterRead.aLabel:counterRead.bLabel)} · {counterRead.state}
-              {/* Whichever side richness favors has its own structural bull/bear bias
-                  (definitional — e.g. a bull put spread wins if price stays up; not
-                  measured from any data). Compare that to REAL spot movement (not Lean,
-                  which is itself options-chain-derived, not price) over the same ~20s
-                  window as the EMA. Same confirms/diverging words as the Positioning
-                  panel's flow tag, applied here instead. No tag while contested (no lean
-                  to check) or while spot hasn't moved enough to call a trend yet. */}
-              {counterRead.tag&&<span style={{color:counterRead.tag==='confirms'?'var(--good)':'var(--warn)'}}>
-                {' · '+counterRead.tag+' (price)'}</span>}
-              {counterRead.state==='committed'?' · held '+fmtHeld(counterRead.heldMs):''}
-            </div>
-          </div>}
+          {counterRead&&(()=>{
+            const cr=counterRead;
+            const {name,pct,mid,zone,fillPct,tick1,tick2}=counterBandDisplay(cr);
+            return <div className="counterband"
+              title="Counter Read — relative richness vs the opposite structure (or, for Iron Condor/Fly, the two wings of this same trade), priced from the same chain/spot. 'confirms (price)' means real spot movement over the last ~20s agrees with the richness lean; 'diverging (price)' means it doesn't (yet) — spot, not Lean, since Lean is itself built from options-chain data, not price. A rich, committed counter side is a cue to adjust strikes/distance before you send — this is a relative-value lean, not a forecast.">
+              <div style={{fontSize:11,letterSpacing:1,color:'var(--dim2)',textTransform:'uppercase'}}>Counter Read — premium split</div>
+              <div className="cband-name" style={{color:zone==='green'?'var(--call)':zone==='red'?'var(--put)':'var(--dim)'}}>
+                {name}<span className="muted" style={{fontWeight:400,fontSize:11,marginLeft:6}}>{pct}%</span>
+              </div>
+              <div className="cband-bar2">
+                <span className="cband-tick" style={{left:tick1+'%'}}></span>
+                {tick2!=null&&<span className="cband-tick" style={{left:tick2+'%'}}></span>}
+                <i className={zone} style={{width:fillPct+'%'}}></i>
+              </div>
+              {mid!=null&&<div className="muted" style={{fontSize:10,marginTop:5}}>{name} mid ${fmt(mid)}</div>}
+              <div className="muted" style={{fontSize:10,marginTop:mid!=null?3:8}}>
+                leaning {cr.side===0?'neither':(cr.side>0?cr.aLabel:cr.bLabel)} · {cr.state}
+                {/* Whichever side richness favors has its own structural bull/bear bias
+                    (definitional — e.g. a bull put spread wins if price stays up; not
+                    measured from any data). Compare that to REAL spot movement (not Lean,
+                    which is itself options-chain-derived, not price) over the same ~20s
+                    window as the EMA. Same confirms/diverging words as the Positioning
+                    panel's flow tag, applied here instead. No tag while contested (no lean
+                    to check) or while spot hasn't moved enough to call a trend yet. */}
+                {cr.tag&&<span style={{color:cr.tag==='confirms'?'var(--good)':'var(--warn)'}}>
+                  {' · '+cr.tag+' (price)'}</span>}
+                {cr.state==='committed'?' · held '+fmtHeld(cr.heldMs):''}
+              </div>
+            </div>;
+          })()}
         </div>
 
         {/* What crossing actually costs. Not a fee — you pay the ask and are
@@ -1057,7 +1042,7 @@ function counterSides(strategyKey,strategies,b){
     // call wing profits if price holds BELOW it (bear-aligned, same as Bear Call).
     return {aLabel:'Put side',aSide:'put',aMid:_sideMid(putLegs),aDir:'bull',
             bLabel:'Call side',bSide:'call',bMid:_sideMid(callLegs),bDir:'bear',
-            aRichness:aR,bRichness:bR};
+            aRichness:aR,bRichness:bR,selfSplit:true};
   }
   if(!b.counter||!b.counter.price||!b.counter.price.complete)return null;
   const cdef=strategies.find(s=>s.key===b.counter.strategy);
@@ -1066,7 +1051,41 @@ function counterSides(strategyKey,strategies,b){
   if(aR==null||bR==null||(aR+bR)<=0)return null;
   return {aLabel:sdef.short||sdef.name,aSide:sdef.side,aMid:b.price.abs_mid,aDir:sdef.dir,
           bLabel:cdef.short||cdef.name,bSide:cdef.side,bMid:b.counter.price.abs_mid,bDir:cdef.dir,
-          aRichness:aR,bRichness:bR};
+          aRichness:aR,bRichness:bR,selfSplit:false};
+}
+// Derives everything the Counter Read band renders from a counterSides()+state
+// object. Pure (no DOM/React), so it's directly unit-testable.
+// Pairs: name is FIXED to the counter (bLabel) — the whole point of this band is
+// watching "the other side of my own trade," so it never flips regardless of who's
+// winning. One number, one mid, always unambiguous because the name never changes
+// under them.
+// Self-split (Iron Condor/Fly): there's no separate "counter" — both wings are the
+// SAME trade — so the name instead flips to whichever wing currently has the pull,
+// colored by option side (green=calls, red=puts), same convention as everywhere
+// else in Torque. The number/mid are computed from `side` (not a fixed field) so
+// they always match whichever name is actually shown — otherwise a flipping name
+// next to a non-flipping number reproduces the exact "1% glued to the wrong label"
+// confusion this whole redesign exists to fix.
+function counterBandDisplay(cr){
+  let name,pct,mid,zone;
+  if(!cr.selfSplit){
+    name=cr.bLabel; pct=Math.round((1-cr.ratio)*100); mid=cr.bMid;
+    zone=cr.side===-1?'green':cr.side===1?'red':'grey';
+  }else if(cr.side===-1){
+    name='Call legs'; pct=Math.round((1-cr.ratio)*100); mid=cr.bMid; zone='green';
+  }else if(cr.side===1){
+    name='Put legs'; pct=Math.round(cr.ratio*100); mid=cr.aMid; zone='red';
+  }else{
+    name='balanced'; pct=Math.round(Math.max(cr.ratio,1-cr.ratio)*100); mid=null; zone='grey';
+  }
+  // Fill width: pairs' `pct` already spans the full 0-100 meaningfully (0=all
+  // current, 100=all counter), so it's used directly. Self-split's `pct` is a "how
+  // dominant" number that's always >=50 by construction (Math.max above) — rescaled
+  // onto the full 0-100 bar so a totally undecided reading starts the fill at 0
+  // rather than looking permanently stuck past the halfway point.
+  const fillPct=cr.selfSplit?Math.max(0,(pct-50)*2):pct;
+  const tick1=cr.selfSplit?16:42, tick2=cr.selfSplit?null:58;
+  return {name,pct,mid,zone,fillPct,tick1,tick2};
 }
 // Real, independent check on the richness lean: is the underlying's OWN price
 // actually moving the way that lean implies? `spotBuf` is a plain array of

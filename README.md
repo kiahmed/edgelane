@@ -13,6 +13,7 @@ Built for personal/local use. The deployed HTML embeds your API keys at build ti
 | **Run the Python tests** | `tests/` — `tradier_smoke.py`, `tradier_execute_ticket.py` |
 | **Run the local CORS proxy during dev** | `python tools/cors_proxy.py` (see deployment.md) |
 | **Place multi-leg orders fast (Torque)** | [docs/torque.md](./docs/torque.md) — `cd market/backend && make run-dev`, open `:8789/torque` |
+| **Understand Torque's controls, readings, and labels** | [docs/torque_operating_manual.html](./docs/torque_operating_manual.html) |
 | **Positions & realized P&L CLI (`tp`)** | [tools/tp_operating_manual.html](./tools/tp_operating_manual.html) |
 
 ## TL;DR

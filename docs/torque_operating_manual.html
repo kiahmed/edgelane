@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Torque — Operating Manual</title>
+<style>
+  :root {
+    --bg: #0a0e14; --bg-elev: #111721; --bg-card: #0d131c;
+    --border: #1d2733; --border-strong: #2a3744;
+    --text: #d6e0ea; --text-dim: #aab7c5; --text-faint: #8d9bab;
+    --accent: #4aa3ff; --accent-warm: #fbbf24;
+    --call: #36d399; --put: #f87272; --amber: #fbbf24;
+    --mono: 'SFMono-Regular', ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+               font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+               line-height: 1.55; font-size: 15px; }
+  body { padding: 40px 24px 80px; }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  h1 { font-size: 32px; font-weight: 800; letter-spacing: -0.5px; margin: 0 0 4px; color: #e2e8f0; }
+  h1 .tagline { font-weight: 400; color: var(--text-faint); font-size: 16px; letter-spacing: 0; }
+  h2 { font-size: 22px; font-weight: 700; margin: 56px 0 16px; color: #e2e8f0;
+       border-bottom: 1px solid var(--border); padding-bottom: 10px; }
+  h2 .num { color: var(--accent); font-family: var(--mono); font-size: 18px; margin-right: 8px; }
+  h3 { font-size: 15px; font-weight: 700; margin: 30px 0 10px; color: #e2e8f0; }
+  h4 { font-size: 12px; font-weight: 600; margin: 20px 0 8px; text-transform: uppercase;
+       letter-spacing: 0.5px; color: var(--text-dim); }
+  p { margin: 8px 0 14px; }
+  a { color: var(--accent); }
+  code { font-family: var(--mono); font-size: 13px; background: rgba(96,165,250,0.1);
+         border: 1px solid rgba(96,165,250,0.2); color: #93c5fd; padding: 1px 6px; border-radius: 4px; }
+  .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;
+          padding: 16px 20px; margin: 14px 0; }
+  .card.warn { background: rgba(251,191,36,0.05); border-color: rgba(251,191,36,0.25); }
+  .card.warn .icon { color: var(--amber); }
+  .card.tip { background: rgba(54,211,153,0.05); border-color: rgba(54,211,153,0.25); }
+  .card.tip .icon { color: var(--call); }
+  .card .icon { font-weight: 700; margin-right: 6px; text-transform: uppercase; font-size: 11px; letter-spacing: 1px; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13.5px; }
+  th { text-align: left; background: var(--bg-elev); color: #e2e8f0; font-weight: 600;
+       padding: 9px 11px; border-bottom: 1px solid var(--border); text-transform: uppercase;
+       font-size: 10.5px; letter-spacing: 0.5px; }
+  td { padding: 9px 11px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .toc { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;
+         padding: 18px 24px; margin: 24px 0 40px; columns: 2; column-gap: 32px; }
+  .toc h4 { margin-top: 0; column-span: all; }
+  .toc ol { margin: 4px 0; padding-left: 20px; }
+  .toc li { margin: 3px 0; break-inside: avoid; font-size: 13.5px; }
+  .toc a { text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 4px; font-family: var(--mono);
+          font-size: 11px; font-weight: 700; letter-spacing: 0.3px;
+          background: rgba(96,165,250,0.12); color: #93c5fd; border: 1px solid rgba(96,165,250,0.25);
+          margin: 1px 3px 1px 0; }
+  .pill.call { background: rgba(54,211,153,0.12); color: #6ee7b0; border-color: rgba(54,211,153,0.3); }
+  .pill.put { background: rgba(248,113,113,0.12); color: #fca5a5; border-color: rgba(248,113,113,0.3); }
+  .pill.amber { background: rgba(251,191,36,0.12); color: #fcd34d; border-color: rgba(251,191,36,0.3); }
+  .pill.dim { background: rgba(141,155,171,0.1); color: var(--text-dim); border-color: var(--border-strong); }
+  .btn-ref { display: flex; gap: 14px; align-items: flex-start; background: var(--bg-card);
+             border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; margin: 10px 0; }
+  .btn-ref .name { font-family: var(--mono); font-weight: 700; color: #e2e8f0; min-width: 190px; flex-shrink: 0; }
+  .btn-ref .desc { color: var(--text-dim); font-size: 13.5px; }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 40px 0; }
+  .footer { text-align: center; color: var(--text-faint); font-size: 12px; margin-top: 60px;
+            padding-top: 24px; border-top: 1px solid var(--border); }
+  blockquote { margin: 14px 0; padding: 4px 0 4px 16px; border-left: 3px solid var(--border-strong);
+               color: var(--text-dim); font-size: 13.5px; }
+  .caption-ex { font-family: var(--mono); font-size: 12.5px; background: #060a10; border: 1px solid var(--border);
+                border-radius: 6px; padding: 8px 12px; display: inline-block; color: #cbd5e1; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Torque <span class="tagline">— Operating Manual</span></h1>
+<p style="color: var(--text-dim); font-size: 14px;">
+  What every control does and what every reading on screen means, in plain
+  language. This is the <em>user-facing</em> guide — for how Torque is built,
+  deployed, or configured, see <code>docs/torque.md</code> instead.
+</p>
+
+<div class="card tip">
+  <div><span class="icon">Read this first</span></div>
+  Nothing on this page is a forecast. Torque shows you where premium currently
+  sits and which way it's moving — deterministic math over the live options
+  chain, never a prediction of where price will go. Every signal here is
+  context for a trade <em>you</em> already had in mind.
+</div>
+
+<div class="toc">
+  <h4>Contents</h4>
+  <ol>
+    <li><a href="#controls">The controls — what each button does</a></li>
+    <li><a href="#lean">Positioning: the Lean</a></li>
+    <li><a href="#skew-magnet">Premium skew &amp; Magnet</a></li>
+    <li><a href="#flow">3-minute Flow</a></li>
+    <li><a href="#combo">Lean × Flow — every combination</a></li>
+    <li><a href="#session">Session Flow (the hour)</a></li>
+    <li><a href="#session-combo">Session bar × Lean — every combination</a></li>
+    <li><a href="#stretched">The ⚡ STRETCHED chip</a></li>
+    <li><a href="#counter">Counter Read — the band on the order builder</a></li>
+    <li><a href="#counter-captions">Counter Read — every possible caption</a></li>
+    <li><a href="#cheat-sheet">Cross-tab verdict cheat-sheet</a></li>
+    <li><a href="#autoclose">Auto-close &amp; Dry Run</a></li>
+    <li><a href="#orders">The Orders panel</a></li>
+    <li><a href="#glossary">Quick glossary</a></li>
+  </ol>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="controls"><span class="num">1</span>The controls — what each button does</h2>
+
+<p>Left to right, top to bottom, everything you can click or type into.</p>
+
+<div class="btn-ref">
+  <div class="name">Ticker dropdown</div>
+  <div class="desc">Switches the underlying. First entry (NDX) is selected on load. Switching
+  tickers resets Lock Strikes, the session-flow history, and Counter Read's spot-trend buffer —
+  none of that carries over between tickers, since it's all tied to that ticker's own price scale.</div>
+</div>
+<div class="btn-ref">
+  <div class="name">Strategy grid</div>
+  <div class="desc">10 tiles, single-select: Long Call, Long Put, Bull Call, Bear Put, Bull Put,
+  Bear Call, Iron Condor, Iron Fly, Call Fly, Put Fly. Click one to build it. On load (and on every
+  ticker switch) the grid <strong>auto-lands once</strong> on whichever structure the current
+  Positioning read makes playable — see <a href="#autoland">"does the auto-pick keep changing?"</a>
+  below. Your manual pick always sticks afterward.</div>
+</div>
+<div class="btn-ref">
+  <div class="name">Lock Strikes <span class="pill dim">toggle</span></div>
+  <div class="desc">Right of the spot line. Off (default): strikes continuously re-anchor to
+  live spot as price moves. On: strikes freeze at whatever spot was <em>the instant you toggled
+  it</em> — premiums keep updating live for those frozen strikes, only the strike selection itself
+  stops drifting. The −/+ steppers still work, relative to the frozen anchor. Turn it back off to
+  resume normal live-anchoring. Resets to off on any ticker or strategy change.</div>
+</div>
+<div class="btn-ref">
+  <div class="name">Leg steppers <span class="pill dim">− / +</span></div>
+  <div class="desc">Next to each leg's strike. Nudges that one leg up/down the real strike grid
+  (skips to the next actually-listed strike, never an invented one). Works whether or not Lock
+  Strikes is on.</div>
+</div>
+<div class="btn-ref">
+  <div class="name">Net price card</div>
+  <div class="desc"><strong>Bid / Mid / Ask</strong> for the whole spread, debit or credit, summed
+  directly off live chain quotes (never a separate quote call that could drop a leg). Refreshes
+  every 3s along with the strikes. If any leg's quote goes briefly missing, the display holds its
+  last good number rather than flash a broken partial price.</div>
+</div>
+<div class="btn-ref">
+  <div class="name">Limit Price</div>
+  <div class="desc">Pre-fills to the current mid; type any price to override. Feeds the
+  <strong>Send Limit</strong> button.</div>
+</div>
+<div class="btn-ref">
+  <div class="name">Qty</div>
+  <div class="desc">Contracts, 1–50.</div>
+</div>
+<div class="btn-ref">
+  <div class="name">TIF</div>
+  <div class="desc"><code>DAY</code> or <code>GTC</code> (good-till-canceled).</div>
+</div>
+<div class="btn-ref">
+  <div class="name">auto-close +N% <span class="pill dim">toggle + %</span></div>
+  <div class="desc">Arms a profit-target close the instant the entry fills — see
+  <a href="#autoclose">Auto-close</a>. Default 30%, editable; some tickers have a raised floor
+  (DJX: 60% default, 45% minimum — its spread is too wide for the global default to ever fill).
+  On tickers where auto-close is <strong>mandatory</strong> the toggle is locked on and marked
+  <span class="pill amber">required</span> — you can still edit the % but can't disarm it.</div>
+</div>
+<div class="btn-ref">
+  <div class="name">SEND LIMIT <span class="pill dim">button</span></div>
+  <div class="desc">Places the entry at your typed limit price (with the auto-close close armed
+  behind it if the toggle is on).</div>
+</div>
+<div class="btn-ref">
+  <div class="name">SEND MARKET <span class="pill dim">button</span></div>
+  <div class="desc">Places the entry at market. Disabled on tickers whose book is too wide for a
+  market order to be safe (e.g. DJX — its ask has been measured at up to 4× its own mid).</div>
+</div>
+<div class="btn-ref">
+  <div class="name">DRY RUN <span class="pill dim">button</span></div>
+  <div class="desc">Submits entry + close to the broker with <code>preview=true</code> — validates
+  format, symbols, and buying power, <strong>places nothing</strong>. Use it before market open to
+  catch format issues ahead of time. See <a href="#autoclose">Dry Run</a> below for how to read the
+  result.</div>
+</div>
+<div class="btn-ref">
+  <div class="name">Working / Past Orders <span class="pill dim">tabs</span></div>
+  <div class="desc">Bottom panel. See <a href="#orders">The Orders panel</a>.</div>
+</div>
+
+<hr>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="lean"><span class="num">2</span>Positioning: the Lean</h2>
+
+<p>The big signed number (−100…+100) at the top of the Positioning panel. It's a
+deterministic blend of three things in the live chain (±3% around spot) — <strong>not</strong>
+a price forecast, just where the current options book already sits:</p>
+
+<table>
+  <tr><th>Input</th><th>What it measures</th><th>Weight</th></tr>
+  <tr><td>Volume P/C</td><td>call vs put contracts traded today</td><td>40%</td></tr>
+  <tr><td>Premium skew <em>(its own tile)</em></td><td>call vs put $ resting in open interest</td><td>30%</td></tr>
+  <tr><td>Magnet <em>(its own tile)</em></td><td>pull toward the most OI-concentrated strike near spot</td><td>30%</td></tr>
+</table>
+
+<h4>Every label the Lean can show</h4>
+<table>
+  <tr><th>Reading</th><th>Label</th><th>Meaning</th></tr>
+  <tr><td>≥ +25</td><td><span class="pill call">call-leaning</span></td><td>book sits call-heavy</td></tr>
+  <tr><td>≤ −25</td><td><span class="pill put">put-leaning</span></td><td>book sits put-heavy</td></tr>
+  <tr><td>−25…+25</td><td><span class="pill dim">balanced</span></td><td>no edge either way — deliberately not forced to a side</td></tr>
+</table>
+
+<p>Think of the Lean as <strong>where the crowd already is</strong> — slow-moving, built from
+standing positioning, so on its own it can be <em>stale</em> (call-heavy because of yesterday, not
+because of anything happening right now). That's what the Flow (next section) is for.</p>
+
+<hr>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="skew-magnet"><span class="num">3</span>Premium skew &amp; Magnet</h2>
+
+<h3>Premium skew <em>(tile)</em></h3>
+<p>Call vs put dollars resting in open interest right now — the standing balance, and one of the
+Lean's three inputs. Shown as a label:</p>
+<table>
+  <tr><th>Label</th><th>Meaning</th></tr>
+  <tr><td><span class="pill call">calls rich</span></td><td>more $ resting on the call side</td></tr>
+  <tr><td><span class="pill put">puts rich</span></td><td>more $ resting on the put side</td></tr>
+  <tr><td><span class="pill dim">balanced</span></td><td>no meaningful tilt</td></tr>
+</table>
+
+<h3>Magnet <em>(tile)</em></h3>
+<p>The near-spot strike with the most concentrated open interest, plus its distance from spot
+(e.g. <code>29,430 · 0.7%</code>). A <strong>tight</strong> near-spot magnet is what flips the
+auto-picked balanced strategy from <strong>Iron Condor</strong> to <strong>Iron Fly</strong> —
+Torque reads a strong pin as worth selling directly at, not around.</p>
+
+<hr>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="flow"><span class="num">4</span>3-minute Flow</h2>
+
+<p>Reports the <strong>premium $ of new contracts traded</strong> on calls vs puts over the last
+3 minutes — e.g. <code>calls +$1.2M · puts +$0.4M · net +$0.8M call</code>. Kept in this browser
+tab's memory only (clears on refresh), sampled every 5s. This is the fast tape — noisy on its own,
+but the earliest tell you get.</p>
+
+<div class="card">
+  <div><span class="icon" style="color:var(--accent)">Why $0 on a side is meaningful</span></div>
+  Each figure is <em>new</em> contracts in the window valued at current premium — not a mid-price
+  diff, which would leak ordinary price movement into the number. Because volume only ever rises,
+  <code>+$0</code> on a side means literally zero new contracts traded there in the window — not
+  "mids fell." A read like <code>calls +$0 / puts +$1.5M</code> under a call-leaning Lean is a
+  genuine early warning, not noise.
+</div>
+
+<h4>Every flow-tag word</h4>
+<table>
+  <tr><th>Tag</th><th>When</th><th>Meaning</th></tr>
+  <tr><td><span class="pill call">confirms</span></td><td>fresh money flows the <strong>same</strong> side as the Lean</td><td>the lean is live, has fuel</td></tr>
+  <tr><td><span class="pill put">diverging</span></td><td>fresh money flows the <strong>opposite</strong> side of the Lean</td><td>the lean is being faded, possible exhaustion</td></tr>
+  <tr><td><span class="pill dim">flat</span></td><td>no decisive net flow (within ~6% of total)</td><td>chop</td></tr>
+  <tr><td><span class="pill amber">call flow</span> / <span class="pill amber">put flow</span></td><td>Lean is <strong>balanced</strong>, so there's nothing yet to confirm/diverge from</td><td>just names which side money is hitting — an early tell before the Lean itself tips</td></tr>
+</table>
+
+<blockquote><strong>call flow / put flow often <em>matures into</em> confirms.</strong> On a
+balanced Lean, persistent <code>put flow</code> is usually the precursor: as it keeps up it drags
+the Lean itself down into put-leaning, and the exact same flow then reads as <code>confirms</code>.
+Watching that hand-off is an early read on a lean about to establish.</blockquote>
+
+<p><strong>The key idea:</strong> the Lean tells you where the crowd is; the Flow tells you whether
+the crowd is still right. A <strong>small lean that flow confirms</strong> is often more tradeable
+than a <strong>big lean that flow is fading</strong>.</p>
+
+<hr>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="combo"><span class="num">5</span>Lean × Flow — every combination</h2>
+
+<p>Rows = the Lean. Columns = the 3-minute Flow tag.</p>
+
+<table>
+  <tr><th>Lean ↓ \ Flow →</th><th>Confirms</th><th>Flat</th><th>Diverges</th></tr>
+  <tr>
+    <td><strong>Strong call</strong> (+50+)</td>
+    <td>Crowded long <em>and still being bought</em> — fuel, but late-stage; watch for a blow-off top.</td>
+    <td>Extended long, no fresh fuel — likely to drift/stall.</td>
+    <td>⚠ Exhaustion/reversal risk — heavily call-positioned but money rotating to puts.</td>
+  </tr>
+  <tr>
+    <td><strong>Mild call</strong> (+25–50)</td>
+    <td><strong>Sweet spot</strong> — fresh call bias with money behind it. Cleanest long read.</td>
+    <td>Weak call tilt, no momentum — low conviction.</td>
+    <td>No edge — a mild lean already being faded.</td>
+  </tr>
+  <tr>
+    <td><strong>Balanced</strong> (−25…+25)</td>
+    <td><em>(call flow)</em> money picking calls before positioning shows it — early bullish tell.</td>
+    <td>True range/chop — premium-selling turf (Condor / Fly).</td>
+    <td><em>(put flow)</em> early put-side tell forming under a flat surface.</td>
+  </tr>
+  <tr>
+    <td><strong>Mild put</strong> (−25–−50)</td>
+    <td><strong>Sweet spot down</strong> — fresh put bias with money behind it. Cleanest short read.</td>
+    <td>Weak put tilt, no momentum.</td>
+    <td>No edge — mild put lean being faded.</td>
+  </tr>
+  <tr>
+    <td><strong>Strong put</strong> (−50+)</td>
+    <td>Crowded short <em>and still being sold</em> — fuel, but late-stage.</td>
+    <td>Extended short, no fresh fuel.</td>
+    <td>⚠ Exhaustion/bounce risk — heavily put-positioned but money rotating to calls.</td>
+  </tr>
+</table>
+
+<p>None of these is a buy/sell instruction — context for a structure you already had in mind.</p>
+
+<hr>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="session"><span class="num">6</span>Session Flow (the hour)</h2>
+
+<p>The 3m Flow is noisy tape; Session Flow integrates it over a <strong>trailing 60 minutes</strong>
+(cumulative delta in premium $) to answer: is there a persistent direction, or just chop?</p>
+
+<h4>What's on the tile</h4>
+<table>
+  <tr><th>Element</th><th>Meaning</th></tr>
+  <tr><td><strong>Net $</strong></td><td><code>Σ(call$ − put$)</code> over the hour. A lone opposite print barely dents it — noise filters itself.</td></tr>
+  <tr><td><strong>Signed bar — length</strong></td><td>magnitude past the flip point (call/put parity), <code>|net|/gross</code>. Right/green = call side, left/red = put side. Longer = harder push <em>right now</em>.</td></tr>
+  <tr><td><strong>Signed bar — color</strong></td><td>commitment, independent of length. Amber &amp; pulsing = within ~10% of the flip line (contested, sign not trustworthy). Solid = persistent (≳70% of 3-min windows agree) <em>and</em> clear of the flip. Amber steady = building, in between.</td></tr>
+  <tr><td><strong>X/Y windows put-side / call-side</strong></td><td>how many of the hour's 3-min windows agree on a side. This decides trend vs chop, not the raw <code>%</code>.</td></tr>
+  <tr><td><strong>% call/put dominance</strong></td><td><code>|net|/gross</code> as a live magnitude — how lopsided the current hourly imbalance is. <strong>Not</strong> an accumulation since the last flip.</td></tr>
+  <tr><td><strong>held Nm</strong></td><td>time since the hour's net last crossed zero (the flip). This is the <em>only</em> "since the flip" number — the <code>%</code> is not.</td></tr>
+</table>
+
+<div class="card warn">
+  <div><span class="icon">Length ≠ trust</span></div>
+  A longer amber bar (hard push, not yet trusted) next to a shorter solid-red bar (milder but
+  persistent) is normal and not a contradiction. Length answers "how hard, right now"; color
+  answers "can I trust the direction." A short, committed drift is more tradeable than a long,
+  contested lurch — don't read a bigger <code>%</code> as "closer to solid."
+</div>
+
+<p><strong>Persistence labels:</strong> ≳70% one side → <code>trending put</code> /
+<code>trending call</code> (a directional debit is in play; small counter-prints are pullbacks,
+not reversals). ~50/50, flipping → <code>chop / range</code> (Iron Condor/Fly turf). In between →
+<code>building</code>.</p>
+
+<hr>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="session-combo"><span class="num">7</span>Session bar × Lean — every combination</h2>
+
+<table>
+  <tr><th>Session bar vs Lean</th><th>Solid (persistent)</th><th>Amber (contested/building)</th></tr>
+  <tr>
+    <td><strong>Confirms</strong> (bar side = Lean)</td>
+    <td><strong>Strongest continuation</strong> — book and hourly flow agree. Ride the directional debit; a counter-print is a pullback.</td>
+    <td>Flow agrees but isn't sticking → chop around an established lean → Condor/Fly.</td>
+  </tr>
+  <tr>
+    <td><strong>Diverges</strong> (bar side ≠ Lean)</td>
+    <td>⚠ <strong>Early rotation</strong> — the book sits one way but persistent hourly flow is fading it. Flow leads, positioning lags — a regime change often starts here.</td>
+    <td>Tentative fade — likely noise testing the lean. Wait for it to harden.</td>
+  </tr>
+</table>
+
+<p>When the two agree by side, conviction is high; when they split, let the session bar's
+<strong>color</strong> break the tie. Always correlate by <strong>side</strong>, never raw numbers —
+the Lean is a −100…+100 composite, the bar <code>%</code> is a flow ratio; different scales.</p>
+
+<hr>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="stretched"><span class="num">8</span>The ⚡ STRETCHED chip</h2>
+
+<p>A slim amber chip that appears in the Positioning panel <strong>only</strong> in one specific
+config: the session bar is trending solid one way, but the Lean is committed, skew is rich, and
+the freshest 3m flow have all turned the <em>other</em> way — the book-leads/hour-flow-lags case.</p>
+
+<p>Reads <code>⚡ STRETCHED · {call/put} favored</code>. Prior: this tension usually resolves by
+the hour-flow reverting <em>toward</em> positioning (the session bar is the side likely to give),
+not the book collapsing to meet the flow — both because the resting book is where dealers defend,
+and because the hour's residue decays as its oldest prints age out of the window. Hover it for the
+full read and its invalidation (skew capitulating is the tell that this is a real regime change
+instead). It's a state, not advice — see the <a href="#cheat-sheet">cheat-sheet</a> for the full
+writeup.</p>
+
+<hr>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="counter"><span class="num">9</span>Counter Read — the band on the order builder</h2>
+
+<p>Everything above reads the market. Counter Read reads <strong>the other side of your own
+trade</strong> — a live band next to the Limit/Qty/TIF/Send controls, showing whether premium is
+leaning toward the structure you're building or its natural opposite.</p>
+
+<h4>Why it's not redundant with put-call parity</h4>
+<p>A vertical and its mirror at <em>identical</em> strikes are arbitrage-locked — one side
+richening necessarily cheapens the other by the same amount, so they'd carry no independent
+information. Torque's counter side uses its <strong>own, independently-configured strikes</strong>
+(call-side and put-side offsets are set separately per ticker), so the two sides are priced off
+genuinely separate parts of the chain — a real, live skew read.</p>
+
+<h4>The pairing</h4>
+<table>
+  <tr><th>Current</th><th>Counter</th></tr>
+  <tr><td>Long Call</td><td>Long Put</td></tr>
+  <tr><td>Bull Call</td><td>Bear Put</td></tr>
+  <tr><td>Bull Put</td><td>Bear Call</td></tr>
+  <tr><td>Call Fly</td><td>Put Fly</td></tr>
+  <tr><td>Iron Condor</td><td><em>(self)</em> bear-call wing vs bull-put wing</td></tr>
+  <tr><td>Iron Fly</td><td><em>(self)</em> call wing vs put wing</td></tr>
+</table>
+
+<h4>The band, piece by piece</h4>
+<p>The band works slightly differently depending on whether you're on a paired strategy or an
+Iron Condor/Fly, because only the pairs have a genuine "counter" to fix on:</p>
+
+<table>
+  <tr><th>Element</th><th>On a pair (Bull Put, Bull Call, etc.)</th><th>On Iron Condor / Iron Fly</th></tr>
+  <tr>
+    <td><strong>Bold name</strong></td>
+    <td><strong>Fixed to the counter</strong> — e.g. always "Bull Call" while you're on Bear Put,
+    no matter which side is winning. The point of the band is watching that other play, so its
+    name never moves.</td>
+    <td><strong>Flips live</strong> to whichever wing currently has the pull — "Call legs" when
+    calls are ahead, "Put legs" when puts are ahead, "balanced" when neither is.</td>
+  </tr>
+  <tr>
+    <td><strong>Number next to the name</strong></td>
+    <td>that fixed counter's own share of the combined total. Always matches the name above it —
+    no flipping, so no ambiguity.</td>
+    <td>whichever side is currently named <em>its own</em> share — recalculated to match
+    whichever name is showing, so "Put legs 89%" always means puts are genuinely at 89%, never a
+    number left over from the other side.</td>
+  </tr>
+  <tr>
+    <td><strong>Color</strong></td>
+    <td><span class="pill call">green</span> = counter thriving (≥59%), <span class="pill put">red</span>
+    = counter fading (≤41%), <span class="pill dim">grey</span> = neutral (42–58%).</td>
+    <td><span class="pill call">green</span> = calls dominant, <span class="pill put">red</span>
+    = puts dominant, <span class="pill dim">grey</span> = neither confidently ahead.</td>
+  </tr>
+  <tr>
+    <td><strong>The bar</strong></td>
+    <td>fills left-to-right from 0, length = the number above. Two small tick marks mark the
+    42%/58% neutral zone.</td>
+    <td>same fill mechanic; only one tick mark, since "neither side ahead" only has one boundary
+    once a wing is confidently winning.</td>
+  </tr>
+  <tr>
+    <td><strong>Mid price under the bar</strong></td>
+    <td>the counter's own mid — always the one named above.</td>
+    <td>whichever wing is currently named; blank in the neutral/balanced zone, since there's no
+    single confident side to attach a price to.</td>
+  </tr>
+  <tr><td colspan="3"><strong>Caption below</strong> — unchanged either way: <code>leaning
+  {Label} · {state} · confirms/diverging (price) · held Nm</code>. See the full table in the next
+  section.</td></tr>
+</table>
+
+<div class="card warn">
+  <div><span class="icon">Why the pair and self-split cases differ</span></div>
+  On a pair, "Bull Call" is a separate play worth watching regardless of who's winning right now —
+  so its name stays put. On Iron Condor/Fly there's no separate play, just two wings of the trade
+  you're already building — so naming whichever one currently has the pull is more useful than
+  fixing on one arbitrarily. An earlier version fixed the number to one side while letting a
+  label imply the other (e.g. a tiny "1%" sitting glued to the pricier label) — that's what this
+  redesign specifically fixes: the number shown always matches whatever name is bold above it.
+</div>
+
+<h4>Confirms / diverging — checked against real price, not Lean</h4>
+<p>Whichever side the band favors has its own <strong>structural</strong> bull/bear bias — not
+measured, just definitional (a bull put spread wins if price holds up, full stop). Torque compares
+that bias to the underlying's <strong>actual spot movement</strong> over the same ~20s window as
+the smoothing (a plain rolling buffer of live spot, with a small ~0.04% deadband so tick noise
+doesn't flip it):</p>
+<table>
+  <tr><th>Tag</th><th>Meaning</th></tr>
+  <tr><td><span class="pill call">confirms</span></td><td>the leaning side's bias matches where spot is actually moving</td></tr>
+  <tr><td><span class="pill amber">diverging</span></td><td>the leaning side's bias contradicts where spot is moving</td></tr>
+  <tr><td><em>(no tag)</em></td><td>spot hasn't moved past the deadband in the last ~20s — nothing to check yet</td></tr>
+</table>
+<div class="card">
+  <div><span class="icon" style="color:var(--accent)">Why spot, not Lean</span></div>
+  Lean is itself <code>40% volume P/C + 30% premium skew + 30% OI-magnet</code> — built entirely
+  from the options chain, the same universe of data richness comes from. Checking richness against
+  Lean would just be cross-referencing two flavors of the same premium/OI data, not validating
+  against price. Spot is the one number on the page genuinely independent of all of it.
+</div>
+
+<p>This is a <strong>relative-value lean, not a forecast</strong> — where premium is currently
+being bid and whether real price agrees, not which way price will go from here. A counter side
+that's richening, committed, and confirmed by price while you're about to send the other side is
+the "don't-enter-blind" case this exists for; use it to adjust strikes/distance, not as a
+standalone signal on its own.</p>
+
+<hr>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="counter-captions"><span class="num">10</span>Counter Read — every possible caption</h2>
+
+<p>The state and the price tag are <strong>independent</strong> — the tag is silently absent
+whenever spot hasn't moved enough recently, which is common and not an error. The complete set:</p>
+
+<table>
+  <tr><th>Caption</th><th>When</th></tr>
+  <tr><td><span class="caption-ex">leaning neither · contested</span></td><td>within 8pts of 50/50 — no lean at all</td></tr>
+  <tr><td><span class="caption-ex">leaning {Label} · building</span></td><td>leaning, held &lt;20s, spot flat</td></tr>
+  <tr><td><span class="caption-ex">leaning {Label} · building · confirms (price)</span></td><td>leaning, held &lt;20s, spot agrees</td></tr>
+  <tr><td><span class="caption-ex">leaning {Label} · building · diverging (price)</span></td><td>leaning, held &lt;20s, spot disagrees</td></tr>
+  <tr><td><span class="caption-ex">leaning {Label} · committed · held Nm</span></td><td>leaning, held ≥20s, spot flat</td></tr>
+  <tr><td><span class="caption-ex">leaning {Label} · committed · confirms (price) · held Nm</span></td><td>leaning, held ≥20s, spot agrees</td></tr>
+  <tr><td><span class="caption-ex">leaning {Label} · committed · diverging (price) · held Nm</span></td><td>leaning, held ≥20s, spot disagrees</td></tr>
+</table>
+
+<p>Seven shapes total. <code>contested</code> never carries a price tag or a held time — there's no
+lean yet to check, or time to have held one.</p>
+
+<div class="card warn">
+  <div><span class="icon">Retired wording</span></div>
+  An earlier version of this feature warned <em>"selling the richer side might be riskier"</em> for
+  credit pairs. That's gone — it only held when richness was driven by adverse price movement, and
+  richness can just as easily rise because price is moving <em>favorably</em> for that side, in
+  which case "riskier" was backwards. Confirms/diverging replaced it: a neutral read of agreement,
+  never an instruction to avoid anything.
+</div>
+
+<hr>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="cheat-sheet"><span class="num">11</span>Cross-tab verdict cheat-sheet</h2>
+
+<p>Reading everything above together. Each is a <strong>prior, not a promise</strong> — the named
+invalidation is what tells you the prior is breaking.</p>
+
+<h3>All tabs agree</h3>
+<p>Session bar, Lean, skew, and 3m flow all the same side → <strong>highest conviction</strong>;
+ride the directional debit; a small counter-print is a pullback. <em>Invalidation:</em> 3m flow
+flips <strong>and</strong> the session bar starts shrinking off its high.</p>
+
+<h3>Flow leads, book lags</h3>
+<p>The session bar has flipped solid to a new side, but the Lean is still balanced and skew still
+reads the old side → rotation in progress, not yet real. <strong>Wait</strong> for the Lean to
+cross ±25 and the tag to turn confirms. <em>Invalidation:</em> the session bar fades and re-flashes
+before the Lean crosses → it was a flow-only pop (fakeout).</p>
+
+<h3>Book leads, hour-flow lags</h3>
+<p>The Lean, skew, and freshest 3m flow are all one side, but the 60m session bar is still deep
+the <em>other</em> way (the case the ⚡ STRETCHED chip flags). The hour's flow is fighting the
+entire structure. <strong>Prior:</strong> this tends to resolve by flow reverting toward
+positioning — the session bar grinds back and flips — not by the book collapsing to meet the flow,
+both because the resting book is where dealers defend and because the hour's residue decays as it
+ages out of the window. <em>Invalidation (a real regime change):</em> skew capitulates, or fresh
+3m flow swings back to the session-bar side.</p>
+
+<h3>Chop / contested</h3>
+<p>Session bar amber (contested near the flip), Lean balanced, 3m flow flat → no trusted side →
+premium-selling/range territory (Condor/Fly), not a directional debit. <em>Invalidation:</em> the
+bar hardens solid off the flip and windows push past 70% one way.</p>
+
+<div class="card warn">
+  <div><span class="icon">Prior, not law</span></div>
+  The "flow reverts toward positioning" verdict is an intraday tendency, not a guarantee. On a
+  true trend day positioning <em>does</em> collapse to meet the flow — that <em>is</em> a regime
+  change — and the skew flip is your early warning you're in that case instead. Trade the prior,
+  respect the invalidation.
+</div>
+
+<hr>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="autoclose"><span class="num">12</span>Auto-close &amp; Dry Run</h2>
+
+<h3>Auto-close</h3>
+<p>The profit target is a % return on the entry's debit/credit:</p>
+<ul>
+  <li><strong>Debit</strong> spreads/singles (Bull Call, Bear Put, flys, Long Call/Put) — close = sell-to-close at 1.30× entry debit (default 30% target).</li>
+  <li><strong>Credit</strong> spreads (Bull Put, Bear Call, IC, Iron Fly) — close = buy-to-close at 0.70× entry credit (keep 30% of the credit).</li>
+</ul>
+<p>Single-leg limit entries use a native broker OTO bracket (the exit survives disconnects).
+Everything else — all spreads, any market entry — uses an app-managed background watcher: the
+entry is submitted and the request returns immediately, then a background task waits for the fill
+and places the close only once it's confirmed. If the entry is rejected, canceled, or never fills,
+<strong>no close is placed</strong> — a rejected/unfilled entry never leaves a naked close behind.</p>
+
+<h3>Dry Run</h3>
+<p>Submits entry <em>and</em> close to the broker with <code>preview=true</code> — validates
+format, symbols, and buying power without placing anything.</p>
+<ul>
+  <li><strong>Entry</strong> → <code>✓ accepted</code>, or the real reason it wouldn't be
+  (e.g. insufficient buying power — an actual account constraint, not a format error).</li>
+  <li><strong>Close</strong> → can't be fully previewed until a position exists to close, so the
+  broker replies "cannot be placed unless closing a position." Torque recognizes this and reports
+  <strong>format valid, validates live after fill</strong> — confirming the close is well-formed. A
+  genuine format/symbol error surfaces differently, distinctly.</li>
+</ul>
+
+<hr>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="orders"><span class="num">13</span>The Orders panel</h2>
+
+<h3>Working <em>(default tab)</em></h3>
+<p>Only <strong>live</strong> orders — entries still resting plus GTC profit-target closes,
+newest-first. Each row's limit price is <strong>click-to-edit</strong> (Enter or ✓ submits a
+modify), and has a <strong>cancel</strong> button. An auto-close watcher strip shows an armed close
+still waiting on its entry to fill; once the close is actually placed it becomes a normal working
+order in the table. Polls every ~4s.</p>
+
+<h3>Past Orders</h3>
+<p><strong>Account-wide</strong>, newest-first: every Torque-tagged order today at any status
+(pending → filled/canceled/rejected/expired). Identical from every tab, always reflects the
+broker's own live status. <em>An order rejected at submission never becomes a broker order, so it
+won't appear here</em> — the red "✗ ENTRY REJECTED" panel right after you send is your record of
+that.</p>
+
+<p>The order-status confirmation under the builder ("✓ ENTRY SENT · entry id N") auto-dismisses
+after 10s — the order itself lives on in Working/Past Orders below.</p>
+
+<hr>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="glossary"><span class="num">14</span>Quick glossary</h2>
+
+<table>
+  <tr><th>Term</th><th>One-line meaning</th></tr>
+  <tr><td>Lean</td><td>where the options book currently sits, −100…+100 (slow, standing positioning)</td></tr>
+  <tr><td>Premium skew</td><td>call vs put $ resting in open interest right now</td></tr>
+  <tr><td>Magnet</td><td>the near-spot strike with the most concentrated OI, and its distance</td></tr>
+  <tr><td>3m Flow</td><td>fresh premium $ traded on calls vs puts, last 3 minutes</td></tr>
+  <tr><td>confirms / diverging</td><td>does fresh flow agree with (or fade) the Lean</td></tr>
+  <tr><td>Session Flow</td><td>the same idea as 3m Flow, integrated over the trailing hour</td></tr>
+  <tr><td>held Nm</td><td>time since the relevant reading last crossed its own center/flip line</td></tr>
+  <tr><td>⚡ STRETCHED</td><td>book &amp; fresh flow agree, but the hour's cumulative flow still disagrees</td></tr>
+  <tr><td>Counter Read</td><td>relative richness between your current structure and its natural opposite</td></tr>
+  <tr><td>Lock Strikes</td><td>freeze strike selection while premiums keep updating live</td></tr>
+  <tr><td>Dry Run</td><td>validate an order with the broker without placing it</td></tr>
+</table>
+
+<div class="footer">
+  <p>Torque — a fast, auto-filling order builder. This manual covers only what you see and how to
+  read it; for build/deploy/config, see <code>docs/torque.md</code>.</p>
+</div>
+
+</div>
+</body>
+</html>

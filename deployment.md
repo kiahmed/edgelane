@@ -129,7 +129,7 @@ summary. Same chain inputs always produce the same trade pick. Torque itself doe
 | `tests/tradier_execute_ticket.py` | Parses EdgeLane copy-button ticket, posts via Tradier. | ✓ |
 | `tests/utils.py` | Shared test helpers (config loader, etc.). | ✓ |
 | `archive/` | Snapshots of prior JSX versions. | ✓ |
-| `docs/` | Implementation notes (`torque.md`, `tradier_implementation.md`, etc.). | ✓ |
+| `docs/` | Implementation notes (`torque.md`, `torque_operating_manual.html`, `tradier_implementation.md`, etc.). | ✓ |
 | `operating_manual.md` | Badge / verdict / score / strategy reference for the UI. | ✓ |
 | `deployment.md` | This file. | ✓ |
 
@@ -509,7 +509,8 @@ For the **market backend / Torque**, the switch is `DEVMODE` in the *separate*
 
 FastAPI service in `market/backend/` that polls Tradier, runs the bias/strategy
 math (parity-tested vs the JSX), and serves **Torque** (`/torque`), the standalone
-multi-leg order builder. Full detail: `docs/torque.md`.
+multi-leg order builder. Technical detail: `docs/torque.md`; what every control and
+reading on screen means: `docs/torque_operating_manual.html`.
 
 ```bash
 cd market/backend

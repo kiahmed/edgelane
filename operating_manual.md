@@ -636,7 +636,8 @@ This is the rare disciplined options play: instead of taking what the market giv
 
 Separate page on the market backend (`:8789/torque`) for placing multi-leg
 orders fast — **no** bias logic. Run: `cd market/backend && make run-dev` (paper)
-or `make run-prod` (real). Full doc: `docs/torque.md`.
+or `make run-prod` (real). Build/deploy doc: `docs/torque.md`; Torque's own
+badge/reading reference (this file's counterpart, for Torque): `docs/torque_operating_manual.html`.
 
 1. Pick a **ticker** + one **strategy** (10, incl. single-leg). Legs auto-fill at
    per-ticker offsets snapped to the live grid; −/+ nudges strikes.
