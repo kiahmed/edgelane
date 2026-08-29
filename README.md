@@ -4,6 +4,22 @@ A single-file web app for finding and ranking multi-leg options spreads with the
 
 Built for personal/local use. The deployed HTML embeds your API keys at build time, so the workflow is private-first — gate the deploy with auth or a tiny key-proxying Pages Function before exposing it publicly.
 
+## The three products
+
+This repo ships as three products under the **Facades** brand
+([facades.trade](https://facades.trade)):
+
+| Product | What it is here | Served at |
+|---|---|---|
+| **Matrix** | this optimizer — `spread_optimizer_v4_7_html.jsx`, `market/ui/` | `matrix.facades.trade` |
+| **Simmer** | earnings / premium-watch engine — `simmer/`, `market/backend/app/simmer_*.py` | `simmer.facades.trade` |
+| **Torque** | standalone order builder — `docs/torque.md` | *not public yet — admin-only, no multi-user login* |
+
+The old internal names stay as they are in the code; the table above is the
+whole mapping. The parent portal — the landing page plus the DNS and hosting
+plumbing for those subdomains — is a separate repo, **facades-portal**, deployed
+to Cloudflare Pages; see its `docs/hosting.md` before touching the domains.
+
 ## Where to start
 
 | If you want to… | Read this |

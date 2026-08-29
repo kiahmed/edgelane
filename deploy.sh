@@ -41,6 +41,13 @@ VERCEL_PROJECT="${VERCEL_PROJECT:-edgelane-matrix}"
 # ⚠ Simmer's hostname must keep matching the backend CORS regex
 # ^https://edgelane[a-z0-9-]*\.vercel\.app$ — see docs/simmer.md "Deployment".
 SIMMER_VERCEL_PROJECT="${SIMMER_VERCEL_PROJECT:-edgelane-simmer}"
+# Parent portal domain. Matrix and Simmer are also served from
+# matrix./simmer.<FACADES_DOMAIN>, so those origins must be in the Supabase Auth
+# redirect allow-list or magic-link and confirmation emails bounce to a host the
+# project does not trust. Torque is deliberately absent — it has no public
+# subdomain yet. Source of truth for which products are live: the facades-portal
+# repo, scripts/products.json. Set FACADES_DOMAIN= (empty) to opt out entirely.
+FACADES_DOMAIN="${FACADES_DOMAIN:-facades.trade}"
 EDGELANE_API_BASE="${EDGELANE_API_BASE:-}"
 COMPOSE="docker compose -f $COMPOSE_FILE --env-file $DEPLOY_ENV"
 
@@ -352,6 +359,13 @@ frontend_setup() {
   [ -n "${EDGE_CONFIG_ID:-${ecid:-}}" ] || warn "Edge Config not set — run 'vercel login' and re-run frontend-setup for tunnel self-heal."
 }
 
+# Redirect patterns for the facades.trade product subdomains, as a comma-prefixed
+# fragment ready to append to an allow-list (empty when FACADES_DOMAIN is unset).
+_facades_allow_fragment() {
+  [ -n "$FACADES_DOMAIN" ] || return 0
+  printf ',https://matrix.%s/**,https://simmer.%s/**' "$FACADES_DOMAIN" "$FACADES_DOMAIN"
+}
+
 # PATCH the Supabase Auth uri_allow_list so confirmation / reset emails may
 # redirect back to BOTH Vercel projects. Only the allow-list is touched (never
 # site_url — a live Matrix deploy owns that from its PROD_URL). Belongs in setup
@@ -361,7 +375,7 @@ _sync_auth_allow_list() {
     warn "  SUPABASE_ACCESS_TOKEN/PROJECT_REF unset — skipping Auth allow-list sync"
     return 0
   fi
-  local allow="https://${VERCEL_PROJECT}.vercel.app/**,https://${VERCEL_PROJECT}-*.vercel.app/**,https://${SIMMER_VERCEL_PROJECT}.vercel.app/**,https://${SIMMER_VERCEL_PROJECT}-*.vercel.app/**,http://localhost:8080/**,http://localhost:8789/**,http://localhost:5173/**"
+  local allow="https://${VERCEL_PROJECT}.vercel.app/**,https://${VERCEL_PROJECT}-*.vercel.app/**,https://${SIMMER_VERCEL_PROJECT}.vercel.app/**,https://${SIMMER_VERCEL_PROJECT}-*.vercel.app/**,http://localhost:8080/**,http://localhost:8789/**,http://localhost:5173/**$(_facades_allow_fragment)"
   if $DRY_RUN; then
     info "  [dry-run] PATCH Supabase Auth uri_allow_list (adds ${SIMMER_VERCEL_PROJECT} origins)"
     return 0
@@ -541,7 +555,7 @@ sync_supabase_site_url() {
   fi
   # Simmer origins ride along so magic-link/confirmation emails can redirect to
   # either app (docs/simmer.md "Deployment" item 2).
-  local allow="$origin/**,https://$VERCEL_PROJECT-*.vercel.app/**,https://$SIMMER_VERCEL_PROJECT.vercel.app/**,https://$SIMMER_VERCEL_PROJECT-*.vercel.app/**,http://localhost:8080/**,http://localhost:8789/**,http://localhost:5173/**"
+  local allow="$origin/**,https://$VERCEL_PROJECT-*.vercel.app/**,https://$SIMMER_VERCEL_PROJECT.vercel.app/**,https://$SIMMER_VERCEL_PROJECT-*.vercel.app/**,http://localhost:8080/**,http://localhost:8789/**,http://localhost:5173/**$(_facades_allow_fragment)"
   if $DRY_RUN; then
     info "would PATCH Supabase Auth site_url=$origin (dry-run)"
     return 0

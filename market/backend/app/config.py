@@ -117,9 +117,13 @@ class Settings(BaseModel):
     # Regex fallback so the deployed Vercel frontend works across renamed projects
     # and rotating preview URLs (edgelane-hazel, edgelane-matrix, *-git-* previews)
     # without re-listing each one. Matched in addition to cors_allow_origins.
+    # The facades.trade alternation covers the parent portal's product
+    # subdomains, which serve the same Vercel deployments under a custom domain.
+    # Torque is absent on purpose: it has no public subdomain yet — add it here
+    # at the same time as its DNS record.
     # Override/disable via CORS_ALLOW_ORIGIN_REGEX in the config (blank = off).
     cors_allow_origin_regex: str | None = Field(
-        default=r"^https://edgelane[a-z0-9-]*\.vercel\.app$")
+        default=r"^https://(edgelane[a-z0-9-]*\.vercel\.app|(matrix|simmer)\.facades\.trade)$")
 
     # WebSocket
     ws_heartbeat_sec: int = Field(default=30)

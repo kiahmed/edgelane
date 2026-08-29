@@ -15,6 +15,26 @@ tool use and verification stay as thorough as the task needs.
 
 EdgeLane is a hybrid (single-file frontend + optional FastAPI backend) options spread optimizer. It finds and ranks multi-leg options spreads by a composite tradeability score (EV, structural health, liquidity, limit-order feasibility, probability of profit). Data comes from Tradier, with Gemini Flash providing prose narrative synthesis.
 
+### Product names
+
+The codebase ships as three products under the **Facades** brand
+(`facades.trade`). The old internal names still appear throughout the code; the
+product names are the user-facing ones:
+
+| Product | Internal name / entry point | Subdomain |
+|---|---|---|
+| **Matrix** | the original EdgeLane optimizer — `spread_optimizer_v4_7_html.jsx`, `market/ui/`, Vercel project `edgelane-matrix` | `matrix.facades.trade` |
+| **Simmer** | `simmer/`, `market/backend/app/simmer_*.py`, Vercel project `edgelane-simmer` | `simmer.facades.trade` |
+| **Torque** | `market/backend/ui/torque.html`, `torque_engine.py` | **none yet** — admin-only, no multi-user login |
+
+Do **not** rename existing symbols, files, or Vercel projects to match. The
+mapping above is the whole translation layer.
+
+The landing page and the DNS/hosting plumbing live in a separate repo,
+**facades-portal** (Cloudflare Pages). Two things in *this* repo depend on those
+hostnames and are commented as such: `cors_allow_origin_regex` in
+`market/backend/app/config.py`, and `_facades_allow_fragment()` in `deploy.sh`.
+
 ## Build & Run Commands
 
 ### Frontend

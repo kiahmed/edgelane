@@ -49,8 +49,10 @@ HTTP_PORT=8788
 CORS_ALLOW_ORIGINS=http://localhost:5173,https://edgelane-matrix.vercel.app
 # Regex fallback (in ADDITION to the list above) so renamed Vercel projects and
 # rotating preview URLs (edgelane-hazel, edgelane-matrix, *-git-* previews) all
-# work without re-listing each. Blank disables it. Default matches edgelane*.vercel.app.
-CORS_ALLOW_ORIGIN_REGEX=^https://edgelane[a-z0-9-]*\.vercel\.app$
+# work without re-listing each. Blank disables it. The second alternation is the
+# facades.trade product subdomains (matrix./simmer.) that front the same Vercel
+# deployments; add torque. here only when Torque gets a public subdomain.
+CORS_ALLOW_ORIGIN_REGEX=^https://(edgelane[a-z0-9-]*\.vercel\.app|(matrix|simmer)\.facades\.trade)$
 
 # ── WebSocket ──
 WS_HEARTBEAT_SEC=30
