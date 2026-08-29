@@ -781,9 +781,25 @@ function App(){
               <div className="muted" style={{fontSize:11,marginTop:5}}>{sess.agree}/{sess.total} windows {sess.sideWord} · <b style={{color:sess.net>=0?'var(--call)':'var(--put)',fontWeight:800,fontSize:12.5}}>{Math.round(sess.dir*100)}%</b> {sess.net>=0?'call':'put'} dominance{sess.heldMs>0?' · held '+fmtHeld(sess.heldMs):''}</div>
             </>:<div className="muted" style={{fontSize:12,padding:'2px 0'}}>building session window… (fills over a few minutes)</div>}
           </div>
+          {/* Both tiles are open-interest × mid, recomputed fresh every poll — not
+              accumulated over any window like the flow tiles above (that's the fact
+              that actually matters here, and it's true regardless of OI mechanics).
+              Deliberately NOT claiming OI itself updates live or is frozen all day —
+              OI nominally settles once overnight (OCC), but `mid` is live and the
+              ±3%-of-spot strike band re-centers on live spot, so the number can move
+              plenty intraday on a big move even if OI barely changed; exactly how
+              often Tradier's own OI field refreshes intraday isn't something this
+              codebase can confirm, so don't overclaim either direction. Not "book"
+              either — order book = live bid/ask depth, a different thing from OI. */}
+          <div className="muted" style={{fontSize:10,marginTop:10,marginBottom:-2}}
+            title="Open interest × live mid, recomputed every poll — not a rolling window like the flow tiles above. OI itself is mostly a standing, slow-moving count (not the live order book); mid and the live spot-centered strike band are what move this during the day.">
+            Live read, no window
+          </div>
           <div className="metrics">
-            <Metric l="Premium skew" v={null} sig={analysis.components.premium_skew.signal} txt={sigTxt(analysis.components.premium_skew.signal)}/>
-            <Metric l="Magnet" v={null} txt={fmt0(analysis.components.magnet.strike)} sub={analysis.components.magnet.dist_pct+'%'} sig={analysis.components.magnet.signal}/>
+            <Metric l="Premium skew" v={null} sig={analysis.components.premium_skew.signal} txt={sigTxt(analysis.components.premium_skew.signal)}
+              tip="Call $ vs put $ resting in open interest right now — which side the book leans heavier on. A snapshot, not a forecast."/>
+            <Metric l="Magnet (raw OI)" v={null} txt={fmt0(analysis.components.magnet.strike)} sub={analysis.components.magnet.dist_pct+'%'} sig={analysis.components.magnet.signal}
+              tip="The strike with the most combined open interest near spot — a simple pull toward the heaviest resting position. Raw OI only, no gamma weighting (unlike a GEX-based wall) — a rough context read, not a directional call."/>
           </div>
           {tens&&<div className={"tension "+tens.side} title={tens.title}>{tens.label}</div>}
         </>}
@@ -868,10 +884,10 @@ function PastList({past}){
   </table>;
 }
 
-function Metric({l,v,sig,txt,sub}){
+function Metric({l,v,sig,txt,sub,tip}){
   const c=sig>0.05?'var(--call)':sig<-0.05?'var(--put)':'var(--dim)';
   const w=Math.min(100,Math.abs((sig||0)*100));
-  return <div className="metric">
+  return <div className="metric" title={tip}>
     <div className="l">{l}</div>
     <div className="v">{txt!=null?txt:(v!=null?fmt(v,2):'—')}{sub&&<span className="muted" style={{fontSize:11}}> {sub}</span>}</div>
     <div className="bar"><i style={{width:w+'%',background:c,marginLeft:sig<0?(100-w)+'%':0}}></i></div>

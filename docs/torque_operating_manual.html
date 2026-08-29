@@ -224,9 +224,16 @@ because of anything happening right now). That's what the Flow (next section) is
 <!-- ══════════════════════════════════════════════════════════════ -->
 <h2 id="skew-magnet"><span class="num">3</span>Premium skew &amp; Magnet</h2>
 
+<p>Both tiles are labeled <strong>"Live read, no window"</strong> right above them — they're
+built from open interest × the current live mid, recomputed fresh every poll. That's a different
+kind of read from everything in the Flow/Session Flow sections below: those accumulate over an
+explicit 3-minute or 60-minute window, these two don't accumulate over any window at all. Hover
+that small label for the full explanation (why "no window," not "live OI" — OI itself is a
+standing count, not something that updates by the second the way mid/spot do).</p>
+
 <h3>Premium skew <em>(tile)</em></h3>
 <p>Call vs put dollars resting in open interest right now — the standing balance, and one of the
-Lean's three inputs. Shown as a label:</p>
+Lean's three inputs. Hover it on screen for a one-line reminder of its purpose. Shown as a label:</p>
 <table>
   <tr><th>Label</th><th>Meaning</th></tr>
   <tr><td><span class="pill call">calls rich</span></td><td>more $ resting on the call side</td></tr>
@@ -234,11 +241,19 @@ Lean's three inputs. Shown as a label:</p>
   <tr><td><span class="pill dim">balanced</span></td><td>no meaningful tilt</td></tr>
 </table>
 
-<h3>Magnet <em>(tile)</em></h3>
+<h3>Magnet (raw OI) <em>(tile)</em></h3>
 <p>The near-spot strike with the most concentrated open interest, plus its distance from spot
 (e.g. <code>29,430 · 0.7%</code>). A <strong>tight</strong> near-spot magnet is what flips the
 auto-picked balanced strategy from <strong>Iron Condor</strong> to <strong>Iron Fly</strong> —
 Torque reads a strong pin as worth selling directly at, not around.</p>
+
+<p>The tile is labeled <strong>"(raw OI)"</strong> on purpose, and hovering it explains why: this
+is plain open-interest concentration, with <strong>no gamma weighting</strong> — a much simpler
+read than a GEX-based dealer-hedging wall (the kind the main EdgeLane app computes). A strike can
+carry heavy OI but low gamma (stale, far-out positioning) or modest OI but high gamma (tight
+near-spot 0DTE concentration) — raw OI and GEX routinely point at different strikes. Magnet here
+is a rough context number feeding the non-predictive Lean, not a directional call the way a GEX
+wall is meant to be.</p>
 
 <hr>
 
@@ -634,7 +649,7 @@ after 10s — the order itself lives on in Working/Past Orders below.</p>
   <tr><th>Term</th><th>One-line meaning</th></tr>
   <tr><td>Lean</td><td>where the options book currently sits, −100…+100 (slow, standing positioning)</td></tr>
   <tr><td>Premium skew</td><td>call vs put $ resting in open interest right now</td></tr>
-  <tr><td>Magnet</td><td>the near-spot strike with the most concentrated OI, and its distance</td></tr>
+  <tr><td>Magnet (raw OI)</td><td>the near-spot strike with the most concentrated OI (no gamma weighting), and its distance</td></tr>
   <tr><td>3m Flow</td><td>fresh premium $ traded on calls vs puts, last 3 minutes</td></tr>
   <tr><td>confirms / diverging</td><td>does fresh flow agree with (or fade) the Lean</td></tr>
   <tr><td>Session Flow</td><td>the same idea as 3m Flow, integrated over the trailing hour</td></tr>
