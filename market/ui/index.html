@@ -706,30 +706,44 @@
   // To override: open index.html?api=http://127.0.0.1:8788
   // To reset:    localStorage.removeItem('edgelane_api_base'); reload.
   // ───────────────────────────────────────────────────────────────────────
-  function _explicitOverride() {
-    // ?api and localStorage are sticky dev overrides — they win over everything,
-    // including the Supabase pointer. Returns the override URL or null.
-    const url = new URL(location.href);
-    const qp = url.searchParams.get('api');
-    if (qp) {
-      try { localStorage.setItem('edgelane_api_base', qp); } catch(e) {}
-      return qp.replace(/\/+$/, '');
-    }
-    try {
-      const stored = localStorage.getItem('edgelane_api_base');
-      if (stored) return stored.replace(/\/+$/, '');
-    } catch(e) {}
-    return null;
-  }
+  const _API_BASE_KEY = 'edgelane_api_base';
+
   function _resolveApiBase() {
-    const ov = _explicitOverride();
-    if (ov) return ov;
-    // Deploy-baked backend URL — the named tunnel's permanent hostname
-    // (edge.facades.trade). Vercel has no co-located backend, so this always
-    // beats same-origin. Set from EDGELANE_API_BASE at deploy time.
-    if (typeof window.__EDGELANE_API_BASE__ === 'string' && window.__EDGELANE_API_BASE__) {
-      return window.__EDGELANE_API_BASE__.replace(/\/+$/, '');
+    const baked = (typeof window.__EDGELANE_API_BASE__ === 'string' && window.__EDGELANE_API_BASE__)
+      ? window.__EDGELANE_API_BASE__.replace(/\/+$/, '') : null;
+
+    // ── Deployed build: the baked base is AUTHORITATIVE ───────────────────
+    // Two reasons it must outrank the sticky localStorage value:
+    //
+    //  1. Correctness. The retired quick-tunnel code wrote every rotated
+    //     *.trycloudflare.com URL into localStorage. Those entries are still in
+    //     returning users' browsers and now point at a dead host — if they won,
+    //     the app would "fail to fetch" against a tunnel that no longer exists,
+    //     with a perfectly healthy backend one URL away.
+    //  2. Security. `https://matrix.facades.trade/?api=https://evil.tld` would
+    //     otherwise repoint a legitimate deployment at an attacker's origin and
+    //     hand it the password typed into the sign-in gate. Simmer already
+    //     refuses this (see the SECURITY note in simmer/ui/src/lib/api.ts).
+    if (baked) {
+      // Evict a stale sticky value so it can't resurface if this ever changes.
+      try {
+        const stored = localStorage.getItem(_API_BASE_KEY);
+        if (stored && stored.replace(/\/+$/, '') !== baked) localStorage.removeItem(_API_BASE_KEY);
+      } catch (e) {}
+      return baked;
     }
+
+    // ── Dev build (nothing baked): overrides are allowed ──────────────────
+    try {
+      const qp = new URL(location.href).searchParams.get('api');
+      if (qp) {
+        try { localStorage.setItem(_API_BASE_KEY, qp); } catch (e) {}
+        return qp.replace(/\/+$/, '');
+      }
+      const stored = localStorage.getItem(_API_BASE_KEY);
+      if (stored) return stored.replace(/\/+$/, '');
+    } catch (e) {}
+
     if ((location.protocol === 'http:' || location.protocol === 'https:') && location.host) {
       return `${location.protocol}//${location.host}`;
     }
@@ -738,9 +752,10 @@
   const API_BASE = _resolveApiBase();
   // UI-owned version, auto-bumped by .githooks/pre-commit on any commit that
   // touches this file (manual: tools/bump_ui_version.sh).
-  const UI_VERSION = '2.1.2';
+  const UI_VERSION = '2.1.3';
   console.info('[edgelane] API_BASE =', API_BASE,
-    '  (override with ?api=http://host:port; clear with localStorage.removeItem("edgelane_api_base"))');
+    (window.__EDGELANE_API_BASE__ ? '  (deploy-baked — ?api= is ignored on deployed builds)'
+                                  : '  (dev build — override with ?api=http://host:port)'));
 
   const $ = (id) => document.getElementById(id);
   const fmt = {
