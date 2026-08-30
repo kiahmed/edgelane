@@ -1,0 +1,1001 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Matrix — Operating Manual</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Newsreader:opsz,wght@6..72,400;6..72,500&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+  :root{
+    --ground:#07090d;
+    --panel:#0e141d;
+    --panel-2:#121a25;
+    --rule:rgba(72,94,126,.30);
+    --rule-strong:rgba(96,124,162,.45);
+    --ink:#e4eaf2;
+    --ink-body:#c2cddc;
+    --ink-dim:#8496ac;
+    --ink-faint:#5d6c80;
+    --mint:#78ffb4;
+    --emerald:#86efac;
+    --amber:#fde68a;
+    --rose:#fda4af;
+    --sky:#7dd3fc;
+    --stone:#94a3b8;
+    --maxw:1180px;
+    color-scheme:dark;
+  }
+
+  body{
+    background:var(--ground);
+    color:var(--ink-body);
+    font-family:"Newsreader",Georgia,"Times New Roman",serif;
+    font-size:17.5px;
+    line-height:1.68;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  /* ── shell ─────────────────────────────────────────────────── */
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 clamp(1.1rem,4vw,2.5rem) 6rem;}
+
+  .masthead{
+    border-bottom:1px solid var(--rule);
+    padding:clamp(3rem,7vw,5.5rem) 0 2.5rem;
+    display:flex;flex-direction:column;gap:1.4rem;
+  }
+  .brandline{
+    display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;
+    font-family:"IBM Plex Mono",ui-monospace,monospace;
+    font-size:.7rem;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-faint);
+  }
+  .brandline .host{color:var(--mint);}
+  .brandline .sep{color:var(--rule-strong);}
+
+  h1{
+    font-family:"Archivo",system-ui,sans-serif;
+    font-weight:700;
+    font-size:clamp(3.4rem,11vw,7rem);
+    line-height:.9;
+    letter-spacing:-.045em;
+    color:var(--ink);
+    margin:0;
+    text-wrap:balance;
+  }
+  .standfirst{
+    font-size:clamp(1.15rem,2.4vw,1.42rem);
+    line-height:1.5;
+    color:var(--ink-dim);
+    max-width:34ch;
+    margin:0;
+  }
+
+  /* ── notices ───────────────────────────────────────────────── */
+  .notices{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule);border-radius:3px;margin-top:.6rem;}
+  @media(min-width:820px){.notices{grid-template-columns:repeat(3,1fr);}}
+  .notice{background:var(--panel);padding:1.15rem 1.25rem;display:flex;flex-direction:column;gap:.5rem;}
+  .notice .tag{
+    font-family:"IBM Plex Mono",monospace;font-size:.63rem;letter-spacing:.16em;
+    text-transform:uppercase;font-weight:600;
+  }
+  .notice p{margin:0;font-size:.94rem;line-height:1.6;color:var(--ink-body);}
+  .notice.discontinued .tag{color:var(--rose);}
+  .notice.rebrand .tag{color:var(--mint);}
+  .notice.internal .tag{color:var(--amber);}
+
+  /* ── layout: rail + column ─────────────────────────────────── */
+  .layout{display:block;}
+  @media(min-width:1040px){
+    .layout{display:grid;grid-template-columns:212px minmax(0,1fr);gap:clamp(2.5rem,5vw,4.5rem);align-items:start;}
+  }
+  .rail{display:none;}
+  @media(min-width:1040px){
+    .rail{
+      display:block;position:sticky;top:2rem;padding-top:3.2rem;
+      font-family:"IBM Plex Mono",monospace;font-size:.72rem;line-height:1.45;
+    }
+  }
+  .rail ol{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:.1rem;}
+  .rail a{
+    display:block;padding:.42rem .55rem;color:var(--ink-faint);text-decoration:none;
+    border-left:2px solid transparent;transition:color .15s,border-color .15s,background .15s;
+  }
+  .rail a:hover,.rail a:focus-visible{color:var(--mint);border-left-color:var(--mint);background:rgba(120,255,180,.05);}
+  .rail .rail-h{
+    color:var(--ink-faint);letter-spacing:.16em;text-transform:uppercase;font-size:.62rem;
+    padding:0 .55rem .7rem;border-bottom:1px solid var(--rule);margin-bottom:.7rem;
+  }
+
+  /* ── sections ──────────────────────────────────────────────── */
+  section{padding-top:3.6rem;scroll-margin-top:1.5rem;}
+  .sec-head{display:flex;flex-direction:column;gap:.45rem;margin-bottom:1.5rem;}
+  .eyebrow{
+    font-family:"IBM Plex Mono",monospace;font-size:.65rem;letter-spacing:.18em;
+    text-transform:uppercase;color:var(--ink-faint);
+  }
+  h2{
+    font-family:"Archivo",system-ui,sans-serif;font-weight:600;
+    font-size:clamp(1.75rem,3.6vw,2.5rem);line-height:1.08;letter-spacing:-.028em;
+    color:var(--ink);margin:0;text-wrap:balance;
+  }
+  h3{
+    font-family:"Archivo",system-ui,sans-serif;font-weight:600;
+    font-size:1.16rem;letter-spacing:-.012em;color:var(--ink);
+    margin:2.6rem 0 .85rem;text-wrap:balance;
+  }
+  h4{
+    font-family:"IBM Plex Mono",monospace;font-weight:600;font-size:.72rem;
+    letter-spacing:.14em;text-transform:uppercase;color:var(--ink-dim);
+    margin:2rem 0 .7rem;
+  }
+  p{margin:0 0 1.05rem;max-width:66ch;}
+  p:last-child{margin-bottom:0;}
+  .lede{font-size:1.14rem;color:var(--ink);max-width:62ch;}
+
+  a{color:var(--mint);text-decoration:none;border-bottom:1px solid rgba(120,255,180,.3);}
+  a:hover{border-bottom-color:var(--mint);}
+  :focus-visible{outline:2px solid var(--mint);outline-offset:3px;border-radius:2px;}
+
+  strong{color:var(--ink);font-weight:500;}
+  em{color:var(--ink);font-style:italic;}
+
+  code,.mono{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.86em;}
+  p code,li code,td code{
+    color:var(--sky);background:rgba(125,211,252,.07);
+    padding:.08em .34em;border-radius:2px;
+  }
+
+  ul.prose{margin:0 0 1.05rem;padding-left:1.1rem;max-width:66ch;}
+  ul.prose li{margin-bottom:.5rem;}
+  ul.prose li::marker{color:var(--ink-faint);}
+
+  /* ── tables ────────────────────────────────────────────────── */
+  .tbl-wrap{overflow-x:auto;margin:1.1rem 0 1.6rem;border:1px solid var(--rule);border-radius:3px;background:var(--panel);}
+  table{border-collapse:collapse;width:100%;min-width:520px;
+    font-family:"IBM Plex Mono",monospace;font-size:.79rem;line-height:1.5;
+    font-variant-numeric:tabular-nums;}
+  thead th{
+    text-align:left;font-weight:600;font-size:.63rem;letter-spacing:.13em;text-transform:uppercase;
+    color:var(--ink-faint);padding:.75rem .9rem;border-bottom:1px solid var(--rule-strong);
+    white-space:nowrap;background:var(--panel-2);
+  }
+  tbody td{padding:.68rem .9rem;border-bottom:1px solid rgba(72,94,126,.16);color:var(--ink-body);vertical-align:top;}
+  tbody tr:last-child td{border-bottom:none;}
+  tbody tr:hover td{background:rgba(120,255,180,.025);}
+  td.k{color:var(--ink);font-weight:500;white-space:nowrap;}
+  td.num{white-space:nowrap;color:var(--ink);}
+
+  /* semantic band chip on the left edge of a row */
+  td.band{position:relative;padding-left:1.35rem;}
+  td.band::before{content:"";position:absolute;left:.55rem;top:.95rem;width:4px;height:4px;border-radius:50%;}
+  tr.g td.band::before{background:var(--emerald);box-shadow:0 0 7px rgba(134,239,172,.6);}
+  tr.a td.band::before{background:var(--amber);box-shadow:0 0 7px rgba(253,230,138,.5);}
+  tr.r td.band::before{background:var(--rose);box-shadow:0 0 7px rgba(253,164,175,.5);}
+  tr.n td.band::before{background:var(--stone);}
+  tr.s td.band::before{background:var(--sky);box-shadow:0 0 7px rgba(125,211,252,.5);}
+
+  .t-g{color:var(--emerald);}
+  .t-a{color:var(--amber);}
+  .t-r{color:var(--rose);}
+  .t-s{color:var(--sky);}
+  .t-n{color:var(--stone);}
+  .t-m{color:var(--mint);}
+
+  /* ── code blocks ───────────────────────────────────────────── */
+  pre{
+    margin:1.1rem 0 1.6rem;padding:1rem 1.1rem;overflow-x:auto;
+    background:var(--panel);border:1px solid var(--rule);border-radius:3px;
+    border-left:2px solid var(--rule-strong);
+    font-family:"IBM Plex Mono",monospace;font-size:.78rem;line-height:1.68;
+    color:var(--ink-body);
+  }
+  pre .c{color:var(--ink-faint);}
+  pre .hl{color:var(--mint);}
+
+  /* ── band strip (score scales) ─────────────────────────────── */
+  .strip{margin:1.4rem 0 1.9rem;}
+  .strip-bar{display:flex;height:34px;border:1px solid var(--rule);border-radius:2px;overflow:hidden;}
+  .strip-bar div{
+    flex:1;display:flex;align-items:center;justify-content:center;
+    font-family:"IBM Plex Mono",monospace;font-size:.63rem;letter-spacing:.09em;
+    text-transform:uppercase;font-weight:600;
+    border-right:1px solid rgba(7,9,13,.65);
+  }
+  .strip-bar div:last-child{border-right:none;}
+  .strip-scale{
+    display:flex;justify-content:space-between;margin-top:.4rem;
+    font-family:"IBM Plex Mono",monospace;font-size:.63rem;color:var(--ink-faint);
+  }
+  .sb-bear{background:rgba(244,63,94,.30);color:#ffd8dd;}
+  .sb-mbear{background:rgba(244,63,94,.15);color:var(--rose);}
+  .sb-neu{background:rgba(148,163,184,.14);color:var(--stone);}
+  .sb-mbull{background:rgba(34,197,94,.15);color:var(--emerald);}
+  .sb-bull{background:rgba(34,197,94,.30);color:#c8f6d9;}
+  .sb-no{background:rgba(244,63,94,.22);color:#ffd8dd;flex:0 0 40%;}
+  .sb-marg{background:rgba(234,179,8,.20);color:var(--amber);flex:0 0 20%;}
+  .sb-ok{background:rgba(34,197,94,.26);color:#c8f6d9;flex:0 0 40%;}
+
+  /* ── callout ───────────────────────────────────────────────── */
+  .callout{
+    margin:1.5rem 0;padding:1.05rem 1.2rem;background:var(--panel);
+    border:1px solid var(--rule);border-left:2px solid var(--mint);border-radius:3px;
+  }
+  .callout.warn{border-left-color:var(--amber);}
+  .callout.gone{border-left-color:var(--rose);}
+  .callout p{margin:0;font-size:.98rem;max-width:64ch;}
+  .callout .lbl{
+    display:block;font-family:"IBM Plex Mono",monospace;font-size:.62rem;
+    letter-spacing:.16em;text-transform:uppercase;color:var(--ink-faint);margin-bottom:.4rem;
+  }
+
+  /* ── before / after ────────────────────────────────────────── */
+  .ba{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule);border-radius:3px;margin:1.3rem 0 1.8rem;}
+  @media(min-width:760px){.ba{grid-template-columns:1fr 1fr;}}
+  .ba-col{background:var(--panel);padding:1.15rem 1.25rem;}
+  .ba-col h5{
+    margin:0 0 .9rem;font-family:"IBM Plex Mono",monospace;font-size:.65rem;
+    letter-spacing:.16em;text-transform:uppercase;font-weight:600;
+  }
+  .ba-col.old h5{color:var(--rose);}
+  .ba-col.new h5{color:var(--mint);}
+  .ba-col ul{margin:0;padding-left:1rem;font-size:.9rem;line-height:1.55;}
+  .ba-col li{margin-bottom:.6rem;}
+  .ba-col li::marker{color:var(--ink-faint);}
+  .ba-col.old{color:var(--ink-dim);}
+
+  /* ── numbered workflow (a real sequence) ───────────────────── */
+  ol.flow{list-style:none;margin:1.3rem 0 0;padding:0;counter-reset:step;max-width:70ch;}
+  ol.flow li{
+    counter-increment:step;position:relative;padding-left:3rem;
+    padding-bottom:1.35rem;border-left:1px solid var(--rule);margin-left:.85rem;
+  }
+  ol.flow li:last-child{border-left-color:transparent;padding-bottom:0;}
+  ol.flow li::before{
+    content:counter(step,decimal-leading-zero);
+    position:absolute;left:-.85rem;top:-.15rem;width:1.7rem;height:1.7rem;
+    display:grid;place-items:center;border-radius:50%;
+    background:var(--ground);border:1px solid var(--rule-strong);
+    font-family:"IBM Plex Mono",monospace;font-size:.62rem;color:var(--ink-dim);
+  }
+  ol.flow li b{color:var(--ink);font-weight:500;}
+
+  /* ── product comparison ────────────────────────────────────── */
+  .prods{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule);border-radius:3px;margin:1.4rem 0;}
+  @media(min-width:820px){.prods{grid-template-columns:repeat(3,1fr);}}
+  .prod{background:var(--panel);padding:1.3rem;display:flex;flex-direction:column;gap:.7rem;}
+  .prod.is-matrix{background:linear-gradient(180deg,rgba(120,255,180,.06),var(--panel) 60%);}
+  .prod h5{
+    margin:0;font-family:"Archivo",sans-serif;font-size:1.2rem;font-weight:600;
+    letter-spacing:-.02em;color:var(--ink);
+  }
+  .prod .host{
+    font-family:"IBM Plex Mono",monospace;font-size:.66rem;letter-spacing:.06em;
+    color:var(--ink-faint);
+  }
+  .prod.is-matrix .host{color:var(--mint);}
+  .prod p{font-size:.92rem;margin:0;line-height:1.55;}
+  .prod .self{
+    margin-top:auto;padding-top:.8rem;border-top:1px solid var(--rule);
+    font-family:"IBM Plex Mono",monospace;font-size:.68rem;letter-spacing:.05em;
+  }
+
+  /* ── trust-state cards ─────────────────────────────────────── */
+  .states{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule);border-radius:3px;margin:1.3rem 0 1.8rem;}
+  @media(min-width:700px){.states{grid-template-columns:repeat(2,1fr);}}
+  .state{background:var(--panel);padding:1.15rem 1.25rem;display:flex;flex-direction:column;gap:.55rem;}
+  .state .nm{
+    font-family:"IBM Plex Mono",monospace;font-size:.68rem;letter-spacing:.14em;
+    text-transform:uppercase;font-weight:600;
+  }
+  .state .shows{
+    font-family:"IBM Plex Mono",monospace;font-size:.76rem;color:var(--ink);
+    background:var(--ground);border:1px solid var(--rule);border-radius:2px;
+    padding:.5rem .6rem;
+  }
+  .state p{font-size:.9rem;margin:0;color:var(--ink-dim);}
+  .state.calib .nm{color:var(--sky);}
+  .state.sync .nm{color:var(--emerald);}
+  .state.paused .nm{color:var(--rose);}
+  .state.lowconf .nm{color:var(--amber);}
+
+  footer{
+    margin-top:5rem;padding-top:1.6rem;border-top:1px solid var(--rule);
+    font-family:"IBM Plex Mono",monospace;font-size:.68rem;color:var(--ink-faint);
+    display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap;
+  }
+
+  @media(prefers-reduced-motion:reduce){
+    *{animation:none!important;transition:none!important;}
+  }
+</style>
+<style>
+  *,*::before,*::after{box-sizing:border-box;}
+  html{-webkit-text-size-adjust:100%;}
+  body{margin:0;}
+  img{max-width:100%;}
+  [hidden]{display:none!important;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="brandline">
+      <span class="host">facades.trade</span>
+      <span class="sep">/</span>
+      <span>Matrix</span>
+      <span class="sep">/</span>
+      <span>Operating manual</span>
+    </div>
+    <h1>Matrix</h1>
+    <p class="standfirst">A dealer-positioning spread optimizer that publishes one pick at a time &mdash; and grades every one of them.</p>
+
+    <div class="notices">
+      <div class="notice discontinued">
+        <span class="tag">Redesigned &middot; legacy discontinued</span>
+        <p>This is not the old single-file spread optimizer. <code>edge_lane.html</code>, built from <code>spread_optimizer_v4_7_html.jsx</code>, is <strong>discontinued</strong> &mdash; along with its manual <em>Detect bias from Greeks</em> button, its strategy / target-delta / wing-width knobs, and its three side-by-side candidate cards. Matrix now runs continuously off a backend poller.</p>
+      </div>
+      <div class="notice rebrand">
+        <span class="tag">Now at matrix.facades.trade</span>
+        <p>Matrix ships under the <strong>Facades</strong> brand at <code>matrix.facades.trade</code>. <strong>facades.trade replaces EdgeLane</strong> as the public name, across the product, the domain, and everything customer-facing.</p>
+      </div>
+      <div class="notice internal">
+        <span class="tag">Internal note &mdash; not public</span>
+        <p>The backend still calls the system <em>edgelane</em> throughout: repo, config keys, DuckDB tables, service names, Vercel projects. That naming is <strong>internal only</strong> and is deliberately not surfaced to users. Nothing public carries the old name.</p>
+      </div>
+    </div>
+  </header>
+
+  <div class="layout">
+
+    <nav class="rail" aria-label="Contents">
+      <div class="rail-h">Contents</div>
+      <ol>
+        <li><a href="#what">What Matrix is</a></li>
+        <li><a href="#redesign">What the redesign changed</a></li>
+        <li><a href="#page">Reading the page</a></li>
+        <li><a href="#bias">The bias read</a></li>
+        <li><a href="#pick">The engine pick</a></li>
+        <li><a href="#limit">Limit-order tiers</a></li>
+        <li><a href="#lookup">Lookup projections</a></li>
+        <li><a href="#lenses">VEX / TEX lenses</a></li>
+        <li><a href="#selfeval">Self-evaluation</a></li>
+        <li><a href="#workflow">Workflow</a></li>
+        <li><a href="#versus">Matrix vs. the others</a></li>
+      </ol>
+    </nav>
+
+    <main>
+
+      <!-- ══ WHAT IT IS ══════════════════════════════════════ -->
+      <section id="what">
+        <div class="sec-head">
+          <span class="eyebrow">01 &mdash; The product</span>
+          <h2>What Matrix is</h2>
+        </div>
+
+        <p class="lede">Matrix reads the options chain as a map of where dealers are forced to hedge, then tells you which multi-leg spread that map actually pays for &mdash; and what premium it would take to be worth trading.</p>
+
+        <p>Every poll, the engine pulls a live chain, aggregates dealer gamma exposure into <strong>walls</strong>, derives a directional <strong>bias</strong> from where spot sits relative to those walls, generates candidate spreads across eight structures, and ranks them by a single composite score built from expected value, structural health, liquidity, limit-order feasibility, and probability of profit. The highest-composite candidate is published as the <strong>engine pick</strong>.</p>
+
+        <p>All of that is deterministic math. The language model in the stack writes prose narrative only &mdash; it never scores, ranks, or picks. If a number appears on the page, Python or JavaScript produced it.</p>
+
+        <div class="callout">
+          <span class="lbl">The part no other product here does</span>
+          <p>Three minutes after Matrix publishes a pick, it re-prices <em>that exact spread</em> and records whether it made money. Those grades accumulate into a published win rate &mdash; and when the record turns, Matrix stops showing the number and says so. See <a href="#selfeval">Self-evaluation</a>.</p>
+        </div>
+      </section>
+
+      <!-- ══ REDESIGN ═══════════════════════════════════════ -->
+      <section id="redesign">
+        <div class="sec-head">
+          <span class="eyebrow">02 &mdash; Legacy &rarr; now</span>
+          <h2>What the redesign changed</h2>
+        </div>
+
+        <p>The legacy build was an <strong>operator's console</strong>: you set the inputs, pressed a button, and read three candidate cards it produced on demand. The redesign inverts that. The backend polls continuously and holds the opinion; the page is a <strong>readout</strong> of a running engine, not a calculator you drive.</p>
+
+        <div class="ba">
+          <div class="ba-col old">
+            <h5>Legacy &mdash; discontinued</h5>
+            <ul>
+              <li>Green <em>Detect bias from Greeks</em> button; nothing computed until you pressed it</li>
+              <li>You chose the strategy, target delta, and wing-width preference by hand</li>
+              <li>Three candidate cards side by side &mdash; Conservative, Balanced, Aggressive</li>
+              <li>One dominant GEX wall</li>
+              <li>Four manual refresh buttons, each costing provider calls</li>
+              <li>Tabs labelled <em>Tickets (3)</em> and <em>Lookup</em></li>
+              <li>No record of whether any of it worked</li>
+              <li>Single HTML file, browser-transpiled, config baked at build time</li>
+            </ul>
+          </div>
+          <div class="ba-col new">
+            <h5>Matrix &mdash; current</h5>
+            <ul>
+              <li>No detect button. The poller refreshes bias, chain, and candidates on a ~20&nbsp;second cadence</li>
+              <li>The engine selects the structure. All eight strategies stay scored and visible; the bias stars the ones it recommends</li>
+              <li>One <strong>engine pick</strong>, promoted with its composite, verdict, structure, and metrics</li>
+              <li><strong>Bilateral walls</strong> &mdash; put wall as magnet, call wall as resistance, each with its own strength</li>
+              <li>Auto-poll with a user-set interval; a status row shows staleness</li>
+              <li>Tabs labelled <strong>Engine pick</strong> and <strong>Lookup</strong></li>
+              <li>Every pick graded three minutes later; a rolling win rate and a regime-shift banner</li>
+              <li>Deployed frontend on <code>matrix.facades.trade</code>, sign-in gated, talking to a live FastAPI + DuckDB service</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout gone">
+          <span class="lbl">If you are coming from the old manual</span>
+          <p>The scoring math did not change &mdash; it was ported from the JSX engine to Python and is held to 56 parity tests, so every threshold below still means what it meant. What changed is <em>who turns the knobs</em>. Anywhere the old manual told you to press a button, the engine now does it on a timer.</p>
+        </div>
+      </section>
+
+      <!-- ══ PAGE ═══════════════════════════════════════════ -->
+      <section id="page">
+        <div class="sec-head">
+          <span class="eyebrow">03 &mdash; Layout</span>
+          <h2>Reading the page</h2>
+        </div>
+
+        <p>Top to bottom, the screen runs from system state, through the market read, to the recommendation, and ends with the engine's own track record.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Element</th><th>What it carries</th></tr></thead>
+            <tbody>
+              <tr><td class="k">Header pills</td><td>Build version, DEVMODE, market open/closed, poller status, and the <span class="t-m">accuracy pill</span> &mdash; the engine's current win rate or the reason it is withholding one.</td></tr>
+              <tr><td class="k">Symbol selector</td><td>Which polled underlying you are looking at. The backend polls a configured set; you switch between them, you do not type one in.</td></tr>
+              <tr><td class="k">Tabs</td><td><strong>Engine pick</strong> and <strong>Lookup</strong>. Switching is free &mdash; no provider call, same data shown two ways.</td></tr>
+              <tr class="r"><td class="k band">Regime banner</td><td>Hidden by default. Appears when the evaluator flags consecutive losing picks: the engine is telling you its read has gone out of sync.</td></tr>
+              <tr><td class="k">Spot card</td><td>Underlying price, DTE and expiration, expected move to expiry from the ATM straddle.</td></tr>
+              <tr><td class="k">Bias card</td><td>Direction pill, &minus;100&hellip;+100 score, confidence, the supporting facts, and the data source.</td></tr>
+              <tr><td class="k">Walls card</td><td>Put wall (magnet) and call wall (resistance) with strengths. Bilateral &mdash; the legacy single dominant wall is retired.</td></tr>
+              <tr class="g"><td class="k band">Engine pick</td><td>The promoted spread: name, composite pill, verdict pill, leg structure, five metrics, and the bias-trust hint when one applies.</td></tr>
+              <tr><td class="k">Strategies (8)</td><td>Every structure scored, with <span class="t-a">&#9733;</span> on the ones the current bias recommends.</td></tr>
+              <tr><td class="k">Recent outcomes</td><td>The last ten graded picks, each with entry and exit premium.</td></tr>
+              <tr><td class="k">Lookup grid</td><td>Black&ndash;Scholes projection for the current engine pick across spot levels and time.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The eight structures</h3>
+        <p>Matrix generates candidates across all eight and scores every one. The bias determines which are starred, not which exist.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Structure</th><th>Type</th><th>Fits bias</th></tr></thead>
+            <tbody>
+              <tr><td class="k">Bull put spread</td><td class="t-g">credit</td><td>bullish, mild bullish, neutral</td></tr>
+              <tr><td class="k">Bear call spread</td><td class="t-g">credit</td><td>bearish, mild bearish, neutral</td></tr>
+              <tr><td class="k">Iron condor</td><td class="t-g">credit</td><td>neutral, mild bullish, mild bearish</td></tr>
+              <tr><td class="k">Iron butterfly</td><td class="t-g">credit</td><td>neutral</td></tr>
+              <tr><td class="k">Bull call spread</td><td class="t-s">debit</td><td>bullish, mild bullish</td></tr>
+              <tr><td class="k">Bear put spread</td><td class="t-s">debit</td><td>bearish, mild bearish</td></tr>
+              <tr><td class="k">Call butterfly</td><td class="t-s">debit</td><td>neutral, mild bullish</td></tr>
+              <tr><td class="k">Put butterfly</td><td class="t-s">debit</td><td>neutral, mild bearish</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h4>Width, delta, and DTE scaling</h4>
+        <p>The legacy UI exposed target delta and wing width as controls. They still exist as engine parameters &mdash; the optimizer hunts a short-strike delta around 0.25&ndash;0.30 for credit structures, and scales wing width off the expected move: <span class="mono t-n">tight 1.0&times;</span>, <span class="mono t-n">balanced 1.5&times;</span>, <span class="mono t-n">generous 2.5&times;</span>. That base width then scales by time to expiry: <span class="mono">0.4&times;</span> at 0 DTE, <span class="mono">1.0&times;</span> at 1&ndash;7 DTE, <span class="mono">1.5&times;</span> beyond a week. Configured server-side now, not clicked.</p>
+      </section>
+
+      <!-- ══ BIAS ═══════════════════════════════════════════ -->
+      <section id="bias">
+        <div class="sec-head">
+          <span class="eyebrow">04 &mdash; The read</span>
+          <h2>The bias read</h2>
+        </div>
+
+        <p>Bias is a single number on a &minus;100 to +100 scale, derived from where spot sits relative to the dominant gamma wall, weighted by how dominant that wall actually is.</p>
+
+        <div class="strip">
+          <div class="strip-bar" role="img" aria-label="Bias scale from bearish at minus 100 through neutral to bullish at plus 100">
+            <div class="sb-bear">Bearish</div>
+            <div class="sb-mbear">Mild bear</div>
+            <div class="sb-neu">Neutral</div>
+            <div class="sb-mbull">Mild bull</div>
+            <div class="sb-bull">Bullish</div>
+          </div>
+          <div class="strip-scale"><span>&minus;100</span><span>&minus;60</span><span>&minus;20</span><span>+20</span><span>+60</span><span>+100</span></div>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Label</th><th>Score</th><th>Strategy intent</th></tr></thead>
+            <tbody>
+              <tr class="g"><td class="k band">Bullish</td><td class="num">&ge; +60</td><td>Strong upward setup. Favors bull put or bull call.</td></tr>
+              <tr class="g"><td class="k band">Mild bullish</td><td class="num">+20 &hellip; +60</td><td>Slow drift up. Bull put is the workhorse; iron condor or call butterfly fit.</td></tr>
+              <tr class="n"><td class="k band">Neutral / range-bound</td><td class="num">&minus;20 &hellip; +20</td><td>Flat tape. Iron condor or iron butterfly maximize premium.</td></tr>
+              <tr class="r"><td class="k band">Mild bearish</td><td class="num">&minus;60 &hellip; &minus;20</td><td>Slow drift down. Bear call is the workhorse; iron condor or put butterfly fit.</td></tr>
+              <tr class="r"><td class="k band">Bearish</td><td class="num">&le; &minus;60</td><td>Strong downward setup. Favors bear call or bear put.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Score formula</h3>
+<pre>score = (spot &minus; wall_strike) / wall_strike &times; 200
+      &times; wall_strength_multiplier   <span class="c">1.5 / 1.0 / 0.5</span>
+      &times; gamma_regime_multiplier    <span class="c">0.7 if pinning, 1.2 if amplifying</span>
+      + dex_skew_contribution      <span class="c">&plusmn;10 max</span>
+
+<span class="c">clamped to [&minus;100, +100]</span></pre>
+
+        <h3>Bilateral walls</h3>
+        <p>The redesign shows both sides of the book rather than one dominant strike. The convention is asymmetric on purpose: <strong>price drifts toward the put wall and gets blocked by the call wall.</strong></p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Wall</th><th>Role</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr class="r"><td class="k band">Put wall</td><td class="t-r">Magnet &darr;</td><td>Strongest put-side gamma cluster. Intraday spot tends to drift toward this strike &mdash; dealer hedging is the pull.</td></tr>
+              <tr class="g"><td class="k band">Call wall</td><td class="t-g">Resistance &uarr;</td><td>Strongest call-side gamma cluster. Rallies stall here as dealers sell into upside.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Wall strength &mdash; how much to trust the wall logic</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Strength</th><th>Trigger &mdash; #1 |GEX| vs #2</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr class="g"><td class="k band">high</td><td class="num">&gt; 2&times;</td><td>Dominant. Pin behavior is reliable.</td></tr>
+              <tr class="a"><td class="k band">medium</td><td class="num">1.2&times; &ndash; 2&times;</td><td>Soft level &mdash; other strikes are close in magnitude.</td></tr>
+              <tr class="r"><td class="k band">low</td><td class="num">&lt; 1.2&times;</td><td>No real wall. Do not lean on wall-aware logic.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Confidence</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Confidence</th><th>Trigger</th></tr></thead>
+            <tbody>
+              <tr class="g"><td class="k band">high</td><td>Wall strength high <em>and</em> |score| &gt; 30 <em>and</em> DEX direction agrees with wall-position direction.</td></tr>
+              <tr class="a"><td class="k band">medium</td><td>Wall present, score has a clear sign, signals not fully aligned.</td></tr>
+              <tr class="r"><td class="k band">low</td><td>Wall is weak <em>or</em> |score| &lt; 15. The structured signals are not telling a coherent story &mdash; fade or reduce size.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>Confidence is not cosmetic. A <span class="mono t-a">low</span> reading feeds straight into the self-evaluation gate and changes how the win rate is presented.</p>
+      </section>
+
+      <!-- ══ PICK ═══════════════════════════════════════════ -->
+      <section id="pick">
+        <div class="sec-head">
+          <span class="eyebrow">05 &mdash; The recommendation</span>
+          <h2>The engine pick</h2>
+        </div>
+
+        <p>One spread is promoted: the highest composite across all generated candidates. Everything on the card exists to answer one question &mdash; is this worth trading right now, at this price?</p>
+
+        <h3>Composite score</h3>
+        <p>Zero to 100, integrating expected value, structural health, liquidity, limit-order feasibility, and probability of profit.</p>
+
+        <div class="strip">
+          <div class="strip-bar" role="img" aria-label="Composite score bands: below 40 do not trade, 40 to 59 marginal, 60 and above tradeable">
+            <div class="sb-no">Do not trade</div>
+            <div class="sb-marg">Marginal</div>
+            <div class="sb-ok">Tradeable</div>
+          </div>
+          <div class="strip-scale"><span>0</span><span>40</span><span>60</span><span>100</span></div>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Score</th><th>Verdict</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr class="g"><td class="k band">&ge; 60</td><td class="t-g">tradeable</td><td>EV positive, structure healthy, liquidity workable.</td></tr>
+              <tr class="a"><td class="k band">40 &ndash; 59</td><td class="t-a">marginal</td><td>Nothing is clearly tradeable. Wait for a limit fill or move to another expiration.</td></tr>
+              <tr class="r"><td class="k band">&lt; 40</td><td class="t-r">do not trade</td><td>No EV edge and acceptable structure. Move on.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre>score = 50                       <span class="c">center</span>
+      + EV component        [  0, +40]  <span class="c">max(0, min(40, ev_adjusted &times; 2))</span>
+      + badge component     [&minus;30, +15]  <span class="c">healthy +15 &middot; thin/directional &minus;5 &middot; broken/trap &minus;30</span>
+      + liquidity component [&minus;10, +10]  <span class="c">high +10 &middot; mid 0 &middot; low &minus;10</span>
+      + limit feasibility   [  0, +30]  <span class="c">feasibility &times; (30 if EV&lt;0 else 10)</span>
+                                       <span class="c">feasibility = 1 &minus; |delta| / current</span>
+      + POP tiebreaker      [ &minus;5,  +5]  <span class="c">(POP &minus; 50) / 10</span>
+
+<span class="c">clamped to [0, 100]. EV is already wall-adjusted, so the wall verdict
+counts through EV without being double-billed.</span></pre>
+
+        <h3>Health badge</h3>
+        <p>The classifier branches on whether the spread sells premium or pays for it &mdash; the failure modes are not the same.</p>
+
+        <h4>Credit structures &mdash; the play is theta harvest</h4>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Badge</th><th>Trigger</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr class="g"><td class="k band">&#10003; Healthy</td><td class="num">&Delta; 0.10&ndash;0.30, DTE &gt; 5, max_loss &le; 5&times; max_profit</td><td>Working zone. Theta and modest delta drift both contribute; capital risk is bounded.</td></tr>
+              <tr class="a"><td class="k band">&#9888; Thin</td><td class="num">net &Delta; &lt; 0.10</td><td>Theta is doing all the work. Needs days, not hours.</td></tr>
+              <tr class="a"><td class="k band">&#9888; Directional</td><td class="num">net &Delta; &gt; 0.30</td><td>Behaves like a directional bet, not premium harvest.</td></tr>
+              <tr class="r"><td class="k band">&#9888; Broken</td><td class="num">net &Delta; &lt; 0.05 and DTE &le; 5</td><td>Gamma dominates before theta delivers. Skip.</td></tr>
+              <tr class="r"><td class="k band">&#9888; Capital trap</td><td class="num">max_loss &gt; 5&times; max_profit</td><td>One loss undoes five winners. The math does not survive a normal hit rate.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h4>Debit structures &mdash; the play is directional</h4>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Badge</th><th>Trigger</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr class="g"><td class="k band">&#10003; Healthy</td><td class="num">payoff/debit &ge; 0.6, DTE &ge; 3</td><td>Reasonable debit for the width and the time.</td></tr>
+              <tr class="a"><td class="k band">&#9888; Thin</td><td class="num">payoff/debit &lt; 0.6</td><td>Mediocre return per dollar. Needs a strong directional move.</td></tr>
+              <tr class="r"><td class="k band">&#9888; Capital trap</td><td class="num">payoff/debit &lt; 0.30</td><td>Overpaid for premium. Breakeven is hard to reach even on a correct call.</td></tr>
+              <tr class="r"><td class="k band">&#9888; Broken</td><td class="num">DTE &le; 2</td><td>Not enough time for the move before gamma dominates.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p><em>Directional</em> never applies to debit structures &mdash; debits are directional by design.</p>
+
+        <h3>Liquidity badge</h3>
+        <p>Driven by the minimum open interest across all legs, because the worst leg sets your fill.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Tier</th><th>Trigger</th><th>What it means at the fill</th></tr></thead>
+            <tbody>
+              <tr class="g"><td class="k band">high</td><td class="num">min OI &gt; 200</td><td>Tight bid/ask. Fill at mid or a penny inside.</td></tr>
+              <tr class="a"><td class="k band">mid</td><td class="num">50 &lt; min OI &le; 200</td><td>Workable, expect a few cents of slippage.</td></tr>
+              <tr class="r"><td class="k band">low</td><td class="num">min OI &le; 50</td><td>Wide spread, partial fills, painful exits. Skip on multi-leg.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Wall verdict</h3>
+        <p>Walls are attractors &mdash; price drifts toward them. Whether that helps depends entirely on where <em>your</em> structure needs price to go.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Structure</th><th>Wall in profit zone</th><th>Wall above</th><th>Wall below</th></tr></thead>
+            <tbody>
+              <tr><td class="k">bull_put <span class="t-n">credit</span></td><td class="t-r">bad &mdash; pin risk on short put</td><td class="t-g">good &mdash; support above</td><td class="t-r">bad &mdash; price drifts through</td></tr>
+              <tr><td class="k">bear_call <span class="t-n">credit</span></td><td class="t-r">bad &mdash; pin risk on short call</td><td class="t-r">bad &mdash; drags into loss</td><td class="t-g">good &mdash; resistance cap</td></tr>
+              <tr><td class="k">iron_condor <span class="t-n">credit</span></td><td class="t-g">good if centered &mdash; ideal pin</td><td class="t-r">bad &mdash; drags price out</td><td class="t-r">bad &mdash; drags price out</td></tr>
+              <tr><td class="k">iron_butterfly <span class="t-n">credit</span></td><td class="t-g">good if at center strike</td><td class="t-r">bad if off-center</td><td class="t-r">bad if off-center</td></tr>
+              <tr><td class="k">bull_call <span class="t-n">debit</span></td><td class="t-g">good &mdash; pulls into profit</td><td class="t-g">good &mdash; pulls past max profit</td><td class="t-r">bad &mdash; pulls away from breakeven</td></tr>
+              <tr><td class="k">bear_put <span class="t-n">debit</span></td><td class="t-g">good &mdash; pulls into profit</td><td class="t-r">bad &mdash; pulls away upward</td><td class="t-g">good &mdash; pulls past max profit</td></tr>
+              <tr><td class="k">butterflies <span class="t-n">debit</span></td><td class="t-g">good if at center</td><td class="t-r">bad if off-center</td><td class="t-r">bad if off-center</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Verdict</th><th>EV multiplier</th></tr></thead>
+            <tbody>
+              <tr class="g"><td class="k band">good</td><td class="num">1.0 &mdash; the wall helps the structure</td></tr>
+              <tr class="n"><td class="k band">neutral</td><td class="num">1.0 &mdash; no material help or harm</td></tr>
+              <tr class="a"><td class="k band">warn</td><td class="num">0.7 &ndash; 0.95 &mdash; close to working against you</td></tr>
+              <tr class="r"><td class="k band">bad</td><td class="num">0.5 &ndash; 0.6 &mdash; actively hurts the structure</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ══ LIMIT TIERS ════════════════════════════════════ -->
+      <section id="limit">
+        <div class="sec-head">
+          <span class="eyebrow">06 &mdash; Pricing your entry</span>
+          <h2>Limit-order tiers</h2>
+        </div>
+
+        <p>When the market is not pricing a spread the way you would want, this section answers a different question: <strong>what premium would make it worth doing</strong>, and which of those prices the market is already offering.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Tier</th><th>Edge target</th><th>Hint</th><th>Typical scenario</th></tr></thead>
+            <tbody>
+              <tr class="g"><td class="k band">modest</td><td class="num">0.75% of width</td><td>often fills</td><td>Patient limit, frequently catchable on normal intraday noise.</td></tr>
+              <tr class="a"><td class="k band">balanced</td><td class="num">1.50% of width</td><td>patient</td><td>Achievable on minor dislocations.</td></tr>
+              <tr class="s"><td class="k band">strong</td><td class="num">3.00% of width</td><td>on dislocations</td><td>Real liquidity events, IV crush, earnings unwinds only.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>Each tier resolves to a limit price &mdash; sell at or above for credit, buy at or below for debit &mdash; and gets tagged <span class="mono t-g">&#10003; met</span> when the live mid already gives you that edge, <span class="mono t-n">&#9675; reachable</span> when a GTC limit could catch it, or hidden entirely when the premium is mathematically impossible on that spread.</p>
+
+        <h3>The headline, in plain English</h3>
+        <p>For credit structures the rule is simple: <strong>the more credit you collect, the better the trade.</strong> Breakeven is the credit at which expected value is exactly zero. For debit structures it mirrors &mdash; <strong>the less you pay, the better.</strong></p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Headline</th><th>What to do</th></tr></thead>
+            <tbody>
+              <tr class="g"><td class="k band">Already at +$X &mdash; beats every tier</td><td>Take it at market. You are collecting more credit (or paying less debit) than even the strong tier asks.</td></tr>
+              <tr class="g"><td class="k band">Already at +$X &mdash; beats modest/balanced</td><td>Paid better than fair, not as well as possible. Taking it now is fine; a slightly better limit is also fine.</td></tr>
+              <tr class="a"><td class="k band">Slight +$X &mdash; under the modest threshold</td><td>Mathematically positive but thin. Market works; a small patient limit gets a meaningfully better fill.</td></tr>
+              <tr class="n"><td class="k band">Sub-fair by $X &mdash; limit only</td><td>The market pays less than the trade is worth. Taking it at market is a math-loser. It only works if the market comes to you.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Reality check &mdash; when to walk away</h3>
+        <p>A sub-fair verdict is not automatically worth waiting for. Size the gap before parking a GTC order.</p>
+
+<pre><span class="hl">&#9678; Sub-fair by $39.19 &mdash; limit-only setup. Need the market to come to you.</span>
+breakeven (EV=0): $70.79 &middot; live: $31.60</pre>
+
+        <p>Read: the market pays $31.60 in credit; this condor needs $70.79 to break even on EV. That is a <strong>2.2&times; jump in collected credit</strong> &mdash; a real volatility spike, not a normal Tuesday.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Gap as % of breakeven</th><th>Realistic to wait?</th></tr></thead>
+            <tbody>
+              <tr class="g"><td class="k band">&lt; 10%</td><td>Yes &mdash; normal intraday noise closes this within a session.</td></tr>
+              <tr class="a"><td class="k band">10 &ndash; 30%</td><td>Maybe &mdash; needs a meaningful move. A day or two.</td></tr>
+              <tr class="r"><td class="k band">30 &ndash; 60%</td><td>Long shot &mdash; needs a real catalyst. Weeks.</td></tr>
+              <tr class="r"><td class="k band">&gt; 60%</td><td>No &mdash; structurally mispriced for your side. Skip.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h4>The math behind the tiers</h4>
+<pre><span class="c">credit spreads &mdash; sell premium</span>
+breakeven_credit    = (1 &minus; POP) &times; width
+target_credit(tier) = breakeven + (tier_pct &times; width) / wall_factor
+<span class="c">place a limit SELL at target_credit or higher</span>
+
+<span class="c">debit spreads &mdash; pay premium</span>
+breakeven_debit     = POP &times; width
+target_debit(tier)  = breakeven &minus; (tier_pct &times; width) / wall_factor
+<span class="c">place a limit BUY at target_debit or lower</span></pre>
+
+        <p>The wall factor is folded in so the target already accounts for any wall penalty or boost. The <span class="mono">modest</span> tier feeds the composite's limit-feasibility component and doubles as the trade-ticket fallback price.</p>
+
+        <div class="callout">
+          <span class="lbl">The discipline this enforces</span>
+          <p>Instead of taking what the market gives, you tell the market what you would accept. Most days you do not fill. The days you do, you have extracted real edge from a market that briefly mispriced your structure.</p>
+        </div>
+      </section>
+
+      <!-- ══ LOOKUP ═════════════════════════════════════════ -->
+      <section id="lookup">
+        <div class="sec-head">
+          <span class="eyebrow">07 &mdash; Trade evolution</span>
+          <h2>Lookup projections</h2>
+        </div>
+
+        <p>A Black&ndash;Scholes projection grid for the current engine pick. Rows are hypothetical spot levels spanning roughly &plusmn;2 expected moves; columns walk wall-clock time in 15-minute steps, ET-session-aware, until expiry. Cells hold projected premium, colored by close-now P&amp;L.</p>
+
+        <p>It is not a forecast. It answers <em>&ldquo;if this happens, here is what the trade looks like&rdquo;</em> &mdash; where the close-now breakeven band sits, how much theta an extra hour buys, whether a run to your short strike is deep enough to want a roll.</p>
+
+        <h4>Heatmap bands &mdash; close-now P&amp;L, normalized to the spread's own max</h4>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Level</th><th>Normalized P&amp;L</th></tr></thead>
+            <tbody>
+              <tr class="g"><td class="k band">+3 deep emerald</td><td class="num">&ge; +55% of max profit</td></tr>
+              <tr class="g"><td class="k band">+2 medium</td><td class="num">+25% &hellip; +55%</td></tr>
+              <tr class="g"><td class="k band">+1 faint</td><td class="num">+8% &hellip; +25%</td></tr>
+              <tr class="n"><td class="k band">0 stone</td><td class="num">within &plusmn;8% of breakeven</td></tr>
+              <tr class="r"><td class="k band">&minus;1 faint rose</td><td class="num">&minus;8% &hellip; &minus;25% of max loss</td></tr>
+              <tr class="r"><td class="k band">&minus;2 medium</td><td class="num">&minus;25% &hellip; &minus;55%</td></tr>
+              <tr class="r"><td class="k band">&minus;3 deep rose</td><td class="num">&ge; &minus;55% of max loss</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Hover decomposition</h3>
+        <p>The tooltip is the point of the grid. It splits close-now P&amp;L into what is actually paying you:</p>
+
+<pre>Spot $182.50 &middot; +30m
+premium +$1.42 &middot; close-now P&amp;L <span class="hl">+$58/contract</span>
+composed: +$28 theta &middot; +$5 delta &middot; +$3 &gamma;/vega</pre>
+
+        <p>When delta dominates a green cell, the trade is direction-dependent &mdash; a reversal gives it back fast. When theta dominates, it is time-dependent and sitting on it is the play. That distinction decides how you exit.</p>
+
+        <h4>Pricing assumptions</h4>
+        <ul class="prose">
+          <li>European exercise &mdash; slight error on early-exercisable American single-name puts near dividends.</li>
+          <li>Sticky-strike implied volatility: each leg's IV stays attached to its strike as spot moves.</li>
+          <li>Constant 5% risk-free rate, no dividends.</li>
+          <li>The center cell is anchored to the live mid; everything else fans out by Black&ndash;Scholes sensitivity.</li>
+          <li>A leg missing IV falls back to intrinsic value, and the card says so in amber.</li>
+        </ul>
+      </section>
+
+      <!-- ══ LENSES ═════════════════════════════════════════ -->
+      <section id="lenses">
+        <div class="sec-head">
+          <span class="eyebrow">08 &mdash; Beyond gamma</span>
+          <h2>VEX / TEX lenses</h2>
+        </div>
+
+        <p>The bias engine is built on <strong>GEX</strong> &mdash; gamma exposure &times; open interest, the structural map of where dealers must hedge. Two adjacent lenses sit alongside it for the cases where gamma alone is not the whole story.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Lens</th><th>The magnet it maps</th></tr></thead>
+            <tbody>
+              <tr><td class="k">GEX wall</td><td>Where dealers pin price &mdash; the structural magnet.</td></tr>
+              <tr><td class="k">VEX wall</td><td>Where vol gets re-priced fastest &mdash; the IV-shock magnet.</td></tr>
+              <tr><td class="k">TEX wall</td><td>Where theta bleed concentrates &mdash; the time-decay magnet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>They serve two genuinely different jobs on the two tabs. On the <strong>engine pick</strong>, the question is <em>&ldquo;is this trade worth doing?&rdquo;</em> &mdash; a static positioning answer that helps you pick. On <strong>Lookup</strong>, it is <em>&ldquo;how does this evolve over the next three hours?&rdquo;</em> &mdash; a dynamic flow answer that helps you decide when to bail or hold.</p>
+
+        <h3>The three-lens divergence strip</h3>
+        <p>Most days you never see it. The strip appears only when the three lenses disagree by more than five strikes:</p>
+
+<pre><span class="c">&#9888;</span> lenses diverge &middot; GEX $235 &middot; VEX $232 <span class="c">(pull below)</span> &middot; TEX $228 <span class="c">(pull below)</span></pre>
+
+        <p>When VEX and TEX pull <em>below</em> the GEX wall, price has a second gravity well your spread is not structured for &mdash; tighten the short strike toward the VEX/TEX side, cut size, or wait for the lenses to re-converge. Divergence pulling above is the mirror.</p>
+
+        <h3>Cluster markers on the grid</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Marker</th><th>Where</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr class="a"><td class="k band">&#9679;</td><td>Spot-row label</td><td>The nearest strike is in the top quartile of vega &times; OI. If price drifts here and IV moves, premium re-prices faster than the linear model shows &mdash; roughly 1.3&times;.</td></tr>
+              <tr class="a"><td class="k band">&#8987;</td><td>Time-column header</td><td>The column is inside the theta-burn window. Shown only for DTE &le; 1, where decay is not roughly constant per day. Actual decay may run ~1.4&times; the estimate.</td></tr>
+              <tr class="a"><td class="k band">amber ring</td><td>Any intersecting cell</td><td>Sits where vol or decay effects concentrate; the tooltip appends the multiplier hint.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>These multipliers are rules of thumb, not corrections &mdash; flags to widen your error bars, not numbers to compute with. The rule of thumb for the pair: <strong>divergence is for picking the trade; clusters are for managing it.</strong> If you enter, set GTC and walk away, the strip is the higher-value signal. If you babysit positions, the grid pays off more.</p>
+      </section>
+
+      <!-- ══ SELF-EVAL ══════════════════════════════════════ -->
+      <section id="selfeval">
+        <div class="sec-head">
+          <span class="eyebrow">09 &mdash; The differentiator</span>
+          <h2>Self-evaluation</h2>
+        </div>
+
+        <p class="lede">Matrix is the only product in the suite that keeps score on itself &mdash; and the only one that will refuse to publish its own win rate when it knows it is out of sync.</p>
+
+        <p>The earlier approach graded the bias <em>direction</em>: did spot move more than 0.05% the predicted way, three minutes later. That was blind to the actual recommended trade and printed a naked percentage even while the read was falling apart. The current metric grades <strong>the called-out spread itself, in real premium</strong>.</p>
+
+        <h3>The one metric &mdash; no branches</h3>
+        <p>Applied to the engine pick only, never the also-rans:</p>
+
+        <ol class="flow">
+          <li><b>At decision, every poll</b> &mdash; the pick's legs, its entry mid net premium, and its type (credit or debit) are saved onto the decision row.</li>
+          <li><b>At eval, ~3 minutes later</b> &mdash; the <em>same saved legs</em> are re-priced from the current chain. The original legs, not whatever is on top now; the bias may have rotated since.</li>
+          <li><b>Favorable delta</b> &mdash; premium movement in the spread's profit direction. A debit wins as it <em>expands</em>: <span class="mono">fav = mid_now &minus; mid_entry</span>. A credit wins as it <em>decays toward zero</em>: <span class="mono">fav = mid_entry &minus; mid_now</span>.</li>
+          <li><b>Friction band</b> &mdash; half the current bid/ask width, so a quote bounce is never scored as a win.</li>
+          <li><b>Result</b> &mdash; <span class="t-g">win</span> above the band, <span class="t-r">loss</span> below it, <span class="t-n">neutral</span> inside it.</li>
+        </ol>
+
+        <div class="callout">
+          <span class="lbl">Why this is the honest version</span>
+          <p>There is no fixed percentage threshold &mdash; <em>any</em> real mid improvement that clears fill friction counts. And because the pick is built <em>from</em> the bias, a winning spread means the bias direction paid off in the structure it actually recommended. Spot-difference grading is gone.</p>
+        </div>
+
+        <h4>Cadence</h4>
+        <p>A decision is born every poll (~15&ndash;20&nbsp;s). The evaluator wakes every 30&nbsp;s only to ask whether any decision has passed the 3-minute window ungraded, grades those once, and sleeps. Thirty seconds is the check interval, not the grading frequency; nothing is ever re-graded.</p>
+
+        <h3>Bias-trust state</h3>
+        <p>Grades roll into a single state that governs what the page is allowed to show. Precedence runs <span class="mono">paused &rarr; low confidence &rarr; calibrating &rarr; in sync</span>. Regime evaluation keeps running in every state &mdash; only the display changes.</p>
+
+        <div class="states">
+          <div class="state calib">
+            <span class="nm">Calibrating</span>
+            <div class="shows">Calibrating &mdash; 6/10 graded</div>
+            <p>Fewer than ten graded outcomes. No percentage published; the pick is tagged <em>confirming edge &mdash; sizing in</em>.</p>
+          </div>
+          <div class="state sync">
+            <span class="nm">In sync</span>
+            <div class="shows">64% win rate (37 graded)</div>
+            <p>Enough samples, no regime alert. The win rate is shown because it has been earned. No hint on the pick card.</p>
+          </div>
+          <div class="state paused">
+            <span class="nm">Out of sync &mdash; paused</span>
+            <div class="shows">&#9208; recalibrating &mdash; bias re-syncing (2 confirming wins to resume)</div>
+            <p>Three consecutive losses tripped the regime alert. The percentage is withheld until two confirming wins clear it. Grading continues silently underneath &mdash; those very evals are what clear the alert.</p>
+          </div>
+          <div class="state lowconf">
+            <span class="nm">Low confidence</span>
+            <div class="shows">58% win rate (22 graded) &mdash; lower-conviction read</div>
+            <p>The bias card itself reads <span class="mono">low</span>, independent of any streak. The number still shows, muted, with a confirm-before-sizing-up hint.</p>
+          </div>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Knob</th><th>Default</th><th>Governs</th></tr></thead>
+            <tbody>
+              <tr><td class="k">poll_interval_sec</td><td class="num">20</td><td>How often a decision is born.</td></tr>
+              <tr><td class="k">eval_window_min</td><td class="num">3</td><td>How long a pick ages before it is graded.</td></tr>
+              <tr><td class="k">eval_min_graded</td><td class="num">10</td><td>Samples needed to leave <em>calibrating</em>.</td></tr>
+              <tr><td class="k">regime_alert_consec_losses</td><td class="num">3</td><td>Consecutive losses that trip the pause.</td></tr>
+              <tr><td class="k">regime_clear_consec_wins</td><td class="num">2</td><td>Confirming wins that clear it.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>Neutrals move neither counter. The pick-card hint is always confidence framing, never <em>don't trade</em> &mdash; the tool exists to find the winning play, and it says so even while it is re-syncing.</p>
+
+        <h3>The archive underneath</h3>
+        <p>Raw decisions and outcomes are <strong>never flushed</strong> &mdash; they are the only labeled ground-truth dataset the system will ever have. Live reads are scoped instead (regime looks at today; accuracy at a rolling window), and each completed ET day is rolled up once into a daily summary: counts, win rate, session span, largest polling gap, coverage.</p>
+
+        <p>Each day carries a <span class="mono">complete</span> flag &mdash; true only when the day covered at least 75% of the 390-minute session with no gap over 15 minutes. Partial days are kept but flagged, so modeling can require full sessions rather than silently averaging in a morning when the backend was off.</p>
+
+        <h4>What the archive is for</h4>
+        <ul class="prose">
+          <li><strong>Threshold tuning</strong> &mdash; is three losses / two wins actually the right regime gate? Replay real streaks and find out. Same for the friction band.</li>
+          <li><strong>Confidence calibration</strong> &mdash; does a <span class="mono">low</span> bias reading genuinely lose more than <span class="mono">high</span>? Today that is an assumption. The data can prove it or kill it.</li>
+          <li><strong>Per-strategy edge</strong> &mdash; does an iron condor in a low-conviction regime actually win? Strategy is persisted per decision, so this is a join away. Offline only: the live streak is deliberately strategy-agnostic, because it is a bias-trust signal, not a per-structure tracker.</li>
+          <li><strong>Engine drift</strong> &mdash; is accuracy trending down week over week? Chart the daily summaries across complete days and watch for the model going stale.</li>
+        </ul>
+      </section>
+
+      <!-- ══ WORKFLOW ═══════════════════════════════════════ -->
+      <section id="workflow">
+        <div class="sec-head">
+          <span class="eyebrow">10 &mdash; In practice</span>
+          <h2>Workflow</h2>
+        </div>
+
+        <p>The redesign removed most of the old steps. What remains is reading, judging, and pricing.</p>
+
+        <ol class="flow">
+          <li><b>Check the accuracy pill first.</b> If it reads <em>recalibrating</em>, the engine is telling you its read is out of sync. Size accordingly before you look at anything else.</li>
+          <li><b>Read the bias card</b> &mdash; label, score, confidence. Low confidence means the signals do not agree; fade or reduce.</li>
+          <li><b>Read the walls.</b> Where is the magnet, where is the resistance, and how strong is each? Weak walls mean the wall-aware logic underneath is not load-bearing.</li>
+          <li><b>Look at the engine pick's composite.</b> Under 40, skip the setup entirely &mdash; there is nothing to salvage below that line.</li>
+          <li><b>Check the health and liquidity badges.</b> A capital trap or a low-OI multi-leg is a no regardless of composite.</li>
+          <li><b>Price the entry from the limit tiers.</b> Green at market, take it. Sub-fair, apply the gap triage before parking a GTC order.</li>
+          <li><b>Optional &mdash; open Lookup.</b> See what the spread looks like in thirty minutes, or if spot runs to your short strike. Check whether your exit horizon lands on a theta-cluster column.</li>
+          <li><b>Push to broker</b> from the pick card, or copy the ticket and place it yourself.</li>
+          <li><b>Leave it open.</b> The poller keeps updating; the regime banner will tell you if the read deteriorates. You no longer refresh anything by hand.</li>
+        </ol>
+      </section>
+
+      <!-- ══ VERSUS ═════════════════════════════════════════ -->
+      <section id="versus">
+        <div class="sec-head">
+          <span class="eyebrow">11 &mdash; The suite</span>
+          <h2>Matrix vs. the others</h2>
+        </div>
+
+        <p>Three products share one backend and one data budget. They do not overlap.</p>
+
+        <div class="prods">
+          <div class="prod is-matrix">
+            <h5>Matrix</h5>
+            <span class="host">matrix.facades.trade</span>
+            <p>Dealer-positioning spread optimizer. Reads GEX walls, forms a directional bias, generates and ranks multi-leg spreads, and prices the entry. Intraday and short-dated index structures.</p>
+            <div class="self t-m">Grades its own picks &middot; publishes a win rate</div>
+          </div>
+          <div class="prod">
+            <h5>Simmer</h5>
+            <span class="host">simmer.facades.trade</span>
+            <p>Premium-selling readiness engine. Watches a list of single names for multi-day equity premium conditions &mdash; catalysts, earnings windows, IV history, news velocity. Scans, it does not optimize.</p>
+            <div class="self t-n">Separate paper-outcome calibration</div>
+          </div>
+          <div class="prod">
+            <h5>Torque</h5>
+            <span class="host">admin only &mdash; no subdomain</span>
+            <p>Fast order builder. Ticker plus one of ten strategies, auto-filled strikes, pricing and lean math, hybrid auto-close. No bias logic at all &mdash; it is the order ticket as its own tool.</p>
+            <div class="self t-n">No self-evaluation &mdash; it does not form an opinion</div>
+          </div>
+        </div>
+
+        <p>Torque has no public subdomain because it has no multi-user login &mdash; it stays admin-only until it gets one.</p>
+      </section>
+
+      <footer>
+        <span>Matrix &middot; facades.trade</span>
+        <span>Reference compiled from the operating manual and the spread-outcome evaluation spec</span>
+      </footer>
+
+    </main>
+  </div>
+</div>
+</body>
+</html>

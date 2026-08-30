@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>EdgeLane Matrix — Spread Optimizer</title>
+  <title>Matrix — Spread Optimizer</title>
   <meta name="description" content="Cut the noise. Trade the decided multi-leg options edge." />
   <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
@@ -24,6 +24,16 @@
     /* Global busy cursor for long-running async actions (contact send, broker connect/test, etc.) */
     body.busy, body.busy * { cursor: progress !important; }
     .neon { text-shadow: 0 0 8px rgba(120,255,180,.45); }
+    /* Brand lockup — logomark + MATRIX + "by Facades" byline. Mirrors Torque's
+       header treatment so the two products read as one family. */
+    .brand-lockup { display:flex; align-items:center; gap:.7rem; }
+    .brand-lockup .logomark { width:3rem; height:3rem; display:block; flex-shrink:0;
+                              filter: drop-shadow(0 0 10px rgba(120,255,180,.28)); }
+    .brand-lockup .names { display:flex; flex-direction:column; line-height:1; }
+    .brand-lockup .wordmark { font-weight:900; letter-spacing:.06em; }
+    .brand-byline { font-style:italic; font-size:10.5px; letter-spacing:.15em;
+                    color:#34d399; font-weight:600; margin-top:.28rem;
+                    text-transform:uppercase; }
     .pill { display:inline-flex; align-items:center; gap:.4rem; padding:.25rem .65rem; border-radius:9999px; font-size:.72rem; font-weight:600; letter-spacing:.04em; text-transform:uppercase; }
     .dot { width:.5rem; height:.5rem; border-radius:9999px; display:inline-block; }
     .dot-pulse { box-shadow: 0 0 0 0 currentColor; animation: pulse 1.6s infinite; }
@@ -242,9 +252,12 @@
        internally, so the profile button can never get pushed to a new line. -->
   <header class="flex items-start gap-3 mb-2">
     <div class="flex items-baseline gap-3 flex-shrink-0">
-      <div>
-        <h1 class="text-2xl md:text-3xl font-black tracking-tight neon">EDGELANE <span class="text-emerald-400">MATRIX</span></h1>
-        <p class="text-[13px] italic text-slate-200 mt-0.5">Cut the noise. Trade the decided multi-leg options edge.</p>
+      <div class="brand-lockup">
+        <img class="logomark" src="assets/matrix-logo.png" alt="Matrix" width="64" height="64" />
+        <div class="names">
+          <h1 class="wordmark text-2xl md:text-3xl tracking-tight neon text-emerald-400">MATRIX</h1>
+          <div class="brand-byline">by Facades</div>
+        </div>
       </div>
       <span id="version" class="text-xs text-slate-600"></span>
     </div>
@@ -318,7 +331,8 @@
     </div>
   </header>
 
-  <p id="lastUpdate" class="text-xs text-slate-500"></p>
+  <p class="text-[13px] italic text-slate-200">Cut the noise. Trade the decided multi-leg options edge.</p>
+  <p id="lastUpdate" class="text-xs text-slate-500 !mt-1"></p>
 
   <!-- Feature 4: Tab strip (left) + social/share cluster (right) ----------- -->
   <div class="flex items-center justify-between gap-2 border-b border-slate-800 mb-2 flex-wrap">
@@ -328,14 +342,14 @@
     </div>
     <div class="flex items-center gap-2 pb-1.5">
       <a href="https://x.com/edgelanematrix" target="_blank" rel="noopener noreferrer"
-         aria-label="EdgeLane Matrix on X" class="social-btn">
+         aria-label="Matrix on X" class="social-btn">
         <svg viewBox="0 0 24 24" aria-hidden="true" class="h-4 w-4" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.66l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231 5.45-6.231Zm-1.161 17.52h1.833L7.084 4.126H5.117L17.083 19.77Z"></path></svg>
       </a>
       <a href="https://www.linkedin.com/company/edgelane-matrix" target="_blank" rel="noopener noreferrer"
-         aria-label="EdgeLane Matrix on LinkedIn" class="social-btn">
+         aria-label="Matrix on LinkedIn" class="social-btn">
         <svg viewBox="0 0 24 24" aria-hidden="true" class="h-4 w-4" fill="currentColor"><path d="M20.45 20.45h-3.56v-5.57c0-1.33-.02-3.04-1.85-3.04-1.85 0-2.13 1.45-2.13 2.94v5.67H9.35V9h3.42v1.56h.05c.48-.9 1.64-1.85 3.37-1.85 3.6 0 4.27 2.37 4.27 5.46v6.28ZM5.34 7.43a2.07 2.07 0 1 1 0-4.14 2.07 2.07 0 0 1 0 4.14ZM7.12 20.45H3.55V9h3.57v11.45ZM22.22 0H1.77C.79 0 0 .77 0 1.73v20.54C0 23.23.79 24 1.77 24h20.45c.98 0 1.78-.77 1.78-1.73V1.73C24 .77 23.2 0 22.22 0Z"></path></svg>
       </a>
-      <button id="shareBtn" class="share-btn" aria-label="Share EdgeLane Matrix">
+      <button id="shareBtn" class="share-btn" aria-label="Share Matrix">
         <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><path d="M8.59 13.51l6.83 3.98M15.41 6.51l-6.82 3.98"></path></svg>
         Share
       </button>
@@ -465,8 +479,8 @@
   </div>
 
   <footer class="flex items-center justify-center gap-2 text-xs text-slate-600 pt-4">
-    <img src="assets/favicon.svg" alt="EdgeLane Matrix" class="h-4 w-4 opacity-80" />
-    <span>© EdgeLane Matrix <span id="footerYear">2026</span>. All rights reserved.</span>
+    <img src="assets/matrix-mark-sm.png" alt="" aria-hidden="true" class="h-4 w-4 opacity-90" />
+    <span>© Facades Matrix <span id="footerYear">2026</span>. All rights reserved.</span>
     <span class="mx-0.5 text-slate-700">·</span>
     <button id="aboutLink" class="footer-link">About</button>
     <span class="mx-0.5 text-slate-700">·</span>
@@ -540,15 +554,15 @@
 </div>
 
 <!-- About dialog --------------------------------------------------- -->
-<div id="aboutModal" class="modal-mask" role="dialog" aria-modal="true" aria-label="About EdgeLane Matrix">
+<div id="aboutModal" class="modal-mask" role="dialog" aria-modal="true" aria-label="About Facades Matrix">
   <div class="modal-card space-y-2">
     <div class="flex items-baseline justify-between gap-3">
-      <h3 class="text-slate-100">About EdgeLane <span class="text-emerald-400">Matrix</span></h3>
+      <h3 class="text-slate-100 flex items-center gap-2"><img src="assets/matrix-mark-sm.png" alt="" aria-hidden="true" class="h-5 w-5" />About <span class="text-emerald-400">Facades Matrix</span></h3>
       <button id="aboutCloseBtn" class="btn">Close</button>
     </div>
     <div class="doc-prose">
       <p><strong>Cut the noise. Get to the trade — fast.</strong> No flipping through ten charts.
-         EdgeLane reads dealer GEX walls, bias, and live liquidity, then surfaces the
+         Matrix reads dealer GEX walls, bias, and live liquidity, then surfaces the
          <strong>few</strong> spreads with real structural edge, each ranked on one composite
          <strong>tradeability score</strong> (EV, health, liquidity, fill feasibility, PoP).
          Fully deterministic math — AI only narrates, never decides.</p>
@@ -556,7 +570,7 @@
       <ul>
         <li><strong>Decision to execution in one click.</strong> Setup looks right → fire the full
             multi-leg spread to a connected broker instantly. On SPX/NDX the level is gone in
-            30–60s — EdgeLane gives that time back to analysis and kills the fat-finger errors of
+            30–60s — Matrix gives that time back to analysis and kills the fat-finger errors of
             hand-keying four legs.</li>
         <li><strong>No supported broker? Still instant.</strong> One click copies the ticket to paste
             into your own broker's app — same speed, same accuracy edge.</li>
@@ -577,7 +591,7 @@
 </div>
 
 <!-- Contact dialog --------------------------------------------------- -->
-<div id="contactModal" class="modal-mask" role="dialog" aria-modal="true" aria-label="Contact EdgeLane Matrix">
+<div id="contactModal" class="modal-mask" role="dialog" aria-modal="true" aria-label="Contact Facades Matrix">
   <div class="modal-card space-y-3">
     <div class="flex items-baseline justify-between gap-3">
       <div>
@@ -615,22 +629,15 @@
 </div>
 
 <!-- Auth gate — signup / signin overlay over the blurred dashboard ------- -->
-<div id="gateMask" class="gate-mask" role="dialog" aria-modal="true" aria-label="Sign in to EdgeLane">
+<div id="gateMask" class="gate-mask" role="dialog" aria-modal="true" aria-label="Sign in to Matrix">
   <div class="gate-card">
     <div class="glow-orb"></div>
     <div class="gate-logo">
-      <span class="mark">
-        <svg width="22" height="22" viewBox="0 0 64 64" aria-hidden="true">
-          <rect x="8" y="18" width="34" height="4" fill="#022c22"/>
-          <rect x="8" y="30" width="34" height="4" fill="#022c22"/>
-          <rect x="8" y="42" width="34" height="4" fill="#022c22"/>
-          <rect x="48" y="18" width="4" height="28" fill="#022c22"/>
-          <rect x="48" y="30" width="9" height="4" fill="#022c22"/>
-        </svg>
-      </span>
+      <img src="assets/matrix-logo.png" alt="" aria-hidden="true"
+           class="w-10 h-10 block flex-shrink-0" />
       <div>
-        <div class="text-lg font-black tracking-tight text-slate-50">EDGELANE <span class="text-emerald-400">MATRIX</span></div>
-        <div class="text-[10px] text-slate-500">Cut the noise. Trade the decided edge.</div>
+        <div class="text-lg font-black tracking-[.06em] text-emerald-400">MATRIX</div>
+        <div class="brand-byline !mt-0.5">by Facades</div>
       </div>
     </div>
 
@@ -772,7 +779,7 @@
   }
   // UI-owned version, auto-bumped by .githooks/pre-commit on any commit that
   // touches this file (manual: tools/bump_ui_version.sh).
-  const UI_VERSION = '2.0.4';
+  const UI_VERSION = '2.1.1';
   console.info('[edgelane] API_BASE =', API_BASE,
     '  (override with ?api=http://host:port; clear with localStorage.removeItem("edgelane_api_base"))');
 
@@ -896,16 +903,36 @@
     const mp = $('modePill');
     mp.className = `pill ${mock ? 'bg-amber-500/20 text-amber-200' : 'bg-sky-500/20 text-sky-200'}`;
     mp.innerHTML = `<span class="dot ${mock?'bg-amber-400':'bg-sky-400'}"></span>${mock ? 'MOCK' : (st.tradier_env||'live').toUpperCase()}`;
-    // Market pill
+    // Market pill — also drives the UI's own poll cadence (see _retunePolling).
+    const wasOpen = state.marketOpen, wasThrottled = state.pollThrottled;
     state.marketOpen = !!st.market_open;
+    // Mock/dev/forced backends keep polling on full cadence off-hours, so the
+    // UI must keep up with them; a live backend only does one slow display-only
+    // poll per closed_display_interval_sec, and idles entirely if that's off.
+    state.pollWhenClosed  = !!st.poll_when_closed;
+    state.closedInterval  = Math.max(30, Number(st.closed_display_interval_sec) || 60);
+    state.displayWhenClosed = st.display_when_closed !== false;
     const mkt = $('marketPill');
     if (st.market_open) {
       mkt.className = 'pill bg-emerald-500/20 text-emerald-200';
       mkt.innerHTML = '<span class="dot bg-emerald-400 dot-pulse"></span>Market Open';
+      mkt.title = 'Regular session (NYSE Mon-Fri 9:30-16:00 ET). Live cadence.';
     } else {
       mkt.className = 'pill bg-amber-500/20 text-amber-200';
-      mkt.innerHTML = `<span class="dot bg-amber-400"></span>Closed · ${st.market_reason || ''}`;
+      const throttled = !state.pollWhenClosed;
+      mkt.innerHTML = `<span class="dot bg-amber-400"></span>Closed · ${st.market_reason || ''}`
+        + (throttled ? ' · paused' : '');
+      mkt.title = throttled
+        ? (state.displayWhenClosed
+            ? `Market closed. The backend drops to one display-only poll every ${state.closedInterval}s `
+              + '(nothing persisted, self-eval paused), so this page slows to match instead of '
+              + 're-fetching unchanged data. Full cadence resumes automatically at the bell.'
+            : 'Market closed and off-hours polling is disabled — the backend is idle, so this '
+              + 'page only checks back periodically. Resumes automatically at the bell.')
+        : 'Market closed, but this backend is configured to poll anytime (mock / dev / forced), '
+          + 'so the UI stays on full cadence.';
     }
+    if (wasOpen !== state.marketOpen || wasThrottled === undefined) _retunePolling();
     // Status pill
     const sp = $('statusPill');
     if (polling) {
@@ -1824,6 +1851,22 @@
     if (!AUTH.session) await _ensureAnonSession();
   }
 
+  // Turnstile can't verify this visitor — tell them, instead of just dropping
+  // the free preview with no explanation. Sign-in is unaffected in every case.
+  function _showTurnstileNotice(code) {
+    const el = $('gateNotice');
+    if (!el) return;
+    const domainIssue = code === '110200';
+    el.textContent = domainIssue
+      ? `Preview unavailable on this domain (${location.hostname}). Sign in for full access.`
+      : 'Preview unavailable — the browser check didn\'t complete. Sign in for full access.';
+    // #gateNotice is emerald (success) by default — this is a caution, not a win.
+    el.classList.remove('hidden', 'text-emerald-300');
+    el.classList.add('text-amber-300');
+    const host = $('gateTurnstile');
+    if (host) host.classList.add('hidden');
+  }
+
   // Anonymous teaser session: Turnstile → POST /session/anon → X-EdgeLane-Session.
   async function _ensureAnonSession() {
     const cfg = _authConfig();
@@ -1839,9 +1882,16 @@
         // hard-block the page. Signed-in users never need the teaser session.
         'error-callback': (code) => {
           console.warn('[auth] Turnstile error', code, '— teaser disabled; sign in for full access');
+          // 110200 = this hostname isn't on the widget's allowed-domains list in
+          // the Cloudflare dashboard. Silent failure here looked like a dead
+          // preview, so say what happened — signing in still works either way.
+          _showTurnstileNotice(String(code || ''));
           return true;   // swallow so the SDK doesn't rethrow
         },
-        'timeout-callback': () => console.warn('[auth] Turnstile timed out'),
+        'timeout-callback': () => {
+          console.warn('[auth] Turnstile timed out');
+          _showTurnstileNotice('timeout');
+        },
       });
     } catch (e) { console.warn('[auth] turnstile render failed', e); }
   }
@@ -1893,7 +1943,7 @@
     $('gateTabSignIn').classList.toggle('active', !signup);
     $('gateTabSignUp').classList.toggle('active', signup);
     $('gateNameWrap').classList.toggle('hidden', !signup);
-    $('gateTitle').textContent = signup ? 'Create your EdgeLane account' : 'Sign in to unlock the full dashboard';
+    $('gateTitle').textContent = signup ? 'Create your Matrix account' : 'Sign in to unlock the full dashboard';
     $('gateEyebrow').textContent = signup ? 'Get started' : 'Welcome';
     $('gateSubmit').textContent = signup ? 'Create account' : 'Sign in';
     $('gateSwitchPrompt').textContent = signup ? 'Already have an account?' : "Don't have an account?";
@@ -2238,10 +2288,45 @@
     if (authChannel && uid) { try { authChannel.postMessage({ type: 'signout', userId: uid }); } catch {} }
   });
 
-  let _pollTimer = setInterval(poll, 5000);
-  function _applyPollInterval(secs) {
+  // ── Poll cadence ───────────────────────────────────────────────────────
+  // Two inputs: the user's preferred interval, and whether the market is open.
+  // Off-hours the backend either idles or does one slow display-only poll, so
+  // asking every 5s just burns requests on data that cannot have changed.
+  let _pollTimer = null;
+  let _userPollSecs = 5;
+  function _effectivePollSecs() {
+    if (state.marketOpen === false && !state.pollWhenClosed) {
+      return state.closedInterval || 60;      // match the backend's closed cadence
+    }
+    return _userPollSecs;                     // open, or a poll-anytime backend
+  }
+  function _retunePolling() {
+    const secs = _effectivePollSecs();
+    if (_pollTimer && state.pollEverySecs === secs) return;   // already tuned
+    state.pollEverySecs = secs;
+    state.pollThrottled = secs !== _userPollSecs;
     clearInterval(_pollTimer);
-    _pollTimer = setInterval(poll, Math.max(5, Number(secs) || 5) * 1000);
+    _pollTimer = setInterval(poll, Math.max(5, secs) * 1000);
+    _retuneAuxTimers(secs);
+  }
+
+  // /accuracy and the Lookup redraw ride the same clock. Off-hours the
+  // evaluator is paused outright, so there are no new outcomes to fetch and no
+  // spot drift to redraw — both drop to the closed cadence with the main poll.
+  let _accuracyTimer = null, _lookupTimer = null;
+  function _retuneAuxTimers(secs) {
+    const throttled = state.marketOpen === false && !state.pollWhenClosed;
+    const accMs    = (throttled ? Math.max(secs, 60) : 10) * 1000;
+    const lookupMs = (throttled ? Math.max(secs, 30) : 5)  * 1000;
+    clearInterval(_accuracyTimer);
+    _accuracyTimer = setInterval(pollAccuracy, accMs);
+    clearInterval(_lookupTimer);
+    _lookupTimer = setInterval(() => { if (activeTab === 'lookup') renderLookup(); }, lookupMs);
+  }
+  function _retuneAccuracy() { _retuneAuxTimers(state.pollEverySecs || _userPollSecs); }
+  function _applyPollInterval(secs) {
+    _userPollSecs = Math.max(5, Number(secs) || 5);
+    _retunePolling();
   }
   (function _initPollInterval() {
     let stored = '5';
@@ -2270,7 +2355,7 @@
 
   // Share — native share sheet where available, clipboard fallback.
   $('shareBtn').addEventListener('click', async () => {
-    const share = { title: 'EdgeLane Matrix', text: 'Cut the noise. Trade the decided multi-leg options edge.', url: location.origin + location.pathname };
+    const share = { title: 'Facades Matrix', text: 'Cut the noise. Trade the decided multi-leg options edge.', url: location.origin + location.pathname };
     try {
       if (navigator.share) { await navigator.share(share); return; }
       await navigator.clipboard.writeText(share.url);
@@ -2603,14 +2688,14 @@
   // Re-render Lookup every poll cycle so spot drift + IV updates flow through.
   const _origRenderSnapshot = renderSnapshot;
   // (Already wrapped via state.snapshot updates — call renderLookup after each poll)
-  setInterval(() => { if (activeTab === 'lookup') renderLookup(); }, 5000);
+  // Timer owned by _retuneAuxTimers so it follows the market-hours cadence.
 
   (async () => {
     await resolveApiBasePointer();   // overlay the current backend URL before first call
     initAuth();
     poll();
     pollAccuracy();
-    setInterval(pollAccuracy, 10000);
+    _retuneAccuracy();
   })();
 })();
 </script>

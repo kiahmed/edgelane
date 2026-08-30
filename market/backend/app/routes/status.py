@@ -67,6 +67,15 @@ async def status(request: Request):
         "polling": poller_state.is_polling,
         "poller_market_open": poller_state.market_open,
         "poller_market_reason": poller_state.market_reason,
+        # Off-hours polling policy — the UI mirrors this so it doesn't hammer
+        # /status + /snapshot every 5s for data the poller isn't refreshing.
+        #   poll_when_closed  → mock/dev/forced: full cadence regardless of clock
+        #   display_when_closed → live: one slow display-only poll, no persistence
+        # Neither → fully idle off-hours.
+        "poll_when_closed": bool(s.should_poll_when_market_closed),
+        "display_when_closed": bool(s.display_when_closed),
+        "closed_display_interval_sec": int(s.closed_display_interval_sec),
+        "evaluation_active": poller_state.evaluation_active,
         "last_poll_at": poller_state.last_poll_at,
         "last_loop_at": poller_state.last_loop_at,
         "last_error": poller_state.last_error,
