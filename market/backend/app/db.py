@@ -808,6 +808,55 @@ class Database:
         out["ts"] = _utc_iso(out.get("ts"))
         return out
 
+    def simmer_readiness_history(self, symbol: str, days: int = 30,
+                                 limit: int = 240) -> list[dict]:
+        """Readiness sweeps for one symbol over the last `days`, oldest first,
+        each carrying its paper outcome if one has been evaluated.
+
+        Powers the expanded card's history chart. Three deliberate choices:
+
+          * LEFT JOIN, not INNER — a sweep only gets an outcome row once its
+            expiry has passed and the evaluator has run, so an inner join would
+            silently drop everything recent, i.e. exactly what the user is
+            looking at.
+          * Vetoed sweeps are KEPT (score is NULL for them). The refusals are the
+            product; charting only the scored rows would draw a flattering line
+            through the gaps.
+          * ORDER BY ts ASC so the caller can render left-to-right without
+            re-sorting, but LIMIT needs the newest N — hence the subquery.
+        """
+        conn = self.connect()
+        with self._lock:
+            cur = conn.execute(
+                """
+                SELECT * FROM (
+                    SELECT r.id, r.ts, r.expiration, r.score, r.vetoed,
+                           r.veto_reasons, r.regime, r.structure,
+                           r.short_strike, r.long_strike, r.credit_fill,
+                           r.pop_breakeven, r.expected_value,
+                           o.held, o.touched, o.max_adverse_pct, o.evaluated_at
+                      FROM simmer_readiness r
+                      LEFT JOIN simmer_outcomes o ON o.readiness_id = r.id
+                     WHERE r.symbol = ?
+                       AND r.ts >= now() - CAST(? AS INTERVAL)
+                     ORDER BY r.ts DESC
+                     LIMIT ?
+                ) ORDER BY ts ASC
+                """,
+                [str(symbol).upper(), f"{int(days)} days", int(limit)],
+            )
+            cols = [c[0] for c in cur.description]
+            rows = cur.fetchall()
+        out = []
+        for r in rows:
+            d = dict(zip(cols, r))
+            d["ts"] = _utc_iso(d.get("ts"))
+            d["evaluated_at"] = _utc_iso(d.get("evaluated_at"))
+            if d.get("expiration") is not None:
+                d["expiration"] = str(d["expiration"])
+            out.append(d)
+        return out
+
     _SIMMER_IV_COLS = (
         "session_date", "symbol", "atm_iv", "atm_iv_xern", "iv60", "iv90",
         "rv20_yz", "rv20_cc", "open_px", "high_px", "low_px", "close_px",

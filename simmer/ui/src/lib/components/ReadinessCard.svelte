@@ -5,6 +5,7 @@
 	// ADVERTISED — the gap is the fill-slippage honesty the docs demand.
 	import GateChecklist from './GateChecklist.svelte';
 	import ScoreMatrix from './ScoreMatrix.svelte';
+	import ReadinessHistory from './ReadinessHistory.svelte';
 	import ScoreBar from './ScoreBar.svelte';
 	import EarningsPanel from './EarningsPanel.svelte';
 	import { gateChecklist } from '$lib/gates';
@@ -158,7 +159,13 @@
 	     on narrow, side-by-side once there's room. -->
 	<div class="grid gap-x-6 gap-y-3 md:grid-cols-2">
 		<GateChecklist {env} />
-		<ScoreMatrix {env} />
+		<!-- Right column: the score matrix collapses to "0.0 / 0.0" on a vetoed
+		     card, and vetoed is the common state — so the history strip sits under
+		     it and gives the column something to say either way. -->
+		<div>
+			<ScoreMatrix {env} />
+			<ReadinessHistory symbol={env.symbol} {readyBand} {watchBand} />
+		</div>
 	</div>
 
 	<!-- 2. Score bar -->

@@ -32,6 +32,47 @@ body.busy * {
 	.neon {
 		text-shadow: 0 0 8px rgba(120, 255, 180, 0.45);
 	}
+	/* Long-form prose inside a modal (About). Ported from Matrix's .doc-prose so
+	   the two products' dialogs read identically. */
+	.doc-prose p {
+		font-size: 0.82rem;
+		line-height: 1.6;
+		color: #cbd5e1;
+		margin: 0.5rem 0;
+	}
+	.doc-prose h4 {
+		font-size: 0.7rem;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+		color: #6ee7b7;
+		font-weight: 700;
+		margin: 1rem 0 0.35rem;
+	}
+	.doc-prose ul {
+		margin: 0.25rem 0;
+		padding-left: 1.1rem;
+	}
+	.doc-prose li {
+		font-size: 0.8rem;
+		line-height: 1.5;
+		color: #cbd5e1;
+		margin: 0.2rem 0;
+		list-style: disc;
+	}
+	/* Verdict tiers, coloured to match the readiness card's own vocabulary. */
+	.doc-prose .tier-ready {
+		color: #86efac;
+		font-weight: 700;
+	}
+	.doc-prose .tier-watch {
+		color: #fde68a;
+		font-weight: 700;
+	}
+	.doc-prose .tier-veto {
+		color: #fda4af;
+		font-weight: 700;
+	}
+
 	/* Brand lockup — logomark + SIMMER + "by Facades" byline. Same treatment as
 	   Matrix (market/ui/index.html) so the two products read as one family. */
 	.brand-lockup {

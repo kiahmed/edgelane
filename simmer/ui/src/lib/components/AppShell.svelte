@@ -5,6 +5,7 @@
 	import StatusPills from './StatusPills.svelte';
 	import SocialShare from './SocialShare.svelte';
 	import ContactModal from './ContactModal.svelte';
+	import AboutModal from './AboutModal.svelte';
 	import { CAPTURE_ID } from '$lib/social';
 	import { auth } from '$lib/stores/auth.svelte';
 	import { watchlist } from '$lib/stores/watchlist.svelte';
@@ -15,6 +16,9 @@
 
 	let menuOpen = $state(false);
 	let contactOpen = $state(false);
+	let aboutOpen = $state(false);
+	// Computed, not hardcoded — Matrix fills its footer year at runtime too.
+	const year = new Date().getFullYear();
 	const initial = $derived((auth.user?.email ?? 'D')[0]?.toUpperCase() ?? 'D');
 	const path = $derived(page.url.pathname);
 </script>
@@ -95,7 +99,28 @@
 	</div>
 
 	<footer class="pt-4 text-center text-[0.68rem] text-slate-600">
-		Research tool, not investment advice. Engine verdicts are calibrated on paper outcomes.
+		<div class="mb-1 flex items-center justify-center gap-2 text-xs">
+			<img
+				src={asset('/assets/simmer-logo.png')}
+				alt=""
+				aria-hidden="true"
+				class="h-4 w-4 opacity-90"
+			/>
+			<span>&copy; Facades Simmer {year}. All rights reserved.</span>
+		</div>
+		<!-- "paper outcomes" refers to how the engine grades its OWN past calls
+		     (simulated, no real fills) — not to the market data, which is a live
+		     production feed. The old wording read as though the data were fake. -->
+		Research tool, not investment advice. Live market data; the engine&rsquo;s track record is
+		self-graded on simulated outcomes, not real fills.
+		<span class="mx-1.5 text-slate-700">·</span>
+		<button
+			class="cursor-pointer border-none bg-transparent p-0 text-[0.68rem] text-slate-500 underline underline-offset-2 hover:text-emerald-400"
+			type="button"
+			onclick={() => (aboutOpen = true)}
+		>
+			About
+		</button>
 		<span class="mx-1.5 text-slate-700">·</span>
 		<button
 			class="cursor-pointer border-none bg-transparent p-0 text-[0.68rem] text-slate-500 underline underline-offset-2 hover:text-emerald-400"
@@ -107,4 +132,5 @@
 	</footer>
 </div>
 
+<AboutModal open={aboutOpen} onclose={() => (aboutOpen = false)} />
 <ContactModal open={contactOpen} onclose={() => (contactOpen = false)} />

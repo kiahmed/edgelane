@@ -581,6 +581,41 @@ async def outcomes_summary(request: Request):
     return summary
 
 
+@router.get("/simmer/history/{symbol}", dependencies=_GATE)
+async def readiness_history(symbol: str, request: Request,
+                            days: int = 30, limit: int = 240):
+    """Readiness sweeps for one symbol over time, each with its paper outcome.
+
+    Feeds the expanded card's history chart. Like /simmer/outcomes/summary these
+    are ENGINE verdicts — rows the watcher wrote without any user's settings —
+    so two users comparing the same ticker see the same history.
+
+    Vetoed sweeps are included with score=null: the refusals are the product,
+    and dropping them would draw a flattering line through the gaps.
+    """
+    db = _db(request)
+    if db is None:
+        raise HTTPException(500, "database not initialized")
+    days = max(1, min(int(days), 365))
+    limit = max(1, min(int(limit), 1000))
+    rows = await asyncio.to_thread(
+        db.simmer_readiness_history, symbol, days, limit)
+
+    # Hit rate over RESOLVED signals only. A signal with no outcome row yet is
+    # not a miss — its expiry hasn't passed — so it must not dilute the rate.
+    resolved = [r for r in rows if r.get("held") is not None]
+    held = sum(1 for r in resolved if r.get("held"))
+    return {
+        "symbol": symbol.upper(),
+        "days": days,
+        "rows": rows,
+        "resolved": len(resolved),
+        "held": held,
+        "hit_rate": (held / len(resolved)) if resolved else None,
+        "basis": "engine_verdicts_only",
+    }
+
+
 # ── Settings (validated + clamped server-side, written service-role) ────────
 _ALLOWED_STRICTNESS = ("relaxed", "balanced", "strict")
 
