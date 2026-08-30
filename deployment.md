@@ -124,8 +124,9 @@ same trade pick, and no LLM is in the decision path. Torque itself does
 | `tests/tradier_execute_ticket.py` | Parses a copy-button ticket, posts via Tradier. | ✓ |
 | `tests/utils.py` | Shared test helpers (config loader, etc.). | ✓ |
 | `docs/` | Implementation notes (`torque.md`, `torque_operating_manual.html`, `tradier_implementation.md`, etc.). | ✓ |
-| `docs/matrix_operating_manual.html` | Matrix badge / score / decision reference. | ✓ |
-| `operating_manual.md` | Operating the stack: Torque, Simmer, deploy, troubleshooting. | ✓ |
+| `docs/matrix_operating_manual.html` | Matrix: onboarding, badges, scores, decision rules. | ✓ |
+| `docs/torque_operating_manual.html` | Torque: controls, readings, labels. | ✓ |
+| `simmer/simmer_operating_manual.html` | Simmer: readiness scoring + operations. | ✓ |
 | `deployment.md` | This file. | ✓ |
 
 ### Deploy / production

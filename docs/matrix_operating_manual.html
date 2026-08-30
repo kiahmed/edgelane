@@ -354,6 +354,7 @@
       <div class="rail-h">Contents</div>
       <ol>
         <li><a href="#what">What Matrix is</a></li>
+        <li><a href="#start">Getting started</a></li>
         <li><a href="#redesign">What the redesign changed</a></li>
         <li><a href="#page">Reading the page</a></li>
         <li><a href="#bias">The bias read</a></li>
@@ -388,10 +389,83 @@
         </div>
       </section>
 
+      <!-- ══ GETTING STARTED ═════════════════════════════════ -->
+      <section id="start">
+        <div class="sec-head">
+          <span class="eyebrow">02 &mdash; Onboarding</span>
+          <h2>Getting started</h2>
+        </div>
+
+        <p>Matrix gates on a sign-in. What you see before signing in is a deliberate
+        preview, not a broken page.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Tier</th><th>Who</th><th>What you get</th></tr></thead>
+            <tbody>
+              <tr class="a"><td class="k band">Teaser</td><td>anonymous, after a Cloudflare browser check</td><td>Spot, bias and the walls. The engine pick, the strategy grid, Lookup and orders are stripped server-side &mdash; not hidden with CSS.</td></tr>
+              <tr class="g"><td class="k band">Product</td><td>signed-up user</td><td>Everything: engine pick, all eight strategies, scoring, Lookup, self-eval history, and order routing.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>If the preview is unavailable, the browser check couldn&rsquo;t run for this
+        domain &mdash; signing in works regardless.</p>
+
+        <h3>Create an account</h3>
+        <ol class="flow">
+          <li><b>Sign up at the gate</b> with email and password.</li>
+          <li><b>Confirm the email.</b> The link expires in 24 hours; the gate has a resend if it lapses.</li>
+          <li><b>Sign in.</b> The session persists per browser tab.</li>
+        </ol>
+
+        <h3>Connect a broker</h3>
+        <p>Market data comes from the operator&rsquo;s own feed &mdash; you don&rsquo;t supply
+        it. A broker connection is only for <em>routing your own orders</em>, and until you
+        add one the push-to-broker button stays disabled.</p>
+
+        <p>Open the avatar menu (top right) &rarr; <strong>Broker connections</strong> &rarr;
+        <strong>Add</strong>:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Provider</th><th>What it needs</th><th>Notes</th></tr></thead>
+            <tbody>
+              <tr class="g"><td class="k band">Tradier</td><td>Bearer token, environment (sandbox or production), optional account id</td><td>Leave the account id blank and it resolves from your token. Full multi-leg support.</td></tr>
+              <tr class="a"><td class="k band">Webull</td><td>App key, app secret, optional account id</td><td>OpenAPI requires request signing, so it routes through the backend.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p><strong>Your token never comes back to the browser.</strong> It is encrypted at
+        rest and decrypted only server-side, which is why <em>Test</em> runs as a backend
+        probe of the provider&rsquo;s profile endpoint and returns just
+        <span class="mono">{ok, env, account_id}</span>. Several connections can coexist;
+        exactly one is active, and that&rsquo;s the one orders use.</p>
+
+        <div class="callout warn">
+          <span class="lbl">Check two things before your first live order</span>
+          <p>That the connection&rsquo;s <strong>environment</strong> matches what you intend
+          &mdash; a sandbox connection fills against simulated quotes &mdash; and that the
+          account carries enough <strong>option approval</strong>: level 3 for credit
+          spreads, level 4 for iron condors. A rejected order usually means one of these,
+          not a bad ticket.</p>
+        </div>
+
+        <h3>Place an order</h3>
+        <p>From the engine pick, the order dialog runs <strong>preview then submit</strong>:
+        preview validates the exact ticket with your broker &mdash; margin, option level,
+        strike spacing &mdash; and places nothing, so a rejection costs you nothing. Only
+        after it passes does submit go live, on your own connection.</p>
+
+        <p>The order path never auto-retries a submit. A network failure there is surfaced
+        rather than repeated, because a retry could double-place a filled order.</p>
+      </section>
+
       <!-- ══ REDESIGN ═══════════════════════════════════════ -->
       <section id="redesign">
         <div class="sec-head">
-          <span class="eyebrow">02 &mdash; Legacy &rarr; now</span>
+          <span class="eyebrow">03 &mdash; Legacy &rarr; now</span>
           <h2>What the redesign changed</h2>
         </div>
 
@@ -435,7 +509,7 @@
       <!-- ══ PAGE ═══════════════════════════════════════════ -->
       <section id="page">
         <div class="sec-head">
-          <span class="eyebrow">03 &mdash; Layout</span>
+          <span class="eyebrow">04 &mdash; Layout</span>
           <h2>Reading the page</h2>
         </div>
 
@@ -486,7 +560,7 @@
       <!-- ══ BIAS ═══════════════════════════════════════════ -->
       <section id="bias">
         <div class="sec-head">
-          <span class="eyebrow">04 &mdash; The read</span>
+          <span class="eyebrow">05 &mdash; The read</span>
           <h2>The bias read</h2>
         </div>
 
@@ -567,7 +641,7 @@
       <!-- ══ PICK ═══════════════════════════════════════════ -->
       <section id="pick">
         <div class="sec-head">
-          <span class="eyebrow">05 &mdash; The recommendation</span>
+          <span class="eyebrow">06 &mdash; The recommendation</span>
           <h2>The engine pick</h2>
         </div>
 
@@ -686,7 +760,7 @@ counts through EV without being double-billed.</span></pre>
       <!-- ══ LIMIT TIERS ════════════════════════════════════ -->
       <section id="limit">
         <div class="sec-head">
-          <span class="eyebrow">06 &mdash; Pricing your entry</span>
+          <span class="eyebrow">07 &mdash; Pricing your entry</span>
           <h2>Limit-order tiers</h2>
         </div>
 
@@ -762,7 +836,7 @@ target_debit(tier)  = breakeven &minus; (tier_pct &times; width) / wall_factor
       <!-- ══ LOOKUP ═════════════════════════════════════════ -->
       <section id="lookup">
         <div class="sec-head">
-          <span class="eyebrow">07 &mdash; Trade evolution</span>
+          <span class="eyebrow">08 &mdash; Trade evolution</span>
           <h2>Lookup projections</h2>
         </div>
 
@@ -808,7 +882,7 @@ composed: +$28 theta &middot; +$5 delta &middot; +$3 &gamma;/vega</pre>
       <!-- ══ LENSES ═════════════════════════════════════════ -->
       <section id="lenses">
         <div class="sec-head">
-          <span class="eyebrow">08 &mdash; Beyond gamma</span>
+          <span class="eyebrow">09 &mdash; Beyond gamma</span>
           <h2>VEX / TEX lenses</h2>
         </div>
 
@@ -852,7 +926,7 @@ composed: +$28 theta &middot; +$5 delta &middot; +$3 &gamma;/vega</pre>
       <!-- ══ SELF-EVAL ══════════════════════════════════════ -->
       <section id="selfeval">
         <div class="sec-head">
-          <span class="eyebrow">09 &mdash; The differentiator</span>
+          <span class="eyebrow">10 &mdash; The differentiator</span>
           <h2>Self-evaluation</h2>
         </div>
 
@@ -937,7 +1011,7 @@ composed: +$28 theta &middot; +$5 delta &middot; +$3 &gamma;/vega</pre>
       <!-- ══ WORKFLOW ═══════════════════════════════════════ -->
       <section id="workflow">
         <div class="sec-head">
-          <span class="eyebrow">10 &mdash; In practice</span>
+          <span class="eyebrow">11 &mdash; In practice</span>
           <h2>Workflow</h2>
         </div>
 
@@ -959,7 +1033,7 @@ composed: +$28 theta &middot; +$5 delta &middot; +$3 &gamma;/vega</pre>
       <!-- ══ VERSUS ═════════════════════════════════════════ -->
       <section id="versus">
         <div class="sec-head">
-          <span class="eyebrow">11 &mdash; The suite</span>
+          <span class="eyebrow">12 &mdash; The suite</span>
           <h2>Matrix vs. the others</h2>
         </div>
 

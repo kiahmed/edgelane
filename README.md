@@ -29,10 +29,10 @@ to Cloudflare Pages; see its `docs/hosting.md` before touching the domains.
 
 | If you want to… | Read this |
 |---|---|
-| **Set it up + run locally** | [deployment.md](./deployment.md) |
-| **Understand Matrix's badges, scores, and decision rules** | [docs/matrix_operating_manual.html](./docs/matrix_operating_manual.html) |
-| **Run + operate the whole stack** | [operating_manual.md](./operating_manual.md) |
+| **Set it up, run + deploy the stack** | [deployment.md](./deployment.md) |
+| **Sign up, connect a broker, use Matrix** | [docs/matrix_operating_manual.html](./docs/matrix_operating_manual.html) |
 | **Run the Python tests** | `tests/` — `tradier_smoke.py`, `tradier_execute_ticket.py` |
+| **Understand Simmer's readiness scoring** | [simmer/simmer_operating_manual.html](./simmer/simmer_operating_manual.html) |
 | **Place multi-leg orders fast (Torque)** | [docs/torque.md](./docs/torque.md) — `cd market/backend && make run-dev`, open `:8789/torque` |
 | **Understand Torque's controls, readings, and labels** | [docs/torque_operating_manual.html](./docs/torque_operating_manual.html) |
 | **Positions & realized P&L CLI (`tp`)** | [tools/tp_operating_manual.html](./tools/tp_operating_manual.html) |
