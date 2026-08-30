@@ -109,7 +109,7 @@
   positions and working orders on a Tradier account directly from bash —
   list, close, add, modify, cancel, open. Single uniform verb-flag scheme.
   Sandbox vs production is picked by the <code>DEVMODE</code> flag in
-  <code>edge_lane_config.config</code>.
+  <code>edgelane_market.config</code>.
 </p>
 
 <div class="toc">
@@ -504,7 +504,7 @@ PREVIEW mode. Add <code>--execute</code> (or <code>-x</code>) to actually submit
 This makes the same command-line safe as a dry-run dispatcher: paste, inspect, then re-run with <code>--execute</code>.</p>
 
 <h3>Sandbox vs production</h3>
-<p>Controlled by <code>DEVMODE</code> in <code>edge_lane_config.config</code>:</p>
+<p>Controlled by <code>DEVMODE</code> in <code>edgelane_market.config</code>:</p>
 <div class="key-grid">
   <code>DEVMODE=true</code><span>→ Tradier sandbox (<code>api.sandbox.tradier.com</code>)</span>
   <code>DEVMODE=false</code><span>→ Tradier production (<code>api.tradier.com</code>)</span>
@@ -547,7 +547,7 @@ The <code>credit</code> / <code>debit</code> / <code>even</code> order types are
 <!-- ─── 12 Install ────────────────────────────────────────────────────── -->
 <h2 id="install"><span class="num">12</span>Installation &amp; alias</h2>
 <p>Tradier credentials and DEVMODE flag live in
-<code>edge_lane_config.config</code> at the repo root. The tool reads them via
+<code>edgelane_market.config</code> at the repo root. The tool reads them via
 <code>tests/utils.py</code> — no additional setup required if EdgeLane itself
 already works.</p>
 

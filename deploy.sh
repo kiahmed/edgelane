@@ -7,7 +7,6 @@
 #
 # The Torque order-builder ships WITH the backend (served at /torque); only the
 # market dashboard (market/ui/index.html) goes to Vercel. The legacy single-file
-# edge_lane.html is NOT deployed.
 #
 # Run `./deploy.sh --help` for usage. Normally invoked via the Makefile:
 #   make deploy-be      backend only   (DEPLOY=local_container)

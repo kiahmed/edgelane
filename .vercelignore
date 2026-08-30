@@ -9,7 +9,6 @@ tools/
 tests/
 docs/
 deploy/
-archive/
 
 # Secrets / local config — NEVER upload these.
 # Match only the KEY=VALUE backend config files, NOT the browser
@@ -21,12 +20,6 @@ archive/
 .env
 .env.*
 deploy/.env
-
-# Legacy single-file frontend (not deployed to Vercel)
-edge_lane.html
-edge_lane*.html
-spread_optimizer_v4_7_html.jsx
-edge_lane.template.html
 
 # Python / build noise
 **/__pycache__/

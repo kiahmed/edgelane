@@ -10,8 +10,6 @@ BACKEND      = market/backend
 PY           = python3
 PORT         ?= 8789
 HOST         ?= 127.0.0.1
-CORS_PORT    ?= 8787
-COPROXY      = ./tools/cors_proxy_service.sh
 DEPLOY_SH    = ./deploy.sh
 # backend deploy target: local_container | cloud
 DEPLOY       ?= local_container
@@ -27,7 +25,6 @@ DATA_VOLUME  = edgelane_edgelane-data
 DATA_DUMP    = deploy/edgelane-data.tar.gz
 
 .PHONY: help \
-        build build-dry cors cors-start cors-stop cors-restart cors-delete \
         setup run run-dev run-prod run-bg stop logs clean \
         diag status snapshot accuracy \
         test test-e2e test-all \
@@ -52,30 +49,6 @@ help: ## Show this help
 	@printf "  \033[38;5;208m%-14s\033[0m %s\n" "DEPLOY=cloud" "backend deploy target (default $(DEPLOY))"
 	@printf "  \033[38;5;208m%-14s\033[0m %s\n" "ARGS=-n"      "extra flags passed through to the underlying script"
 	@printf "\n  e.g. \033[94mmake run\033[0m \033[38;5;208mPORT=8788\033[0m   |   \033[94mmake deploy-prod\033[0m \033[38;5;208mARGS=-n\033[0m\n\n"
-
-# ---- Frontend (legacy single-file app) ----
-
-build: ## Run edge_lane_build.sh → produces edge_lane.html
-	@./edge_lane_build.sh
-
-build-dry: ## Dry-run the build (preview substitutions, write nothing)
-	@./edge_lane_build.sh --dry-run
-
-cors: ## Start the CORS proxy on CORS_PORT=8787 (background)
-	@echo ">>> CORS proxy on port $(CORS_PORT) (background)"
-	@$(PY) tools/cors_proxy.py &
-
-cors-start: ## Start the CORS proxy via the service manager (auto-restart)
-	@EDGELANE_CORS_PORT=$(CORS_PORT) $(COPROXY) start
-
-cors-stop: ## Stop the CORS proxy service
-	@$(COPROXY) stop
-
-cors-restart: ## Restart the CORS proxy service
-	@EDGELANE_CORS_PORT=$(CORS_PORT) $(COPROXY) restart
-
-cors-delete: ## Uninstall the CORS proxy auto-start hook
-	@$(COPROXY) uninstall
 
 # ---- Backend — setup ----
 

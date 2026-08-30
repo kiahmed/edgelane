@@ -1,8 +1,13 @@
 # EdgeLane — Options Spread Optimizer
 
-A single-file web app for finding and ranking multi-leg options spreads with the highest **composite tradeability score** (EV + structural health + liquidity + limit-order feasibility + POP). Pulls dealer-positioning bias from Tradier, synthesizes a narrative with Gemini Flash, then ranks candidates client-side. (EdgeLane originally sourced bias from Atlas's API (mind-vest.io); that provider was fully retired ~May 2026.)
+Finds and ranks multi-leg options spreads by a **composite tradeability score**
+(EV + structural health + liquidity + limit-order feasibility + POP), reading
+dealer-positioning bias from Tradier — and grades its own picks afterwards, so the
+published win rate is earned rather than asserted. (EdgeLane originally sourced
+bias from Atlas's API (mind-vest.io); that provider was fully retired ~May 2026.)
 
-Built for personal/local use. The deployed HTML embeds your API keys at build time, so the workflow is private-first — gate the deploy with auth or a tiny key-proxying Pages Function before exposing it publicly.
+A FastAPI + DuckDB backend holds all the math and runs behind a Cloudflare named
+tunnel at `edge.facades.trade`, serving all three products below.
 
 ## The three products
 
@@ -11,7 +16,7 @@ This repo ships as three products under the **Facades** brand
 
 | Product | What it is here | Served at |
 |---|---|---|
-| **Matrix** | this optimizer — `spread_optimizer_v4_7_html.jsx`, `market/ui/` | `matrix.facades.trade` |
+| **Matrix** | this optimizer — `market/ui/` | `matrix.facades.trade` |
 | **Simmer** | earnings / premium-watch engine — `simmer/`, `market/backend/app/simmer_*.py` | `simmer.facades.trade` |
 | **Torque** | standalone order builder — `docs/torque.md` | *not public yet — admin-only, no multi-user login* |
 
@@ -25,9 +30,9 @@ to Cloudflare Pages; see its `docs/hosting.md` before touching the domains.
 | If you want to… | Read this |
 |---|---|
 | **Set it up + run locally** | [deployment.md](./deployment.md) |
-| **Understand the badges, scores, and decision rules** | [operating_manual.md](./operating_manual.md) |
+| **Understand Matrix's badges, scores, and decision rules** | [docs/matrix_operating_manual.html](./docs/matrix_operating_manual.html) |
+| **Run + operate the whole stack** | [operating_manual.md](./operating_manual.md) |
 | **Run the Python tests** | `tests/` — `tradier_smoke.py`, `tradier_execute_ticket.py` |
-| **Run the local CORS proxy during dev** | `python tools/cors_proxy.py` (see deployment.md) |
 | **Place multi-leg orders fast (Torque)** | [docs/torque.md](./docs/torque.md) — `cd market/backend && make run-dev`, open `:8789/torque` |
 | **Understand Torque's controls, readings, and labels** | [docs/torque_operating_manual.html](./docs/torque_operating_manual.html) |
 | **Positions & realized P&L CLI (`tp`)** | [tools/tp_operating_manual.html](./tools/tp_operating_manual.html) |
@@ -35,18 +40,23 @@ to Cloudflare Pages; see its `docs/hosting.md` before touching the domains.
 ## TL;DR
 
 ```bash
-cp edge_lane_config.config.example edge_lane_config.config  # paste real keys
-python tools/cors_proxy.py &                                 # background terminal
-./edge_lane_build.sh                                         # produces edge_lane.html
-python -m http.server 8080                                   # → http://localhost:8080/edge_lane.html
+cp edgelane_market.config.example edgelane_market.config   # paste real keys
+cd market/backend && make setup && make run-dev            # backend on :8789
+make ui                                                    # open Matrix against it
 ```
 
 ## Source of truth
 
-`spread_optimizer_v4_7_html.jsx` is the only source file. The build script:
-1. strips ESM imports + `export default`
-2. inlines the JSX into `edge_lane.template.html`
-3. substitutes API keys, model name, version, proxy URLs from the config
-4. emits `edge_lane.html`
+The backend (`market/backend/app/`) owns every number: bias, walls, candidate
+generation, composite scoring, and the self-evaluation. The UIs are readouts —
+`market/ui/index.html` (Matrix, static, no build step), `simmer/ui/` (SvelteKit),
+and `market/backend/ui/torque.html` (served by the backend at `/torque`).
 
-Auto-versioning: the build hashes JSX + template; patch number bumps on real changes, stays put on no-op rebuilds, resets when you edit `EDGE_LANE_VERSION` in config.
+The 56 parity tests in `market/backend/tests/parity/` pin the Python math to the
+original JSX engine's output; they must stay green when touching `bias_engine`,
+`strategy_engine`, or `walls`.
+
+> **Removed 2026-08:** the original single-file frontend
+> (`spread_optimizer_v4_7_html.jsx` → `edge_lane.html`, built by
+> `edge_lane_build.sh`) and its dev-only Gemini CORS proxy. Matrix superseded it;
+> recover from git history if you ever need it.

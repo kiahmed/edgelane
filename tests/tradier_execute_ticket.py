@@ -5,7 +5,7 @@ Takes a single-line trade ticket in EdgeLane's copy-button format and submits
 it to Tradier as a multi-leg order. Defaults to PREVIEW-ONLY (no live submit)
 so it's safe to dry-run.
 
-Ticket format (matches _buildTradeTicket in spread_optimizer_v4_7_html.jsx):
+Ticket format (originally _buildTradeTicket in the retired JSX frontend):
 
     {verb} {label} . {SYMBOL} . {YYYY-MM-DD} . {legs} . {mode} . {N} contract[s]
 

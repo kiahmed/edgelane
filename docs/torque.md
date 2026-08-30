@@ -36,9 +36,8 @@ Then open **http://127.0.0.1:8789/torque** (port = `HTTP_PORT`, default 8788; th
 
 ### Config file + DEVMODE
 
-Torque reads **`edgelane_market.config`** (the market-backend config) — *not*
-`edge_lane_config.config`, which belongs to the old standalone frontend and has its
-own unrelated `DEVMODE`. The single flag that decides sandbox vs production for
+Torque reads **`edgelane_market.config`** (the market-backend config), which is now
+the only config in the repo. The single flag that decides sandbox vs production for
 Torque is **`DEVMODE`** in `edgelane_market.config`:
 
 - `DEVMODE=true` → sandbox token + `sandbox.tradier.com` + sandbox DB (paper).

@@ -18,17 +18,14 @@ production (market backend on Docker + Cloudflare tunnel, dashboard on Vercel).
 5. [Prerequisites](#prerequisites)
 6. [Initial setup (one-time)](#initial-setup-one-time)
 7. [Configuration reference](#configuration-reference)
-8. [CORS proxy — what it does and how to manage it](#cors-proxy--what-it-does-and-how-to-manage-it)
-9. [Build — `edge_lane_build.sh`](#build--edge_lane_buildsh)
-10. [Local run + browser](#local-run--browser)
-11. [Tools: `tp` and `coproxy` shell aliases](#tools-tp-and-coproxy-shell-aliases)
-12. [Test scripts — what to run before committing](#test-scripts--what-to-run-before-committing)
-13. [Daily workflow](#daily-workflow)
-14. [Switching between sandbox and production](#switching-between-sandbox-and-production)
-15. [Market backend & Torque (local run)](#market-backend--torque-local-run)
-16. [Troubleshooting](#troubleshooting)
-17. [Production deployment](#production-deployment)
-18. [Quick reference card](#quick-reference-card)
+8. [Tools: the `tp` shell alias](#tools-the-tp-shell-alias)
+9. [Test scripts — what to run before committing](#test-scripts--what-to-run-before-committing)
+10. [Daily workflow](#daily-workflow)
+11. [Switching between sandbox and production](#switching-between-sandbox-and-production)
+12. [Market backend & Torque (local run)](#market-backend--torque-local-run)
+13. [Troubleshooting](#troubleshooting)
+14. [Production deployment](#production-deployment)
+15. [Quick reference card](#quick-reference-card)
 
 ---
 
@@ -37,15 +34,17 @@ production (market backend on Docker + Cloudflare tunnel, dashboard on Vercel).
 A hybrid options-spread optimizer:
 
 - Pulls live options chain + Greeks from Tradier (EdgeLane originally used Atlas's API (mind-vest.io) as its data provider; Atlas was fully retired ~May 2026 and Tradier is now the sole provider)
-- Computes a deterministic market-bias signal in JavaScript (Gemini Flash only writes the prose summary, not the bias decision)
+- Computes a deterministic market-bias signal in Python, server-side
 - Scores candidate spreads (verticals, condors, butterflies, iron flies)
 - Lets the user sign in, attach a Tradier brokerage connection, copy a ticket to clipboard, or push an order straight to the broker
 - A separate Python toolchain (`tp` and friends) covers everything the UI doesn't: listing / closing / modifying / cancelling live positions and working orders.
 
-The legacy front-end ships as one `edge_lane.html` produced by `edge_lane_build.sh` —
-no bundler, no Node runtime, no install step; Babel-standalone compiles the JSX in
-the browser. The current product surface is the **market backend** (FastAPI) plus its
-two UIs: the **market dashboard** (Vercel) and **Torque** (served by the backend).
+The product surface is the **market backend** (FastAPI) plus three UIs: **Matrix**
+(Vercel), **Simmer** (Vercel), and **Torque** (served by the backend itself).
+
+> The original single-file `edge_lane.html`, built from a ~5,500-line JSX file by
+> `edge_lane_build.sh` with Babel-standalone compiling in the browser, was removed
+> in 2026-08 along with its dev-only Gemini CORS proxy. Matrix replaced it.
 
 ---
 
@@ -57,8 +56,8 @@ between a one-command deploy and chasing a change that never went live:
 | Deployable | Source | Served from | Shipped by |
 |---|---|---|---|
 | **Market backend API + Torque page** | `market/backend/` (`app/` + `ui/torque.html`) | **Docker container** (FastAPI, behind a Cloudflare tunnel) | `make deploy-be` / `make deploy-be-restart` |
-| **Market dashboard UI** | `market/ui/index.html` | **Vercel** | `make deploy-fe` |
-| **Legacy single-file optimizer** | `edge_lane.html` (built from JSX) | *not currently deployed* (optional Cloudflare Pages) | manual `wrangler pages deploy` |
+| **Matrix UI** | `market/ui/index.html` | **Vercel** (`matrix.facades.trade`) | `make deploy-fe` |
+| **Simmer UI** | `simmer/ui/` | **Vercel** (`simmer.facades.trade`) | `make deploy-simmer` |
 
 > ⚠️ **Torque is part of the backend, not Vercel.** `market/backend/ui/torque.html`
 > is `COPY`-baked into the backend Docker image (`Dockerfile`: `COPY ui ./ui`) and
@@ -72,38 +71,38 @@ between a one-command deploy and chasing a change that never went live:
 ## Architecture in one diagram
 
 ```
-                 ┌─────────────────────────────┐
-                 │  edge_lane.html  (browser)  │   ← legacy single-file optimizer
-                 └────┬───────────────────┬────┘
-                      │                   │
-        market data ──┤                   ├── per-user broker orders
-        (operator)    │                   │   (user's Tradier connection)
-                      ▼                   ▼
-        ┌─────────────────────┐   ┌─────────────────────┐
-        │ CORS proxy :8787    │   │ Tradier api endpoint│
-        │ tools/cors_proxy.py │   │ (sandbox or prod)   │
-        └────┬──────────┬─────┘   └─────────────────────┘
-             │          │
-             │          └──→ Gemini  (prose only)
-             └────────────→ Tradier  (chain, GEX, quote — operator-level)
+                        the browser
+   ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+   │ Matrix           │  │ Simmer           │  │ Torque           │
+   │ matrix.facades…  │  │ simmer.facades…  │  │ …/torque         │
+   │ (Vercel, static) │  │ (Vercel, Svelte) │  │ (backend-served) │
+   └────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘
+            └─────────────────────┼─────────────────────┘
+                                  ▼   https://edge.facades.trade
+                       ┌──────────────────────┐
+                       │ Cloudflare named     │  permanent hostname
+                       │ tunnel (connector)   │
+                       └──────────┬───────────┘
+                                  ▼
+                       ┌──────────────────────┐        ┌──────────────────┐
+                       │ market backend       │───────▶│ Tradier API      │
+                       │ FastAPI + DuckDB     │        │ (sandbox / prod) │
+                       │ Docker, port 8789    │        └──────────────────┘
+                       │  + Torque at /torque │
+                       └──────────────────────┘
+                        polls · scores · persists · self-evaluates
 
-Market service (current product):
-        ┌──────────────────────────────┐        ┌─────────────────────┐
-        │ market dashboard index.html  │───────▶│ market backend      │
-        │ (Vercel)                     │  api   │ FastAPI, Docker      │
-        └──────────────────────────────┘        │  + Torque /torque    │
-                                                 │  behind CF tunnel    │
-        ┌──────────────────────────────┐  same  └─────────────────────┘
-        │ Torque /torque (backend-served) │◀── origin (COPY-baked into image)
+Per-user broker orders route through the backend using each user's own
+Tradier connection — the house token is read-only market data.
 
 Python side (no browser involved):
-    tradier_smoke.py            chain/quote sanity check
-    tradier_execute_ticket.py   parse EdgeLane copy-button string + submit
-    tools/tradier_positions.py  list / sell / open / modify / cancel positions
+    tests/tradier_smoke.py            chain/quote sanity check
+    tests/tradier_execute_ticket.py   parse a copy-button ticket + submit
+    tools/tradier_positions.py        list / sell / open / modify / cancel
 ```
 
-Bias decision is **always deterministic** — Gemini only writes the human-readable
-summary. Same chain inputs always produce the same trade pick. Torque itself does
+Bias decision is **always deterministic**: same chain inputs always produce the
+same trade pick, and no LLM is in the decision path. Torque itself does
 **no** forecasting (no bias engine) — just positioning/flow reads + order building.
 
 ---
@@ -114,23 +113,19 @@ summary. Same chain inputs always produce the same trade pick. Torque itself doe
 
 | Path | Role | Commit? |
 |---|---|---|
-| `spread_optimizer_v4_7_html.jsx` | Source of truth. All optimizer logic. Edit this. | ✓ |
-| `edge_lane.template.html` | HTML shell — CDN imports, theme CSS, placeholders. | ✓ |
-| `edge_lane_build.sh` | Build script. Auto-bumps version. | ✓ |
-| `edge_lane_config.config.example` | Template config with placeholders. | ✓ |
-| `edge_lane_config.config` | Your real keys + DEVMODE. | ✗ (gitignored) |
-| `edge_lane.html` | Build artifact. Overwritten every build. | ✗ |
-| `.edge_lane_buildstate` | Version-bump state. | ✗ |
-| `tools/cors_proxy.py` | Local CORS proxy (browser → Tradier + Gemini). | ✓ |
-| `tools/cors_proxy_service.sh` | Service manager: start/stop/status/install. | ✓ |
+| `market/ui/index.html` | Matrix UI. Static, no build step. | ✓ |
+| `simmer/ui/` | Simmer UI (SvelteKit SPA). | ✓ |
+| `market/backend/` | The backend: engine, routes, Torque page. | ✓ |
+| `edgelane_market.config.example` | Template config with placeholders. | ✓ |
+| `edgelane_market.config` | Your real keys + DEVMODE. | ✗ (gitignored) |
 | `tools/tradier_positions.py` | `tp` — Tradier position + order manager. | ✓ |
 | `tools/tp_operating_manual.html` | Operating manual for `tp` (HTML). | ✓ |
 | `tests/tradier_smoke.py` | Tradier API sanity check. | ✓ |
-| `tests/tradier_execute_ticket.py` | Parses EdgeLane copy-button ticket, posts via Tradier. | ✓ |
+| `tests/tradier_execute_ticket.py` | Parses a copy-button ticket, posts via Tradier. | ✓ |
 | `tests/utils.py` | Shared test helpers (config loader, etc.). | ✓ |
-| `archive/` | Snapshots of prior JSX versions. | ✓ |
 | `docs/` | Implementation notes (`torque.md`, `torque_operating_manual.html`, `tradier_implementation.md`, etc.). | ✓ |
-| `operating_manual.md` | Badge / verdict / score / strategy reference for the UI. | ✓ |
+| `docs/matrix_operating_manual.html` | Matrix badge / score / decision reference. | ✓ |
+| `operating_manual.md` | Operating the stack: Torque, Simmer, deploy, troubleshooting. | ✓ |
 | `deployment.md` | This file. | ✓ |
 
 ### Deploy / production
@@ -156,13 +151,13 @@ summary. Same chain inputs always produce the same trade pick. Torque itself doe
 
 | What | Why | Notes |
 |---|---|---|
-| WSL2 with Ubuntu (or any Linux) | Build script + proxy + tests run there | Windows users: use WSL, not Git Bash — the proxy is long-lived |
-| Python 3.10+ | Build script + proxy + all CLI tools | stdlib only; **no `pip install` required** for the frontend/tools |
-| Bash | Build script + service manager | comes with WSL/Linux |
-| A browser | Open `edge_lane.html` / `/torque` | Chromium-family preferred for DevTools depth |
-| Node.js | Optional (JSX validation); required for Vercel deploy | `@babel/parser` syntax-check; `vercel` CLI |
+| WSL2 with Ubuntu (or any Linux) | Backend + tools run there | Windows users: use WSL, not Git Bash |
+| Python 3.10+ | Backend + all CLI tools | the CLI tools are stdlib-only; the backend has its own venv (`make setup`) |
+| Bash | `deploy.sh` + make targets | comes with WSL/Linux |
+| A browser | Open Matrix / `/torque` | Chromium-family preferred for DevTools depth |
+| Node.js | Simmer build, parity tests, Vercel deploy | `vercel` CLI; `node` runs the parity harness |
 | Docker | Production backend (container + tunnel) | only needed to `deploy-be` |
-| `curl`, `ss` | Optional, for proxy health checks | universally available |
+| `curl` | Health checks (`make status`, `make check-tunnel`) | universally available |
 
 ---
 
@@ -173,231 +168,69 @@ summary. Same chain inputs always produce the same trade pick. Torque itself doe
 cd /mnt/c/soljet_dev/EdgeLane
 
 # 2. Create your config from the example
-cp edge_lane_config.config.example edge_lane_config.config
+cp edgelane_market.config.example edgelane_market.config
 
 # 3. Open it and fill in your keys — see the next section for what each does
-$EDITOR edge_lane_config.config
+$EDITOR edgelane_market.config
 
-# 4. Start the CORS proxy as a background service (see CORS proxy section)
-./tools/cors_proxy_service.sh start
+# 4. One-time backend venv + deps
+cd market/backend && make setup && cd ../..
 
-# 5. Build the HTML
-./edge_lane_build.sh
+# 5. Boot the backend (sandbox Tradier, polls regardless of market hours)
+cd market/backend && make run-dev
 
-# 6. Serve it
-python3 -m http.server 8080
-# open http://localhost:8080/edge_lane.html
+# 6. Open a UI against it
+make ui                        # Matrix  → market/ui/index.html
+# Torque → http://127.0.0.1:8789/torque
 ```
 
-That's the whole loop. Everything below is detail and tooling around those six commands.
+That's the whole loop. Everything below is detail and tooling around those commands.
 
 ---
 
 ## Configuration reference
 
-`edge_lane_config.config` is the single source of secrets + environment flags for the
-**frontend/tools**. The build script `source`s it as bash, so values must use bash
-quoting rules. (The **market backend / Torque** use a *separate* file,
-`edgelane_market.config` — see [Market backend & Torque](#market-backend--torque-local-run).)
+`edgelane_market.config` is the single source of secrets + environment flags for
+the backend, Torque, and the Python CLI tools. KEY=VALUE, `#` comments. Gitignored.
+
+Deploy-time values live separately in `deploy/.env` (`CF_TUNNEL_TOKEN`,
+`EDGELANE_API_BASE`, Vercel/Supabase provisioning) — read by `deploy.sh` and
+docker compose, never by the running app.
 
 ### Required keys
 
 | Key | What it's for |
 |---|---|
-| `GEMINI_API_KEY` | Bias prose generation (deterministic JS does the math; Gemini just narrates) |
 | `TRADIER_TOKEN` | Operator-level Tradier token (chain + GEX + quote) |
-| `TRADIER_TOKEN_SANDBOX` | Sandbox-environment Tradier token (used when `DEVMODE=true`) |
+| `TRADIER_TOKEN_SANDBOX` | Sandbox token (used when `DEVMODE=true`) |
+| `SYMBOLS` | Which underlyings the poller tracks, comma-separated |
 
 ### Environment toggles
 
 | Key | Values | Effect |
 |---|---|---|
-| `DEVMODE` | `true` / `false` | When `true`, Python CLI tools (`tp`, `tradier_smoke.py`, etc.) target Tradier sandbox; when `false`, they target production. The browser's data provider env is set by `TRADIER_ENV` below, independently. |
-| `DATA_PROVIDER` | `tradier` | Data provider EdgeLane uses for chain + GEX in the browser (Tradier is the only supported value) |
-| `TRADIER_ENV` | `production` / `sandbox` | Browser-side env when `DATA_PROVIDER=tradier` |
-| `EDGE_LANE_VERSION` | e.g. `4.7` | Major.minor base — build script auto-appends `.<patch>` per content change |
+| `DEVMODE` | `true` / `false` | `true` → sandbox token + `sandbox.tradier.com` + sandbox DB, and the poller runs regardless of market hours. `false` → production token, market-hours gated. Also selects which token the Python CLI tools (`tp`, `tradier_smoke.py`) use. |
+| `AUTH_ENABLED` | `true` / `false` | Supabase JWT enforcement + rate limiting. `false` for local dev. |
+| `EMAIL_PROVIDER` | `auto` / `smtp` / `brevo` | Contact-form transport. See [contact tickets](./docs/contact_tickets.md). |
+| `FORCE_POLL_WHEN_CLOSED` | `true` / `false` | Override the off-hours polling policy. |
 
-### Local-dev URLs
+The `make` targets manage `DEVMODE` for you: `make run-dev` rewrites it to `true`,
+`make run-prod` to `false`, and plain `make run` leaves whatever is in the file.
 
-When the CORS proxy is running locally, point both Tradier and Gemini at it so the browser doesn't hit CORS walls:
-
-```
-TRADIER_BASE_URL="http://localhost:8787/tradier"
-GEMINI_BASE_URL="http://localhost:8787/gemini"
-```
-
-In production these point at server-side proxies/functions instead (see [Production deployment](#production-deployment)).
-
-### Example
-
-```bash
-# edge_lane_config.config
-GEMINI_API_KEY="AIzaXXXX"
-GEMINI_MODEL=gemini-2.5-flash
-
-TRADIER_TOKEN="prod-token-xxxx"
-TRADIER_TOKEN_SANDBOX="sb-token-xxxx"
-DEVMODE=false                     # python CLI tools → production
-DATA_PROVIDER=tradier             # browser-side data provider
-TRADIER_ENV=production            # browser-side env
-
-TRADIER_BASE_URL="http://localhost:8787/tradier"
-GEMINI_BASE_URL="http://localhost:8787/gemini"
-
-EDGE_LANE_VERSION="4.7"
-```
-
-> ⚠️ Don't edit-paste broken quotes into this file. Bash refuses to source any file with an unclosed `"`, and the build will fail with `GEMINI_API_KEY missing` or similar — even though the key is right there. If the build complains a key is missing, re-paste with proper closing quotes.
+> ⚠️ Inline `#` comments inside an **unquoted** value get parsed as part of the
+> value by `tests/utils.py:load_config`. Write `TRADIER_TOKEN="abc"  # prod`, or
+> drop the comment.
 
 ---
 
-## CORS proxy — what it does and how to manage it
+## Tools: the `tp` shell alias
 
-Tradier and Gemini don't return CORS headers, so the browser can't call them from a `file://` or `localhost` page directly. The proxy at `tools/cors_proxy.py` listens on `127.0.0.1:8787` and adds those headers while forwarding requests upstream. Keys are passed through from the browser's headers; the proxy never stores them.
-
-### Routes
-
-```
-/tradier/<rest>  →  https://api.tradier.com/<rest>
-/gemini/<rest>   →  https://generativelanguage.googleapis.com/v1beta/<rest>
-```
-
-### Service manager — `tools/cors_proxy_service.sh`
-
-Don't run `cors_proxy.py` by hand. Use the manager — it handles PID tracking, untracked-process detection, and integrates with systemd for auto-start.
-
-```bash
-./tools/cors_proxy_service.sh start      # bring it up
-./tools/cors_proxy_service.sh status     # show running state + health probe
-./tools/cors_proxy_service.sh restart    # stop + start
-./tools/cors_proxy_service.sh stop       # shut down
-./tools/cors_proxy_service.sh logs       # tail -f the log file
-./tools/cors_proxy_service.sh install    # auto-start on WSL boot
-./tools/cors_proxy_service.sh uninstall  # remove auto-start hook
-./tools/cors_proxy_service.sh help
-```
-
-State lives in `~/.edgelane/` (PID file + log). Port + bind are configurable:
-
-```bash
-EDGELANE_CORS_PORT=9000 EDGELANE_CORS_BIND=0.0.0.0 ./tools/cors_proxy_service.sh start
-```
-
-The script path is long — add the `coproxy` alias so you can type `coproxy start/status/install/...` instead. See [Tools: `tp` and `coproxy` shell aliases](#tools-tp-and-coproxy-shell-aliases).
-
-### Auto-start on WSL boot
-
-```bash
-./tools/cors_proxy_service.sh install
-```
-
-- If your WSL has systemd enabled (`systemd=true` in `/etc/wsl.conf` — the modern Windows 11 default), this writes a user-level systemd unit at `~/.config/systemd/user/edgelane-cors-proxy.service`, enables it, and starts it.
-- To keep it running without an active login, run once: `sudo loginctl enable-linger $USER`
-- If systemd isn't available, the script falls back to adding a `boot.command` line to `/etc/wsl.conf`.
-
-After install you can use **either** `coproxy start/stop/...` (the script delegates to systemd if the unit is present) or `systemctl --user {start,stop,restart,status} edgelane-cors-proxy` directly.
-
-### Health check
-
-```bash
-./tools/cors_proxy_service.sh status
-# ● running (systemd)
-#   unit    : edgelane-cors-proxy.service
-#   pid     : 24
-#   listen  : 127.0.0.1:8787
-#   manage  : systemctl --user {status,stop,restart} edgelane-cors-proxy
-#   logs    : journalctl --user -u edgelane-cors-proxy -f
-```
-
-Or with curl:
-
-```bash
-curl -i -X OPTIONS http://localhost:8787/gemini/models \
-  -H 'Access-Control-Request-Method: POST'
-# expect: HTTP/1.0 204 No Content + Access-Control-Allow-Origin: *
-```
-
----
-
-## Build — `edge_lane_build.sh`
-
-The build script does four things:
-
-1. Sources `edge_lane_config.config` for keys + URLs + version
-2. Reads `spread_optimizer_v4_7_html.jsx` and transforms it for browser use (strips ESM imports, drops `export default`)
-3. Wraps the transformed JSX inside `edge_lane.template.html`, substituting `__GEMINI_API_KEY__`, `__TRADIER_TOKEN__`, `__DATA_PROVIDER__`, `__VERSION__`, base URLs, etc.
-4. Writes the final `edge_lane.html` and updates `.edge_lane_buildstate` so the patch number auto-bumps on content change.
-
-### Basic usage
-
-```bash
-./edge_lane_build.sh
-# ✓ wrote edge_lane.html  (5290 lines, 273275 bytes)
-#   version: v4.7.56  (content change (hash X → Y))
-#   provider: tradier (production - https://api.tradier.com)
-```
-
-The version line tells you exactly why the patch did (or didn't) bump:
-
-| Reason | Means |
-|---|---|
-| `first build` | No `.edge_lane_buildstate` yet — patch starts at 1 |
-| `no content change` | JSX + template hashes unchanged — patch stays |
-| `content change (hash A → B)` | Hashes differ — patch +1 |
-| `base change (4.7 → 4.8)` | You edited `EDGE_LANE_VERSION` in config — patch resets to 1 |
-
-Force a reset by deleting `.edge_lane_buildstate`.
-
-### Flags
-
-```bash
-./edge_lane_build.sh --help                       # full flag list
-./edge_lane_build.sh --dry-run                    # checks + planned substitutions, write nothing
-./edge_lane_build.sh -n                           # write to edge_lane_v{VERSION}.html instead of overwriting
-./edge_lane_build.sh --config edge_lane_config.production.config
-./edge_lane_build.sh --jsx spread_optimizer_v4_5.jsx --out edge_lane_v4_5.html
-```
-
-### Optional pre-flight: JSX parse check
-
-Before building, you can syntax-check the JSX with Babel:
-
-```bash
-node -e "
-  const fs = require('fs'); const p = require('@babel/parser');
-  try { p.parse(fs.readFileSync('spread_optimizer_v4_7_html.jsx','utf8'),
-                { sourceType:'module', plugins:['jsx'] });
-        console.log('OK'); }
-  catch(e){ console.error('PARSE ERROR line', e.loc?.line, e.message); process.exit(1); }
-"
-```
-
-(Install once with `cd /tmp && npm install @babel/parser`.)
-
----
-
-## Local run + browser
-
-```bash
-python3 -m http.server 8080
-# then open http://localhost:8080/edge_lane.html
-```
-
-Hard-reload (Ctrl+Shift+R) after every rebuild — browsers cache aggressively. Open DevTools (F12) on first run so you can see Console errors immediately.
-
-For local development you can also just open `file:///C:/soljet_dev/EdgeLane/edge_lane.html` directly — works for most things, but a few features (clipboard, certain fetch behaviors) require a real HTTP origin.
-
----
-
-## Tools: `tp` and `coproxy` shell aliases
-
-The two CLI tools are long-named. Add aliases to your shell to save typing:
+`tp` is long-named. Add an alias to your shell to save typing:
 
 ```bash
 # Append to ~/.bashrc
 cat >> ~/.bashrc <<'EOF'
 alias tp='python3 /mnt/c/soljet_dev/EdgeLane/tools/tradier_positions.py'
-alias coproxy='/mnt/c/soljet_dev/EdgeLane/tools/cors_proxy_service.sh'
 EOF
 source ~/.bashrc
 ```
@@ -417,19 +250,9 @@ tp -C 2 --execute                            # cancel order #2
 
 All destructive actions default to PREVIEW (no `--execute` = dry run).
 
-### `coproxy` — CORS proxy service
-
-See [CORS proxy](#cors-proxy--what-it-does-and-how-to-manage-it) above.
-
-```bash
-coproxy start | stop | restart | status | logs | install | uninstall
-```
-
----
-
 ## Test scripts — what to run before committing
 
-All frontend tests are stdlib-only, load keys from `edge_lane_config.config`, and run from the repo root. Run them in this order when you've touched anything that touches the data path:
+These integration scripts are stdlib-only, load keys from `edgelane_market.config`, and run from the repo root. Run them in this order when you've touched anything that touches the data path:
 
 ### 1. Tradier API sanity (provider-side)
 
@@ -471,36 +294,40 @@ Must be green before commit. See [Market backend & Torque](#market-backend--torq
 
 ```bash
 # ── Start of day ──
-coproxy status                        # confirm proxy is up; if not: coproxy start
+cd market/backend && make run-dev      # or make run-prod
+make status                            # poller alive? market open?
 
-# ── After every JSX edit ──
-./edge_lane_build.sh                  # patch auto-bumps if content changed
-# (browser tab: Ctrl+Shift+R to hard-refresh)
+# ── While working ──
+make test                              # 56 parity tests — must stay green
+make ui                                # open Matrix against the local backend
 
 # ── Before committing ──
-python3 tests/tradier_smoke.py SPY
-./edge_lane_build.sh --dry-run        # confirm substitutions are clean
-# (also run any of the test scripts touching the path you changed)
+make test
+python3 tests/tradier_smoke.py SPY     # provider-side sanity (live token)
+cd simmer/ui && npm run check          # only if you touched Simmer
 ```
 
-If you broke the parse (truncated JSX, unbalanced braces, etc.), the build script will refuse and tell you which line. Restore from `archive/` if needed — every shipped version is snapshotted there.
+Touching `bias_engine`, `strategy_engine`, or `walls` means the parity tests are
+the gate — they pin the Python math to the original JSX engine's output.
 
 ---
 
 ## Switching between sandbox and production
 
-For the **frontend / CLI tools**, two independent env switches:
+One switch, `DEVMODE` in `edgelane_market.config`:
 
-| Switch | Affects |
-|---|---|
-| `DEVMODE` in `edge_lane_config.config` | Python CLI tools (`tp`, `tradier_smoke.py`, `tradier_execute_ticket.py`). Selects which token (`TRADIER_TOKEN` vs `TRADIER_TOKEN_SANDBOX`) and which base URL. |
-| `TRADIER_ENV` in `edge_lane_config.config` | The browser's chain/GEX/quote data provider. Set at build time. Rebuild after changing. |
-| Per-user broker connection (Settings UI) | The browser's **order submission** path. Each user adds their own Tradier connection, which carries its own env field. |
+| `DEVMODE` | Backend + Torque | Python CLI tools |
+|---|---|---|
+| `true` | sandbox token, `sandbox.tradier.com`, sandbox DB, polls regardless of market hours | sandbox token + base URL |
+| `false` | production token, `api.tradier.com`, market-hours gated | production token + base URL |
 
-**Common gotcha**: the operator-level browser token can be production while a user's broker connection is sandbox. The canonical-root probe in v4.7.54+ uses the broker connection's env when present, so order POSTs always go to the same env as the chain lookup. But chain rendering on screen still comes from the operator-level token. If that mismatches, the candidate strikes you see may not match the strikes available on your account.
+`make run-dev` / `make run-prod` rewrite the flag before booting; bare `make run`
+respects whatever is already in the file.
 
-For the **market backend / Torque**, the switch is `DEVMODE` in the *separate*
-`edgelane_market.config` — see the next section.
+**Order submission is separate.** Each user attaches their own Tradier connection
+in Settings, and that connection carries its own env field. So a user's orders can
+route to sandbox while the house token renders a production chain — if those
+mismatch, the strikes on screen may not exist on their account.
 
 ---
 
@@ -523,7 +350,6 @@ make test             # parity + torque + guardrails tests (must be green before
 
 - **Config**: `edgelane_market.config` (KEY=VALUE). `DEVMODE=true` → sandbox token
   + `sandbox.tradier.com` + sandbox DB; `false` → production, market-hours gated.
-  This flag is **separate** from the frontend's `edge_lane_config.config`.
 - **`run-dev`/`run-prod` rewrite `DEVMODE`** before booting; bare `run` respects it.
 - **Spot** = Yahoo live quote → Tradier put-call parity fallback. **Chain** keeps
   only the live root (NDX→NDXP, SPX→SPXW, RUT→RUTW, DJX→DJXW); UI shows the base ticker.
@@ -548,45 +374,14 @@ Torque — it is not on Vercel.
 
 ## Troubleshooting
 
-### Bias detection fails / "Failed to fetch" in console
-Almost always the CORS proxy isn't running. Run:
-```bash
-coproxy status
-coproxy start   # if it says stopped
-```
-
-### Bias detection fails with a specific HTTP error in console
-Read the `[label]: HTTP <code> — <body>` message. Most common:
-- `GEMINI_API_KEY missing` → config got truncated; re-paste keys with closing quotes
-- `HTTP 429` → Gemini quota; wait or switch to `gemini-2.5-flash-lite`
-- `HTTP 400 — invalid response_schema` → Google tightened schema validation; check `_BIAS_PROSE_SCHEMA` in JSX
-
 ### "Undefined symbol" on order POST
 v4.7.56+ handles the NDX/NDXP/SPX/SPXW family. If you see this on a non-index ticker, the chain may have returned a ghost listing (rare but possible). Open the console, look for `[Tradier root probe]` and `[Tradier submit] live response:` lines — they tell you exactly what Tradier rejected.
-
-### "Tradier …: blocked by CORS"
-Same root cause as bias detection: proxy down. `coproxy start`.
-
-### Babel error in browser console
-JSX got truncated mid-token (file tool truncation, bad merge, etc.).
-```bash
-wc -l spread_optimizer_v4_7_html.jsx
-# should be ~5000 lines for v4.7.x
-```
-If short, restore from `archive/` and reapply your changes.
-
-### Version doesn't bump on rebuild
-- `no content change` reason → expected, JSX + template hashes are identical
-- Force reset: `rm .edge_lane_buildstate && ./edge_lane_build.sh`
 
 ### `tp` errors with "config file has problem"
 99% of the time it's an inline `#` comment inside an unquoted string. `tests/utils.py:load_config` strips comments only outside quoted values — if your config has `TRADIER_TOKEN=abc # prod`, the `# prod` makes it through. Quote the value or remove the comment.
 
 ### Tradier rate-limit errors
 The browser auto-retries with exponential backoff. If you hit the limit repeatedly, you're probably running tests + UI clicks against the same token in parallel — Tradier sandbox is especially strict. Switch to production or space the calls out.
-
-### Proxy says "● running (UNTRACKED)"
-Something else started `cors_proxy.py` outside the service manager. `coproxy stop` will find it and kill it; then `coproxy start` to relaunch cleanly.
 
 ### Torque UI change didn't show up after deploy
 You almost certainly ran `deploy-fe` (Vercel) instead of `deploy-be-restart`. Torque
@@ -606,8 +401,8 @@ The market service ships two deployables (plus the optional legacy single-file p
   **`edge.facades.trade`**. The hostname belongs to the tunnel, not the container, so
   restarts and host moves keep the same URL — both frontends simply bake it at deploy
   time from `EDGELANE_API_BASE`.
-- **Frontend** (`market/ui/index.html` — the market dashboard, *not* the legacy
-  `edge_lane.html`) deploys to **Vercel**.
+- **Frontends** — Matrix (`market/ui/index.html`) and Simmer (`simmer/ui/`) deploy
+  to **Vercel**.
 
 **Torque is part of the backend container, not the Vercel deploy.** `torque.html`
 is `COPY`-baked into the image (`Dockerfile`: `COPY app ./app` + `COPY ui ./ui`) and
@@ -621,9 +416,9 @@ exactly what `deploy-be-restart` does.
 |---|---|---|
 | `market/backend/ui/torque.html` (Torque UI) | **`make deploy-be-restart`** | HTML is baked into the backend image |
 | `market/backend/app/**` (API, guardrails, engine) | **`make deploy-be-restart`** | Python is baked into the backend image |
-| `market/ui/index.html` (dashboard) | **`make deploy-fe`** | that file goes to Vercel |
+| `market/ui/index.html` (Matrix) | **`make deploy-fe`** | that file goes to Vercel |
+| `simmer/ui/**` (Simmer) | **`make deploy-simmer`** | separate Vercel project |
 | both backend + dashboard | `make deploy-prod` | backend first, then Vercel |
-| `edge_lane.html` (legacy) | manual `wrangler pages deploy` | not part of the market deploy |
 
 > `make deploy-be-restart` builds from the **working tree** (Docker's build context is
 > the filesystem, not git) — so **uncommitted** changes are baked in; you don't have to
@@ -840,41 +635,18 @@ frontends (`make deploy-fe` + `make deploy-simmer`). There is no runtime fallbac
 catch a mismatch — `deploy.sh` fails fast on a blank base, but it cannot know a
 non-blank one is wrong.
 
-### Legacy: shipping `edge_lane.html` on Cloudflare Pages
-
-The single-file optimizer is **not** part of the market deploy and is not currently
-hosted. If you ever need to ship it standalone, it's one static file — two paths:
-
-- **Path A — private deploy (keys baked in).** For an access-gated page (Cloudflare
-  Access, basic auth, IP allowlist):
-  ```bash
-  npm install -g wrangler && wrangler login
-  ./edge_lane_build.sh && wrangler pages deploy . --project-name=edgelane
-  ```
-  Keys live in the deployed HTML — fine when access is controlled.
-- **Path B — public deploy (keys server-side).** Add a Cloudflare Pages Function
-  `functions/api/[[path]].js` that proxies `/api/tradier/*` and `/api/gemini/*` to the
-  upstreams, attaching `TRADIER_TOKEN` / `GEMINI_API_KEY` from Pages **environment
-  variables**; then build with **empty** browser-side keys and
-  `TRADIER_BASE_URL="/api/tradier"` / `GEMINI_BASE_URL="/api/gemini"` so the browser
-  hits the same origin and the keys never leave Cloudflare. (Historical recipe — key
-  names in the build config may differ from the current `edge_lane_config.config`.)
-
----
-
 ## Quick reference card
 
 ```bash
-# ─── everyday loop (frontend) ───
-coproxy start                              # CORS proxy
-./edge_lane_build.sh                       # rebuild after JSX edits
-python3 -m http.server 8080                # serve
-# open http://localhost:8080/edge_lane.html  (Ctrl+Shift+R after rebuild)
+# ─── everyday loop ───
+cd market/backend && make run-dev          # backend on :8789 (sandbox)
+make ui                                    # open Matrix against it
+# Torque → http://127.0.0.1:8789/torque
 
 # ─── before commit ───
-python3 tests/tradier_smoke.py SPY
-./edge_lane_build.sh --dry-run
-cd market/backend && make test             # if you touched the backend
+cd market/backend && make test             # 56 parity tests
+python3 tests/tradier_smoke.py SPY         # provider-side sanity (live token)
+cd simmer/ui && npm run check && npx vitest run   # if you touched Simmer
 
 # ─── market backend + Torque (local) ───
 cd market/backend
@@ -885,13 +657,14 @@ make run-prod         # production (real money)
 # ─── ship to production (from repo root) ───
 make doctor                                # prerequisites check
 make deploy-be-restart                     # backend + Torque UI (image rebuild)
-make deploy-fe                             # market dashboard → Vercel
-make deploy-prod                           # both, backend first
+make deploy-fe                             # Matrix → Vercel
+make deploy-simmer                         # Simmer → Vercel
+make deploy-prod                           # backend + Matrix, backend first
+make check-tunnel                          # end-to-end health via edge.facades.trade
 
 # ─── tools ───
 tp                                         # list positions
 tp -O                                      # list working orders
-tp --open '<ticket>' --execute             # place order from copy-button ticket
-coproxy status | install                   # proxy health / autostart
+tp --open '<ticket>' --execute             # place order from a copy-button ticket
 python3 tools/supabase_admin.py tables     # prod data admin
 ```

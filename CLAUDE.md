@@ -13,7 +13,7 @@ tool use and verification stay as thorough as the task needs.
 
 ## What This Is
 
-EdgeLane is a hybrid (single-file frontend + optional FastAPI backend) options spread optimizer. It finds and ranks multi-leg options spreads by a composite tradeability score (EV, structural health, liquidity, limit-order feasibility, probability of profit). Data comes from Tradier, with Gemini Flash providing prose narrative synthesis.
+EdgeLane is a FastAPI + DuckDB backend serving three options-trading products (see below). It finds and ranks multi-leg options spreads by a composite tradeability score (EV, structural health, liquidity, limit-order feasibility, probability of profit), and grades its own picks over time. Data comes from Tradier.
 
 ### Product names
 
@@ -23,7 +23,7 @@ product names are the user-facing ones:
 
 | Product | Internal name / entry point | Subdomain |
 |---|---|---|
-| **Matrix** | the original EdgeLane optimizer — `spread_optimizer_v4_7_html.jsx`, `market/ui/`, Vercel project `edgelane-matrix` | `matrix.facades.trade` |
+| **Matrix** | the original EdgeLane optimizer — `market/ui/`, Vercel project `edgelane-matrix` | `matrix.facades.trade` |
 | **Simmer** | `simmer/`, `market/backend/app/simmer_*.py`, Vercel project `edgelane-simmer` | `simmer.facades.trade` |
 | **Torque** | `market/backend/ui/torque.html`, `torque_engine.py` | **none yet** — admin-only, no multi-user login |
 
@@ -46,18 +46,16 @@ tunnel with Supabase/Edge-Config pointers — all removed 2026-08.)
 
 ### Frontend
 
+Matrix (`market/ui/index.html`) is a static page with no build step — serve it and
+point it at a backend. Simmer (`simmer/ui/`) is a SvelteKit SPA.
+
 ```bash
-# First-time setup
-cp edge_lane_config.config.example edge_lane_config.config  # fill in API keys
+make ui                            # open market/ui/index.html in a browser
+# or serve it, then override the backend it calls:
+python -m http.server 8080 --directory market/ui
+#   → http://localhost:8080/index.html?api=http://127.0.0.1:8789
 
-# Build (produces edge_lane.html from JSX + template + config)
-./edge_lane_build.sh
-./edge_lane_build.sh --dry-run     # preview substitutions without writing
-./edge_lane_build.sh --new-output  # write to edge_lane_v{VERSION}.html
-
-# Serve locally
-python tools/cors_proxy.py &       # CORS proxy on port 8787 (needed for dev)
-python -m http.server 8080         # open http://localhost:8080/edge_lane.html
+make simmer-ui-dev                 # Simmer dev server (Vite, :5173)
 ```
 
 ### Backend (market service)
@@ -90,20 +88,25 @@ python tests/tradier_smoke.py
 
 ## Architecture
 
-### Frontend: `spread_optimizer_v4_7_html.jsx`
+### Frontend: `market/ui/index.html`
 
-This single JSX file (~5,500 lines) is the **source of truth** for the frontend. The build script (`edge_lane_build.sh`) strips ESM syntax, inlines it into `edge_lane.template.html`, substitutes config values (`__TRADIER_TOKEN__`, `__GEMINI_API_KEY__`, `__EDGE_LANE_VERSION__`, etc.), and emits `edge_lane.html`. No Node.js build step — Babel-standalone transpiles in-browser.
+Matrix's deployed UI — a single static page (Tailwind CDN + hand-written `<style>`,
+no build step, no framework). It is a **readout of the backend**, not a calculator:
+the backend poller owns the math and the opinion, and the page renders the engine
+pick, the bilateral walls, the strategy grid, and the rolling self-eval outcomes.
+Deploy-time config is injected as `window.__EDGELANE_*__` globals via
+`dist/edgelane.config.js` (written by `deploy.sh`).
 
-Key subsystems within the JSX:
-- **Bias engine** — deterministic dealer GEX wall detection + confidence scoring (JS math, not LLM)
-- **Strategy engine** — candidate generation, width selection, composite scoring, health badges
-- **Wall finder** — bilateral put/call GEX walls with strength tiers and penalties
-- **Gemini integration** — structured output mode for prose narrative only; all math stays in JS
-- **Chain fetching** — filters ±30% around spot, normalizes strikes, computes mids
+> The original frontend was a ~5,500-line single JSX file
+> (`spread_optimizer_v4_7_html.jsx`) built into a standalone `edge_lane.html` by
+> `edge_lane_build.sh`, with a manual "Detect bias" button and in-browser Gemini
+> narration. It was **discontinued and removed in 2026-08** — recover it from git
+> history if ever needed. The engine modules below still cite it as the source
+> they were ported from; those references are historical, not live paths.
 
 ### Backend: `market/backend/app/`
 
-FastAPI + DuckDB service that continuously polls Tradier, runs the same math as the JSX (ported to Python), persists results, and evaluates bias accuracy over time.
+FastAPI + DuckDB service that continuously polls Tradier, runs the math (originally ported from the JSX engine), persists results, and evaluates bias accuracy over time. This is the source of truth for every product.
 
 | Module | Role |
 |---|---|
@@ -137,20 +140,17 @@ in the page. Run via `make run-dev` (sandbox) and open `:8789/torque`. Full doc:
 ### Data Providers
 
 Tradier is the sole live data provider (EdgeLane was originally built on Atlas (mind-vest.io), which was fully retired ~May 2026):
-- **Tradier** — raw chains + local GEX aggregation, for both frontend and backend
+- **Tradier** — raw chains + local GEX aggregation
 - **Mock** — deterministic synthetic chain when no Tradier token configured
 
 ## Configuration
 
-Two config files (both KEY=VALUE format, `#` comments):
-- `edge_lane_config.config` — frontend: API keys, model, data provider, proxy URLs, version
-- `edgelane_market.config` — backend (FastAPI service + **Torque**): Tradier tokens, symbols, poll interval, scoring params, DB path, CORS origins
+Two files, both KEY=VALUE format with `#` comments, both gitignored:
+- `edgelane_market.config` — the backend (FastAPI service + **Torque**): Tradier tokens, symbols, poll interval, scoring params, DB path, CORS origins, email transport.
+- `deploy/.env` — deploy-time only: `CF_TUNNEL_TOKEN`, `EDGELANE_API_BASE`, Vercel/Supabase provisioning. Read by `deploy.sh` and docker compose, **never** by the app. (Tunnel vars belong here, not in the market config — compose interpolates them from this file.)
 
-**DEVMODE** controls sandbox vs production Tradier and market-hours gating. Each
-config file has its **own** `DEVMODE`, read by a **separate** code path — the
-frontend file's flag is consumed only by the browser JSX build; the backend file's
-flag is consumed only by the market service / Torque. They are independent; setting
-one does not affect the other.
+**DEVMODE** (in `edgelane_market.config`) controls sandbox vs production Tradier
+and market-hours gating.
 
 For the backend (`edgelane_market.config`), the `make` targets manage `DEVMODE` for you:
 - `make run-dev` **rewrites** `DEVMODE=true` (sandbox token + `sandbox.tradier.com` + sandbox DB), then boots.
