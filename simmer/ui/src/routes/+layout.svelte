@@ -9,7 +9,6 @@
 	import AppShell from '$lib/components/AppShell.svelte';
 	import Toast from '$lib/components/Toast.svelte';
 	import { auth } from '$lib/stores/auth.svelte';
-	import { resolveApiBasePointer } from '$lib/api';
 	import { watchlist } from '$lib/stores/watchlist.svelte';
 	import { settingsStore } from '$lib/stores/settings.svelte';
 	import { Poller } from '$lib/stores/poll.svelte';
@@ -19,9 +18,7 @@
 	const poller = new Poller();
 
 	$effect(() => {
-		// Deployed builds: adopt the Edge Config pointer (self-heals a rotated
-		// tunnel URL) BEFORE auth makes its first call. No-op on dev builds.
-		void resolveApiBasePointer().finally(() => auth.init());
+		auth.init();
 	});
 
 	// Start/stop the poll loop off the full-access state (dev-bypass or signed

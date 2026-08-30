@@ -31,9 +31,16 @@ Do **not** rename existing symbols, files, or Vercel projects to match. The
 mapping above is the whole translation layer.
 
 The landing page and the DNS/hosting plumbing live in a separate repo,
-**facades-portal** (Cloudflare Pages). Two things in *this* repo depend on those
+**facades-portal** (Cloudflare Pages). Three things in *this* repo depend on those
 hostnames and are commented as such: `cors_allow_origin_regex` in
-`market/backend/app/config.py`, and `_facades_allow_fragment()` in `deploy.sh`.
+`market/backend/app/config.py`, `_facades_allow_fragment()` in `deploy.sh`, and
+`EDGELANE_API_BASE` in `deploy/.env`.
+
+The backend is reached at the permanent hostname **`edge.facades.trade`** (a
+Cloudflare *named* tunnel), which serves all three products — Matrix's API,
+Simmer's `/simmer/*`, and the Torque page at `/torque`. Both SPAs bake that URL at
+deploy time; there is no runtime URL discovery. (It used to be a rotating quick
+tunnel with Supabase/Edge-Config pointers — all removed 2026-08.)
 
 ## Build & Run Commands
 

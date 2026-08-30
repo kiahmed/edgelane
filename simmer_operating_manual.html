@@ -268,11 +268,11 @@
 
           <rect class="box" x="446" y="300" width="200" height="54" rx="9" style="stroke-dasharray:4 3"></rect>
           <text class="lbl" x="546" y="322" text-anchor="middle">Vercel</text>
-          <text class="sub" x="546" y="338" text-anchor="middle">Simmer UI · Edge Config pointer</text>
+          <text class="sub" x="546" y="338" text-anchor="middle">Simmer UI · baked API base</text>
 
           <rect class="box" x="664" y="300" width="216" height="54" rx="9" style="stroke-dasharray:4 3"></rect>
-          <text class="lbl" x="772" y="322" text-anchor="middle">Cloudflare quick tunnel</text>
-          <text class="sub" x="772" y="338" text-anchor="middle">public HTTPS · rotates on restart</text>
+          <text class="lbl" x="772" y="322" text-anchor="middle">Cloudflare named tunnel</text>
+          <text class="sub" x="772" y="338" text-anchor="middle">edge.facades.trade · permanent</text>
         </g>
         <text class="sub" x="10" y="386">Dashed = external stores / hosts the backend depends on.</text>
       </svg>
@@ -291,7 +291,7 @@
       <tr><td><strong>Readiness engine</strong></td><td>Runs the 10 gates, then the composite score, regime multiplier and data-confidence. Emits the full envelope (verdict, strikes, EV, POP, management).</td></tr>
       <tr><td><strong>Supabase</strong></td><td>All <em>user</em> data (watchlist, settings, alerts) under row-level security. The browser never talks to it directly — auth and every read/write go through the backend API.</td></tr>
       <tr><td><strong>DuckDB</strong></td><td>Market/runtime state only: persisted readiness (so cards survive a restart / weekend), research cache, IV history, paper outcomes. No user settings live here.</td></tr>
-      <tr><td><strong>Vercel + Cloudflare tunnel</strong></td><td>The Simmer SPA is on Vercel; the backend is a local container behind a rotating Cloudflare quick tunnel. The UI self-heals the rotating URL via an Edge Config pointer.</td></tr>
+      <tr><td><strong>Vercel + Cloudflare tunnel</strong></td><td>The Simmer SPA is on Vercel; the backend is a local container behind a Cloudflare <strong>named</strong> tunnel on the permanent hostname <code>edge.facades.trade</code>. The UI bakes that URL at deploy time — no runtime pointer.</td></tr>
     </table>
   </section>
 
@@ -627,24 +627,26 @@
   <section id="deploy">
     <h2>Deploy &amp; update</h2>
     <p>Do only the steps for what changed; the <strong>sequence matters</strong> — schema, then backend, then
-    frontends — because the backend restart rotates the tunnel and republishes the URL pointers.</p>
+    frontends — because a frontend may depend on a new backend field. The tunnel hostname is permanent, so
+    nothing moves when the backend restarts.</p>
     <ol class="body">
       <li><strong>DB schema changed</strong> → <code>make db-push</code> (applies <code>supabase/migrations</code>).</li>
       <li><strong>Backend / engine changed</strong> → confirm <code>DEVMODE=false</code>, then
-        <code>make deploy-be</code> (full, rotates the tunnel) or <code>make deploy-be-restart</code>
+        <code>make deploy-be</code> (full rebuild) or <code>make deploy-be-restart</code>
         (rebuilds &amp; recreates only the backend container — tunnel untouched). A config-only change just
         needs a restart (the file is bind-mounted).</li>
       <li><strong>Matrix UI changed</strong> → <code>make deploy-fe</code> (also re-syncs Supabase
         <code>site_url</code> + redirect allow-list).</li>
       <li><strong>Simmer UI changed</strong> → <code>make deploy-simmer</code> (npm ci + build can take &gt; 2 min).</li>
-      <li><strong>Always finish</strong> → <code>make check-tunnel</code> — container health, the Supabase
-        pointer, the Edge Config pointer matching it, tunnel <code>/status</code>, CORS, and the auth path.</li>
+      <li><strong>Always finish</strong> → <code>make check-tunnel</code> — container health, tunnel
+        <code>/status</code>, CORS, and the auth path.</li>
     </ol>
     <h3>One-time setup</h3>
-    <p><code>make frontend-setup</code> links both Vercel projects, provisions the Edge Config self-heal, and
-    syncs the Supabase auth allow-list. Run <code>vercel login</code> first (setup reads that session).
-    For the container to self-heal the rotating tunnel URL into Edge Config, put a <strong>no-expiration</strong>
-    <code>VERCEL_API_TOKEN</code> in <code>deploy/.env</code> — the container can't read your host CLI login.</p>
+    <p><code>make frontend-setup</code> links both Vercel projects and syncs the Supabase auth allow-list.
+    Run <code>vercel login</code> first (setup reads that session). Separately, create the Cloudflare named
+    tunnel once (Zero Trust → Networks → Tunnels), route <code>edge.facades.trade</code> to
+    <code>http://edgelane-backend:8789</code>, and put its <code>CF_TUNNEL_TOKEN</code> plus
+    <code>EDGELANE_API_BASE=https://edge.facades.trade</code> in <code>deploy/.env</code>.</p>
   </section>
 
   <section id="trouble">
@@ -667,10 +669,8 @@
           <td>The app isn't resolving the backend via <code>/api/config</code>. Confirm it's a production build, that <code>/api/config</code> returns the tunnel URL, and Edge Config has <code>api_base</code>.</td></tr>
       <tr><td>Simmer <strong>subroutes 404</strong> on refresh (<code>/settings</code>, <code>/news</code>)</td>
           <td>SPA fallback. <code>simmer/ui/vercel.json</code> must use <code>rewrites: /(.*) → /index.html</code> and <strong>no</strong> <code>cleanUrls</code>; Vercel's <code>source</code> is path-to-regexp — no lookaheads.</td></tr>
-      <tr><td>After a restart, Simmer can't reach the backend (Matrix is fine)</td>
-          <td>Edge Config <code>api_base</code> went stale — the container couldn't PATCH it. Missing/expired permanent <code>VERCEL_API_TOKEN</code> in <code>deploy/.env</code>; check the cloudflared logs and refresh it.</td></tr>
-      <tr><td><code>make check-tunnel</code> says "Edge Config not configured"</td>
-          <td>Set <code>VERCEL_API_TOKEN</code> + <code>EDGE_CONFIG_ID</code> in <code>deploy/.env</code> (run <code>make frontend-setup</code>).</td></tr>
+      <tr><td>After a restart, neither UI can reach the backend</td>
+          <td>The hostname is permanent, so this is the connector, not a rotation. Check <code>docker compose … logs edgelane-cloudflared</code> for a registered connector and that the tunnel still routes <code>edge.facades.trade</code> → <code>http://edgelane-backend:8789</code>.</td></tr>
       <tr><td>Simmer email confirmation / reset link rejected on redirect</td>
           <td>The Simmer origin isn't in Supabase <code>uri_allow_list</code>. Run <code>make frontend-setup</code> or <code>make deploy-fe</code>.</td></tr>
     </table>

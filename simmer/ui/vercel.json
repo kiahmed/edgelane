@@ -16,15 +16,6 @@
 					"value": "no-store"
 				}
 			]
-		},
-		{
-			"source": "/api/config",
-			"headers": [
-				{
-					"key": "Cache-Control",
-					"value": "no-store, must-revalidate"
-				}
-			]
 		}
 	]
 }

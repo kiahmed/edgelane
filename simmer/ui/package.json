@@ -23,7 +23,6 @@
     "vitest": "^3.1.0"
   },
   "dependencies": {
-    "@vercel/edge-config": "^1.4.0",
     "html-to-image": "^1.11.13"
   }
 }

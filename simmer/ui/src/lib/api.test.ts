@@ -2,19 +2,18 @@ import { describe, expect, it, vi } from 'vitest';
 import { authHeaders, resolveApiBase, withAdminToken } from './api';
 import { isDevBypass } from './config';
 
-describe('isDevBypass — deployed-build detection (gates ?api= lockout + /api/config pointer)', () => {
+describe('isDevBypass — deployed-build detection (gates the ?api= lockout)', () => {
 	it('true only when NO deploy config is baked at all (real local dev)', () => {
 		expect(
 			isDevBypass({ apiBase: null, supabaseUrl: null, supabaseAnonKey: null, turnstileSiteKey: null })
 		).toBe(true);
 	});
 
-	it('REGRESSION: Simmer quick-tunnel deploy (apiBase=null + Supabase globals) is NOT dev', () => {
-		// apiBase is null BY DESIGN (backend URL resolved at runtime via
-		// /api/config); the Supabase marker globals prove the build is deployed.
-		// api.ts once used `!apiBase` here, which flagged every deployed Simmer
-		// build as dev — skipping the pointer fetch (login hit the wrong origin)
-		// AND reopening the ?api= phishing override.
+	it('REGRESSION: a deployed build with no baked apiBase is still NOT dev', () => {
+		// Deploys now always bake the tunnel hostname, but dev-detection must not
+		// hinge on it: api.ts once used `!apiBase` here, which flagged deployed
+		// builds as dev and reopened the ?api= phishing override. The Supabase
+		// marker globals are what prove a build is deployed.
 		expect(
 			isDevBypass({
 				apiBase: null,

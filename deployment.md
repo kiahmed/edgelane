@@ -142,7 +142,6 @@ summary. Same chain inputs always produce the same trade pick. Torque itself doe
 | `deploy/docker-compose.yml` | Backend + cloudflared quick-tunnel/publisher sidecar. | ✓ |
 | `market/backend/Dockerfile` | Backend image (`COPY app` + `COPY ui`; serves API + Torque). | ✓ |
 | `market/backend/.dockerignore` | Keeps secrets/tests out of the build context. | ✓ |
-| `deploy/cloudflared/` | Quick-tunnel image: `Dockerfile` + `publish-url.sh` (publishes the rotating URL to Supabase). | ✓ |
 | `tools/db_push.py` | Applies `supabase/migrations/*.sql` (schema) via the Management API. | ✓ |
 | `tools/supabase_admin.py` | Standalone no-SQL data admin CLI: list tables + CRUD. | ✓ |
 | `deploy/.env.example` | Template: Supabase keys, image, Vercel project, optional tunnel token/API base. | ✓ |
@@ -603,11 +602,10 @@ The market service ships two deployables (plus the optional legacy single-file p
 
 - **Backend** (`market/backend` — FastAPI API **and** the Torque order builder at
   `/torque`) runs as a **Docker container on a local PC**, exposed over HTTPS by a
-  **Cloudflare *quick* tunnel** sidecar — free, no domain, no token. The cloudflared
-  container gets a fresh `*.trycloudflare.com` URL on each start and **publishes it to
-  Supabase** (`app_config.api_base`); the frontend reads that at load, so a rotated
-  URL needs **no redeploy**. (A stable named tunnel is a later option once you own a
-  domain — see below.)
+  **Cloudflare *named* tunnel** sidecar on the permanent hostname
+  **`edge.facades.trade`**. The hostname belongs to the tunnel, not the container, so
+  restarts and host moves keep the same URL — both frontends simply bake it at deploy
+  time from `EDGELANE_API_BASE`.
 - **Frontend** (`market/ui/index.html` — the market dashboard, *not* the legacy
   `edge_lane.html`) deploys to **Vercel**.
 
@@ -705,29 +703,26 @@ it. Advisories like the `AUTH_ENABLED`/`DEVMODE` warnings don't fail it.
    token and `DEVMODE=false` (deploy.sh warns if it's `true`). Bind-mounted
    read-only into the container at `/config/`; DuckDB persists in the
    `edgelane-data` volume.
-2. **Cloudflare quick tunnel** — nothing to create. The `edgelane-cloudflared`
-   container (built from `deploy/cloudflared/`) starts a free quick tunnel and
-   publishes its URL to Supabase. It only needs `SUPABASE_URL` +
-   `SUPABASE_SERVICE_KEY` in `deploy/.env` (the service key writes
-   `app_config.api_base`). `CF_TUNNEL_TOKEN`/`EDGELANE_API_BASE` stay blank.
+2. **Cloudflare named tunnel** — create it once in the dashboard (Zero Trust →
+   Networks → Tunnels → Create tunnel), add public hostname `edge.facades.trade`
+   → `http://edgelane-backend:8789`, and put the connector token in `deploy/.env`
+   as `CF_TUNNEL_TOKEN`. The DNS record is created for you.
 3. **Vercel** — `npm i -g vercel && vercel login`. First `deploy-fe` links the
-   repo to the `edgelane` Vercel project. Leave `EDGELANE_API_BASE` blank — the
-   UI discovers the backend URL at runtime.
+   repo to the `edgelane-matrix` Vercel project. Set
+   `EDGELANE_API_BASE=https://edge.facades.trade` in `deploy/.env`.
 
-**Backend URL wiring (runtime service discovery):** the cloudflared container
-publishes its current `*.trycloudflare.com` URL to Supabase `app_config.api_base`
-on every start (migration `0005`, anon-readable / service_role-write). At load,
-`market/ui/index.html` reads that pointer (`resolveApiBasePointer()`) and, on a
-failed call, re-reads it and retries once — so a tunnel rotation is invisible to
-users with **no Vercel redeploy**. Explicit `?api=` / `localStorage` overrides
-still win (dev); local dev falls back to `127.0.0.1:8789`.
+**Backend URL wiring:** there is none at runtime. `EDGELANE_API_BASE` is baked into
+both SPAs at deploy time as `window.__EDGELANE_API_BASE__`, and `deploy.sh` refuses
+to deploy a frontend when it's blank. Explicit `?api=` / `localStorage` overrides
+still win on Matrix (dev); local dev falls back to `127.0.0.1:8789`. On Simmer a
+baked base is authoritative and cannot be overridden — see the SECURITY note in
+`simmer/ui/src/lib/api.ts`.
 
 ### Migrating the backend to another machine
 
-The Vercel frontend has **no baked-in backend URL** — the cloudflared container
-publishes its `*.trycloudflare.com` URL to Supabase `app_config.api_base` on every
-start, and the UI reads that pointer at runtime. So moving the backend host needs
-**no Vercel redeploy**: the new tunnel publishes a new URL and the frontend follows.
+The tunnel hostname is permanent and belongs to the Cloudflare tunnel, not to the
+host running it. So moving the backend needs **no Vercel redeploy** — bring the new
+host up with the same `CF_TUNNEL_TOKEN` and `edge.facades.trade` follows it.
 
 `make setup` is **not** needed on the new host — that builds a native Python venv
 for `make run`. The container deploy builds its own deps inside the image, so the
@@ -743,17 +738,17 @@ scp deploy/edgelane-data.tar.gz \
 # ── on the NEW machine (repo cloned, Docker installed) ──
 # place deploy/.env + edgelane_market.config + deploy/edgelane-data.tar.gz
 make deploy-data-restore   # load history into the volume BEFORE first boot
-make deploy-be             # build + start; tunnel publishes the new api_base
+make deploy-be             # build + start; the tunnel reattaches on the same hostname
 
 # ── back on the OLD machine, once the new one is serving ──
 make deploy-down           # stop backend + cloudflared here
 ```
 
-> ⚠️ **Don't leave both machines' cloudflared running.** Each tunnel writes
-> `app_config.api_base`; two publishers race, and the old one (pointing at the host
-> you're abandoning) can overwrite the pointer and send the frontend to a dead
-> backend. Exactly **one** stack should be up. `make deploy-down` only touches Docker
-> on that host — the Vercel site is untouched and stays live throughout.
+> ⚠️ **Don't leave both machines' cloudflared running.** Two connectors on the same
+> tunnel token both register as healthy origins, and Cloudflare will load-balance
+> between them — so requests land on whichever host answers, including the one you're
+> abandoning (stale DuckDB, possibly stale code). Exactly **one** stack should be up.
+> `make deploy-down` only touches Docker on that host — the Vercel site stays live.
 
 > **DuckDB history doesn't move on its own.** It lives in the `edgelane_edgelane-data`
 > named volume, local to each host; `make deploy-down` keeps it *on that host*. Skip
@@ -810,32 +805,40 @@ It also flags `SET NULL`/`SET DEFAULT` refs (row kept, column nulled) and any
 the preview. To delete a user, delete the **parent** (`auth.users` — cascades
 clean), not the child rows piecemeal.
 
-### Upgrading to a stable named tunnel (later, once you own a domain)
+### The named tunnel (done — was a quick tunnel)
 
-The quick tunnel is best-effort and rate-limited — fine for launch/traffic-building,
-but when you outgrow it, move to a stable named tunnel on your own domain. This is
-**not** a single env flip; it's a one-time setup:
+The backend used to sit behind a free Cloudflare **quick** tunnel, whose
+`*.trycloudflare.com` hostname changed on every container restart. That forced a
+whole runtime-discovery layer: a publisher sidecar wrote the current URL to Supabase
+`app_config.api_base` and Vercel Edge Config, and both SPAs fetched a pointer at
+boot (and re-read it mid-session on a failed call).
 
-1. **Register a domain** and add it to Cloudflare as a zone (Cloudflare Registrar
-   is at-cost; any registrar works if you point its nameservers at Cloudflare).
-2. **Create a named tunnel** (CF dashboard → Zero Trust → Networks → Tunnels, or
-   `cloudflared tunnel create edgelane-backend`) and add a **public hostname**
-   `api.<domain>` → service `http://edgelane-backend:8789`. Copy the connector token.
-3. **`deploy/.env`** — set `CF_TUNNEL_TOKEN=<connector token>` and
-   `EDGELANE_API_BASE=https://api.<domain>`.
-4. **`deploy/docker-compose.yml`** — replace the `edgelane-cloudflared` service's
-   `build:`/`image:`/`environment:` with the named-tunnel form (commented inline
-   in that service):
-   ```yaml
-   image: cloudflare/cloudflared:latest
-   command: tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN}
-   ```
-5. `make deploy-prod` (or `deploy-be` + `deploy-fe`).
+That is all gone. The backend now runs behind a **named tunnel** on the permanent
+hostname `edge.facades.trade`, and the URL is baked at deploy time.
 
-After the swap, the backend always answers at `https://api.<domain>` (no rotation),
-so `EDGELANE_API_BASE` is baked into the frontend as the primary URL. The Supabase
-`app_config.api_base` pointer is no longer written by the named-tunnel container —
-leave the row as-is or drop it; the frontend prefers the baked URL when present.
+| | Before (quick tunnel) | Now (named tunnel) |
+|---|---|---|
+| Hostname | `*.trycloudflare.com`, rotates each restart | `edge.facades.trade`, permanent |
+| cloudflared image | custom build, `deploy/cloudflared/` | stock `cloudflare/cloudflared` |
+| Frontend URL | fetched at boot from a pointer | baked `window.__EDGELANE_API_BASE__` |
+| Matrix pointer | Supabase `app_config.api_base` | *removed* |
+| Simmer pointer | `/api/config` → Vercel Edge Config | *removed* |
+| On restart | publish new URL, frontends self-heal | nothing — same URL |
+
+**What this means day to day:** restarting or rebuilding the backend no longer
+touches the frontends, and moving the backend to another machine needs no Vercel
+redeploy — just bring the new host up with the same `CF_TUNNEL_TOKEN`.
+
+**Leftovers, inert and safe to drop whenever:** the Supabase `app_config` table
+(migration `0005`) and the Vercel Edge Config store `edgelane-api-base` are no
+longer read or written by anything. Drop them only *after* both frontends are
+redeployed with a baked base — an older deployed build still reads its pointer.
+
+**If you ever change the hostname:** update the tunnel's public hostname in
+Cloudflare, set the new `EDGELANE_API_BASE` in `deploy/.env`, then redeploy **both**
+frontends (`make deploy-fe` + `make deploy-simmer`). There is no runtime fallback to
+catch a mismatch — `deploy.sh` fails fast on a blank base, but it cannot know a
+non-blank one is wrong.
 
 ### Legacy: shipping `edge_lane.html` on Cloudflare Pages
 

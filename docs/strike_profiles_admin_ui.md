@@ -41,7 +41,7 @@ the Torque page route. Keep the JSON API router admin-gated as it already is.
 
 ## API contract (already live)
 
-Base URL = backend host (prod = the CF `*.trycloudflare.com` tunnel URL; local =
+Base URL = backend host (prod = `https://edge.facades.trade`; local =
 `http://127.0.0.1:8789`).
 
 ### `GET /strike-profiles`

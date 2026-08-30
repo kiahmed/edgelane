@@ -2059,19 +2059,20 @@ spot-check `slate-*`/`emerald-*` shades side by side.
 
 ### Config injection — keep the runtime pattern
 
-**Do not use `VITE_*` env vars for `api_base`.** They inline at build time, so a
-rotated Cloudflare quick-tunnel URL would require a full rebuild — defeating the
-entire `app_config.api_base` discovery mechanism. Instead, mirror
-`deploy.sh:197–240`: write `build/edgelane.config.js` **after** `npm run build`,
-defining the same `window.__EDGELANE_*__` globals, plus
-`__EDGELANE_MATRIX_ORIGIN__` for the SSO peer. Simmer then inherits the tunnel
-self-heal (`getJSON` re-resolves the pointer and retries once) for free.
+**Do not use `VITE_*` env vars for `api_base`.** They inline at build time, so the
+backend URL would be frozen into the bundle and any change would need a full
+rebuild. Instead, mirror `deploy.sh`: write `build/edgelane.config.js` **after**
+`npm run build`, defining the same `window.__EDGELANE_*__` globals, plus
+`__EDGELANE_MATRIX_ORIGIN__` for the SSO peer.
 
 Serve that file with `Cache-Control: no-store` via `vercel.json` headers.
 
-> **Pre-existing bug worth fixing regardless of Simmer:** Matrix's
-> `dist/edgelane.config.js` carries no cache header today, so Vercel's CDN can
-> serve a stale tunnel URL after rotation.
+> **Superseded (2026-08):** this section originally justified the pattern by the
+> rotating quick-tunnel URL and the `app_config.api_base` / Edge Config pointers.
+> The backend now sits on the permanent hostname `edge.facades.trade`, both
+> pointers are gone, and `EDGELANE_API_BASE` is simply baked. The separate config
+> file is still the right shape — it keeps the URL and the public auth keys out of
+> the compiled bundle — but there is no longer any runtime self-heal behind it.
 
 ### Component inventory
 
@@ -2134,8 +2135,8 @@ deploy-simmer:
    its own `.vercel/`.
 
 Backend needs **no new deployment surface**: `/simmer/*` routes ship inside the
-existing image via `make deploy-be-restart`, and reach the frontend through the
-existing Cloudflare tunnel and `app_config.api_base` pointer.
+existing image via `make deploy-be-restart`, and reach the frontend over the same
+named Cloudflare tunnel (`edge.facades.trade`) that Matrix and Torque use.
 
 ---
 
@@ -2270,8 +2271,7 @@ low-confidence.
 rewrites the redirect allow-list from `$VERCEL_PROJECT` on **every** deploy, so
 with two Vercel apps each deploy can clobber the other's allow-list — it must
 emit both origins, not just the one being deployed. Turnstile needs the new
-hostname (else error 110200). And Matrix's `edgelane.config.js` has no cache
-header, so a rotated tunnel URL can be served stale.
+hostname (else error 110200).
 
 *(CORS is no longer on this list — `edgelane-simmer` was chosen precisely so it
 matches the existing regex.)*

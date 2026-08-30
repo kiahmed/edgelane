@@ -3,23 +3,24 @@
 # check_tunnel.sh — verify the production backend is reachable end-to-end the
 # same way the deployed Vercel frontend reaches it:
 #
-#   browser ─ anon read ─▶ Supabase app_config.api_base   (the published URL)
-#           ─ HTTPS ──────▶ *.trycloudflare.com (quick tunnel)
-#           ─ tunnel ─────▶ edgelane-backend container
+#   browser ─ HTTPS ─▶ edge.facades.trade (named tunnel, permanent hostname)
+#           ─ tunnel ─▶ edgelane-backend container
 #
-# It checks: local container health, the published api_base pointer, the tunnel
-# /status, CORS for the Vercel origin, and the /session/anon (Turnstile) path.
-# Read-only; safe to run anytime.
+# It checks: local container health, the tunnel /status, CORS for the frontend
+# origin, and the /session/anon (Turnstile) path. Read-only; safe to run anytime.
+#
+# The backend URL is EDGELANE_API_BASE from deploy/.env — the same value baked
+# into both SPAs. There is no pointer to look up: the hostname is permanent.
 #
 #   ./tools/check_tunnel.sh [origin]
-#       origin  Vercel origin to test CORS against
-#               (default: https://edgelane-matrix.vercel.app)
+#       origin  frontend origin to test CORS against
+#               (default: https://matrix.facades.trade)
 
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$ROOT_DIR/deploy/.env"
-ORIGIN="${1:-https://edgelane-matrix.vercel.app}"
+ORIGIN="${1:-https://matrix.facades.trade}"
 TIMEOUT=20
 
 if [ -t 1 ]; then
@@ -33,8 +34,8 @@ FAILED=0
 
 [ -f "$ENV_FILE" ] || { echo "missing $ENV_FILE"; exit 2; }
 set -a; . "$ENV_FILE"; set +a
-: "${SUPABASE_URL:?SUPABASE_URL not set in deploy/.env}"
-: "${SUPABASE_ANON_KEY:?SUPABASE_ANON_KEY not set in deploy/.env}"
+: "${EDGELANE_API_BASE:?EDGELANE_API_BASE not set in deploy/.env}"
+URL="${EDGELANE_API_BASE%/}"
 
 echo "── EdgeLane tunnel health ──────────────────────────────"
 
@@ -51,40 +52,9 @@ else
   warn "docker not on this host — skipping container check"
 fi
 
-# 2) Published api_base pointer (what the browser reads via the anon key)
-URL=$(curl -s -m "$TIMEOUT" \
-  "$SUPABASE_URL/rest/v1/app_config?select=value&key=eq.api_base" \
-  -H "apikey: $SUPABASE_ANON_KEY" -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
-  | python3 -c "import sys,json;d=json.load(sys.stdin);print(d[0]['value'] if d else '')" 2>/dev/null)
-if [ -n "$URL" ]; then
-  pass "Supabase app_config.api_base published"
-  info "$URL"
-else
-  fail "no api_base in Supabase — cloudflared never published (frontend can't find the backend)"
-  echo; echo "Result: FRONTEND CANNOT DISCOVER BACKEND"; exit 1
-fi
-
-# 2b) Vercel Edge Config pointer — what the DEPLOYED Simmer SPA reads via
-#     /api/config (the Simmer browser never touches Supabase). cloudflared
-#     PATCHes this on every restart; it should match the Supabase value.
-if [ -n "${VERCEL_API_TOKEN:-}" ] && [ -n "${EDGE_CONFIG_ID:-}" ]; then
-  EURL=$(curl -s -m "$TIMEOUT" \
-    "https://api.vercel.com/v1/edge-config/${EDGE_CONFIG_ID}/items${VERCEL_TEAM_ID:+?teamId=${VERCEL_TEAM_ID}}" \
-    -H "Authorization: Bearer $VERCEL_API_TOKEN" \
-    | python3 -c "import sys,json;d=json.load(sys.stdin);L=d if isinstance(d,list) else [];print(next((i['value'] for i in L if i.get('key')=='api_base'),''))" 2>/dev/null)
-  if [ -z "$EURL" ]; then
-    fail "Edge Config has no api_base — deployed Simmer SPA can't discover the backend (cloudflared Edge Config publish failed?)"
-  elif [ "$EURL" = "$URL" ]; then
-    pass "Vercel Edge Config api_base matches Supabase"
-    info "$EURL"
-  else
-    warn "Edge Config api_base differs from Supabase (tunnel rotation in progress, or a stale token stopped the last publish)"
-    info "edge:     $EURL"
-    info "supabase: $URL"
-  fi
-else
-  warn "Edge Config not configured (VERCEL_API_TOKEN/EDGE_CONFIG_ID unset) — Simmer tunnel self-heal is OFF"
-fi
+# 2) The backend URL under test — baked, not discovered
+pass "backend URL (baked into both SPAs)"
+info "$URL"
 
 # 3) Tunnel reaches the backend
 read -r code time < <(curl -s -m "$TIMEOUT" -o /dev/null -w "%{http_code} %{time_total}" "$URL/status")

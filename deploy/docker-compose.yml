@@ -3,7 +3,7 @@
 #   edgelane-backend   FastAPI app + Torque page (port 8789, internal)
 #   edgelane-cloudflared  Cloudflare tunnel exposing the backend over HTTPS
 #
-# The tunnel routes a public hostname (e.g. edgelane-api.<your-domain>) to
+# The tunnel routes the permanent hostname edge.facades.trade to
 # http://edgelane-backend:8789 across the compose network — so nothing needs
 # to be published to the host's public interface.
 #
@@ -50,36 +50,33 @@ services:
     networks:
       - edgelane-network
 
-  # Free Cloudflare *quick* tunnel (no domain, no token). On each start it
-  # publishes the freshly-assigned *.trycloudflare.com URL to Supabase
-  # (app_config.api_base) so the Vercel frontend discovers it at runtime — no
-  # redeploy when the URL rotates on restart. To switch to a STABLE named tunnel
-  # later (after you own a domain): set CF_TUNNEL_TOKEN and replace this service
-  # with `image: cloudflare/cloudflared:latest` +
-  # `command: tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN}`.
+  # Cloudflare *named* tunnel — a permanent hostname (edge.facades.trade) routed
+  # to http://edgelane-backend:8789. The hostname and its DNS record live in the
+  # Cloudflare dashboard and belong to the tunnel, not to this container, so a
+  # restart (or a rebuild, or a move to another host) keeps the same URL.
+  #
+  # That permanence is why there is no URL publisher here any more: the frontends
+  # bake https://edge.facades.trade at deploy time instead of discovering a
+  # rotating *.trycloudflare.com address at runtime. One host serves all three
+  # products — Matrix's API, Simmer's /simmer/*, and the Torque page at /torque.
+  #
+  # Setup (once, on the host that runs this stack):
+  #   1. Cloudflare dashboard → Zero Trust → Networks → Tunnels → Create tunnel
+  #   2. Public hostname:  edge.facades.trade  →  http://edgelane-backend:8789
+  #   3. Copy the connector token into CF_TUNNEL_TOKEN in deploy/.env
   edgelane-cloudflared:
-    build:
-      context: ./cloudflared
-      dockerfile: Dockerfile
-    image: edgelane-cloudflared:latest
+    image: cloudflare/cloudflared:latest
     container_name: edgelane-cloudflared
     restart: unless-stopped
+    command: tunnel --no-autoupdate run
     environment:
-      TUNNEL_TARGET: http://edgelane-backend:8789
+      TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN:?CF_TUNNEL_TOKEN is required — see deploy/.env.example}
       # Force HTTP/2 (TCP 443) instead of QUIC (UDP 7844). The QUIC datagram
       # path to Cloudflare's edge degrades intermittently on this host (WSL2
       # NAT), and cloudflared can get stuck retrying QUIC instead of falling
       # back — surfacing as endless "control stream encountered a failure" /
       # "datagram handler: context canceled" loops. TCP is stable here.
       TUNNEL_TRANSPORT_PROTOCOL: http2
-      # service_role write to app_config (the URL pointer). Server-only secret.
-      SUPABASE_URL: ${SUPABASE_URL:-}
-      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY:-}
-      # Publish the rotated tunnel URL to Vercel Edge Config too, so the
-      # DEPLOYED SPA self-heals without a redeploy. Optional — skipped when unset.
-      VERCEL_API_TOKEN: ${VERCEL_API_TOKEN:-}
-      EDGE_CONFIG_ID: ${EDGE_CONFIG_ID:-}
-      VERCEL_TEAM_ID: ${VERCEL_TEAM_ID:-}
     depends_on:
       edgelane-backend:
         condition: service_started

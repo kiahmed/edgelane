@@ -41,10 +41,9 @@ export function readGlobals(w?: Partial<Window>): EdgelaneGlobals {
  *
  *  The deployed-vs-dev signal is `import.meta.env.PROD` — Vite compiles it into
  *  the bundle at `vite build`, so it survives Vercel's remote rebuild and needs
- *  NO baked config. This is the point of the API + Edge Config migration: a
- *  production build resolves the backend URL from /api/config and carries no
- *  Supabase creds or other secrets in the browser, so "deployed" can no longer
- *  hinge on their presence. Only a Vite dev server (import.meta.env.DEV) is
+ *  NO baked config. A production build carries no Supabase creds or other
+ *  secrets in the browser, so "deployed" can no longer hinge on their
+ *  presence. Only a Vite dev server (import.meta.env.DEV) is
  *  dev-bypass. The globals fallback is kept for tests / non-Vite consumers.
  *
  *  The backend still 401s unless it runs AUTH_ENABLED=false or an admin token is

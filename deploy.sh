@@ -230,13 +230,12 @@ deploy_backend_local_container() {
     warn "edgelane_market.config has DEVMODE=true (sandbox Tradier). Production usually wants DEVMODE=false."
     confirm "Deploy backend with DEVMODE=true anyway?" || die "aborted — set DEVMODE=false in edgelane_market.config"
   fi
-  # Quick-tunnel mode (default): no CF token needed. The cloudflared publisher
-  # writes the rotating *.trycloudflare.com URL to Supabase app_config.api_base,
-  # so it needs SUPABASE_URL + SUPABASE_SERVICE_KEY. Without them the frontend
-  # can't discover the backend URL.
-  if [ -f "$DEPLOY_ENV" ] && { ! grep -qE '^SUPABASE_URL=.+' "$DEPLOY_ENV" || ! grep -qE '^SUPABASE_SERVICE_KEY=.+' "$DEPLOY_ENV"; }; then
-    $DRY_RUN && warn "SUPABASE_URL/SUPABASE_SERVICE_KEY missing in deploy/.env (ignored in dry-run)" \
-             || die "SUPABASE_URL + SUPABASE_SERVICE_KEY must be set in deploy/.env so the tunnel can publish its URL (see deploy/.env.example)"
+  # The named tunnel needs its connector token — without it the cloudflared
+  # container can't attach to the tunnel and the backend has no public URL.
+  # (compose also refuses to start on a blank CF_TUNNEL_TOKEN.)
+  if [ -f "$DEPLOY_ENV" ] && ! grep -qE '^CF_TUNNEL_TOKEN=.+' "$DEPLOY_ENV"; then
+    $DRY_RUN && warn "CF_TUNNEL_TOKEN missing in deploy/.env (ignored in dry-run)" \
+             || die "CF_TUNNEL_TOKEN must be set in deploy/.env — create the named tunnel and route ${EDGELANE_API_BASE:-https://edge.facades.trade} to http://edgelane-backend:8789 (see deploy/.env.example)"
   fi
 
   info "Deploying backend -> local Docker container + Cloudflare tunnel"
@@ -262,10 +261,12 @@ deploy_backend() {
 # (Matrix + Simmer) need, ONCE, idempotently. Torque is backend-served and
 # intentionally not on Vercel, so it is untouched here.
 #   1. link/create both Vercel projects
-#   2. create the Edge Config store + read token, connect it to the Simmer
-#      project (injects the EDGE_CONFIG env its /api/config function reads)
-#   3. persist EDGE_CONFIG_ID + VERCEL_API_TOKEN to deploy/.env for cloudflared
+#   2. sync the Supabase Auth redirect allow-list to the live origins
 # Re-running is safe: each step no-ops when already done.
+#
+# There is no Edge Config / URL-pointer step any more: the backend sits behind a
+# NAMED Cloudflare tunnel on a permanent hostname (edge.facades.trade), which
+# both SPAs bake at deploy time from EDGELANE_API_BASE.
 # ----------------------------------------------------------------------------
 _link_project() {  # dir  project-name
   local dir="$1" name="$2"
@@ -295,68 +296,14 @@ frontend_setup() {
     ok "Vercel token resolved (from CLI login / env)"
   fi
 
-  info "1/3  Vercel projects"
+  info "1/2  Vercel projects"
   _link_project "$ROOT_DIR"      "$VERCEL_PROJECT"          # Matrix (repo root)
   _link_project "$SIMMER_UI_SRC" "$SIMMER_VERCEL_PROJECT"   # Simmer (simmer/ui)
 
-  info "2/3  Edge Config (Simmer rotating-tunnel self-heal)"
-  if [ -z "$tok" ]; then
-    warn "  no Vercel token — skipping Edge Config. Simmer will use its baked URL"
-    warn "  (no self-heal on tunnel rotation). Run 'vercel login' and re-run to enable."
-  elif [ -n "${EDGE_CONFIG_ID:-}" ]; then
-    ok "  already provisioned (EDGE_CONFIG_ID=$EDGE_CONFIG_ID)"
-  else
-    local team_q="" ; [ -n "${VERCEL_TEAM_ID:-}" ] && team_q="?teamId=$VERCEL_TEAM_ID"
-    local ecid conn rtok
-    if $DRY_RUN; then
-      info "  [dry-run] find-or-create /v1/edge-config {slug:edgelane-api-base}"
-      ecid="ecfg_DRYRUN"
-    else
-      # Idempotent: reuse an existing store with our slug (so a re-run after a
-      # partial failure never spawns duplicate stores), else create one.
-      ecid=$(curl -sf "https://api.vercel.com/v1/edge-config${team_q}"         -H "Authorization: Bearer $tok"         | python3 -c 'import sys,json; d=json.load(sys.stdin); L=d if isinstance(d,list) else d.get("edgeConfigs",[]); print(next((x["id"] for x in L if x.get("slug")=="edgelane-api-base"),""))' 2>/dev/null)         || true
-      if [ -n "$ecid" ]; then
-        ok "  reusing existing store"
-      else
-        ecid=$(curl -sf -X POST "https://api.vercel.com/v1/edge-config${team_q}"           -H "Authorization: Bearer $tok" -H "Content-Type: application/json"           -d '{"slug":"edgelane-api-base"}' | _json_get id)           || die "Edge Config create failed (Vercel token rejected — try 'vercel login')"
-        [ -n "$ecid" ] || die "Edge Config create: no id in response"
-      fi
-    fi
-    ok "  store: $ecid"
-    if ! $DRY_RUN; then
-      # The token endpoint returns {token,id}; the EDGE_CONFIG connection string
-      # the SDK reads is built from the store id + that token.
-      rtok=$(curl -sf -X POST "https://api.vercel.com/v1/edge-config/${ecid}/token${team_q}"         -H "Authorization: Bearer $tok" -H "Content-Type: application/json"         -d '{"label":"simmer-read"}' | _json_get token)         || die "Edge Config read-token failed"
-      [ -n "$rtok" ] || die "no token from Edge Config token endpoint"
-      conn="https://edge-config.vercel.com/${ecid}?token=${rtok}"
-      # Inject as the Simmer project's EDGE_CONFIG env so /api/config reads it
-      # with zero config. Ignore 'already exists' — this step is idempotent.
-      curl -s -X POST "https://api.vercel.com/v10/projects/${SIMMER_VERCEL_PROJECT}/env${team_q}"         -H "Authorization: Bearer $tok" -H "Content-Type: application/json"         -d "{\"key\":\"EDGE_CONFIG\",\"value\":\"${conn}\",\"type\":\"encrypted\",\"target\":[\"production\",\"preview\"]}"         >/dev/null 2>&1 || true
-      ok "  connected EDGE_CONFIG env to project '$SIMMER_VERCEL_PROJECT'"
-      _env_upsert EDGE_CONFIG_ID "$ecid"
-      ok "  wrote EDGE_CONFIG_ID to deploy/.env"
-    fi
-  fi
-
-  # Container tunnel self-heal needs a PERMANENT token in deploy/.env: the
-  # cloudflared container PATCHes the rotating URL into Edge Config on every
-  # restart and can't read the host CLI login. We never auto-write the ephemeral
-  # CLI token (it expires → silent failure, and would clobber a permanent token).
-  # Report status whenever a store exists — on fresh provision AND on re-run.
-  if [ -n "$tok" ] && [ -n "${EDGE_CONFIG_ID:-${ecid:-}}" ]; then
-    if [ -n "${VERCEL_API_TOKEN:-}" ]; then
-      ok "  container tunnel self-heal enabled (VERCEL_API_TOKEN set)"
-    elif ! $DRY_RUN; then
-      warn "  container WON'T self-heal on tunnel rotation — set a PERMANENT VERCEL_API_TOKEN"
-      warn "  in deploy/.env (Vercel → Account Settings → Tokens, expiration: No Expiration)."
-    fi
-  fi
-
-  info "3/3  Supabase Auth redirect allow-list (Matrix + Simmer origins)"
+  info "2/2  Supabase Auth redirect allow-list (Matrix + Simmer origins)"
   _sync_auth_allow_list
 
   ok "frontend setup complete. Now: make deploy-fe  and  make deploy-simmer"
-  [ -n "${EDGE_CONFIG_ID:-${ecid:-}}" ] || warn "Edge Config not set — run 'vercel login' and re-run frontend-setup for tunnel self-heal."
 }
 
 # Redirect patterns for the facades.trade product subdomains, as a comma-prefixed
@@ -391,13 +338,13 @@ stage_frontend() {
   run mkdir -p "$DIST_DIR"
   run cp -r "$UI_SRC/." "$DIST_DIR/"
 
-  # Bake the backend URL the deployed UI should call. In quick-tunnel mode this
-  # is intentionally blank — the UI discovers the rotating URL at runtime from
-  # Supabase app_config.api_base (published by the cloudflared container). Only
-  # set EDGELANE_API_BASE for a stable named tunnel / custom domain, where it
-  # serves as a static fallback baked into window.__EDGELANE_API_BASE__.
+  # Bake the backend URL the deployed UI should call — the named tunnel's
+  # permanent hostname (edge.facades.trade), from EDGELANE_API_BASE in
+  # deploy/.env. This is REQUIRED: runtime URL discovery is gone, so a blank
+  # value ships a UI that falls back to its own Vercel origin and 404s every
+  # API call. Fail here rather than deploying something that cannot work.
   if [ -z "$EDGELANE_API_BASE" ]; then
-    info "EDGELANE_API_BASE unset — UI will resolve the backend URL at runtime from Supabase (quick-tunnel mode)"
+    die "EDGELANE_API_BASE is unset — set it to the tunnel hostname (e.g. https://edge.facades.trade) in deploy/.env"
   fi
   # Public auth keys baked alongside the API base. These are browser-safe by
   # design (Supabase anon key is RLS-gated; Turnstile site key is public). The
@@ -495,6 +442,11 @@ stage_simmer() {
   # as Matrix; EDGELANE_SIMMER_* variables override, falling back to the shared
   # ones so a single deploy/.env keeps working.
   EDGELANE_SIMMER_API_BASE="${EDGELANE_SIMMER_API_BASE:-$EDGELANE_API_BASE}"
+  # Same reasoning as Matrix: no runtime pointer any more, so a blank base ships
+  # a Simmer build that can't reach the backend.
+  if [ -z "$EDGELANE_SIMMER_API_BASE" ]; then
+    die "EDGELANE_API_BASE (or EDGELANE_SIMMER_API_BASE) is unset — set it to the tunnel hostname (e.g. https://edge.facades.trade) in deploy/.env"
+  fi
   EDGELANE_SIMMER_SUPABASE_URL="${EDGELANE_SIMMER_SUPABASE_URL:-${EDGELANE_SUPABASE_URL:-${SUPABASE_URL:-}}}"
   EDGELANE_SIMMER_SUPABASE_ANON_KEY="${EDGELANE_SIMMER_SUPABASE_ANON_KEY:-${EDGELANE_SUPABASE_ANON_KEY:-${SUPABASE_ANON_KEY:-}}}"
   EDGELANE_SIMMER_TURNSTILE_SITE_KEY="${EDGELANE_SIMMER_TURNSTILE_SITE_KEY:-${EDGELANE_TURNSTILE_SITE_KEY:-}}"

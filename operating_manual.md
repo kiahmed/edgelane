@@ -707,15 +707,21 @@ read go through the backend API — the **browser never contacts Supabase direct
 
 | Piece | Lives on | How it's reached |
 |---|---|---|
-| Backend (market API + Torque + Simmer) | local Docker container `edgelane-backend` | Cloudflare **quick tunnel** — URL **rotates on every container restart** |
-| Cloudflared publisher | container `edgelane-cloudflared` | on start, writes the fresh tunnel URL to **both** Supabase `app_config.api_base` (Matrix) **and** Vercel Edge Config `api_base` (Simmer) |
-| Matrix UI | Vercel project `edgelane-matrix` | reads `app_config.api_base` from Supabase at boot |
-| Simmer UI | Vercel project `edgelane-simmer` | reads `GET /api/config` at boot → Vercel Edge Config `api_base` |
-| Edge Config store `edgelane-api-base` | Vercel | serverless `/api/config` reads it; cloudflared PATCHes it on rotation |
+| Backend (market API + Torque + Simmer) | local Docker container `edgelane-backend` | Cloudflare **named tunnel** → permanent hostname **`edge.facades.trade`** |
+| Cloudflared connector | container `edgelane-cloudflared` | `cloudflare/cloudflared` running `tunnel run` with `CF_TUNNEL_TOKEN` |
+| Matrix UI | Vercel project `edgelane-matrix` at `matrix.facades.trade` | calls the baked `window.__EDGELANE_API_BASE__` |
+| Simmer UI | Vercel project `edgelane-simmer` at `simmer.facades.trade` | calls the baked `window.__EDGELANE_API_BASE__` |
+| Torque | served by the backend itself | `https://edge.facades.trade/torque` |
 
-Because there's no fixed domain, the tunnel URL rotates and the two frontends
-**self-heal** at boot from their pointers — no redeploy needed when only the tunnel
-moves, *provided* the publisher can write those pointers (see the token note below).
+One host serves all three products. The hostname belongs to the **tunnel**, not to
+the container, so restarts, rebuilds and host moves all keep the same URL — which is
+why both frontends simply **bake** it at deploy time from `EDGELANE_API_BASE`. There
+is no runtime pointer, no publisher, and no self-heal step any more; if you change
+the hostname, redeploy the frontends.
+
+> The Supabase `app_config.api_base` row and the Vercel Edge Config store that the
+> old rotating-URL scheme used are no longer read or written by anything. They're
+> inert — drop them whenever convenient.
 
 ### One-time setup — `make frontend-setup`
 
@@ -725,36 +731,31 @@ Idempotent; safe to re-run.
 ```bash
 vercel login            # setup reads this CLI session for provisioning — no token to paste
 make frontend-setup     # 1) links/creates BOTH Vercel projects (Matrix + Simmer)
-                        # 2) creates the Edge Config store, connects it to the Simmer
-                        #    project (EDGE_CONFIG env), writes EDGE_CONFIG_ID → deploy/.env
-                        # 3) syncs Supabase Auth uri_allow_list with both origins
+                        # 2) syncs Supabase Auth uri_allow_list with both origins
 ```
 
 `deploy-fe` / `deploy-simmer` **refuse** until the project is linked and point you
 here. Provisioning uses your Vercel CLI login (`~/.local/share/com.vercel.cli/auth.json`).
 
-**Container tunnel self-heal needs a PERMANENT token.** The cloudflared container
-can't read your host CLI login, so to let it PATCH Edge Config on rotation, put a
-**no-expiration** token in `deploy/.env`:
+**The tunnel is created once, in the Cloudflare dashboard** (Zero Trust → Networks →
+Tunnels → Create tunnel), with public hostname `edge.facades.trade` →
+`http://edgelane-backend:8789`. Paste the connector token into `deploy/.env`:
 
 ```bash
-# Vercel → Account Settings → Tokens → Create (scope: your account, expiration: No Expiration)
-VERCEL_API_TOKEN=vcp_...        # deploy/.env  — setup never overwrites this
+CF_TUNNEL_TOKEN=eyJ...                        # deploy/.env — compose fails fast if blank
+EDGELANE_API_BASE=https://edge.facades.trade  # baked into both SPAs; deploy.sh dies if blank
 ```
-
-Without it: not an error — the container logs `skipping Edge Config`, and Simmer keeps
-its last-known tunnel URL until the token is set and the container republishes. `make
-frontend-setup` prints whether self-heal is enabled.
 
 ### Deploy / update — what to run, in what order
 
-Do only the steps for what changed; the **sequence matters** (schema → backend →
-frontends), because the backend restart rotates the tunnel and republishes the pointers.
+Do only the steps for what changed. The **sequence matters** (schema → backend →
+frontends) because a frontend may depend on a new backend field, not because any URL
+moves — the tunnel hostname is fixed.
 
 1. **DB schema changed** → `make db-push` (applies `supabase/migrations`).
 2. **Backend / engine changed** → verify `DEVMODE=false`, then `make deploy-be`
-   (rebuild) or `make deploy-be-restart`. This **rotates the tunnel**; cloudflared
-   republishes `api_base` to Supabase **and** Edge Config on boot.
+   (rebuild) or `make deploy-be-restart`. The tunnel hostname is unchanged, so no
+   frontend redeploy is needed unless the UI itself changed.
    - Config-only change (keys in `edgelane_market.config`): the file is bind-mounted —
      a container restart suffices, no rebuild.
 3. **Matrix UI changed** → `make deploy-fe` (also re-syncs Supabase `site_url` +
@@ -853,7 +854,7 @@ the Cloudflare tunnel URL + the same path. Auth (same admin secret as Torque):
 | Simmer **subroutes 404** on direct load/refresh (`/settings`, `/news`) but `/` works | SPA fallback not firing. `simmer/ui/vercel.json` must have `rewrites: /(.*) → /index.html` and **no `cleanUrls`** (it conflicts with the rewrite target). Never use a lookahead in `source` — path-to-regexp silently no-ops it. Redeploy with `make deploy-simmer`. |
 | After a backend/tunnel restart, Simmer can't reach the backend (Matrix is fine) | Edge Config `api_base` went stale — the container couldn't PATCH it. `deploy/.env` is missing a **permanent** `VERCEL_API_TOKEN`, or it expired. Check `docker compose … logs edgelane-cloudflared` for `skipping Edge Config` / non-200; set the token and restart the container. |
 | `make check-tunnel` says **"Edge Config not configured"** | `VERCEL_API_TOKEN` / `EDGE_CONFIG_ID` unset in `deploy/.env`. Run `make frontend-setup` (writes `EDGE_CONFIG_ID`) and add a permanent `VERCEL_API_TOKEN`. |
-| `make check-tunnel`: **Edge Config api_base differs from Supabase** | Mid-rotation (harmless, re-run in a few seconds) or a stale/expired token stopped the last publish. If it persists, refresh `VERCEL_API_TOKEN` and restart the container. |
+| Frontends can't reach the backend after a restart | The hostname is permanent, so this is the tunnel connector, not a rotation. Check `docker compose … logs edgelane-cloudflared` for a registered connector, and that the tunnel's public hostname still routes to `http://edgelane-backend:8789`. |
 | Simmer email confirmation / password-reset link is **rejected on redirect** | The Simmer origin isn't in Supabase Auth `uri_allow_list`. Run `make frontend-setup` or `make deploy-fe` (both PATCH it), or add `https://edgelane-simmer.vercel.app/**` manually. |
 | `make frontend-setup` prints **"no Vercel token — skipping Edge Config"** | You're not logged in for provisioning. Run `vercel login`, then re-run. (This is separate from the permanent `VERCEL_API_TOKEN` the container needs.) |
 | Simmer prod `edgelane.config.js` shows `API_BASE = null` / "LOCAL DEV config" | Expected. Vercel rebuilds remotely and serves the `static/` file; it's **inert** — detection is `import.meta.env.PROD` and the API base comes from `/api/config`. Not a bug. |

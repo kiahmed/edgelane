@@ -17,9 +17,9 @@
 //   global). On a deployed build a baked base cannot be overridden — see the
 //   SECURITY note on resolveApiBase.
 //
-// Deploys MUST bake window.__EDGELANE_API_BASE__ (a stable tunnel or custom
-// domain) — there is no longer a runtime pointer to self-heal a rotated
-// quick-tunnel URL.
+// Deploys MUST bake window.__EDGELANE_API_BASE__ — the named tunnel's permanent
+// hostname (edge.facades.trade). There is no runtime pointer: the URL no longer
+// rotates, so there is nothing to self-heal.
 import { readGlobals, isDevBypass, API_BASE_KEY, ADMIN_TOKEN_KEY } from './config';
 
 const strip = (s: string): string => s.replace(/\/+$/, '');
@@ -96,10 +96,8 @@ function browserSources(): ApiSources {
 	try {
 		const url = new URL(location.href);
 		// A build is "dev" only when it's a Vite dev server (isDevBypass →
-		// import.meta.env). Simmer's quick-tunnel deploys bake apiBase=null on
-		// purpose (backend URL resolved at runtime via /api/config), so the old
-		// `!g.apiBase` check wrongly flagged every deployed build as dev —
-		// reopening the ?api= override hole AND skipping the pointer fetch.
+		// import.meta.env), never "has no baked apiBase" — that older check
+		// flagged deployed builds as dev and reopened the ?api= override hole.
 		const devBuild = isDevBypass(g);   // overrides allowed only in true dev
 		queryApi = devBuild ? url.searchParams.get('api') : null;
 		if (queryApi) {
@@ -143,34 +141,6 @@ function browserSources(): ApiSources {
 			? `${location.protocol}//${location.host}`
 			: null;
 	return { queryApi, stored, baked: g.apiBase, origin };
-}
-
-let pointerResolved = false;
-
-/** Deployed-build self-heal: fetch the same-origin /api/config pointer (backed
- *  by Vercel Edge Config, updated by cloudflared on tunnel rotation) and adopt
- *  its api_base over the baked fallback. No-op on dev builds (no baked base) and
- *  fully best-effort — any failure leaves the baked/resolved value in place.
- *  Call once at boot BEFORE the first API request. */
-export async function resolveApiBasePointer(): Promise<void> {
-	if (pointerResolved) return;
-	pointerResolved = true;
-	const g = readGlobals();
-	if (isDevBypass(g)) return;          // true dev build — keep local/override behavior
-	apiBase();                           // seed the sync (baked) value first
-	try {
-		// /api/config is a serverless function on the PAGE (Vercel) origin — a
-		// page-relative fetch, NOT a call to the tunnel backend.
-		const resp = await fetch('/api/config', { headers: { Accept: 'application/json' } });
-		if (!resp.ok) return;
-		const j = (await resp.json()) as { apiBase?: string | null };
-		if (j?.apiBase && /^https?:\/\//.test(j.apiBase)) {
-			API_BASE = strip(j.apiBase);
-			console.info('[simmer] API_BASE (edge-config pointer) =', API_BASE);
-		}
-	} catch {
-		/* best-effort — baked value stands */
-	}
 }
 
 export function apiBase(): string {

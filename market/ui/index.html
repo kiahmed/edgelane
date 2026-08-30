@@ -724,9 +724,9 @@
   function _resolveApiBase() {
     const ov = _explicitOverride();
     if (ov) return ov;
-    // Deploy-baked backend URL (Vercel has no co-located backend, so prefer
-    // this over same-origin). null/absent when the backend URL is dynamic
-    // (Cloudflare quick tunnel) — then the Supabase pointer below supplies it.
+    // Deploy-baked backend URL — the named tunnel's permanent hostname
+    // (edge.facades.trade). Vercel has no co-located backend, so this always
+    // beats same-origin. Set from EDGELANE_API_BASE at deploy time.
     if (typeof window.__EDGELANE_API_BASE__ === 'string' && window.__EDGELANE_API_BASE__) {
       return window.__EDGELANE_API_BASE__.replace(/\/+$/, '');
     }
@@ -735,51 +735,10 @@
     }
     return 'http://127.0.0.1:8789';
   }
-  let API_BASE = _resolveApiBase();
-
-  // ── Runtime service discovery ───────────────────────────────────────────
-  // The backend runs behind a Cloudflare *quick* tunnel whose hostname rotates
-  // on every cloudflared restart. The backend publishes its current URL to a
-  // public, anon-readable Supabase row (app_config.api_base) on each start; we
-  // read it here at load so rotations need no frontend redeploy. Explicit
-  // ?api/localStorage overrides always win (dev). Self-heals: getJSON re-reads
-  // the pointer and retries once on a network error (mid-session rotation).
-  async function _fetchApiBasePointer() {
-    const sUrl = window.__EDGELANE_SUPABASE_URL__, sKey = window.__EDGELANE_SUPABASE_ANON_KEY__;
-    if (!sUrl || !sKey) return null;   // dev-bypass (no Supabase) → keep sync fallback
-    try {
-      const r = await fetch(`${sUrl.replace(/\/+$/, '')}/rest/v1/app_config?select=value&key=eq.api_base`,
-        { headers: { apikey: sKey, Authorization: `Bearer ${sKey}` } });
-      if (!r.ok) return null;
-      const rows = await r.json();
-      const v = rows && rows[0] && rows[0].value;
-      return (typeof v === 'string' && v) ? v.replace(/\/+$/, '') : null;
-    } catch (e) { return null; }
-  }
-  async function resolveApiBasePointer() {
-    // Precedence: a CURRENT ?api= query param  >  baked __EDGELANE_API_BASE__
-    // (stable named tunnel / custom domain)  >  live Supabase pointer
-    // (quick-tunnel mode)  >  stale localStorage.
-    //
-    // NOTE: a persisted localStorage `edgelane_api_base` must NOT outrank the
-    // pointer here — otherwise a dev who once used ?api= (which stickies it to
-    // localStorage) can never reach the rotating tunnel: discovery would be
-    // skipped forever and the UI would hit a dead URL. localStorage still wins
-    // in dev-bypass (no Supabase → pointer is null → the sync fallback keeps it).
-    const qp = new URL(location.href).searchParams.get('api');
-    if (qp) return;   // explicit, current-session override wins
-    if (typeof window.__EDGELANE_API_BASE__ === 'string' && window.__EDGELANE_API_BASE__) return;
-    const ptr = await _fetchApiBasePointer();
-    if (ptr && ptr !== API_BASE) {
-      API_BASE = ptr;
-      // Refresh the sticky value so the next load's sync resolve starts correct.
-      try { localStorage.setItem('edgelane_api_base', ptr); } catch (e) {}
-      console.info('[edgelane] API_BASE (pointer) =', API_BASE);
-    }
-  }
+  const API_BASE = _resolveApiBase();
   // UI-owned version, auto-bumped by .githooks/pre-commit on any commit that
   // touches this file (manual: tools/bump_ui_version.sh).
-  const UI_VERSION = '2.1.1';
+  const UI_VERSION = '2.1.2';
   console.info('[edgelane] API_BASE =', API_BASE,
     '  (override with ?api=http://host:port; clear with localStorage.removeItem("edgelane_api_base"))');
 
@@ -877,15 +836,10 @@
 
   // ── fetch helpers ──
   async function getJSON(path) {
-    let r;
-    try {
-      r = await fetch(`${API_BASE}${path}`, { mode:'cors', headers: _authHeaders() });
-    } catch (netErr) {
-      // Network-level failure (tunnel rotated / backend unreachable): re-read
-      // the Supabase pointer for a fresh URL and retry once before giving up.
-      await resolveApiBasePointer();
-      r = await fetch(`${API_BASE}${path}`, { mode:'cors', headers: _authHeaders() });
-    }
+    // API_BASE is the named tunnel's permanent hostname — a network failure
+    // means the backend is down, not that the URL moved, so there is nothing
+    // to re-resolve and retry against.
+    const r = await fetch(`${API_BASE}${path}`, { mode:'cors', headers: _authHeaders() });
     if (r.status === 404) return { __404: true };
     if (!r.ok) throw new Error(`${path} → HTTP ${r.status}`);
     return r.json();
@@ -1396,14 +1350,7 @@
   // backend now bounds every broker stage and answers well inside this window,
   // so a 60s abort is the last-resort backstop rather than the usual path — a
   // real stall comes back from the server naming the stage that gave up.
-  //
-  // `retryOnNetworkError` re-runs the request once against a freshly resolved
-  // API base, the same self-heal getJSON does when the quick tunnel's hostname
-  // rotates mid-session (otherwise the order path is the one screen that stays
-  // broken until reload). ONLY safe for idempotent calls: preview places
-  // nothing, so a retry is free. A live submit must never auto-retry — the
-  // first attempt may have reached the broker, and a second would double-place.
-  async function _postOrder(path, body, timeoutMs = 60000, retryOnNetworkError = false) {
+  async function _postOrder(path, body, timeoutMs = 60000) {
     async function _attempt() {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -1428,14 +1375,8 @@
         clearTimeout(timer);
       }
     }
-    const first = await _attempt();
-    // Retry only a genuine "couldn't reach the backend" failure — never a
-    // timeout (the request may still be in flight at the broker).
-    if (first.ok || !retryOnNetworkError || first.status !== 0 || first.aborted) return first;
-    const before = API_BASE;
-    await resolveApiBasePointer();
-    if (API_BASE === before) return first;    // same URL → nothing new to try
-    console.info('[edgelane] retrying order request against refreshed API_BASE');
+    // The backend URL is permanent, so a network failure has no alternate URL
+    // to retry against — surface it rather than firing a duplicate order.
     return _attempt();
   }
 
@@ -1449,7 +1390,7 @@
     // Preview is idempotent (the broker validates and places nothing), so it may
     // safely retry against a refreshed API base.
     const { ok, status, payload } = await withBusy(
-      () => _postOrder('/orders/preview', body, 60000, true));
+      () => _postOrder('/orders/preview', body, 60000));
     $('orderPreviewPane').textContent = JSON.stringify(payload, null, 2);
     // Show the account the broker actually used. Left blank the backend resolves
     // it from the user's own token, and echoing it back is the only way the user
@@ -2691,7 +2632,6 @@
   // Timer owned by _retuneAuxTimers so it follows the market-hours cadence.
 
   (async () => {
-    await resolveApiBasePointer();   // overlay the current backend URL before first call
     initAuth();
     poll();
     pollAccuracy();
