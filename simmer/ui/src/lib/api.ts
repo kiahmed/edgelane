@@ -145,7 +145,22 @@ function browserSources(): ApiSources {
 
 export function apiBase(): string {
 	if (API_BASE === null) {
-		API_BASE = resolveApiBase(browserSources());
+		const src = browserSources();
+		API_BASE = resolveApiBase(src);
+		// A production build with no baked base is ALWAYS a deploy bug: it falls
+		// back to the page's own origin, so every call lands on the static host
+		// instead of the backend and POSTs come back 405 — which reads like a
+		// broken backend rather than a missing config file. Say so plainly; this
+		// exact misconfiguration once shipped and cost real debugging time.
+		if (import.meta.env.PROD && !src.baked) {
+			console.error(
+				'[simmer] NO BAKED API BASE on a production build — falling back to',
+				API_BASE,
+				'\nedgelane.config.js is missing or has __EDGELANE_API_BASE__ = null.',
+				'\nEvery /auth/* POST will fail with HTTP 405 (static host, not the API).',
+				'\nFix: redeploy with `make deploy-simmer`, which bakes it from deploy/.env.'
+			);
+		}
 		console.info(
 			'[simmer] API_BASE =',
 			API_BASE,

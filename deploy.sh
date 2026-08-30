@@ -58,6 +58,8 @@ DO_FRONTEND_SETUP=false
 DO_BACKEND=false
 DO_SIMMER=false
 DO_SIMMER_BUILD=false
+VERCEL_CLEAN_PROJECT=""
+DO_CLEAN=false
 DRY_RUN=false
 ASSUME_YES=false
 SKIP_DB=false
@@ -99,10 +101,12 @@ ${BOLD}TARGETS${NC} (default: frontend + backend)
   -S, --frontend-setup    One-time: create/link the Vercel projects + Edge Config
   -s, --simmer            Deploy only the Simmer UI (Vercel, simmer/ui)
       --simmer-build      Build + bake Simmer's config from deploy/.env, no deploy
+      --vercel-clean <p>  Delete a Vercel project's old deployments, keeping the live one
       (no target)         Deploy frontend + backend (Simmer only with -s)
 
 ${BOLD}OPTIONS${NC}
   -t, --target <name>     Backend target: local_container (default) | cloud
+      --clean             Wipe local build artifacts before staging (see CLEAN=1)
   -n, --dry-run           Print every command without running it
   -y, --yes               Don't prompt for confirmation
       --skip-db           Skip the Supabase migration push (full deploy only)
@@ -140,7 +144,10 @@ while [ $# -gt 0 ]; do
     -b|--backend)  DO_BACKEND=true ;;
     -s|--simmer)   DO_SIMMER=true ;;
     --simmer-build) DO_SIMMER_BUILD=true ;;
+    --vercel-clean) shift; VERCEL_CLEAN_PROJECT="${1:-}"
+                    [ -n "$VERCEL_CLEAN_PROJECT" ] || die "--vercel-clean needs a project name (e.g. $VERCEL_PROJECT or $SIMMER_VERCEL_PROJECT)" ;;
     -t|--target)   shift; DEPLOY_TARGET="${1:-}"; [ -n "$DEPLOY_TARGET" ] || die "--target needs a value" ;;
+    --clean)       DO_CLEAN=true ;;
     -n|--dry-run)  DRY_RUN=true ;;
     -y|--yes)      ASSUME_YES=true ;;
     --skip-db)     SKIP_DB=true ;;
@@ -151,7 +158,8 @@ while [ $# -gt 0 ]; do
 done
 
 # No explicit target => do both classic targets (Simmer stays opt-in via -s).
-if ! $DO_FRONTEND && ! $DO_BACKEND && ! $DO_SIMMER && ! $DO_SIMMER_BUILD && ! $DO_FRONTEND_SETUP; then DO_FRONTEND=true; DO_BACKEND=true; fi
+if ! $DO_FRONTEND && ! $DO_BACKEND && ! $DO_SIMMER && ! $DO_SIMMER_BUILD && ! $DO_FRONTEND_SETUP \
+   && [ -z "$VERCEL_CLEAN_PROJECT" ]; then DO_FRONTEND=true; DO_BACKEND=true; fi
 
 # Idempotently set KEY=VALUE in deploy/.env (append or replace in place).
 _env_upsert() {
@@ -458,9 +466,36 @@ deploy_frontend() {
 # ----------------------------------------------------------------------------
 # Simmer UI: npm build in simmer/ui, bake runtime config, deploy to Vercel
 # ----------------------------------------------------------------------------
+# Where the baked runtime config must land. `vercel build` emits the Build
+# Output API layout, and its static assets directory is what --prebuilt uploads
+# verbatim; a plain `npm run build` leaves them in build/ instead.
+SIMMER_PREBUILT_STATIC="$SIMMER_UI_SRC/.vercel/output/static"
+
 stage_simmer() {
   need npm "install Node 22 + npm"
   [ -d "$SIMMER_UI_SRC" ] || die "missing $SIMMER_UI_SRC"
+
+  # A gitignored static/edgelane.config.js is POISON here: SvelteKit copies
+  # static/ into the build output, so a developer's local dev config (API base
+  # null) silently becomes the deployed config and the app then dials its own
+  # Vercel origin instead of the backend — every /auth/* POST 405s. The baked
+  # file below is the only one that may ship, so drop any local shadow first.
+  if [ -f "$SIMMER_UI_SRC/static/edgelane.config.js" ]; then
+    warn "removing local static/edgelane.config.js — it would shadow the baked deploy config"
+    run rm -f "$SIMMER_UI_SRC/static/edgelane.config.js"
+  fi
+
+  # --clean: drop everything a previous build left behind, so nothing stale can
+  # survive into the upload. Each path is spelled out under $SIMMER_UI_SRC rather
+  # than globbed — and .vercel/OUTPUT specifically, never .vercel/, which also
+  # holds project.json (the Vercel project link; deleting it unlinks the project).
+  if $DO_CLEAN; then
+    info "Clean build: removing previous build artifacts"
+    run rm -rf "$SIMMER_UI_SRC/build" \
+               "$SIMMER_UI_SRC/.vercel/output" \
+               "$SIMMER_UI_SRC/.svelte-kit" \
+               "$SIMMER_UI_SRC/node_modules/.vite"
+  fi
 
   info "Building Simmer UI -> $SIMMER_UI_SRC/build"
   run bash -c "cd '$SIMMER_UI_SRC' && npm ci && npm run build"
@@ -481,20 +516,60 @@ stage_simmer() {
   if [ -z "$EDGELANE_SIMMER_SUPABASE_URL" ] || [ -z "$EDGELANE_SIMMER_SUPABASE_ANON_KEY" ]; then
     warn "Supabase URL/anon key unset — deployed Simmer UI will run in dev-bypass (no login gate)"
   fi
-  _js() { [ -n "$1" ] && printf '"%s"' "$1" || printf 'null'; }
+  write_simmer_config "$SIMMER_UI_SRC/build"
+}
+
+# Emit edgelane.config.js into $1. Regenerated from the resolved values every
+# time rather than copied from a previous output dir — `vercel build` re-runs
+# the framework build and wipes build/, so there is no earlier file to trust.
+# Callers must have run the resolution half of stage_simmer first.
+write_simmer_config() {  # dest-dir
+  local dest="$1/edgelane.config.js"
   if $DRY_RUN; then
     printf "${DIM}[dry-run]${NC} write %s (API base=%s, supabase=%s)\n" \
-      "$SIMMER_UI_SRC/build/edgelane.config.js" \
-      "${EDGELANE_SIMMER_API_BASE:-<unset>}" "${EDGELANE_SIMMER_SUPABASE_URL:-<unset>}"
-  else
-    {
-      printf 'window.__EDGELANE_API_BASE__ = %s;\n'           "$(_js "$EDGELANE_SIMMER_API_BASE")"
-      printf 'window.__EDGELANE_SUPABASE_URL__ = %s;\n'       "$(_js "$EDGELANE_SIMMER_SUPABASE_URL")"
-      printf 'window.__EDGELANE_SUPABASE_ANON_KEY__ = %s;\n'  "$(_js "$EDGELANE_SIMMER_SUPABASE_ANON_KEY")"
-      printf 'window.__EDGELANE_TURNSTILE_SITE_KEY__ = %s;\n' "$(_js "$EDGELANE_SIMMER_TURNSTILE_SITE_KEY")"
-    } > "$SIMMER_UI_SRC/build/edgelane.config.js"
-    ok "wrote simmer/ui/build/edgelane.config.js (API base: ${EDGELANE_SIMMER_API_BASE:-null}, auth: $([ -n "$EDGELANE_SIMMER_SUPABASE_URL" ] && echo configured || echo dev-bypass))"
+      "$dest" "${EDGELANE_SIMMER_API_BASE:-<unset>}" "${EDGELANE_SIMMER_SUPABASE_URL:-<unset>}"
+    return 0
   fi
+  [ -d "$1" ] || die "cannot write runtime config: $1 does not exist"
+  local _js; _js() { [ -n "$1" ] && printf '"%s"' "$1" || printf 'null'; }
+  {
+    printf 'window.__EDGELANE_API_BASE__ = %s;\n'           "$(_js "$EDGELANE_SIMMER_API_BASE")"
+    printf 'window.__EDGELANE_SUPABASE_URL__ = %s;\n'       "$(_js "$EDGELANE_SIMMER_SUPABASE_URL")"
+    printf 'window.__EDGELANE_SUPABASE_ANON_KEY__ = %s;\n'  "$(_js "$EDGELANE_SIMMER_SUPABASE_ANON_KEY")"
+    printf 'window.__EDGELANE_TURNSTILE_SITE_KEY__ = %s;\n' "$(_js "$EDGELANE_SIMMER_TURNSTILE_SITE_KEY")"
+  } > "$dest"
+  ok "wrote ${dest#$ROOT_DIR/} (API base: ${EDGELANE_SIMMER_API_BASE:-null}, auth: $([ -n "$EDGELANE_SIMMER_SUPABASE_URL" ] && echo configured || echo dev-bypass))"
+}
+
+# Bake the config into the prebuilt output that --prebuilt uploads verbatim.
+# `vercel build` re-runs the framework build, regenerating the file from static/,
+# so this has to happen AFTER that build — not before.
+bake_simmer_prebuilt() {
+  if ! $DRY_RUN; then
+    [ -d "$SIMMER_PREBUILT_STATIC" ] \
+      || die "vercel build produced no $SIMMER_PREBUILT_STATIC — cannot deploy --prebuilt"
+  fi
+  write_simmer_config "$SIMMER_PREBUILT_STATIC"
+}
+
+# Fail loudly if the deployed config is not the one we just baked. This is the
+# check that would have caught the 405-at-signin incident immediately: the app
+# had shipped with a null API base and silently fell back to its own origin.
+verify_simmer_config() {  # origin
+  local url="$1/edgelane.config.js" got
+  $DRY_RUN && { info "  [dry-run] verify $url"; return 0; }
+  got="$(curl -fsS --max-time 15 "$url" 2>/dev/null || true)"
+  case "$got" in
+    *"\"$EDGELANE_SIMMER_API_BASE\""*)
+      ok "verified live config -> $EDGELANE_SIMMER_API_BASE" ;;
+    "")
+      warn "could not fetch $url — verify by hand before trusting this deploy" ;;
+    *)
+      warn "DEPLOYED CONFIG IS WRONG at $url"
+      warn "  expected API base: $EDGELANE_SIMMER_API_BASE"
+      warn "  got: $(printf '%s' "$got" | grep -m1 API_BASE || echo '<no API_BASE line>')"
+      warn "  the app will fall back to its own origin and every /auth/* POST will 405" ;;
+  esac
 }
 
 deploy_simmer() {
@@ -512,9 +587,22 @@ deploy_simmer() {
 
   stage_simmer
 
+  # --prebuilt, NOT a plain `vercel deploy`. A plain deploy uploads SOURCE and
+  # rebuilds on Vercel's side (simmer/ui/vercel.json sets framework=sveltekit),
+  # which regenerates the output from static/ and throws away the runtime config
+  # stage_simmer just baked — shipping a UI with a null API base that dials its
+  # own Vercel origin. Matrix never hit this only because it declares no
+  # framework, so Vercel has nothing to build and ships dist/ verbatim.
+  info "Building Simmer UI for --prebuilt upload"
+  ( cd "$SIMMER_UI_SRC" && _vc build --prod )
+  bake_simmer_prebuilt
+
   info "Deploying Simmer UI -> Vercel project '$SIMMER_VERCEL_PROJECT'"
-  ( cd "$SIMMER_UI_SRC" && _vc deploy --prod --yes --no-wait )
+  # --archive=tgz: the SvelteKit output is thousands of small files; archiving
+  # keeps the upload under Vercel's per-deploy file limit.
+  ( cd "$SIMMER_UI_SRC" && _vc deploy --prebuilt --archive=tgz --prod --yes )
   ok "Simmer UI deployed -> https://$SIMMER_VERCEL_PROJECT.vercel.app"
+  verify_simmer_config "https://$SIMMER_VERCEL_PROJECT.vercel.app"
   warn "reminders: Supabase uri_allow_list picks up the Simmer origin on the next Matrix deploy (or PATCH manually); Turnstile allowed-domains is a manual dashboard step if the teaser is ever enabled"
 }
 
@@ -567,6 +655,32 @@ deploy_db() {
 }
 
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Delete a Vercel project's OLD deployments, keeping whatever is currently live.
+# ----------------------------------------------------------------------------
+# `--safe` is hard-coded and deliberately NOT exposed as a flag. Per Vercel's
+# docs, `vercel remove <project-name>` without it removes "the entire Vercel
+# Project ... from the current scope" — domains, env vars and all — rather than
+# just its deployments. With --safe it skips "deployments with an active preview
+# URL or production domain", which is exactly "keep the live one, bin the rest".
+#
+# Cost of running this: old production deployments are what Vercel rolls BACK to.
+# Once they're gone, recovery is a fresh deploy, not a one-click promote.
+vercel_clean() {
+  local project="$1"
+  need vercel "npm i -g vercel (auth via VERCEL_TOKEN in deploy/.env, or 'vercel login')"
+  export VERCEL_TELEMETRY_DISABLED=1
+  $DRY_RUN || _require_vercel_auth
+
+  info "Deployments currently in '$project':"
+  _vc list "$project" || warn "could not list deployments (continuing)"
+
+  confirm "Delete OLD deployments of '$project', keeping the live one? (rollback targets are lost)" \
+    || die "aborted"
+  _vc remove "$project" --safe --yes
+  ok "old deployments removed from '$project' (live deployment kept)"
+}
+
 # Main
 # ----------------------------------------------------------------------------
 $DRY_RUN && warn "DRY RUN — no commands will execute"
@@ -579,6 +693,8 @@ if $DO_FRONTEND_SETUP; then frontend_setup; ok "all done"; exit 0; fi
 if $DO_BACKEND && $DO_FRONTEND && ! $SKIP_DB; then
   deploy_db
 fi
+
+if [ -n "$VERCEL_CLEAN_PROJECT" ]; then vercel_clean "$VERCEL_CLEAN_PROJECT"; ok "all done"; exit 0; fi
 
 $DO_BACKEND  && deploy_backend
 $DO_FRONTEND && deploy_frontend

@@ -2141,6 +2141,36 @@ A blank `EDGELANE_API_BASE` is a hard failure, not a warning: there is no runtim
 discovery fallback any more, so an unbaked production build cannot reach the
 backend at all.
 
+#### Why the deploy uses `--prebuilt` (do not "simplify" this)
+
+`deploy_simmer()` runs `vercel build` locally, overwrites the runtime config in
+`.vercel/output/static/`, then uploads with `vercel deploy --prebuilt`. That looks
+like a needless extra step next to Matrix's plain `vercel deploy`. It is not.
+
+A plain `vercel deploy` **uploads source and rebuilds on Vercel's side**, because
+`simmer/ui/vercel.json` sets `"framework": "sveltekit"`. That remote rebuild
+regenerates the output from `static/` — discarding the `build/edgelane.config.js`
+that `stage_simmer()` had just baked. The deployed app then has
+`__EDGELANE_API_BASE__ = null`, `resolveApiBase()` falls back to the page's own
+origin, and every `/auth/*` POST hits the Vercel static host and returns **HTTP
+405**. It reads like a broken backend; the backend is fine.
+
+This bit Simmer in production (2026-08-30, "405 at sign-in") and Matrix never hit
+it only by luck: Matrix's `vercel.json` declares **no** framework, so Vercel has
+nothing to build and ships `dist/` verbatim.
+
+Three guards now exist, because any one of them alone can be defeated:
+
+1. `--prebuilt` — Vercel uploads what we staged and never rebuilds it.
+2. `stage_simmer()` deletes any `simmer/ui/static/edgelane.config.js` before
+   building. That file is gitignored, so it survives `git pull` on a deploy host
+   and SvelteKit copies it into the output — a stale local dev config with a null
+   API base is exactly what shipped in the incident above.
+3. `verify_simmer_config()` fetches the live `edgelane.config.js` after deploying
+   and warns loudly if the API base is not the one just baked. The frontend also
+   `console.error`s on a production build with no baked base (`api.ts`), so the
+   next occurrence names itself instead of presenting as a 405.
+
 ### Four things that will break if missed
 
 1. **CORS — already satisfied for both hostnames Simmer answers on.** The regex
