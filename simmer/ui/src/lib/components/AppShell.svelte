@@ -4,15 +4,17 @@
 	import type { Snippet } from 'svelte';
 	import StatusPills from './StatusPills.svelte';
 	import SocialShare from './SocialShare.svelte';
+	import ContactModal from './ContactModal.svelte';
 	import { CAPTURE_ID } from '$lib/social';
 	import { auth } from '$lib/stores/auth.svelte';
 	import { watchlist } from '$lib/stores/watchlist.svelte';
 	import { page } from '$app/state';
-	import { resolve } from '$app/paths';
+	import { asset, resolve } from '$app/paths';
 
 	let { children }: { children: Snippet } = $props();
 
 	let menuOpen = $state(false);
+	let contactOpen = $state(false);
 	const initial = $derived((auth.user?.email ?? 'D')[0]?.toUpperCase() ?? 'D');
 	const path = $derived(page.url.pathname);
 </script>
@@ -26,11 +28,27 @@
 <div class="mx-auto max-w-6xl space-y-4 p-4 md:p-6">
 	<header class="mb-2 flex items-start gap-3">
 		<div class="flex-shrink-0">
-			<h1 class="neon text-2xl font-black tracking-tight md:text-3xl">
-				EDGELANE <span class="text-emerald-400">SIMMER</span>
-			</h1>
-			<p class="mt-0.5 text-[13px] text-slate-200 italic">
-				Let your targets simmer — we'll ring the bell when the premium's ready to sell.
+			<!-- Brand lockup — logomark + SIMMER + "by Facades" byline. Mirrors the
+			     Matrix header treatment so the two products read as one family.
+			     simmer-logo.png and every favicon are GENERATED from the master
+			     art at simmer/ui/assets/facades_simmer_logo_mark.png — replace
+			     that, then run `python3 tools/simmer_icons.py`. -->
+			<div class="brand-lockup">
+				<img
+					class="logomark"
+					src={asset('/assets/simmer-logo.png')}
+					alt="Simmer"
+					width="192"
+					height="192"
+				/>
+				<div class="names">
+					<h1 class="neon wordmark text-2xl tracking-tight text-emerald-400 md:text-3xl">SIMMER</h1>
+					<div class="brand-byline">by Facades</div>
+				</div>
+			</div>
+			<p class="mt-1 text-[13px] text-slate-200 italic">
+				Cut the research friction. Simmer monitors the heat and alerts you when options
+				premium is fully baked.
 			</p>
 		</div>
 		<div class="ml-auto min-w-0">
@@ -78,5 +96,15 @@
 
 	<footer class="pt-4 text-center text-[0.68rem] text-slate-600">
 		Research tool, not investment advice. Engine verdicts are calibrated on paper outcomes.
+		<span class="mx-1.5 text-slate-700">·</span>
+		<button
+			class="cursor-pointer border-none bg-transparent p-0 text-[0.68rem] text-slate-500 underline underline-offset-2 hover:text-emerald-400"
+			type="button"
+			onclick={() => (contactOpen = true)}
+		>
+			Contact us
+		</button>
 	</footer>
 </div>
+
+<ContactModal open={contactOpen} onclose={() => (contactOpen = false)} />

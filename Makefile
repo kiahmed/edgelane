@@ -216,17 +216,26 @@ check-tunnel: ## Verify the prod backend end-to-end (tunnel + CORS + auth)
 # ---- Simmer ----
 # Simmer UI (simmer/ui — SvelteKit 5 SPA) + its Vercel deploy. Backend routes
 # (/simmer/*) ship inside the existing market image. See docs/simmer.md.
+#
+# Config, same rule as Matrix: nothing here reads deploy/.env directly. Every
+# target that produces a *shippable* build shells out to deploy.sh, which owns
+# the one implementation of "bake window.__EDGELANE_*__ from deploy/.env" —
+# so a `make simmer-ui-build` artifact points at the same backend
+# (EDGELANE_API_BASE → edge.facades.trade) a real deploy would. Only the Vite
+# dev server is unbaked, and that is deliberate: no baked base means
+# api.ts falls through to http://127.0.0.1:8789, which is what
+# `make run-dev` is serving. Point dev at another backend with ?api=… .
 
 SIMMER_UI = simmer/ui
 
 simmer-ui-install: ## Install Simmer UI deps (npm ci, simmer/ui)
 	@cd $(SIMMER_UI) && npm ci
 
-simmer-ui-dev: ## Vite dev server on :5173 (backend CORS already allows it)
+simmer-ui-dev: ## Vite dev server on :5173, unbaked → local backend on :8789
 	@cd $(SIMMER_UI) && npm run dev
 
-simmer-ui-build: ## Production build (adapter-static → simmer/ui/build)
-	@cd $(SIMMER_UI) && npm run build
+simmer-ui-build: ## Production build + config baked from deploy/.env (no deploy)
+	@$(DEPLOY_SH) --simmer-build $(ARGS)
 
 simmer-ui-check: ## svelte-check — Svelte 5 runes + TS, must be 0 errors
 	@cd $(SIMMER_UI) && npm run check

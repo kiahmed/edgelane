@@ -9,7 +9,7 @@ import { getJSON } from '$lib/api';
 
 export interface SocialConfig {
 	enabled: boolean; // show the X / LinkedIn profile chips
-	handle: string; // display/title only, e.g. "@edgelane_simmer"
+	handle: string; // display/title only, e.g. "@facades_simmer"
 	x_url: string; // product page
 	linkedin_url: string; // product page
 	share_enabled: boolean; // show the snapshot Share button

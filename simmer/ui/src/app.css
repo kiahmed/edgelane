@@ -32,6 +32,38 @@ body.busy * {
 	.neon {
 		text-shadow: 0 0 8px rgba(120, 255, 180, 0.45);
 	}
+	/* Brand lockup — logomark + SIMMER + "by Facades" byline. Same treatment as
+	   Matrix (market/ui/index.html) so the two products read as one family. */
+	.brand-lockup {
+		display: flex;
+		align-items: center;
+		gap: 0.7rem;
+	}
+	.brand-lockup .logomark {
+		width: 3rem;
+		height: 3rem;
+		display: block;
+		flex-shrink: 0;
+		filter: drop-shadow(0 0 10px rgba(120, 255, 180, 0.28));
+	}
+	.brand-lockup .names {
+		display: flex;
+		flex-direction: column;
+		line-height: 1;
+	}
+	.brand-lockup .wordmark {
+		font-weight: 900;
+		letter-spacing: 0.06em;
+	}
+	.brand-byline {
+		font-style: italic;
+		font-size: 10.5px;
+		letter-spacing: 0.15em;
+		color: #34d399;
+		font-weight: 600;
+		margin-top: 0.28rem;
+		text-transform: uppercase;
+	}
 	.pill {
 		display: inline-flex;
 		align-items: center;
@@ -185,7 +217,10 @@ body.busy * {
 		display: none;
 		align-items: center;
 		justify-content: center;
-		z-index: 60;
+		/* Above .gate-mask (70). The contact dialog is opened FROM the gates —
+		   ProductGate's "contact the operator" — so at 60 it rendered behind the
+		   full-screen gate overlay and was invisible and unclickable. */
+		z-index: 80;
 	}
 	.modal-mask.show {
 		display: flex;
@@ -372,13 +407,14 @@ body.busy * {
 		align-items: center;
 		gap: 0.6rem;
 	}
+	/* Holds the real logomark, which carries its own dark ground and rounded
+	   corners — so no gradient tile behind it (that used to back a flat glyph). */
 	.gate-logo .mark {
 		width: 2.5rem;
 		height: 2.5rem;
-		border-radius: 0.7rem;
-		display: grid;
-		place-items: center;
-		background: linear-gradient(135deg, #34d399, #0d9488);
+		display: block;
+		flex-shrink: 0;
+		filter: drop-shadow(0 0 10px rgba(120, 255, 180, 0.28));
 	}
 	.gate-eyebrow {
 		font-size: 0.65rem;

@@ -185,9 +185,9 @@ MANAGEMENT: dict[str, float] = {
 # no product handle and is on by default.
 SOCIAL: dict[str, Any] = {
     "enabled":            False,   # master switch for the X / LinkedIn profile chips
-    "handle":             "",      # display/title only, e.g. "@edgelane_simmer"
-    "x_url":              "",      # product page,  e.g. "https://x.com/edgelane_simmer"
-    "linkedin_url":       "",      # product page,  e.g. "https://www.linkedin.com/company/edgelane"
+    "handle":             "",      # display/title only, e.g. "@facades_simmer"
+    "x_url":              "",      # product page,  e.g. "https://x.com/facades_simmer"
+    "linkedin_url":       "",      # product page,  e.g. "https://www.linkedin.com/company/facades"
     "share_enabled":      True,    # the snapshot Share button
     # Composer URLs the Share button opens (image-paste target); rarely changed.
     "x_share_url":        "https://x.com/compose/post",

@@ -87,6 +87,17 @@
   .callout.key { border-left-color:var(--accent2); }
   .callout .h { font-weight:700; margin:0 0 4px; }
 
+  /* Masthead branding notices — mirrors the Matrix manual's notice strip so the
+     two products carry the same rebrand statement in the same place. */
+  .notices { display:grid; gap:1px; background:var(--border); border:1px solid var(--border);
+             border-radius:10px; overflow:hidden; margin:20px 0 30px; }
+  @media (min-width:860px) { .notices { grid-template-columns:repeat(2,1fr); } }
+  .notice { background:var(--card); padding:14px 16px; display:flex; flex-direction:column; gap:6px; }
+  .notice .tag { font-size:11px; font-weight:750; letter-spacing:.08em; text-transform:uppercase; }
+  .notice p { margin:0; font-size:14px; line-height:1.6; color:var(--fg); }
+  .notice.rebrand .tag { color:var(--accent); }
+  .notice.internal .tag { color:var(--warn); }
+
   .badge { display:inline-block; font-size:11px; font-weight:750; letter-spacing:.03em;
            padding:2px 8px; border-radius:999px; text-transform:uppercase; vertical-align:middle; }
   .badge.lock { color:var(--lock); background:var(--lock-bg); }
@@ -132,7 +143,7 @@
 
 <nav class="toc">
   <p class="brand">Simmer<span>.</span></p>
-  <p class="tag">Operating Manual</p>
+  <p class="tag">by Facades &middot; Operating Manual</p>
   <ol>
     <li><a href="#overview">What Simmer is</a></li>
     <li><a href="#components">Components &amp; dependencies</a></li>
@@ -161,6 +172,23 @@
   <h1>Simmer</h1>
   <p class="lede">A premium-selling <strong>readiness engine</strong>. It watches your tickers and tells you
   <em>when</em> a name is conditioned to sell a credit spread — and, far more often, why it isn't.</p>
+
+  <div class="notices">
+    <div class="notice rebrand">
+      <span class="tag">Now at simmer.facades.trade</span>
+      <p>Simmer ships under the <strong>Facades</strong> brand at <code>simmer.facades.trade</code>.
+      <strong>facades.trade replaces EdgeLane</strong> as the public name, across the product, the domain,
+      and everything customer-facing. Its sibling products are <strong>Matrix</strong>
+      (<code>matrix.facades.trade</code>) and <strong>Torque</strong> (admin-only, no public subdomain yet).</p>
+    </div>
+    <div class="notice internal">
+      <span class="tag">Internal note — not public</span>
+      <p>The backend still calls the system <em>edgelane</em> throughout: repo, config keys, DuckDB tables,
+      service names, the <code>edgelane-simmer</code> Vercel project, and the
+      <code>window.__EDGELANE_*__</code> runtime globals. That naming is <strong>internal only</strong> and is
+      deliberately not surfaced to users. Nothing public carries the old name.</p>
+    </div>
+  </div>
 
   <section id="overview">
     <h2>What Simmer is</h2>

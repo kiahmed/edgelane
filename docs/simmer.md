@@ -2,7 +2,28 @@
 
 > *Let it simmer. We'll tell you when it's ready.*
 
-Simmer is the third EdgeLane product surface, alongside the **market dashboard**
+---
+
+> ### 🏷 Branding — Simmer is a **Facades** product
+>
+> **Public name.** Simmer ships under the **Facades** brand at
+> **`simmer.facades.trade`**. **facades.trade replaces EdgeLane** as the public
+> name, across the product, the domain, and everything customer-facing. Its
+> siblings are **Matrix** (`matrix.facades.trade`) and **Torque** (admin-only,
+> no public subdomain yet). The landing page and DNS live in the separate
+> **facades-portal** repo.
+>
+> **Internal name — not public.** The backend deliberately still calls the
+> system *edgelane* throughout, and this document follows that convention below:
+> the repo, config keys (`edgelane_market.config`, `EDGELANE_API_BASE`), DuckDB
+> tables, service names, the `edgelane-simmer` Vercel project, and the
+> `window.__EDGELANE_*__` runtime globals all keep the legacy name. **Do not
+> rename them.** Read every "EdgeLane" below as the internal system identifier,
+> never as a user-facing string — nothing public carries the old name.
+
+---
+
+Simmer is the third Facades product surface, alongside the **market dashboard**
 (Matrix) and **Torque**. You give it a watchlist. It watches those names
 continuously, and tells you **when a name is ready to have premium sold against
 it** — and at which strikes, for one expiration you choose.
@@ -2101,29 +2122,46 @@ New Vercel project **`edgelane-simmer`**, deployed from `simmer/ui/`, built with
 
 ### `deploy-simmer`
 
-`deploy.sh` already has the right seams: `stage_frontend()` (:197),
-`deploy_frontend()` (:241), `sync_supabase_site_url()` (:297). Add a
-`-s|--simmer` flag with parallel `stage_simmer()` / `deploy_simmer()` functions
-rather than a second script, then in the root `Makefile`:
-
-```make
-deploy-simmer:
-	./deploy.sh -s $(ARGS)
-```
-
+**Shipped.** `deploy.sh` grew `-s|--simmer` with `stage_simmer()` /
+`deploy_simmer()` mirroring the Matrix pair, rather than a second script.
 `stage_simmer()` runs `npm ci && npm run build` in `simmer/ui/`, then writes
-`build/edgelane.config.js` from `deploy/.env` exactly as `stage_frontend()` does.
+`build/edgelane.config.js` from `deploy/.env` exactly as `stage_frontend()` does
+— `EDGELANE_SIMMER_*` wins if set, otherwise the shared `EDGELANE_*` values, so
+one `deploy/.env` drives both products.
+
+Config-baking lives **only** there. No make target reads `deploy/.env` itself:
+
+| Target | What it does |
+|---|---|
+| `make simmer-ui-dev` | Vite dev server, **unbaked** — `api.ts` falls through to `http://127.0.0.1:8789` (what `make run-dev` serves). Override with `?api=…`. |
+| `make simmer-ui-build` | `deploy.sh --simmer-build` — full build **with** config baked from `deploy/.env`, no Vercel deploy. |
+| `make deploy-simmer` | `deploy.sh -s` — the same build, then push to Vercel. |
+
+A blank `EDGELANE_API_BASE` is a hard failure, not a warning: there is no runtime
+discovery fallback any more, so an unbaked production build cannot reach the
+backend at all.
 
 ### Four things that will break if missed
 
-1. **CORS — already satisfied, and this is why the hostname was chosen.**
-   `edgelane-simmer.vercel.app` matches the existing regex
-   `^https://edgelane[a-z0-9-]*\.vercel\.app$`, so **no config change is needed.**
-   ⚠️ This is load-bearing: a hostname that does *not* start with `edgelane`
-   (e.g. `simmer-edgelane.vercel.app`) fails the regex and silently breaks every
-   API call from the browser. **Do not rename the Vercel project** without also
-   widening `CORS_ALLOW_ORIGINS` / `CORS_ALLOW_ORIGIN_REGEX` in
-   `edgelane_market.config`.
+1. **CORS — already satisfied for both hostnames Simmer answers on.** The regex
+   in `config.py` (and `edgelane_market.config.example`) is now:
+
+   ```
+   ^https://(edgelane[a-z0-9-]*\.vercel\.app|(matrix|simmer)\.facades\.trade)$
+   ```
+
+   The first branch covers the raw Vercel origin `edgelane-simmer.vercel.app`;
+   the second covers the public Facades subdomain `simmer.facades.trade`. **No
+   config change is needed** for either.
+   ⚠️ Both branches are load-bearing. A Vercel project renamed to something that
+   does *not* start with `edgelane` (e.g. `simmer-edgelane.vercel.app`) fails the
+   first branch, and a new product subdomain that isn't `matrix`/`simmer` fails
+   the second — either way every API call from the browser silently dies on a
+   preflight. **Do not rename the Vercel project or add a product subdomain**
+   without also widening `CORS_ALLOW_ORIGIN_REGEX` in `edgelane_market.config`
+   (and its `.example`). This is one of the three places the portal hostnames are
+   hardcoded — the others are `_facades_allow_fragment()` in `deploy.sh` and
+   `EDGELANE_API_BASE` in `deploy/.env`.
 2. **Supabase redirect allow-list.** `sync_supabase_site_url()` rewrites
    `uri_allow_list` on every deploy from `$VERCEL_PROJECT`. Extend it to include
    the Simmer origin or confirmation/magic-link emails will redirect wrong.
@@ -2457,6 +2495,28 @@ ones and puts the results on screen.
     above the configured threshold. Nothing else depends on it, so it lands after
     the core engine is proven. *(Use short **interest**, not daily short volume
     as a level — see the market-maker hedging caveat in Data sourcing.)*
+
+39. **Turnstile-verify account creation on `/auth/signup` (both products).**
+    Today nothing bot-verifies signup. Matrix *renders* a Turnstile widget on its
+    gate, but that token is only ever posted to `/session/anon` to mint the
+    anonymous teaser session — `auth_proxy.py` never checks a token on
+    `/auth/signup` or `/auth/login`. The only protection on those endpoints is
+    the IP-keyed limiter (`rate_limit_auth_per_min`, default 10/min, active only
+    when `auth_enabled=true`), which a distributed bot rotating IPs walks past.
+    Exposure is Supabase account spam plus confirmation emails burning the Brevo
+    send quota.
+
+    Fix is **backend-first, and covers Matrix and Simmer at once** since they
+    share the endpoint: add a Turnstile verify helper in `auth_proxy.py`, require
+    the token on `/auth/signup` (login can stay on rate-limiting alone —
+    weigh the friction), then render the widget in Simmer's `AuthGate.svelte`
+    and send the token from both UIs. Note Simmer already has
+    `__EDGELANE_TURNSTILE_SITE_KEY__` baked by `stage_simmer()`, so no deploy
+    config changes — but `simmer.facades.trade` must be added to the widget's
+    allowed-hostnames in the Cloudflare dashboard, or it fails with `110200`.
+
+    ⚠️ Don't mistake this for a Simmer-only gap: adding the widget to Simmer's
+    gate *without* the server-side check buys nothing but a spinner.
 
 ### Sequencing note
 

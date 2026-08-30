@@ -57,6 +57,7 @@ DO_FRONTEND=false
 DO_FRONTEND_SETUP=false
 DO_BACKEND=false
 DO_SIMMER=false
+DO_SIMMER_BUILD=false
 DRY_RUN=false
 ASSUME_YES=false
 SKIP_DB=false
@@ -97,6 +98,7 @@ ${BOLD}TARGETS${NC} (default: frontend + backend)
   -b, --backend           Deploy only the backend (Docker + tunnel)
   -S, --frontend-setup    One-time: create/link the Vercel projects + Edge Config
   -s, --simmer            Deploy only the Simmer UI (Vercel, simmer/ui)
+      --simmer-build      Build + bake Simmer's config from deploy/.env, no deploy
       (no target)         Deploy frontend + backend (Simmer only with -s)
 
 ${BOLD}OPTIONS${NC}
@@ -122,8 +124,9 @@ ${BOLD}PREREQS${NC}
              SUPABASE_SERVICE_KEY (quick tunnel publishes its URL there);
              edgelane_market.config with production Tradier token (DEVMODE=false)
   frontend:  vercel CLI (npm i -g vercel) + VERCEL_TOKEN in deploy/.env
-             (or 'vercel login'). EDGELANE_API_BASE is
-             optional (blank = discover the backend URL at runtime via Supabase)
+             (or 'vercel login'). EDGELANE_API_BASE is REQUIRED — the
+             named tunnel hostname baked into both SPAs; there is no runtime
+             discovery fallback, so a blank value ships an unreachable UI.
 EOF
 }
 
@@ -136,6 +139,7 @@ while [ $# -gt 0 ]; do
     -S|--frontend-setup) DO_FRONTEND_SETUP=true ;;
     -b|--backend)  DO_BACKEND=true ;;
     -s|--simmer)   DO_SIMMER=true ;;
+    --simmer-build) DO_SIMMER_BUILD=true ;;
     -t|--target)   shift; DEPLOY_TARGET="${1:-}"; [ -n "$DEPLOY_TARGET" ] || die "--target needs a value" ;;
     -n|--dry-run)  DRY_RUN=true ;;
     -y|--yes)      ASSUME_YES=true ;;
@@ -147,7 +151,7 @@ while [ $# -gt 0 ]; do
 done
 
 # No explicit target => do both classic targets (Simmer stays opt-in via -s).
-if ! $DO_FRONTEND && ! $DO_BACKEND && ! $DO_SIMMER && ! $DO_FRONTEND_SETUP; then DO_FRONTEND=true; DO_BACKEND=true; fi
+if ! $DO_FRONTEND && ! $DO_BACKEND && ! $DO_SIMMER && ! $DO_SIMMER_BUILD && ! $DO_FRONTEND_SETUP; then DO_FRONTEND=true; DO_BACKEND=true; fi
 
 # Idempotently set KEY=VALUE in deploy/.env (append or replace in place).
 _env_upsert() {
@@ -579,5 +583,6 @@ fi
 $DO_BACKEND  && deploy_backend
 $DO_FRONTEND && deploy_frontend
 $DO_SIMMER   && deploy_simmer
+$DO_SIMMER_BUILD && stage_simmer
 
 ok "all done"

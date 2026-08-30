@@ -4,6 +4,7 @@
 	// password against the backend's /auth/* proxy endpoints — the browser
 	// never talks to Supabase. Turnstile and the SSO ticket flow are
 	// deliberately absent in Simmer v1 (auth required or dev-bypass).
+	import { asset } from '$app/paths';
 	import { auth } from '$lib/stores/auth.svelte';
 
 	let email = $state('');
@@ -60,18 +61,15 @@
 	<div class="gate-card">
 		<div class="glow-orb"></div>
 		<div class="gate-logo mb-4">
-			<div class="mark">
-				<svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-					<path d="M4 17c3-1 5-6 8-6s5 4 8 2" stroke="#022c22" stroke-width="2.4" stroke-linecap="round" />
-				</svg>
-			</div>
+			<img class="mark" src={asset('/assets/simmer-logo.png')} alt="" aria-hidden="true" />
 			<div>
-				<div class="gate-eyebrow">EdgeLane</div>
+				<div class="gate-eyebrow">Facades</div>
 				<div class="text-lg font-black tracking-tight text-slate-100">SIMMER</div>
 			</div>
 		</div>
 		<p class="mb-4 text-sm text-slate-400">
-			Premium-selling readiness. Most days the right trade is no trade — sign in to see why.
+			Cut the research friction. Simmer monitors the heat and alerts you when options premium
+			is fully baked.
 		</p>
 
 		<div class="mb-4 flex border-b border-slate-700/60">

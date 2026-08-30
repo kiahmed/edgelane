@@ -189,7 +189,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 			mode: 'cors',
 			...init,
 			headers: {
-				...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+				// Only a string body is JSON. FormData MUST go without an explicit
+				// Content-Type so the browser can add the multipart boundary — set it
+				// by hand and the backend cannot parse a single field.
+				...(typeof init?.body === 'string' ? { 'Content-Type': 'application/json' } : {}),
 				...authHeaders({ accessToken: tokenProvider() }),
 				...(init?.headers ?? {})
 			}
@@ -234,6 +237,12 @@ export const getEarnings = <T>(symbol: string, refresh = false): Promise<T> =>
 
 export const postJSON = <T>(path: string, body: unknown): Promise<T> =>
 	request<T>(path, { method: 'POST', body: JSON.stringify(body) });
+
+/** multipart/form-data POST — the support-ticket form, which can carry a file.
+ *  Goes through request() so it inherits the bearer token and the 401
+ *  refresh-and-replay; see the Content-Type note there. */
+export const postForm = <T>(path: string, form: FormData): Promise<T> =>
+	request<T>(path, { method: 'POST', body: form });
 
 export const patchJSON = <T>(path: string, body: unknown): Promise<T> =>
 	request<T>(path, { method: 'PATCH', body: JSON.stringify(body) });
