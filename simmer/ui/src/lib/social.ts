@@ -2,7 +2,7 @@
 //
 // Everything here is CONFIG-DRIVEN: the values come from the backend
 // (GET /simmer/config → `social`), sourced from simmer_config.SOCIAL and
-// overridable in simmer_tickers.json. Change them there and restart the backend
+// overridable in simmer/simmer_tickers.json. Change them there and restart the backend
 // to publish — no frontend rebuild. Chips stay hidden until real URLs are set
 // (an unregistered handle is a squatting risk); the Share button is independent.
 import { getJSON } from '$lib/api';

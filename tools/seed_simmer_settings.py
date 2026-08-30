@@ -4,7 +4,7 @@
 Only the USER-FACING columns are managed here — the alert bar (min_score,
 min_iv_percentile), risk_profile, sweep_interval, and notify_email. Engine
 behavior (DTE window, strike delta, structures, regime, safety gates) is
-admin-global in `simmer_tickers.json`, NOT per user, so it is deliberately
+admin-global in `simmer/simmer_tickers.json`, NOT per user, so it is deliberately
 untouched.
 
 Runs against the Supabase Management API (same path as tools/db_push.py) using

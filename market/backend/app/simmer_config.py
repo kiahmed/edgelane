@@ -8,9 +8,12 @@ API keys belong in `edgelane_market.config` via `config.Settings`, NOT in
 patterns).
 
 The override file is discovered via `$SIMMER_TICKERS_CONFIG`, then by walking
-`Path(__file__).parents` looking for `simmer_tickers.json` — so it resolves both
-in the dev tree (repo root) and in the container, where the package is mounted
-at `/srv/app` and `parents[3]` does not exist.
+`Path(__file__).parents` looking for `simmer/simmer_tickers.json` (its home in
+the dev tree) and then `simmer_tickers.json` beside each ancestor. Walking rather
+than indexing `parents[3]` is deliberate: in the container the package sits at
+`/srv/app`, `parents[3]` does not exist, and compose points
+`$SIMMER_TICKERS_CONFIG` at the bind-mounted `/config/simmer_tickers.json`
+anyway.
 
 Override-file shape (every key optional, deep-merged over the defaults):
 
@@ -172,7 +175,7 @@ MANAGEMENT: dict[str, float] = {
 
 # ── Social / sharing (frontend chips; display-only, no secrets) ─────────────
 # Served to the browser via GET /simmer/config so the UI reads it at runtime:
-# change these in simmer_tickers.json (the SAME override file as the gates) and
+# change these in simmer/simmer_tickers.json (the SAME override file as the gates) and
 # restart the backend to publish — no frontend rebuild.
 #
 # Chips default HIDDEN (enabled False, empty URLs): linking to an unregistered
@@ -357,14 +360,19 @@ def _deep_merge(base: dict, over: dict) -> dict:
 def _load_overrides_file() -> dict[str, Any]:
     """Optional JSON override file, deep-merged over the module defaults.
 
-    Discovery order: `$SIMMER_TICKERS_CONFIG`, then `simmer_tickers.json` at any
-    ancestor of this file. Walking `parents` (rather than indexing `parents[3]`)
-    is deliberate — in the container the package sits at `/srv/app` and
-    `parents[3]` does not exist."""
+    Discovery order: `$SIMMER_TICKERS_CONFIG`, then, for every ancestor of this
+    file, `simmer/simmer_tickers.json` (where it lives in the dev tree) followed
+    by `simmer_tickers.json` beside that ancestor. Walking `parents` (rather than
+    indexing `parents[3]`) is deliberate — in the container the package sits at
+    `/srv/app` and `parents[3]` does not exist.
+
+    The bare-`simmer_tickers.json` fallback is kept so an existing deployment
+    that still has the file at the repo root keeps working after the move."""
     path = os.environ.get("SIMMER_TICKERS_CONFIG")
     candidates = [Path(path)] if path else []
     here = Path(__file__).resolve()
     for parent in here.parents:
+        candidates.append(parent / "simmer" / "simmer_tickers.json")
         candidates.append(parent / "simmer_tickers.json")
     for p in candidates:
         try:

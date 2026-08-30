@@ -2153,15 +2153,17 @@ deep-merged with a JSON override file — not a second KEY=VALUE file.
   eligible at all (some tickers have chains too thin to sell).
 - Accessors mirroring `torque_config.py`: `tickers()`, `ticker_rule(symbol)`,
   `weights()`, `gates()`.
-- Overrides loaded from `simmer_tickers.json`, discovered via env
-  `SIMMER_TICKERS_CONFIG` then by walking `Path(__file__).parents` (so it
-  resolves at `/srv/app` in the container, where `parents[3]` doesn't exist).
+- Overrides loaded from `simmer/simmer_tickers.json`, discovered via env
+  `SIMMER_TICKERS_CONFIG` then by walking `Path(__file__).parents`, checking
+  `simmer/simmer_tickers.json` and then a bare `simmer_tickers.json` beside each
+  ancestor (so it resolves at `/srv/app` in the container, where `parents[3]`
+  doesn't exist).
 
 Secrets and environment-level settings (Gemini API key, any news-provider key)
 belong in `edgelane_market.config` alongside the existing keys, surfaced through
 `config.py`'s `Settings` model with the usual `_coerce` line per key. **Do not
-put API keys in `simmer_tickers.json`** — that file is not gitignored by the
-existing patterns.
+put API keys in `simmer/simmer_tickers.json`** — that file is tracked in git and
+not covered by the gitignore patterns.
 
 ---
 

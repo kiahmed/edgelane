@@ -37,7 +37,7 @@ services:
       # Live config (Tradier tokens, DEVMODE, symbols) — read-only.
       - ../edgelane_market.config:/config/edgelane_market.config:ro
       # Admin-global engine tuning — edit + restart to retune for everyone.
-      - ../simmer_tickers.json:/config/simmer_tickers.json:ro
+      - ../simmer/simmer_tickers.json:/config/simmer_tickers.json:ro
       # Persist the DuckDB store across container recreates (DB_PATH defaults
       # to ~/.edgelane/market.duckdb → /root/.edgelane inside the container).
       - edgelane-data:/root/.edgelane
