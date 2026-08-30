@@ -121,7 +121,8 @@ ${BOLD}PREREQS${NC}
   backend:   docker + docker compose; deploy/.env with SUPABASE_URL +
              SUPABASE_SERVICE_KEY (quick tunnel publishes its URL there);
              edgelane_market.config with production Tradier token (DEVMODE=false)
-  frontend:  vercel CLI (npm i -g vercel) + 'vercel login'. EDGELANE_API_BASE is
+  frontend:  vercel CLI (npm i -g vercel) + VERCEL_TOKEN in deploy/.env
+             (or 'vercel login'). EDGELANE_API_BASE is
              optional (blank = discover the backend URL at runtime via Supabase)
 EOF
 }
@@ -168,8 +169,8 @@ _json_get() { python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(s
 #   2. the Vercel CLI login (~/.local/share/com.vercel.cli/auth.json) — the SAME
 #      credential `vercel deploy` uses, auto-refreshed by `vercel login`. A token
 #      past its expiresAt is treated as absent so the caller re-prompts login.
-#   3. $VERCEL_API_TOKEN  — the permanent token you set in deploy/.env for the
-#      cloudflared container (also a provisioning fallback if no CLI login)
+#   3. $VERCEL_API_TOKEN  — a permanent token in deploy/.env, so a headless host
+#      can deploy without ever running `vercel login`
 # Prints the token (empty string if none resolvable).
 _VERCEL_AUTH_JSON="${VERCEL_AUTH_JSON:-$HOME/.local/share/com.vercel.cli/auth.json}"
 _vercel_token() {
@@ -192,6 +193,35 @@ if tok and (not exp or exp > time.time()):   # a past token is treated as absent
     if [ -n "$t" ]; then printf '%s' "$t"; return 0; fi
   fi
   printf '%s' "${VERCEL_API_TOKEN:-}"
+}
+
+# Run the Vercel CLI with explicit auth. `--token` is passed rather than relying
+# on $VERCEL_TOKEN being picked up from the environment: which env names the CLI
+# honors varies by version, while `--token` has always worked. The token is NEVER
+# echoed — `run()` prints its arguments, so these calls bypass it.
+_vc() {
+  local tok; tok="$(_vercel_token)"
+  if $DRY_RUN; then
+    printf "${DIM}[dry-run]${NC} vercel %s%s\n" "$*" "${tok:+ --token ***}"
+    return 0
+  fi
+  printf "${DIM}\$ vercel %s%s${NC}\n" "$*" "${tok:+ --token ***}"
+  if [ -n "$tok" ]; then vercel "$@" --token "$tok"; else vercel "$@"; fi
+}
+
+# Same, but quiet — for probes whose output we inspect ourselves.
+_vc_q() {
+  local tok; tok="$(_vercel_token)"
+  if [ -n "$tok" ]; then vercel "$@" --token "$tok" 2>/dev/null
+  else vercel "$@" 2>/dev/null; fi
+}
+
+# Fail early with a message that names every way to authenticate.
+_require_vercel_auth() {
+  if $DRY_RUN; then warn "skipping Vercel auth check (dry-run)"; return 0; fi
+  local who; who="$(_vc_q whoami)"
+  [ -n "$who" ] && { ok "Vercel auth OK ($who)"; return 0; }
+  die "Vercel auth failed — set VERCEL_TOKEN (or VERCEL_API_TOKEN) in deploy/.env, or run 'vercel login'"
 }
 
 confirm() {
@@ -273,26 +303,22 @@ _link_project() {  # dir  project-name
     ok "  $name already linked ($dir/.vercel/project.json)"
   else
     info "  linking/creating Vercel project '$name' ($dir)"
-    run bash -c "cd '$dir' && vercel link --yes --project '$name'"
+    ( cd "$dir" && _vc link --yes --project "$name" )
   fi
 }
 
 frontend_setup() {
   export VERCEL_TELEMETRY_DISABLED=1
-  # Edge Config provisioning is a raw REST call, so it needs a bearer token — but
-  # we source it from the SAME credential `vercel deploy` uses (the CLI login),
-  # so there is nothing to hand-manage. See _vercel_token.
+  # Project linking needs auth; see _vercel_token for where it comes from.
   local tok; tok="$(_vercel_token)"
   if [ -z "$tok" ]; then
     if $DRY_RUN; then
-      warn "dry-run: no Vercel token resolvable now — a real run needs 'vercel login'"
-    elif vercel whoami >/dev/null 2>&1; then
-      die "Vercel CLI session token is missing/expired — run 'vercel login', then re-run frontend-setup"
+      warn "dry-run: no Vercel token resolvable now"
     else
-      die "Vercel auth needed — run 'vercel login' (or export VERCEL_TOKEN=…), then re-run frontend-setup"
+      die "Vercel auth needed — set VERCEL_TOKEN (or VERCEL_API_TOKEN) in deploy/.env, or run 'vercel login', then re-run frontend-setup"
     fi
   else
-    ok "Vercel token resolved (from CLI login / env)"
+    ok "Vercel token resolved (deploy/.env or CLI login)"
   fi
 
   info "1/2  Vercel projects"
@@ -382,12 +408,11 @@ _require_link() {  # dir  project-name  (die → point at frontend-setup)
 }
 
 deploy_frontend() {
-  need vercel "npm i -g vercel + run 'vercel login'"
+  need vercel "npm i -g vercel (auth via VERCEL_TOKEN in deploy/.env, or 'vercel login')"
   # Telemetry adds end-of-run network calls that can stall the CLI on exit.
   export VERCEL_TELEMETRY_DISABLED=1
   if ! $DRY_RUN; then
-    vercel whoami >/dev/null 2>&1 && ok "Vercel auth OK ($(vercel whoami 2>/dev/null))" \
-      || die "not logged in to Vercel — run 'vercel login' or export VERCEL_TOKEN=..."
+    _require_vercel_auth
   else
     warn "skipping Vercel auth check (dry-run)"
   fi
@@ -407,7 +432,7 @@ deploy_frontend() {
   # CLI keeps the build log-stream open and never exits (worse when stdout isn't a
   # TTY, e.g. under `make`), forcing a manual Ctrl+C even though the deploy already
   # succeeded. The final production URL is resolved via `vercel project ls` below.
-  run vercel deploy --prod --yes --no-wait
+  _vc deploy --prod --yes --no-wait
   # NB: the bare $VERCEL_PROJECT.vercel.app domain may be taken by another
   # account (global namespace) — Vercel then assigns a suffixed alias
   # (e.g. edgelane-hazel.vercel.app for the old 'edgelane' name). Print the real
@@ -469,11 +494,10 @@ stage_simmer() {
 }
 
 deploy_simmer() {
-  need vercel "npm i -g vercel + run 'vercel login'"
+  need vercel "npm i -g vercel (auth via VERCEL_TOKEN in deploy/.env, or 'vercel login')"
   export VERCEL_TELEMETRY_DISABLED=1
   if ! $DRY_RUN; then
-    vercel whoami >/dev/null 2>&1 && ok "Vercel auth OK ($(vercel whoami 2>/dev/null))" \
-      || die "not logged in to Vercel — run 'vercel login' or export VERCEL_TOKEN=..."
+    _require_vercel_auth
   else
     warn "skipping Vercel auth check (dry-run)"
   fi
@@ -485,7 +509,7 @@ deploy_simmer() {
   stage_simmer
 
   info "Deploying Simmer UI -> Vercel project '$SIMMER_VERCEL_PROJECT'"
-  run bash -c "cd '$SIMMER_UI_SRC' && vercel deploy --prod --yes --no-wait"
+  ( cd "$SIMMER_UI_SRC" && _vc deploy --prod --yes --no-wait )
   ok "Simmer UI deployed -> https://$SIMMER_VERCEL_PROJECT.vercel.app"
   warn "reminders: Supabase uri_allow_list picks up the Simmer origin on the next Matrix deploy (or PATCH manually); Turnstile allowed-domains is a manual dashboard step if the teaser is ever enabled"
 }
