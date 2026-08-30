@@ -70,7 +70,11 @@ services:
     restart: unless-stopped
     command: tunnel --no-autoupdate run
     environment:
-      TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN:?CF_TUNNEL_TOKEN is required — see deploy/.env.example}
+      # Deliberately `:-` and not `:?`. A required-variable guard here fails
+      # EVERY compose command — `down`, `logs`, `ps` included — so a missing
+      # token would lock you out of tearing the stack down. deploy.sh guards
+      # before it deploys; an empty token just makes cloudflared exit.
+      TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN:-}
       # Force HTTP/2 (TCP 443) instead of QUIC (UDP 7844). The QUIC datagram
       # path to Cloudflare's edge degrades intermittently on this host (WSL2
       # NAT), and cloudflared can get stuck retrying QUIC instead of falling
