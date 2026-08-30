@@ -1,12 +1,15 @@
 """Transactional email for the contact-form route.
 
 Transport is pluggable, resolved per-send from config:
-  * SMTP    — if SMTP_HOST is set (e.g. Google Workspace: smtp.gmail.com:587 with
-              an App Password, or the smtp-relay.gmail.com relay). Uses stdlib
+  * SMTP    — if SMTP_HOST is set. Works with any relay, including Brevo's
+              (smtp-relay.brevo.com:587), which needs an SMTP key (xsmtpsib-…)
+              — a DIFFERENT credential from the v3 API key below. Uses stdlib
               smtplib (no extra deps); blocking I/O is run in a worker thread.
-  * Resend  — else if RESEND_API_KEY is set (HTTP API via httpx).
+  * Brevo   — else if BREVO_API_KEY is set: the v3 HTTP API via httpx. Same key
+              and sending domain as facades-portal, so both products send as the
+              one authenticated Facades sender.
   * none    — else logged, not sent.
-EMAIL_PROVIDER (auto|smtp|resend) can force one; default 'auto' picks as above.
+EMAIL_PROVIDER (auto|smtp|brevo) can force one; default 'auto' picks as above.
 
 Sending is best-effort and NEVER raises: callers treat a False return as
 "logged, not sent" so an email outage can't fail an otherwise-successful request.
@@ -27,18 +30,28 @@ from .config import get_settings
 
 log = logging.getLogger("edgelane.market.email")
 
-_RESEND_URL = "https://api.resend.com/emails"
+_BREVO_URL = "https://api.brevo.com/v3/smtp/email"
 
 
 def _provider(settings) -> str:
     choice = (settings.email_provider or "auto").strip().lower()
-    if choice in ("smtp", "resend"):
+    if choice in ("smtp", "brevo"):
         return choice
     if settings.smtp_host:
         return "smtp"
-    if settings.resend_api_key:
-        return "resend"
+    if settings.brevo_api_key:
+        return "brevo"
     return "none"
+
+
+def _address(value: str) -> dict:
+    """Split "Display Name <addr@host>" into Brevo's {name, email}.
+    SMTP takes the combined string; Brevo insists on the structured form."""
+    name, addr = parseaddr(value or "")
+    out = {"email": addr or (value or "").strip()}
+    if name:
+        out["name"] = name
+    return out
 
 
 async def send_email(
@@ -64,9 +77,9 @@ async def send_email(
     if provider == "smtp":
         return await asyncio.to_thread(
             _send_smtp, settings, to_email, subject, html, reply_to, attachment, sender)
-    if provider == "resend":
-        return await _send_resend(settings, to_email, subject, html, reply_to, attachment, sender)
-    log.warning("[email] no transport configured (set SMTP_HOST or RESEND_API_KEY) — "
+    if provider == "brevo":
+        return await _send_brevo(settings, to_email, subject, html, reply_to, attachment, sender)
+    log.warning("[email] no transport configured (set SMTP_HOST or BREVO_API_KEY) — "
                 "would email %s: %s", to_email, subject)
     return False
 
@@ -107,33 +120,35 @@ def _send_smtp(settings, to_email, subject, html, reply_to, attachment, sender) 
         return False
 
 
-async def _send_resend(settings, to_email, subject, html, reply_to, attachment, sender) -> bool:
+async def _send_brevo(settings, to_email, subject, html, reply_to, attachment, sender) -> bool:
     payload: dict = {
-        "from": sender,
-        "to": [to_email],
+        "sender": _address(sender),
+        "to": [{"email": to_email}],
         "subject": subject,
-        "html": html,
+        "htmlContent": html,
     }
     if reply_to:
-        payload["reply_to"] = reply_to
+        payload["replyTo"] = _address(reply_to)
     if attachment:
         filename, content = attachment
-        payload["attachments"] = [{
-            "filename": filename,
+        payload["attachment"] = [{
+            "name": filename,
             "content": base64.b64encode(content).decode("ascii"),
         }]
     try:
         async with httpx.AsyncClient(timeout=20) as c:
             r = await c.post(
-                _RESEND_URL,
-                headers={"Authorization": f"Bearer {settings.resend_api_key}",
-                         "Content-Type": "application/json"},
+                _BREVO_URL,
+                headers={"api-key": settings.brevo_api_key,
+                         "content-type": "application/json",
+                         "accept": "application/json"},
                 json=payload,
             )
+        # Brevo answers 201 + {"messageId": …} on success, not 200.
         if r.status_code >= 300:
-            log.error("[email] Resend failed (%s): %s", r.status_code, r.text[:300])
+            log.error("[email] Brevo failed (%s): %s", r.status_code, r.text[:300])
             return False
         return True
     except Exception as exc:
-        log.error("[email] Resend send error for %s: %s", to_email, exc)
+        log.error("[email] Brevo send error for %s: %s", to_email, exc)
         return False

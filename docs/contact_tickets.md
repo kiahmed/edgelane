@@ -10,13 +10,17 @@ The **frontend is done**; this documents the endpoint the backend session must b
 > `SUPPORT_EMAIL` (`app/emailer.py`). The email is **best-effort**: the saved
 > ticket is the source of truth, so a send failure still returns 2xx.
 >
-> **Email transport is pluggable** (`EMAIL_PROVIDER=auto|smtp|resend`): SMTP when
-> `SMTP_HOST` is set (e.g. Google Workspace — `smtp.gmail.com:587` + App Password,
-> or the `smtp-relay.gmail.com` relay; stdlib `smtplib`, no deps), otherwise Resend
-> (HTTP API). Config keys in `edgelane_market.config`: `SUPPORT_EMAIL`,
-> `CONTACT_FROM_EMAIL`, `CONTACT_ATTACHMENT_MAX_BYTES`, `CONTACT_BUCKET`,
-> `EMAIL_PROVIDER`, SMTP: `SMTP_HOST/PORT/USER/PASSWORD/STARTTLS/USE_SSL`, or
-> `RESEND_API_KEY`.
+> **Email transport is pluggable** (`EMAIL_PROVIDER=auto|smtp|brevo`): SMTP when
+> `SMTP_HOST` is set (any relay — stdlib `smtplib`, no deps), otherwise **Brevo**'s
+> v3 HTTP API. Production runs Brevo, using the same key and authenticated sending
+> domain as facades-portal so both products send as the one Facades sender.
+> Config keys in `edgelane_market.config`: `SUPPORT_EMAIL`, `CONTACT_FROM_EMAIL`,
+> `CONTACT_ATTACHMENT_MAX_BYTES`, `CONTACT_BUCKET`, `EMAIL_PROVIDER`, SMTP:
+> `SMTP_HOST/PORT/USER/PASSWORD/STARTTLS/USE_SSL`, or `BREVO_API_KEY`.
+>
+> Note the two different Brevo credentials: `BREVO_API_KEY` is the **v3 API key**
+> (`xkeysib-…`); Brevo's SMTP relay (`smtp-relay.brevo.com:587`) instead wants an
+> **SMTP key** (`xsmtpsib-…`) in `SMTP_PASSWORD`. Resend was removed 2026-08.
 >
 > **Why backend-side, not a Supabase trigger:** the backend already holds the
 > uploaded file bytes (so it can attach them directly); a DB-webhook→Edge-Function

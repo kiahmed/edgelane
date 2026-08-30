@@ -154,28 +154,30 @@ class Settings(BaseModel):
     rate_limit_auth_per_min: int = Field(default=10)
     rate_limit_window_sec: int = Field(default=60)
 
-    # --- Support / contact form (Resend email) ---
+    # --- Support / contact form (Brevo email) ---
     # POST /contact stores the ticket (+ private-bucket attachment) then emails
-    # support via Resend. support_email is the destination; from_email must be a
-    # Resend-verified sender (or onboarding@resend.dev in test mode). If
-    # resend_api_key/support_email are blank the ticket is still saved — the email
-    # is just logged, not sent (non-fatal).
+    # support. support_email is the destination; from_email must be on a sending
+    # domain authenticated in Brevo (facades.trade). If the transport or
+    # support_email is blank the ticket is still saved — the email is just
+    # logged, not sent (non-fatal).
     support_email: str = Field(default="")
-    contact_from_email: str = Field(default="EdgeLane <onboarding@resend.dev>")
+    contact_from_email: str = Field(default="Facades <noreply@facades.trade>")
     contact_attachment_max_bytes: int = Field(default=5 * 1024 * 1024)   # 5 MB
     contact_bucket: str = Field(default="contact-attachments")
-    # Transport: auto (SMTP if SMTP_HOST set, else Resend), or force smtp|resend.
+    # Transport: auto (SMTP if SMTP_HOST set, else Brevo), or force smtp|brevo.
     email_provider: str = Field(default="auto")
-    # SMTP (e.g. Google Workspace: smtp.gmail.com:587 + App Password, or the
-    # smtp-relay.gmail.com relay). Leave SMTP_HOST blank to use Resend instead.
+    # SMTP — any relay. For Brevo's, use smtp-relay.brevo.com:587 with an SMTP
+    # key (xsmtpsib-…), which is NOT the v3 API key below. Leave SMTP_HOST blank
+    # to send over Brevo's HTTP API instead.
     smtp_host: str = Field(default="")
     smtp_port: int = Field(default=587)
     smtp_user: str = Field(default="")
     smtp_password: str = Field(default="")
     smtp_starttls: bool = Field(default=True)   # 587 STARTTLS (set false only with SSL)
     smtp_use_ssl: bool = Field(default=False)   # implicit TLS on 465
-    # Resend (HTTP API) — used when SMTP isn't configured.
-    resend_api_key: str = Field(default="")
+    # Brevo v3 HTTP API key (xkeysib-…) — the same key and sending domain as
+    # facades-portal, so both products send as the one Facades sender.
+    brevo_api_key: str = Field(default="")
     # Product-specific sender for Simmer readiness-alert emails (must be on the
     # authenticated sending domain — solutionjet.net for the Workspace relay).
     simmer_alert_from_email: str = Field(
@@ -384,7 +386,7 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
         out["smtp_starttls"] = raw["SMTP_STARTTLS"].strip().lower() in ("true", "1", "yes", "on")
     if "SMTP_USE_SSL" in raw:
         out["smtp_use_ssl"] = raw["SMTP_USE_SSL"].strip().lower() in ("true", "1", "yes", "on")
-    if "RESEND_API_KEY" in raw:              out["resend_api_key"] = raw["RESEND_API_KEY"].strip()
+    if "BREVO_API_KEY" in raw:               out["brevo_api_key"] = raw["BREVO_API_KEY"].strip()
     if "SIMMER_ALERT_FROM_EMAIL" in raw:     out["simmer_alert_from_email"] = raw["SIMMER_ALERT_FROM_EMAIL"].strip()
     if "SIMMER_APP_URL" in raw:              out["simmer_app_url"] = raw["SIMMER_APP_URL"].strip().rstrip("/")
 

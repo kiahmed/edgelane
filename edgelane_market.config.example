@@ -93,11 +93,11 @@ RATE_LIMIT_WINDOW_SEC=60
 # Attachment cap + Storage use the backend's SUPABASE_SERVICE_KEY (set above).
 SUPPORT_EMAIL=
 # From address. For SMTP it must be the authenticated mailbox or a send-as alias.
-CONTACT_FROM_EMAIL=EdgeLane <support@yourdomain.com>
+CONTACT_FROM_EMAIL=Facades <noreply@yourdomain.com>
 CONTACT_ATTACHMENT_MAX_BYTES=5242880
 CONTACT_BUCKET=contact-attachments
 
-# Transport: auto = SMTP if SMTP_HOST set, else Resend. Force with smtp|resend.
+# Transport: auto = SMTP if SMTP_HOST set, else Brevo. Force with smtp|brevo.
 EMAIL_PROVIDER=auto
 
 # -- Option A: SMTP (e.g. Google Workspace) --
@@ -114,10 +114,12 @@ SMTP_PASSWORD=
 SMTP_STARTTLS=true          # true for port 587 (STARTTLS)
 SMTP_USE_SSL=false          # true (and STARTTLS=false) for implicit TLS on port 465
 
-# -- Option B: Resend (HTTP API) — used only when SMTP_HOST is blank --
-# API key (re_…) from resend.com. With onboarding@resend.dev it only delivers to
-# the Resend account owner; use a verified domain for prod.
-RESEND_API_KEY=
+# -- Option B: Brevo (v3 HTTP API) — used only when SMTP_HOST is blank --
+# Key (xkeysib-…) from Brevo → SMTP & API → API Keys. NOT the SMTP password
+# shown on that page — that one (xsmtpsib-…) is for Brevo's SMTP relay
+# (smtp-relay.brevo.com:587), which goes in Option A instead.
+# CONTACT_FROM_EMAIL must be on a domain authenticated in Brevo.
+BREVO_API_KEY=
 
 # ── Off-hours polling policy ──
 # Auto-derived: poller skips off-hours when DEVMODE=false AND a real Tradier
