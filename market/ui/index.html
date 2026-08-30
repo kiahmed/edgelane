@@ -345,7 +345,7 @@
          aria-label="Matrix on X" class="social-btn">
         <svg viewBox="0 0 24 24" aria-hidden="true" class="h-4 w-4" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.66l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231 5.45-6.231Zm-1.161 17.52h1.833L7.084 4.126H5.117L17.083 19.77Z"></path></svg>
       </a>
-      <a href="https://www.linkedin.com/company/edgelane-matrix" target="_blank" rel="noopener noreferrer"
+      <a href="https://www.linkedin.com/showcase/facades-matrix" target="_blank" rel="noopener noreferrer"
          aria-label="Matrix on LinkedIn" class="social-btn">
         <svg viewBox="0 0 24 24" aria-hidden="true" class="h-4 w-4" fill="currentColor"><path d="M20.45 20.45h-3.56v-5.57c0-1.33-.02-3.04-1.85-3.04-1.85 0-2.13 1.45-2.13 2.94v5.67H9.35V9h3.42v1.56h.05c.48-.9 1.64-1.85 3.37-1.85 3.6 0 4.27 2.37 4.27 5.46v6.28ZM5.34 7.43a2.07 2.07 0 1 1 0-4.14 2.07 2.07 0 0 1 0 4.14ZM7.12 20.45H3.55V9h3.57v11.45ZM22.22 0H1.77C.79 0 0 .77 0 1.73v20.54C0 23.23.79 24 1.77 24h20.45c.98 0 1.78-.77 1.78-1.73V1.73C24 .77 23.2 0 22.22 0Z"></path></svg>
       </a>
@@ -752,7 +752,7 @@
   const API_BASE = _resolveApiBase();
   // UI-owned version, auto-bumped by .githooks/pre-commit on any commit that
   // touches this file (manual: tools/bump_ui_version.sh).
-  const UI_VERSION = '2.1.4';
+  const UI_VERSION = '2.1.5';
   console.info('[edgelane] API_BASE =', API_BASE,
     (window.__EDGELANE_API_BASE__ ? '  (deploy-baked — ?api= is ignored on deployed builds)'
                                   : '  (dev build — override with ?api=http://host:port)'));
@@ -2337,9 +2337,14 @@
       await withBusy(async () => {
         const fd = new FormData();
         fd.append('name', name); fd.append('email', email); fd.append('message', message);
+        // Which product the ticket came from. /contact is SHARED with Simmer, so
+        // without this the operator can't tell the two apart; omitting it files
+        // the ticket as "unknown" rather than mis-attributing it.
+        fd.append('product', 'matrix');
         if (file) fd.append('attachment', file, file.name);
-        // Backend contract (to be built): POST {API_BASE}/contact, multipart/form-data
-        //   fields: name, email, message, attachment(optional ≤5MB) → inserts a support ticket row.
+        // POST {API_BASE}/contact, multipart/form-data
+        //   fields: name, email, message, product, attachment(optional ≤5MB)
+        //   → inserts a contact_tickets row + emails support.
         const r = await fetch(`${API_BASE}/contact`, { method: 'POST', mode: 'cors', headers: _authHeaders(), body: fd });
         if (r.ok) {
           status.className = 'text-xs text-emerald-300 min-h-[1rem]';
