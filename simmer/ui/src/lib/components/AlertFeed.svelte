@@ -3,8 +3,11 @@
 	// watcher fires once, with hysteresis); ack is a POST the backend applies
 	// to the user's own rows. Payload carries the full component breakdown, so
 	// "why did this fire" needs no recompute — surfaced via the title tooltip
-	// for now.
+	// Detail lives in a click-through dialog (AlertDetailModal), not a title
+	// tooltip — the payload is the raw engine envelope and dumping it as JSON on
+	// hover was unreadable at exactly the moment a decision gets made.
 	import { getJSON, postJSON } from '$lib/api';
+	import AlertDetailModal from './AlertDetailModal.svelte';
 	import { ago, money, scoreClass, structureName } from '$lib/fmt';
 	import { toast } from '$lib/stores/toast.svelte';
 	import type { AlertsResponse, SimmerAlert } from '$lib/types';
@@ -12,6 +15,7 @@
 	let alerts = $state<SimmerAlert[]>([]);
 	let error = $state<string | null>(null);
 	let unackedOnly = $state(true);
+	let selected = $state<SimmerAlert | null>(null);
 
 	export async function refresh(): Promise<void> {
 		try {
@@ -66,7 +70,12 @@
 	{:else}
 		<div class="space-y-1.5">
 			{#each alerts as a (a.id)}
-				<div class="flex items-center gap-2 text-sm" title={JSON.stringify(a.payload, null, 2)}>
+				<button
+					class="alert-row flex w-full items-center gap-2 text-left text-sm"
+					type="button"
+					title="Click to see what this alert means and what to do"
+					onclick={() => (selected = a)}
+				>
 					<span class="pill {stateClass(a.state)}">{a.state}</span>
 					<span class="font-bold">{a.symbol}</span>
 					<span class="text-[0.7rem] text-slate-400">{a.expiration}</span>
@@ -84,10 +93,29 @@
 					<span class="ml-auto font-mono text-xs {scoreClass(a.score)}">{money(a.score, 0)}</span>
 					<span class="text-[0.65rem] text-slate-600">{ago(a.created_at)}</span>
 					{#if !a.acknowledged}
-						<button class="btn" type="button" title="Acknowledge" onclick={() => ack(a)}>ack</button>
+						<!-- stopPropagation: ack must not also open the detail dialog -->
+						<span
+							class="btn"
+							role="button"
+							tabindex="0"
+							title="Acknowledge"
+							onclick={(e) => {
+								e.stopPropagation();
+								ack(a);
+							}}
+							onkeydown={(e) => {
+								if (e.key === 'Enter' || e.key === ' ') {
+									e.preventDefault();
+									e.stopPropagation();
+									ack(a);
+								}
+							}}>ack</span
+						>
 					{/if}
-				</div>
+				</button>
 			{/each}
 		</div>
 	{/if}
 </div>
+
+<AlertDetailModal alert={selected} onclose={() => (selected = null)} />

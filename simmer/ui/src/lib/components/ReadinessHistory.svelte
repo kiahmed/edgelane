@@ -56,15 +56,25 @@
 	let error = $state('');
 	let loading = $state(true);
 	let hover = $state<number | null>(null);
+	/** symbol we already have data for — refetching the same one must not flash */
+	let loadedFor = $state<string | null>(null);
 
 	$effect(() => {
 		const sym = symbol;
+		// The card re-renders on every poll. Refetching per poll and flipping
+		// `loading` blanked the plot for a frame each time — the flicker. History
+		// is daily-bucketed, so it cannot meaningfully change between polls: fetch
+		// once per symbol and leave it alone.
+		if (sym === loadedFor) return;
 		let cancelled = false;
-		loading = true;
+		// Only show the loading state when there is nothing to show yet.
+		if (data === null) loading = true;
 		error = '';
 		getJSON<HistoryResp>(`/simmer/history/${encodeURIComponent(sym)}?days=${days}`)
 			.then((d) => {
-				if (!cancelled) data = d;
+				if (cancelled) return;
+				data = d;
+				loadedFor = sym;
 			})
 			.catch((e) => {
 				if (!cancelled) error = errorMessage(e);
@@ -79,7 +89,7 @@
 
 	// ── Geometry. Bars are ≤24px and never fill their slot; the leftover is the
 	//    2px surface gap that separates neighbours (no strokes). ──────────────
-	const H = 96; // plot height, px
+	const H = 120; // plot height, px — taller now the card has room
 	const VETO_STUB = 5; // px — visible refusal, clearly below any real score
 
 	// Defensive daily collapse, mirroring the server's bucket="day".
@@ -118,32 +128,70 @@
 	// Fill by outcome. Unresolved is deliberately quiet — it is not a result yet.
 	function fill(r: HistoryRow): string {
 		if (r.vetoed || r.score == null) return 'var(--h-veto)';
-		if (r.held === true) return 'var(--h-held)';
-		if (r.held === false) return 'var(--h-breached)';
+		if (resolved(r)) return r.held ? 'var(--h-held)' : 'var(--h-breached)';
 		return 'var(--h-pending)';
 	}
 
-	function vetoList(r: HistoryRow): string[] {
+	// veto_reasons arrives as `structure:gate[:detail]`, one entry per
+	// structure×gate permutation — 13 entries for what the card header calls
+	// "3 of 10 vetoed". Collapse to the DISTINCT GATE (segment 2) so the takeaway
+	// is "liquidity, dollar friction, short-delta band" and not a wall of text.
+	function vetoGates(r: HistoryRow): string[] {
 		if (!r.veto_reasons) return [];
 		try {
-			const p = JSON.parse(r.veto_reasons);
-			return Array.isArray(p) ? p.map((k) => humanizeReason(String(k))) : [];
+			const parsed = JSON.parse(r.veto_reasons);
+			if (!Array.isArray(parsed)) return [];
+			const gates = new Set<string>();
+			for (const raw of parsed) {
+				const parts = String(raw).split(':');
+				gates.add(humanizeReason(parts.length > 1 ? parts[1] : parts[0]).toLowerCase());
+			}
+			return [...gates];
 		} catch {
 			return [];
 		}
 	}
 
-	function label(r: HistoryRow): string {
-		if (r.vetoed || r.score == null) {
-			const v = vetoList(r);
-			return `vetoed${v.length ? ` — ${v.join(', ')}` : ''}`;
-		}
-		const outcome = r.held === true ? 'held' : r.held === false ? 'breached' : 'not yet resolved';
-		return `score ${r.score.toFixed(0)} · ${outcome}`;
+	/** Did the engine actually ISSUE this one? Outcomes are graded on the last
+	 *  row before expiry that carried strikes — which can be well below the ready
+	 *  line. Badging those as held/breached claims credit for a call that was
+	 *  never made, so only ready-band rows count as signals. */
+	function isSignal(r: HistoryRow): boolean {
+		return r.score != null && r.score >= readyBand;
+	}
+	function resolved(r: HistoryRow): boolean {
+		return isSignal(r) && r.held != null;
 	}
 
+	/** One plain sentence: what happened, and what it means. */
+	function takeaway(r: HistoryRow): string {
+		if (r.vetoed || r.score == null) {
+			const g = vetoGates(r);
+			if (!g.length) return 'No trade — the engine refused this day.';
+			const head = g.slice(0, 3).join(', ');
+			const rest = g.length > 3 ? ` +${g.length - 3} more` : '';
+			return `No trade — blocked on ${head}${rest}.`;
+		}
+		const s = Math.round(r.score);
+		if (resolved(r)) {
+			return r.held
+				? `Scored ${s} — the engine called it, and the short strike was still safe at expiry.`
+				: `Scored ${s} — the engine called it, and price went through the short strike before expiry.`;
+		}
+		if (isSignal(r)) return `Scored ${s} — above the ${readyBand} line. Sellable that day.`;
+		if (r.score >= watchBand) return `Scored ${s} — warming up, still short of the ${readyBand} line.`;
+		return `Scored ${s} — well below the ${readyBand} line. Nothing to do.`;
+	}
+
+	// Counted client-side, NOT from data.hit_rate: the server grades the last row
+	// before expiry that carried strikes, which can sit well below the ready line.
+	// Only calls the engine actually issued belong in a published hit rate.
+	const signalsResolved = $derived(rows.filter(resolved));
+	const signalsHeld = $derived(signalsResolved.filter((r) => r.held).length);
 	const hitPct = $derived(
-		data?.hit_rate != null ? Math.round(data.hit_rate * 100) : null
+		signalsResolved.length
+			? Math.round((signalsHeld / signalsResolved.length) * 100)
+			: null
 	);
 </script>
 
@@ -180,7 +228,7 @@
 					onmouseleave={() => (hover = null)}
 					onfocus={() => (hover = i)}
 					onblur={() => (hover = null)}
-					aria-label="{etDateTime(r.ts)} — {label(r)}"
+					aria-label="{etDateTime(r.ts)} — {takeaway(r)}"
 				>
 					<span
 						class="hist-bar"
@@ -188,10 +236,11 @@
 						style="height:{barHeight(r)}px; background:{fill(r)}"
 					></span>
 					<!-- Secondary encoding: outcome is never colour-alone. -->
-					{#if r.held === true}
-						<span class="hist-glyph held" style="bottom:{barHeight(r) + 2}px">✓</span>
-					{:else if r.held === false}
-						<span class="hist-glyph breached" style="bottom:{barHeight(r) + 2}px">✗</span>
+					{#if resolved(r)}
+						<span
+							class="hist-glyph {r.held ? 'held' : 'breached'}"
+							style="bottom:{barHeight(r) + 2}px">{r.held ? '✓' : '✗'}</span
+						>
 					{/if}
 				</button>
 			{/each}
@@ -201,26 +250,28 @@
 			{@const r = rows[hover]}
 			<div class="hist-tip">
 				<span class="text-slate-400">{etDateTime(r.ts)}</span>
-				<span class="text-slate-200">{label(r)}</span>
+				<span class="text-slate-200">{takeaway(r)}</span>
 			</div>
 		{:else}
 			<div class="hist-tip hist-tip-idle">hover a bar for that evaluation</div>
 		{/if}
 
 		<div class="hist-legend">
-			<span><i class="sw" style="background:var(--h-held)"></i>✓ held</span>
-			<span><i class="sw" style="background:var(--h-breached)"></i>✗ breached</span>
-			<span><i class="sw" style="background:var(--h-pending)"></i>no outcome yet</span>
-			<span><i class="sw sw-veto" style="background:var(--h-veto)"></i>vetoed (stub)</span>
+			<span><i class="sw" style="background:var(--h-held)"></i>✓ safe at expiry</span>
+			<span><i class="sw" style="background:var(--h-breached)"></i>✗ went through</span>
+			<span><i class="sw" style="background:var(--h-pending)"></i>scored, no trade</span>
+			<span><i class="sw sw-veto" style="background:var(--h-veto)"></i>refused (stub)</span>
 		</div>
 
-		{#if data && data.resolved > 0}
+		{#if signalsResolved.length}
 			<div class="hist-rate">
-				<strong class="text-slate-200">{data.held} of {data.resolved}</strong> resolved signals held
-				<span class="text-slate-500">({hitPct}%)</span>
+				<strong class="text-slate-200">{signalsHeld} of {signalsResolved.length}</strong>
+				ready calls stayed safe to expiry <span class="text-slate-500">({hitPct}%)</span>
 			</div>
 		{:else}
-			<div class="hist-rate text-slate-500">No signals have reached expiry yet.</div>
+			<div class="hist-rate text-slate-500">
+				No ready calls have reached expiry yet — nothing graded so far.
+			</div>
 		{/if}
 	{/if}
 </div>

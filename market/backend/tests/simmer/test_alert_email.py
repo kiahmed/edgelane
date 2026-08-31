@@ -93,7 +93,7 @@ async def test_optin_user_gets_email_with_product_sender(wired):
     assert len(wired["sent"]) == 1
     to, frm = wired["sent"][0]
     assert to == "trader@example.com"
-    assert "solutionjet.net" in frm and "Simmer" in frm   # product-specific sender
+    assert "facades.trade" in frm and "Simmer" in frm   # product-specific sender
 
 
 async def test_optout_user_gets_no_email(wired):

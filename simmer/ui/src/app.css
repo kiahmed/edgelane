@@ -539,6 +539,8 @@ body.busy * {
 	   supporting horizontal bar (radar charts explicitly rejected in docs). */
 	.gate-row {
 		display: flex;
+		/* wrap: the reason list is now multi-line rather than truncated */
+		flex-wrap: wrap;
 		align-items: baseline;
 		gap: 0.5rem;
 		padding: 0.22rem 0.3rem;
@@ -547,6 +549,17 @@ body.busy * {
 	}
 	.gate-row:nth-child(odd) {
 		background: rgba(15, 23, 42, 0.45);
+	}
+	/* The failing-detail list. Wraps under the gate name instead of being cut
+	   off mid-word, and indents so a wrapped line reads as continuation. */
+	.gate-why {
+		flex: 1 1 100%;
+		min-width: 0;
+		padding-left: 1.6rem;
+		font-size: 0.7rem;
+		line-height: 1.45;
+		color: #94a3b8;
+		overflow-wrap: anywhere;
 	}
 	.gate-pass {
 		color: #86efac;

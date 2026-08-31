@@ -14,6 +14,18 @@
 	const icon = (s: string) => (s === 'pass' ? '✓' : s === 'fail' ? '✗' : '?');
 	const cls = (s: string) =>
 		s === 'pass' ? 'gate-pass' : s === 'fail' ? 'gate-fail' : 'gate-unknown';
+
+	/** Distinct failing sub-checks for one gate, in first-seen order.
+	 *  `bear_call:liquidity:open_interest` -> "open interest". Falls back to the
+	 *  gate segment when a reason has no detail. */
+	function detailsOf(reasons: string[]): string[] {
+		const seen = new Set<string>();
+		for (const raw of reasons) {
+			const parts = String(raw).split(':');
+			seen.add(humanizeReason(parts.length > 2 ? parts[2] : parts[parts.length - 1]));
+		}
+		return [...seen];
+	}
 </script>
 
 <div>
@@ -34,8 +46,13 @@
 					<span class="text-[0.6rem] text-slate-600" title="Safety gate — never user-adjustable">🔒</span>
 				{/if}
 				{#if c.reasons.length}
-					<span class="min-w-0 truncate text-[0.7rem] text-slate-400" title={c.reasons.join('\n')}>
-						{c.reasons.map(humanizeReason).join(' · ')}
+					<!-- Reasons arrive as structure:gate:detail, one per permutation — six
+					     entries saying "liquidity failed" three different ways. The gate is
+					     already named to the left, so show only the DISTINCT failing detail,
+					     and wrap instead of truncating (this line used to read
+					     "bear call · liquidity · open interest · be…"). -->
+					<span class="gate-why" title={c.reasons.join('\n')}>
+						{detailsOf(c.reasons).join(' · ')}
 					</span>
 				{/if}
 			</div>

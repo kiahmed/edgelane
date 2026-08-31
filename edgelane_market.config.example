@@ -121,6 +121,20 @@ SMTP_USE_SSL=false          # true (and STARTTLS=false) for implicit TLS on port
 # CONTACT_FROM_EMAIL must be on a domain authenticated in Brevo.
 BREVO_API_KEY=
 
+# ⚠ EVERY sender address the app uses must be on a Brevo-AUTHENTICATED DOMAIN —
+# not merely a "verified sender". Domain authentication lets you send as any
+# address on that domain; a lone verified sender does not extend to others.
+# This bit us: Simmer's readiness alerts defaulted to a noreply@ on a second
+# domain that was never authenticated, so Brevo rejected every alert email while
+# the contact form kept working. The failure is SILENT to the app — send_email
+# just returns False — so it looks like "alerts aren't firing" when they are.
+# Both of these must sit on the authenticated domain:
+#   CONTACT_FROM_EMAIL        (support tickets)
+#   SIMMER_ALERT_FROM_EMAIL   (readiness alerts; default below)
+SIMMER_ALERT_FROM_EMAIL=Facades Simmer <noreply@yourdomain.com>
+# Base URL used for the "open in Simmer" link inside alert emails.
+SIMMER_APP_URL=https://simmer.yourdomain.com
+
 # ── Off-hours polling policy ──
 # Auto-derived: poller skips off-hours when DEVMODE=false AND a real Tradier
 # token is set (avoid burning quota when no one's looking). Override with:

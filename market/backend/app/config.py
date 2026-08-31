@@ -178,12 +178,17 @@ class Settings(BaseModel):
     # Brevo v3 HTTP API key (xkeysib-…) — the same key and sending domain as
     # facades-portal, so both products send as the one Facades sender.
     brevo_api_key: str = Field(default="")
-    # Product-specific sender for Simmer readiness-alert emails (must be on the
-    # authenticated sending domain — solutionjet.net for the Workspace relay).
+    # Product-specific sender for Simmer readiness-alert emails. MUST be on the
+    # Brevo-authenticated sending domain (facades.trade), same as
+    # contact_from_email. The old default sent from a SECOND domain that was
+    # never authenticated in Brevo, so Brevo rejected every readiness alert while
+    # contact email kept working. The failure is silent from the app's side:
+    # send_email just returns False.
     simmer_alert_from_email: str = Field(
-        default="Simmer <noreply-edgelane-simmer@solutionjet.net>")
+        default="Facades Simmer <noreply@facades.trade>")
     # Base URL of the Simmer UI, for the "open in Simmer" link in alert emails.
-    simmer_app_url: str = Field(default="https://edgelane-simmer.vercel.app")
+    # The public hostname, not the raw Vercel URL it fronts.
+    simmer_app_url: str = Field(default="https://simmer.facades.trade")
 
     # Dev override: keep polling even when market is closed (mock-mode dev)
     force_poll_when_closed: bool = Field(default=False)

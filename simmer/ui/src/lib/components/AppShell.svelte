@@ -29,7 +29,7 @@
 	}}
 />
 
-<div class="mx-auto max-w-6xl space-y-4 p-4 md:p-6">
+<div class="mx-auto max-w-7xl space-y-4 p-4 md:p-6">
 	<header class="mb-2 flex items-start gap-3">
 		<div class="flex-shrink-0">
 			<!-- Brand lockup — logomark + SIMMER + "by Facades" byline. Mirrors the
