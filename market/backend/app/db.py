@@ -809,7 +809,8 @@ class Database:
         return out
 
     def simmer_readiness_history(self, symbol: str, days: int = 30,
-                                 limit: int = 240) -> list[dict]:
+                                 limit: int = 240,
+                                 bucket: str = "day") -> list[dict]:
         """Readiness sweeps for one symbol over the last `days`, oldest first,
         each carrying its paper outcome if one has been evaluated.
 
@@ -824,32 +825,52 @@ class Database:
             through the gaps.
           * ORDER BY ts ASC so the caller can render left-to-right without
             re-sorting, but LIMIT needs the newest N — hence the subquery.
+
+        bucket="day" (default) collapses to ONE row per calendar day. The watcher
+        sweeps every ~5 minutes, so a raw 30-day window is ~8,600 rows; the old
+        raw+LIMIT 240 quietly returned the last ~20 HOURS while the UI labelled
+        it "last 30d", and 240 bars in a ~370px plot render sub-pixel. Within a
+        day we keep the row that carries a paper outcome if there is one (those
+        are the trust markers and must never be bucketed away), else the day's
+        last sweep — its closing verdict. bucket="raw" returns every sweep.
         """
+        base = """
+            SELECT r.id, r.ts, r.expiration, r.score, r.vetoed,
+                   r.veto_reasons, r.regime, r.structure,
+                   r.short_strike, r.long_strike, r.credit_fill,
+                   r.pop_breakeven, r.expected_value,
+                   o.held, o.touched, o.max_adverse_pct, o.evaluated_at
+              FROM simmer_readiness r
+              LEFT JOIN simmer_outcomes o ON o.readiness_id = r.id
+             WHERE r.symbol = ?
+               AND r.ts >= now() - CAST(? AS INTERVAL)
+        """
+        if bucket == "raw":
+            sql = f"SELECT * FROM ({base} ORDER BY r.ts DESC LIMIT ?) ORDER BY ts ASC"
+        else:
+            # One row per day: prefer a row with an outcome, else the last sweep.
+            sql = f"""
+                SELECT * FROM (
+                    SELECT * FROM (
+                        SELECT *, ROW_NUMBER() OVER (
+                                     PARTITION BY CAST(ts AS DATE)
+                                     ORDER BY (held IS NOT NULL) DESC, ts DESC
+                                 ) AS rn
+                          FROM ({base}) t
+                    ) WHERE rn = 1
+                    ORDER BY ts DESC LIMIT ?
+                ) ORDER BY ts ASC
+            """
         conn = self.connect()
         with self._lock:
             cur = conn.execute(
-                """
-                SELECT * FROM (
-                    SELECT r.id, r.ts, r.expiration, r.score, r.vetoed,
-                           r.veto_reasons, r.regime, r.structure,
-                           r.short_strike, r.long_strike, r.credit_fill,
-                           r.pop_breakeven, r.expected_value,
-                           o.held, o.touched, o.max_adverse_pct, o.evaluated_at
-                      FROM simmer_readiness r
-                      LEFT JOIN simmer_outcomes o ON o.readiness_id = r.id
-                     WHERE r.symbol = ?
-                       AND r.ts >= now() - CAST(? AS INTERVAL)
-                     ORDER BY r.ts DESC
-                     LIMIT ?
-                ) ORDER BY ts ASC
-                """,
-                [str(symbol).upper(), f"{int(days)} days", int(limit)],
-            )
+                sql, [str(symbol).upper(), f"{int(days)} days", int(limit)])
             cols = [c[0] for c in cur.description]
             rows = cur.fetchall()
         out = []
         for r in rows:
             d = dict(zip(cols, r))
+            d.pop("rn", None)          # window-function helper, not payload
             d["ts"] = _utc_iso(d.get("ts"))
             d["evaluated_at"] = _utc_iso(d.get("evaluated_at"))
             if d.get("expiration") is not None:

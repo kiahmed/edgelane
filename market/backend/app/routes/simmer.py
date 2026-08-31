@@ -583,7 +583,8 @@ async def outcomes_summary(request: Request):
 
 @router.get("/simmer/history/{symbol}", dependencies=_GATE)
 async def readiness_history(symbol: str, request: Request,
-                            days: int = 30, limit: int = 240):
+                            days: int = 30, limit: int = 240,
+                            bucket: str = "day"):
     """Readiness sweeps for one symbol over time, each with its paper outcome.
 
     Feeds the expanded card's history chart. Like /simmer/outcomes/summary these
@@ -592,14 +593,20 @@ async def readiness_history(symbol: str, request: Request,
 
     Vetoed sweeps are included with score=null: the refusals are the product,
     and dropping them would draw a flattering line through the gaps.
+
+    bucket defaults to "day" — one bar per calendar day. The watcher sweeps every
+    ~5 min, so raw rows overflow any sane limit: a 30-day window is ~8,600 rows,
+    and the old raw default silently returned the newest 240 (~20 hours) behind a
+    "last 30d" label. Pass bucket=raw for every sweep.
     """
     db = _db(request)
     if db is None:
         raise HTTPException(500, "database not initialized")
     days = max(1, min(int(days), 365))
     limit = max(1, min(int(limit), 1000))
+    bucket = "raw" if str(bucket).lower() == "raw" else "day"
     rows = await asyncio.to_thread(
-        db.simmer_readiness_history, symbol, days, limit)
+        db.simmer_readiness_history, symbol, days, limit, bucket)
 
     # Hit rate over RESOLVED signals only. A signal with no outcome row yet is
     # not a miss — its expiry hasn't passed — so it must not dilute the rate.
@@ -608,6 +615,7 @@ async def readiness_history(symbol: str, request: Request,
     return {
         "symbol": symbol.upper(),
         "days": days,
+        "bucket": bucket,
         "rows": rows,
         "resolved": len(resolved),
         "held": held,

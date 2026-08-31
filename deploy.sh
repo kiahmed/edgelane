@@ -594,7 +594,13 @@ deploy_simmer() {
   # own Vercel origin. Matrix never hit this only because it declares no
   # framework, so Vercel has nothing to build and ships dist/ verbatim.
   info "Building Simmer UI for --prebuilt upload"
-  ( cd "$SIMMER_UI_SRC" && _vc build --prod )
+  # --yes is REQUIRED, not politeness: `vercel build` needs the project's
+  # settings pulled locally and a linked .vercel/project.json alone does not
+  # satisfy it — it fails with project_settings_required. --yes runs the pull
+  # automatically (equivalent to `vercel pull --yes --environment production`
+  # first). The pull writes .vercel/.env.production.local, which is covered by
+  # the .vercel ignore rules in both .gitignore files.
+  ( cd "$SIMMER_UI_SRC" && _vc build --prod --yes )
   bake_simmer_prebuilt
 
   info "Deploying Simmer UI -> Vercel project '$SIMMER_VERCEL_PROJECT'"

@@ -82,7 +82,31 @@
 	const H = 96; // plot height, px
 	const VETO_STUB = 5; // px — visible refusal, clearly below any real score
 
-	const rows = $derived(data?.rows ?? []);
+	// Defensive daily collapse, mirroring the server's bucket="day".
+	//
+	// The server buckets already, but this component must stay correct against a
+	// backend that predates that change (they deploy separately) — and against
+	// bucket=raw. The watcher sweeps every ~5 min, so raw rows arrive in the
+	// hundreds; at 240 bars each slot is ~1.5px and the 2px surface gap clamps
+	// every bar to zero width, i.e. an empty chart. Same tie-break as the SQL:
+	// keep the row carrying a paper outcome, else the day's last sweep.
+	function collapseByDay(src: HistoryRow[]): HistoryRow[] {
+		const best = new Map<string, HistoryRow>();
+		for (const r of src) {
+			const day = (r.ts ?? '').slice(0, 10);
+			const cur = best.get(day);
+			if (!cur) { best.set(day, r); continue; }
+			const better = r.held != null && cur.held == null;
+			const laterSameClass = (r.held != null) === (cur.held != null) && r.ts > cur.ts;
+			if (better || laterSameClass) best.set(day, r);
+		}
+		return [...best.values()].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+	}
+
+	const rawRows = $derived(data?.rows ?? []);
+	// Only collapse when the payload is clearly un-bucketed; a already-daily
+	// series passes through untouched (collapsing it would be a no-op anyway).
+	const rows = $derived(rawRows.length > 45 ? collapseByDay(rawRows) : rawRows);
 	const slot = $derived(rows.length ? 100 / rows.length : 100); // % width per bar
 	const y = (score: number) => H - (Math.max(0, Math.min(100, score)) / 100) * H;
 
