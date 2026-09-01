@@ -56,28 +56,35 @@
 	let error = $state('');
 	let loading = $state(true);
 	let hover = $state<number | null>(null);
-	/** symbol we already have data for — refetching the same one must not flash */
-	let loadedFor = $state<string | null>(null);
+	/** Symbol already fetched. Deliberately a PLAIN let, not $state: an $effect
+	 *  tracks every $state it reads, so reading a reactive guard here made the
+	 *  effect depend on its own result. The fetch resolved -> wrote state ->
+	 *  invalidated the effect -> re-run fired the PREVIOUS run's cleanup ->
+	 *  cancelled = true -> the .finally skipped `loading = false` and the widget
+	 *  hung on "loading…" forever. A plain variable is read without subscribing,
+	 *  so the effect now depends on `symbol`/`days` only. */
+	let fetchedFor: string | null = null;
 
 	$effect(() => {
+		// Tracked: symbol + days, nothing else. The card re-renders every poll, but
+		// history is daily-bucketed and cannot change between polls — refetching
+		// per poll is what caused the original flicker.
 		const sym = symbol;
-		// The card re-renders on every poll. Refetching per poll and flipping
-		// `loading` blanked the plot for a frame each time — the flicker. History
-		// is daily-bucketed, so it cannot meaningfully change between polls: fetch
-		// once per symbol and leave it alone.
-		if (sym === loadedFor) return;
+		const window = days;
+		if (fetchedFor === sym) return;
+		fetchedFor = sym;
+
 		let cancelled = false;
-		// Only show the loading state when there is nothing to show yet.
-		if (data === null) loading = true;
+		loading = true;
 		error = '';
-		getJSON<HistoryResp>(`/simmer/history/${encodeURIComponent(sym)}?days=${days}`)
+		getJSON<HistoryResp>(`/simmer/history/${encodeURIComponent(sym)}?days=${window}`)
 			.then((d) => {
-				if (cancelled) return;
-				data = d;
-				loadedFor = sym;
+				if (!cancelled) data = d;
 			})
 			.catch((e) => {
-				if (!cancelled) error = errorMessage(e);
+				if (cancelled) return;
+				error = errorMessage(e);
+				fetchedFor = null; // let a later re-render retry a failed symbol
 			})
 			.finally(() => {
 				if (!cancelled) loading = false;
