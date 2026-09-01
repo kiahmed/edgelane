@@ -22,8 +22,13 @@ venv/
 # Secrets — never commit your real keys (incl. ANY backup/variant of the configs)
 edgelane_market.config
 edgelane_market.config.*
-# ...but keep the sanitized template
+# The legacy single-file app's config — same real Tradier/Gemini/Anthropic keys,
+# different filename, so the rules above never matched it.
+edge_lane_config.config
+edge_lane_config.config.*
+# ...but keep the sanitized templates
 !edgelane_market.config.example
+!edge_lane_config.config.example
 
 # Backup / scratch files that routinely capture live config (never commit)
 *.bak
