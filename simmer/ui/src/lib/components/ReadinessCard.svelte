@@ -170,7 +170,13 @@
 
 	<!-- 2. Score bar -->
 	<div class="mt-3">
-		<ScoreBar score={env.score} ready={readyBand} watch={watchBand} />
+		<!-- null, not env.score: a vetoed name was never scored, and the envelope's
+			     0.0 would render as a real "0.0" reading. ScoreBar's money() shows "—". -->
+			<ScoreBar
+				score={env.decision === 'vetoed' ? null : env.score}
+				ready={readyBand}
+				watch={watchBand}
+			/>
 		<div class="mt-1 flex justify-between text-[0.65rem] text-slate-500">
 			<span>confidence {money((env.confidence ?? 0) * 100, 0)}%</span>
 			{#if env.regime?.state}

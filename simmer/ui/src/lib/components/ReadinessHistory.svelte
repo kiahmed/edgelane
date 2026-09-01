@@ -107,10 +107,26 @@
 	// hundreds; at 240 bars each slot is ~1.5px and the 2px surface gap clamps
 	// every bar to zero width, i.e. an empty chart. Same tie-break as the SQL:
 	// keep the row carrying a paper outcome, else the day's last sweep.
+	/** ET calendar day for a UTC instant. Must match the server's bucketing: a
+	 *  sweep at 8:42 PM ET is stored on the NEXT UTC date, so slicing the ISO
+	 *  string (UTC) splits one trading day across two bars. */
+	function etDay(iso: string): string {
+		try {
+			return new Intl.DateTimeFormat('en-CA', {
+				timeZone: 'America/New_York',
+				year: 'numeric',
+				month: '2-digit',
+				day: '2-digit'
+			}).format(new Date(iso));
+		} catch {
+			return (iso ?? '').slice(0, 10);
+		}
+	}
+
 	function collapseByDay(src: HistoryRow[]): HistoryRow[] {
 		const best = new Map<string, HistoryRow>();
 		for (const r of src) {
-			const day = (r.ts ?? '').slice(0, 10);
+			const day = etDay(r.ts);
 			const cur = best.get(day);
 			if (!cur) { best.set(day, r); continue; }
 			const better = r.held != null && cur.held == null;

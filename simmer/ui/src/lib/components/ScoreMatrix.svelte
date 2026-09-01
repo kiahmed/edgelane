@@ -6,9 +6,17 @@
 	// Weights are read LIVE from the envelope (component.weight, emitted by the
 	// engine after simmer_tickers.json overrides) — never hardcoded here, so a
 	// backend retune can't make this reconciliation silently stop adding up.
+	import { money } from '$lib/fmt';
 	import type { ReadinessEnvelope } from '$lib/types';
 
 	let { env }: { env: ReadinessEnvelope } = $props();
+
+	// A veto SHORT-CIRCUITS scoring: the engine stops at the failing gate and
+	// never weighs the components. The DB stores that as NULL, but the API
+	// envelope sends score: 0.0 — so `money()` alone can't tell the two apart and
+	// the card read "0.0", i.e. "every component scored zero". `decision` is the
+	// authoritative field; a vetoed name has no score to show at all.
+	const unscored = $derived(env.decision === 'vetoed');
 
 	// Display labels + a fallback weight used ONLY for pre-emit cached envelopes
 	// (before the engine started emitting component.weight). Live envelopes
@@ -51,7 +59,7 @@
 <div>
 	<div class="mb-1 flex items-baseline justify-between">
 		<span class="text-[0.65rem] font-bold tracking-wider text-slate-500 uppercase">Score matrix</span>
-		<span class="text-[0.7rem] text-slate-500">of {(env.score ?? 0).toFixed(1)}</span>
+		<span class="text-[0.7rem] text-slate-500">of {unscored ? '—' : money(env.score, 1)}</span>
 	</div>
 	<div class="space-y-1">
 		{#each rows as r (r.key)}
@@ -80,7 +88,7 @@
 		{/if}
 		<div class="flex justify-between font-semibold text-slate-200">
 			<span>score</span>
-			<span class="font-mono">{(env.score ?? 0).toFixed(1)}</span>
+			<span class="font-mono">{unscored ? '—' : money(env.score, 1)}</span>
 		</div>
 	</div>
 </div>

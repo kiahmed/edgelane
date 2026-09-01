@@ -826,7 +826,14 @@ class Database:
           * ORDER BY ts ASC so the caller can render left-to-right without
             re-sorting, but LIMIT needs the newest N — hence the subquery.
 
-        bucket="day" (default) collapses to ONE row per calendar day. The watcher
+        bucket="day" (default) collapses to ONE row per US/Eastern calendar day.
+        Eastern, not UTC: `ts` is stored naive-UTC, so a sweep at 8:42 PM ET lands
+        on the NEXT UTC date and a single trading day was being split across two
+        bars — visible as a bar labelled 8/31 sitting in the 9/01 bucket.
+        The double AT TIME ZONE is required and not redundant: the first reads the
+        naive value AS UTC, the second converts that instant to Eastern. A single
+        `AT TIME ZONE 'America/New_York'` INTERPRETS the naive value as Eastern,
+        which is the opposite of what is wanted and silently changes nothing. The watcher
         sweeps every ~5 minutes, so a raw 30-day window is ~8,600 rows; the old
         raw+LIMIT 240 quietly returned the last ~20 HOURS while the UI labelled
         it "last 30d", and 240 bars in a ~370px plot render sub-pixel. Within a
@@ -853,7 +860,9 @@ class Database:
                 SELECT * FROM (
                     SELECT * FROM (
                         SELECT *, ROW_NUMBER() OVER (
-                                     PARTITION BY CAST(ts AS DATE)
+                                     PARTITION BY CAST(
+                                         (ts AT TIME ZONE 'UTC')
+                                             AT TIME ZONE 'America/New_York' AS DATE)
                                      ORDER BY (held IS NOT NULL) DESC, ts DESC
                                  ) AS rn
                           FROM ({base}) t
