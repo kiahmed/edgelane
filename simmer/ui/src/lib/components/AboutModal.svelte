@@ -72,6 +72,28 @@
 			</li>
 		</ul>
 
+		<h4>The number nothing else on your screen shows you</h4>
+		<p>
+			Every scanner can print a <em>skew</em> reading. A raw skew number isn't actionable — it
+			tells you the surface is tilted, not what that tilt is doing to <strong>your</strong> trade.
+		</p>
+		<p>
+			Simmer prices the <em>identical</em> spread twice: once on the chain's real per-strike
+			implied vol, once with flat at-the-money vol at both legs. The difference is
+			<strong>skew cost</strong> — in dollars and as a percentage of the credit. When a card says
+			<em>&ldquo;skew costs 6.2% of credit,&rdquo;</em> that is 6.2% of your premium being eaten by
+			the shape of the vol surface, on those exact strikes.
+		</p>
+		<p>
+			It also corrects a rule most traders have backwards. &ldquo;Steep put skew means more
+			premium&rdquo; is true for a <strong>naked put</strong> — you're short skew. On a
+			<strong>put credit spread</strong> it is the opposite: the further-OTM leg you
+			<em>buy</em> carries the higher IV, so steepening skew raises the cost of the leg you bought
+			more than the one you sold, and compresses your credit. Index call skew slopes the other
+			way, so a call credit spread gets the favourable version. Simmer computes which case you're
+			actually in instead of applying the folk rule.
+		</p>
+
 		<h4>Exit discipline, fixed before entry</h4>
 		<p>Every READY signal ships with its risk management already set:</p>
 		<ul>

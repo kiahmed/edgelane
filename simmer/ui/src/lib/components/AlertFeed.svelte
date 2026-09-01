@@ -71,7 +71,7 @@
 		<div class="space-y-1.5">
 			{#each alerts as a (a.id)}
 				<button
-					class="alert-row flex w-full items-center gap-2 text-left text-sm"
+					class="alert-row flex w-full cursor-pointer items-center gap-2 text-left text-sm"
 					type="button"
 					title="Click to see what this alert means and what to do"
 					onclick={() => (selected = a)}
@@ -90,7 +90,15 @@
 							⚡ earnings · close before print
 						</span>
 					{/if}
-					<span class="ml-auto font-mono text-xs {scoreClass(a.score)}">{money(a.score, 0)}</span>
+					<!-- Snapshot at fire time. The card beside it shows the CURRENT score,
+					     which drifts away within minutes — an alert that fired at 70 sitting
+					     next to a card reading 55 is the engine working, not a mismatch. -->
+					<span
+						class="ml-auto font-mono text-xs {scoreClass(a.score)}"
+						title="Score when this alert fired — the card shows the current score, which moves"
+						>{money(a.score, 0)}</span
+					>
+					<span class="text-[0.6rem] text-slate-600">at fire</span>
 					<span class="text-[0.65rem] text-slate-600">{ago(a.created_at)}</span>
 					{#if !a.acknowledged}
 						<!-- stopPropagation: ack must not also open the detail dialog -->

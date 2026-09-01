@@ -131,9 +131,13 @@ BREVO_API_KEY=
 # Both of these must sit on the authenticated domain:
 #   CONTACT_FROM_EMAIL        (support tickets)
 #   SIMMER_ALERT_FROM_EMAIL   (readiness alerts; default below)
-SIMMER_ALERT_FROM_EMAIL=Facades Simmer <noreply@yourdomain.com>
+# Both default correctly in code — LEAVE THESE COMMENTED unless you are on a
+# different domain. Uncommenting with the placeholder still in it sets a REAL
+# override to an unroutable sender, Brevo rejects every alert, and the app logs
+# nothing useful. (That is not hypothetical: it happened.)
+# SIMMER_ALERT_FROM_EMAIL=Facades Simmer <noreply@your-authenticated-domain>
 # Base URL used for the "open in Simmer" link inside alert emails.
-SIMMER_APP_URL=https://simmer.yourdomain.com
+# SIMMER_APP_URL=https://simmer.your-domain
 
 # ── Off-hours polling policy ──
 # Auto-derived: poller skips off-hours when DEVMODE=false AND a real Tradier

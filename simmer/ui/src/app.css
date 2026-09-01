@@ -537,6 +537,18 @@ body.busy * {
 	/* ── Simmer-specific: gate checklist + score bar ─────────────────────── */
 	/* Refusal-first: the checklist is the card's lead element, the score a
 	   supporting horizontal bar (radar charts explicitly rejected in docs). */
+	/* Whole alert row is a click target for the detail dialog. */
+	.alert-row {
+		cursor: pointer;
+		background: transparent;
+		border: none;
+		padding: 0.15rem 0;
+		border-radius: 6px;
+	}
+	.alert-row:hover {
+		background: rgba(15, 23, 42, 0.55);
+	}
+
 	.gate-row {
 		display: flex;
 		/* wrap: the reason list is now multi-line rather than truncated */

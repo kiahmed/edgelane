@@ -240,11 +240,47 @@
 				stop at {money(mgmt.stop_credit_multiple, 0)}× credit
 			</div>
 		</div>
+	{:else if env.structure && env.decision !== 'vetoed'}
+		<!-- WATCH: gates all clear, score just short of the ready band. The engine
+		     HAS picked a candidate here — envelope carries structure/strikes/credit
+		     — and hiding it left the card unable to answer "ready for what?" while
+		     the alert feed was already naming a Bull Put. Shown deliberately muted:
+		     this is the shape it is leaning toward, not a call to act. -->
+		<div class="mt-3 rounded-lg border border-amber-500/25 bg-amber-500/5 p-3">
+			<div class="mb-1 flex flex-wrap items-baseline gap-2">
+				<span class="text-sm font-bold text-amber-200">{structureName(env.structure)}</span>
+				<span class="text-[0.7rem] text-amber-300/80">leaning — not sellable yet</span>
+			</div>
+			<div class="mb-2 text-[0.75rem] text-slate-400">
+				All gates clear. Score {money(env.score, 0)} is under the {readyBand} ready line, so the
+				engine is not calling it. This is the structure it would sell if it got there.
+			</div>
+			{#if vertical}
+				<code class="kv">{strike(vertical.short)} / {strike(vertical.long)} · {strike(vertical.width)} wide</code>
+			{:else if condor}
+				<code class="kv">
+					P {strike(condor.put.short)}/{strike(condor.put.long)} · C {strike(condor.call.short)}/{strike(condor.call.long)}
+				</code>
+			{/if}
+			<div class="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-[0.75rem] sm:grid-cols-3">
+				<div>
+					<span class="text-slate-500">credit</span>
+					<div class="font-mono text-slate-300">{money(env.credit_fill)}</div>
+				</div>
+				<div>
+					<span class="text-slate-500">max loss</span>
+					<div class="font-mono text-slate-300">{money(env.max_loss)}</div>
+				</div>
+				<div>
+					<span class="text-slate-500">chance of profit</span>
+					<div class="font-mono text-slate-300">{prob(env.pop_breakeven)}</div>
+				</div>
+			</div>
+		</div>
 	{:else}
-		<!-- Vetoed / not ready: NO strike is produced (a lone underlying price is
-		     not a strike). Say so plainly — the short strike is delta-selected and
-		     placed beyond the expected move + wall ONLY when the name clears the
-		     gates. -->
+		<!-- Vetoed: NO strike is produced (a lone underlying price is not a strike).
+		     Say so plainly — the short strike is delta-selected and placed beyond
+		     the expected move + wall ONLY when the name clears the gates. -->
 		<div class="mt-3 rounded-lg border border-slate-600/30 bg-slate-800/30 p-3 text-[0.8rem] text-slate-400">
 			<span class="text-slate-300">No sellable spread.</span>
 			{#if env.decision === 'vetoed'}
