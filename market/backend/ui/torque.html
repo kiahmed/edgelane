@@ -103,13 +103,18 @@
   .counterband{flex:1 1 160px;min-width:0;overflow:hidden;align-self:stretch;
     background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
   .cband-name{font-size:13px;font-weight:800;line-height:1.3}
-  .cband-bar2{position:relative;height:8px;border-radius:4px;background:var(--line2);margin-top:8px;overflow:visible}
+  .cband-bar2{position:relative;height:8px;border-radius:4px;background:var(--line2);margin-top:8px;margin-bottom:14px;overflow:visible}
   .cband-bar2 i{position:absolute;left:0;top:0;height:100%;border-radius:4px;background:var(--dim);
     transition:width .4s,background .4s}
   .cband-bar2 i.green{background:var(--call)}
   .cband-bar2 i.red{background:var(--put)}
   .cband-bar2 i.grey{background:var(--warn);animation:pulse 1.1s infinite}
   .cband-tick{position:absolute;top:-2px;width:1px;height:12px;background:var(--dim2);opacity:.6}
+  /* Tick value, centered under its mark. The bar is overflow:visible and carries
+     margin-bottom to reserve this row, so the labels never collide with the
+     mid/leaning lines below. */
+  .cband-tick-lab{position:absolute;top:12px;font-size:9px;line-height:1;color:var(--dim2);
+    opacity:.7;transform:translateX(-50%);white-space:nowrap;pointer-events:none}
   @media(max-width:900px){.counterband{display:none}}
   .toggle{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--dim);cursor:pointer;user-select:none}
   .toggle .sw{width:36px;height:20px;border-radius:11px;background:var(--line2);position:relative;transition:.15s}
@@ -666,12 +671,20 @@ function App(){
               title="Counter Read — relative richness vs the opposite structure (or, for Iron Condor/Fly, the two wings of this same trade), priced from the same chain/spot. 'confirms (price)' means real spot movement over the last ~20s agrees with the richness lean; 'diverging (price)' means it doesn't (yet) — spot, not Lean, since Lean is itself built from options-chain data, not price. A rich, committed counter side is a cue to adjust strikes/distance before you send — this is a relative-value lean, not a forecast.">
               <div style={{fontSize:11,letterSpacing:1,color:'var(--dim2)',textTransform:'uppercase'}}>Counter Read — premium split</div>
               <div className="cband-name" style={{color:zone==='green'?'var(--call)':zone==='red'?'var(--put)':'var(--dim)'}}>
-                {name}<span className="muted" style={{fontWeight:400,fontSize:11,marginLeft:6}}>{pct}%</span>
+                {name}{pct!=null&&<span className="muted" style={{fontWeight:400,fontSize:11,marginLeft:6}}>{pct}%</span>}
               </div>
               <div className="cband-bar2">
+                {/* Ticks mark the SAME thresholds the EMA uses to call a side, so the
+                    grey (contested) zone is the span between them. Labelled so the
+                    band is readable without knowing the constants: pairs get both
+                    edges (42/58); self-split has a single edge at 58. */}
                 <span className="cband-tick" style={{left:tick1+'%'}}></span>
-                {tick2!=null&&<span className="cband-tick" style={{left:tick2+'%'}}></span>}
-                <i className={zone} style={{width:fillPct+'%'}}></i>
+                <span className="cband-tick-lab" style={{left:tick1+'%'}}>{tick1}%</span>
+                {tick2!=null&&<>
+                  <span className="cband-tick" style={{left:tick2+'%'}}></span>
+                  <span className="cband-tick-lab" style={{left:tick2+'%'}}>{tick2}%</span>
+                </>}
+                {fillPct!=null&&<i className={zone} style={{width:fillPct+'%'}}></i>}
               </div>
               {mid!=null&&<div className="muted" style={{fontSize:10,marginTop:5}}>{name} mid ${fmt(mid)}</div>}
               <div className="muted" style={{fontSize:10,marginTop:mid!=null?3:8}}>
@@ -1085,6 +1098,9 @@ function counterSides(strategyKey,strategies,b){
 function counterBandDisplay(cr){
   let name,pct,mid,zone;
   if(!cr.selfSplit){
+    // Pairs: pct is meaningful across the WHOLE 0-100 range, contested included
+    // (e.g. "Bull Call 47%" while contested is a coherent, honest read) — so it's
+    // shown in every zone, and the fill is always literally that same number.
     name=cr.bLabel; pct=Math.round((1-cr.ratio)*100); mid=cr.bMid;
     zone=cr.side===-1?'green':cr.side===1?'red':'grey';
   }else if(cr.side===-1){
@@ -1092,15 +1108,19 @@ function counterBandDisplay(cr){
   }else if(cr.side===1){
     name='Put legs'; pct=Math.round(cr.ratio*100); mid=cr.aMid; zone='red';
   }else{
-    name='balanced'; pct=Math.round(Math.max(cr.ratio,1-cr.ratio)*100); mid=null; zone='grey';
+    // Self-split, contested: neither wing is confidently ahead, so there is no
+    // single side's "own share" to honestly report — showing one anyway (as an
+    // earlier version did, via max(ratio,1-ratio)) printed a specific-looking %
+    // next to "balanced" that didn't mean anything, and — because it was ALSO
+    // being rescaled for the fill while the displayed number wasn't — the bar
+    // and the number visibly disagreed (55% next to a sliver of fill). Simplest
+    // correct fix: contested shows no number and no fill at all, just the name.
+    name='balanced'; pct=null; mid=null; zone='grey';
   }
-  // Fill width: pairs' `pct` already spans the full 0-100 meaningfully (0=all
-  // current, 100=all counter), so it's used directly. Self-split's `pct` is a "how
-  // dominant" number that's always >=50 by construction (Math.max above) — rescaled
-  // onto the full 0-100 bar so a totally undecided reading starts the fill at 0
-  // rather than looking permanently stuck past the halfway point.
-  const fillPct=cr.selfSplit?Math.max(0,(pct-50)*2):pct;
-  const tick1=cr.selfSplit?16:42, tick2=cr.selfSplit?null:58;
+  // Fill width is ALWAYS exactly the displayed number — no separate rescale
+  // formula, so bar length and printed % can never again disagree.
+  const fillPct=pct;
+  const tick1=cr.selfSplit?58:42, tick2=cr.selfSplit?null:58;
   return {name,pct,mid,zone,fillPct,tick1,tick2};
 }
 // Real, independent check on the richness lean: is the underlying's OWN price

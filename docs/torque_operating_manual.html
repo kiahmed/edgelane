@@ -450,11 +450,14 @@ Iron Condor/Fly, because only the pairs have a genuine "counter" to fix on:</p>
   </tr>
   <tr>
     <td><strong>Number next to the name</strong></td>
-    <td>that fixed counter's own share of the combined total. Always matches the name above it —
-    no flipping, so no ambiguity.</td>
-    <td>whichever side is currently named <em>its own</em> share — recalculated to match
-    whichever name is showing, so "Put legs 89%" always means puts are genuinely at 89%, never a
-    number left over from the other side.</td>
+    <td>that fixed counter's own share of the combined total — shown in every zone, including
+    contested, since a fixed name's own share is meaningful either way. Always matches the fill
+    bar's length exactly.</td>
+    <td>whichever side is currently named <em>its own</em> share, recalculated to match whichever
+    name is showing — so "Put legs 89%" always means puts are genuinely at 89%. <strong>In the
+    contested "balanced" state there is no number at all</strong> — with neither side confidently
+    ahead, there's no single share left to honestly report, so none is shown rather than printing
+    an approximate one next to a bar that doesn't match it.</td>
   </tr>
   <tr>
     <td><strong>Color</strong></td>
@@ -465,10 +468,11 @@ Iron Condor/Fly, because only the pairs have a genuine "counter" to fix on:</p>
   </tr>
   <tr>
     <td><strong>The bar</strong></td>
-    <td>fills left-to-right from 0, length = the number above. Two small tick marks mark the
-    42%/58% neutral zone.</td>
-    <td>same fill mechanic; only one tick mark, since "neither side ahead" only has one boundary
-    once a wing is confidently winning.</td>
+    <td>fills left-to-right from 0, length always exactly equal to the number above it. Two small
+    tick marks mark the 42%/58% neutral zone.</td>
+    <td>same — fill length always exactly equals the number above it (never an approximation of
+    it). One tick mark at 58%, where a decided lean begins. <strong>Contested shows no fill at
+    all</strong> — same reasoning as the missing number: nothing confident to show a length for.</td>
   </tr>
   <tr>
     <td><strong>Mid price under the bar</strong></td>
