@@ -208,8 +208,12 @@ real buying-power limit.
 
 Offsets are **backend-owned and API-served** — never hardcoded in the page. Edit
 defaults in `market/backend/app/torque_config.py`, or drop a `torque_tickers.json`
-at the repo root (or point `$TORQUE_TICKERS_CONFIG` at one) to override without
-touching code. Shape:
+at **`market/backend/torque/torque_tickers.json`** (a dedicated folder for Torque
+config, kept alongside — not inside — the `app/` code; a template with every
+current key is at `torque_tickers.json.example` in that same folder) to override
+without touching code. `$TORQUE_TICKERS_CONFIG` still works too if you'd rather
+point at a file elsewhere; a bare `torque_tickers.json` at the repo root is also
+still picked up as a back-compat fallback. Shape:
 
 ```json
 {
@@ -240,6 +244,13 @@ debit-vertical `anchor`/`width` shown — condor/fly widths match):
 
 These are starting points — tune per taste in `torque_config.py` or `torque_tickers.json`.
 
+**Counter Read's noise floor** lives in the same override file, under a
+`richness_floor` key (per-ticker, in $) — see
+[Counter Read](torque_operating_manual.html#counter) for what it does and why one
+flat number doesn't work across tickers with different premium scales. Defaults:
+NDX/SPX/RUT `0.05`, SPY/QQQ/DJX `0.02`, everything else `0.03`. Served to the
+frontend as `richness_floors` in `GET /torque/config`.
+
 Anchoring model (points from spot, snapped to the chain grid):
 - `single` — long option `offset` points OTM (0 = ATM).
 - `vertical` — near leg `anchor` from spot; far leg `width` beyond it. Near leg is
@@ -254,7 +265,7 @@ Anchoring model (points from spot, snapped to the chain grid):
 | Endpoint | Purpose |
 |---|---|
 | `GET /torque` | the page |
-| `GET /torque/config` | tickers + strategy registry + env/mode |
+| `GET /torque/config` | tickers + strategy registry + env/mode + per-ticker `close_targets`/`richness_floors` |
 | `GET /torque/clock` | `{market_state, open}` from Yahoo `marketState` (holiday/early-close aware; cached ~30s success / ~8s failure so an outage doesn't re-hit each poll) — gates the pause |
 | `GET /torque/analyze/{sym}` | spot + positioning snapshot (poll ~5s) |
 | `POST /torque/build` | auto-filled legs for (ticker, strategy, step adjustments); optional `anchor_spot` freezes the strikes (Lock Strikes); also returns `counter` — the opposite structure's legs+price from the same chain/spot, `null` for Iron Condor/Fly (see [Counter Read](torque_operating_manual.html#counter)) |

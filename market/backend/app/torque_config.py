@@ -311,6 +311,38 @@ def close_targets_map() -> dict[str, dict[str, float]]:
             for t in tickers()}
 
 
+# ── Counter Read noise floor ─────────────────────────────────────────────────
+# Counter Read's richness ratio is `mid / width` — fine with real premium, but
+# right at 0DTE close a structure's legs can collapse toward worthless together,
+# and a penny-level difference between two near-zero mids (e.g. $0.03 vs $0.00)
+# produces a 100%/0% ratio with no real conviction behind it. Below this floor,
+# BOTH sides being under it means the reading is noise, not signal.
+#
+# One flat number is wrong in both directions across tickers: NDX/SPX/RUT trade
+# in bigger dollar increments (a $0.05 mid there really can be near-worthless),
+# while SPY/QQQ run smaller nominal premiums (a $0.50 mid there is still a real,
+# meaningful price) — so the floor is sized per ticker, same pattern as
+# COMMISSION_PER_CONTRACT / CLOSE_TARGETS above.
+DEFAULT_RICHNESS_FLOOR = 0.03
+RICHNESS_FLOOR: dict[str, float] = {
+    "NDX": 0.05, "SPX": 0.05, "RUT": 0.05,
+    "SPY": 0.02, "QQQ": 0.02, "DJX": 0.02,
+}
+
+
+def richness_floor(ticker: str) -> float:
+    f = _load_overrides_file().get("richness_floor", {})
+    tk = (ticker or "").upper()
+    if isinstance(f, dict) and tk in f:
+        return float(f[tk])
+    return float(RICHNESS_FLOOR.get(tk, DEFAULT_RICHNESS_FLOOR))
+
+
+def richness_floors_map() -> dict[str, float]:
+    """Per-ticker Counter Read noise floor for the frontend."""
+    return {t: richness_floor(t) for t in tickers()}
+
+
 def _deep_merge(base: dict, over: dict) -> dict:
     out = dict(base)
     for k, v in (over or {}).items():
@@ -326,10 +358,14 @@ def _load_overrides_file() -> dict[str, Any]:
        {"tickers":[...], "default_strategy":"...", "overrides":{"NDX":{...}}}"""
     path = os.environ.get("TORQUE_TICKERS_CONFIG")
     candidates = [Path(path)] if path else []
-    # repo root = .../EdgeLane (dev: this file is market/backend/app/torque_config.py).
-    # Walk up looking for torque_tickers.json so it works regardless of how deep
-    # the package is mounted (e.g. /srv/app in the Docker image has no parents[3]).
+    # Canonical location: market/backend/torque/torque_tickers.json — a dedicated
+    # folder for Torque config, alongside (not inside) the app/ package so it's
+    # obviously config, not code. this file lives at market/backend/app/torque_config.py,
+    # so parents[1] is market/backend.
     here = Path(__file__).resolve()
+    candidates.append(here.parents[1] / "torque" / "torque_tickers.json")
+    # Back-compat fallback: also walk up looking for a bare torque_tickers.json at
+    # any ancestor (e.g. repo root), in case one was ever placed there directly.
     for parent in here.parents:
         candidates.append(parent / "torque_tickers.json")
     for p in candidates:

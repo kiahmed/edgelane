@@ -1,0 +1,29 @@
+{
+  "_comment": "Optional overrides for Torque's per-ticker config, deep-merged over the hardcoded defaults in app/torque_config.py. Copy this file to torque_tickers.json (same folder) to activate it — nothing here is required; every key below already has a working default. You can include just the keys you want to change.",
+
+  "richness_floor": {
+    "_comment": "Counter Read's 'too noisy to trust' floor, in $. Below this, BOTH compared sides' mids being under it means the reading is 0DTE-close penny noise (e.g. $0.03 vs $0.00), not a real richness signal, so the band falls back to contested/no-read instead of showing an artificial 100%. Sized per ticker on purpose: NDX/SPX/RUT trade bigger dollar increments than SPY/QQQ, so one flat number would be wrong in both directions. Defaults already in code: NDX/SPX/RUT=0.05, SPY/QQQ/DJX=0.02, everything else=0.03.",
+    "NDX": 0.05,
+    "SPX": 0.05,
+    "RUT": 0.05,
+    "SPY": 0.02,
+    "QQQ": 0.02,
+    "DJX": 0.02
+  },
+
+  "close_targets": {
+    "_comment": "Per-ticker auto-close profit target overrides — see docs/torque.md and docs/torque_operating_manual.html.",
+    "DJX": { "default": 60.0, "min": 45.0, "spread_scaled": true, "required": true }
+  },
+
+  "overrides": {
+    "_comment": "Per-ticker strike offset overrides (anchor/width/short_offset/wing/tick) — see docs/torque.md 'Per-ticker strike config'.",
+    "NDX": {
+      "tick": 0.05,
+      "vertical": { "anchor": 20, "width": 100 },
+      "condor": { "short_offset": 100, "width": 100 },
+      "iron_fly": { "width": 100 },
+      "butterfly": { "body_offset": 0, "wing": 100 }
+    }
+  }
+}

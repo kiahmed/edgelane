@@ -103,18 +103,13 @@
   .counterband{flex:1 1 160px;min-width:0;overflow:hidden;align-self:stretch;
     background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
   .cband-name{font-size:13px;font-weight:800;line-height:1.3}
-  .cband-bar2{position:relative;height:8px;border-radius:4px;background:var(--line2);margin-top:8px;margin-bottom:14px;overflow:visible}
+  .cband-bar2{position:relative;height:8px;border-radius:4px;background:var(--line2);margin-top:8px;margin-bottom:6px;overflow:visible}
   .cband-bar2 i{position:absolute;left:0;top:0;height:100%;border-radius:4px;background:var(--dim);
     transition:width .4s,background .4s}
   .cband-bar2 i.green{background:var(--call)}
   .cband-bar2 i.red{background:var(--put)}
   .cband-bar2 i.grey{background:var(--warn);animation:pulse 1.1s infinite}
   .cband-tick{position:absolute;top:-2px;width:1px;height:12px;background:var(--dim2);opacity:.6}
-  /* Tick value, centered under its mark. The bar is overflow:visible and carries
-     margin-bottom to reserve this row, so the labels never collide with the
-     mid/leaning lines below. */
-  .cband-tick-lab{position:absolute;top:12px;font-size:9px;line-height:1;color:var(--dim2);
-    opacity:.7;transform:translateX(-50%);white-space:nowrap;pointer-events:none}
   @media(max-width:900px){.counterband{display:none}}
   .toggle{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--dim);cursor:pointer;user-select:none}
   .toggle .sw{width:36px;height:20px;border-radius:11px;background:var(--line2);position:relative;transition:.15s}
@@ -362,18 +357,30 @@ function App(){
           spotBufRef.current=buf;
         }
         if(sides){
-          const ratio=sides.aRichness/(sides.aRichness+sides.bRichness);
-          const prevEma=counterEmaRef.current;
-          const prevTs=counterTsRef.current;
-          const ema=(prevEma==null)?ratio:prevEma+(ratio-prevEma)*(1-Math.exp(-(now-prevTs)/15000));
-          counterEmaRef.current=ema;counterTsRef.current=now;
-          const sd=ema>0.58?1:ema<0.42?-1:0;
-          if(sd!==counterHoldRef.current.side)counterHoldRef.current={side:sd,since:now};
-          const heldMs=sd!==0?now-counterHoldRef.current.since:0;
-          const state=sd===0?'contested':heldMs>=20000?'committed':'building';
-          const dir=sd>0?sides.aDir:sd<0?sides.bDir:null;
-          const tag=priceTag(dir,spotTrend(spotBufRef.current));
-          setCounterRead({...sides,ratio:ema,side:sd,state,heldMs,tag});
+          // 0DTE-close guard: once BOTH compared sides are trading under this
+          // ticker's noise floor, a penny-level difference between two near-
+          // worthless legs (e.g. $0.03 vs $0.00) can swing the ratio to a
+          // false 100%/0% with zero real conviction behind it. Reset to a
+          // clean neutral read rather than let a stale EMA keep reporting an
+          // extreme that pennies produced, not the market.
+          const floor=(cfg&&cfg.richness_floors&&cfg.richness_floors[ticker])??0.03;
+          if(isNoisyPair(sides.aMid,sides.bMid,floor)){
+            counterEmaRef.current=null;counterTsRef.current=0;counterHoldRef.current={side:0,since:now};
+            setCounterRead({...sides,ratio:0.5,side:0,state:'contested',heldMs:0,tag:null,noisy:true});
+          }else{
+            const ratio=sides.aRichness/(sides.aRichness+sides.bRichness);
+            const prevEma=counterEmaRef.current;
+            const prevTs=counterTsRef.current;
+            const ema=(prevEma==null)?ratio:prevEma+(ratio-prevEma)*(1-Math.exp(-(now-prevTs)/15000));
+            counterEmaRef.current=ema;counterTsRef.current=now;
+            const sd=ema>0.58?1:ema<0.42?-1:0;
+            if(sd!==counterHoldRef.current.side)counterHoldRef.current={side:sd,since:now};
+            const heldMs=sd!==0?now-counterHoldRef.current.since:0;
+            const state=sd===0?'contested':heldMs>=20000?'committed':'building';
+            const dir=sd>0?sides.aDir:sd<0?sides.bDir:null;
+            const tag=priceTag(dir,spotTrend(spotBufRef.current));
+            setCounterRead({...sides,ratio:ema,side:sd,state,heldMs,tag,noisy:false});
+          }
         }
       })
       .catch(e=>{setErr('build: '+e.message);setBuild(null)});
@@ -675,19 +682,21 @@ function App(){
               </div>
               <div className="cband-bar2">
                 {/* Ticks mark the SAME thresholds the EMA uses to call a side, so the
-                    grey (contested) zone is the span between them. Labelled so the
-                    band is readable without knowing the constants: pairs get both
-                    edges (42/58); self-split has a single edge at 58. */}
+                    grey (contested) zone is the span between them — plain separator
+                    marks, no numeric label (a static "58%" sitting next to a live,
+                    changing reading reads as a stale leftover, not a fixed reference).
+                    Pairs get both edges (42/58); self-split has a single edge at 58. */}
                 <span className="cband-tick" style={{left:tick1+'%'}}></span>
-                <span className="cband-tick-lab" style={{left:tick1+'%'}}>{tick1}%</span>
-                {tick2!=null&&<>
-                  <span className="cband-tick" style={{left:tick2+'%'}}></span>
-                  <span className="cband-tick-lab" style={{left:tick2+'%'}}>{tick2}%</span>
-                </>}
+                {tick2!=null&&<span className="cband-tick" style={{left:tick2+'%'}}></span>}
                 {fillPct!=null&&<i className={zone} style={{width:fillPct+'%'}}></i>}
               </div>
               {mid!=null&&<div className="muted" style={{fontSize:10,marginTop:5}}>{name} mid ${fmt(mid)}</div>}
-              <div className="muted" style={{fontSize:10,marginTop:mid!=null?3:8}}>
+              {cr.noisy?
+                <div style={{fontSize:10,marginTop:8,color:'var(--warn)'}}
+                  title="Both sides are trading under this ticker's noise floor — a penny-level gap between two near-worthless 0DTE legs isn't a real richness signal, so the read is suppressed rather than show a false extreme.">
+                  ⚠ noisy premiums — read paused
+                </div>
+              :<div className="muted" style={{fontSize:10,marginTop:mid!=null?3:8}}>
                 leaning {cr.side===0?'neither':(cr.side>0?cr.aLabel:cr.bLabel)} · {cr.state}
                 {/* Whichever side richness favors has its own structural bull/bear bias
                     (definitional — e.g. a bull put spread wins if price stays up; not
@@ -699,7 +708,7 @@ function App(){
                 {cr.tag&&<span style={{color:cr.tag==='confirms'?'var(--good)':'var(--warn)'}}>
                   {' · '+cr.tag+' (price)'}</span>}
                 {cr.state==='committed'?' · held '+fmtHeld(cr.heldMs):''}
-              </div>
+              </div>}
             </div>;
           })()}
         </div>
@@ -1054,6 +1063,14 @@ function _richness(legs){
 function _sideMid(legs){
   return Math.abs(legs.reduce((s,l)=>s+((l.action||'').startsWith('buy')?1:-1)*(l.mid??0),0));
 }
+// Counter Read noise guard: true only when BOTH sides are under the ticker's
+// floor. One side being cheap is normal and informative (that's the whole
+// point of the band); it's only meaningless once NEITHER side has real premium
+// left to compare — a penny difference between two near-zero mids at 0DTE
+// close, not a real richness signal.
+function isNoisyPair(aMid,bMid,floor){
+  return Math.abs(aMid)<floor && Math.abs(bMid)<floor;
+}
 // Iron Condor/Fly: self-split (put wing vs call wing, both already in `legs`).
 // Everything else: current vs `build.counter` (opposite strikes, same chain/spot —
 // see COUNTER_STRATEGY on the backend). Null if strategy/response isn't ready yet.
@@ -1096,6 +1113,13 @@ function counterSides(strategyKey,strategies,b){
 // next to a non-flipping number reproduces the exact "1% glued to the wrong label"
 // confusion this whole redesign exists to fix.
 function counterBandDisplay(cr){
+  // Noise guard fires first, before the pair/self-split branching below — a
+  // ratio built from two near-worthless legs is meaningless either way, so
+  // neither variant's normal name/number/fill logic should run on it.
+  if(cr.noisy){
+    return {name:'—',pct:null,mid:null,zone:'grey',fillPct:null,
+      tick1:cr.selfSplit?58:42,tick2:cr.selfSplit?null:58};
+  }
   let name,pct,mid,zone;
   if(!cr.selfSplit){
     // Pairs: pct is meaningful across the WHOLE 0-100 range, contested included

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -94,6 +95,58 @@ def test_file_override_merges(tmp_path, monkeypatch):
     assert r["tick"] == 0.10        # overridden
     assert r["anchor"] == 5         # overridden
     assert r["width"] == 100        # untouched base/ticker value preserved
+
+
+# ── Counter Read noise floor ───────────────────────────────────────────────
+def test_richness_floor_defaults_are_sized_per_ticker():
+    # Index tickers (bigger dollar increments) get a looser floor than the
+    # lower-nominal-premium ETFs — one flat number would misfire on both ends.
+    assert tc.richness_floor("NDX") == 0.05
+    assert tc.richness_floor("SPX") == 0.05
+    assert tc.richness_floor("RUT") == 0.05
+    assert tc.richness_floor("SPY") == 0.02
+    assert tc.richness_floor("QQQ") == 0.02
+    assert tc.richness_floor("DJX") == 0.02
+
+
+def test_richness_floor_unknown_ticker_falls_back_to_default():
+    assert tc.richness_floor("ZZZZ") == tc.DEFAULT_RICHNESS_FLOOR
+
+
+def test_richness_floors_map_covers_every_configured_ticker():
+    m = tc.richness_floors_map()
+    assert set(m) == set(tc.tickers())
+    assert m["SPY"] == 0.02
+
+
+def test_richness_floor_file_override(tmp_path, monkeypatch):
+    cfg = {"richness_floor": {"NDX": 0.09}}
+    p = tmp_path / "torque_tickers.json"
+    p.write_text(json.dumps(cfg))
+    monkeypatch.setenv("TORQUE_TICKERS_CONFIG", str(p))
+    assert tc.richness_floor("NDX") == 0.09      # overridden
+    assert tc.richness_floor("SPY") == 0.02      # untouched ticker keeps its default
+
+
+def test_overrides_file_found_in_dedicated_torque_folder(monkeypatch):
+    # Canonical location: market/backend/torque/torque_tickers.json — a real
+    # file there (not just the env-var override) must be picked up with no
+    # TORQUE_TICKERS_CONFIG set at all.
+    monkeypatch.delenv("TORQUE_TICKERS_CONFIG", raising=False)
+    here = Path(tc.__file__).resolve()
+    target_dir = here.parents[1] / "torque"
+    target = target_dir / "torque_tickers.json"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    pre_existing = target.exists()
+    original = target.read_text() if pre_existing else None
+    try:
+        target.write_text(json.dumps({"richness_floor": {"SPY": 0.011}}))
+        assert tc.richness_floor("SPY") == 0.011
+    finally:
+        if pre_existing:
+            target.write_text(original)
+        else:
+            target.unlink(missing_ok=True)
 
 
 # ── DJX (DJXW root) ────────────────────────────────────────────────────────

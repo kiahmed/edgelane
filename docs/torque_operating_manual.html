@@ -538,10 +538,26 @@ whenever spot hasn't moved enough recently, which is common and not an error. Th
   <tr><td><span class="caption-ex">leaning {Label} · committed · held Nm</span></td><td>leaning, held ≥20s, spot flat</td></tr>
   <tr><td><span class="caption-ex">leaning {Label} · committed · confirms (price) · held Nm</span></td><td>leaning, held ≥20s, spot agrees</td></tr>
   <tr><td><span class="caption-ex">leaning {Label} · committed · diverging (price) · held Nm</span></td><td>leaning, held ≥20s, spot disagrees</td></tr>
+  <tr><td><span class="caption-ex" style="color:#fcd34d">⚠ noisy premiums — read paused</span></td><td>both sides are under this ticker's noise floor — see below</td></tr>
 </table>
 
-<p>Seven shapes total. <code>contested</code> never carries a price tag or a held time — there's no
+<p>Eight shapes total. <code>contested</code> never carries a price tag or a held time — there's no
 lean yet to check, or time to have held one.</p>
+
+<div class="card warn">
+  <div><span class="icon">Noisy premiums — read paused</span></div>
+  Right at 0DTE close, both sides of a structure can collapse to pennies together —
+  a $0.03 vs $0.00 gap between two near-worthless legs can swing the ratio to a false
+  "100%" with zero real conviction behind it. When <strong>both</strong> compared
+  sides fall under the ticker's own noise floor, the band shows nothing confident —
+  no name, no %, no fill, no mid — just this caution line, until real premium
+  returns to at least one side. The floor is set <strong>per ticker</strong>
+  (<code>richness_floor</code> in the config override file — see
+  <a href="torque.md#per-ticker-strike-config">Per-ticker strike config</a>) because
+  one flat number is wrong in both directions: NDX/SPX/RUT trade in bigger dollar
+  increments (default floor $0.05) than SPY/QQQ, where a $0.50 mid is still a real,
+  meaningful price (default floor $0.02).
+</div>
 
 <div class="card warn">
   <div><span class="icon">Retired wording</span></div>

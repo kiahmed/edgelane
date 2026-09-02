@@ -363,6 +363,10 @@ async def torque_cfg():
         # closed at the global 30% default) — the UI should prefill `default`
         # and refuse to submit below `min`.
         "close_targets": tcfg.close_targets_map(),
+        # Per-ticker Counter Read noise floor — below this, both compared sides'
+        # mids being under it means the reading is 0DTE-close penny noise, not a
+        # real richness signal, so the UI suppresses it (see Counter Read docs).
+        "richness_floors": tcfg.richness_floors_map(),
         "env": settings.tradier_env,
         "mode": settings.tradier_mode,
         "devmode": bool(getattr(settings, "devmode", False)),

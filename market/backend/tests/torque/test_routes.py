@@ -55,6 +55,10 @@ async def test_config_endpoint():
     assert c["tickers"][0] == "NDX"
     assert c["default_strategy"] == "bull_call"
     assert len(c["strategies"]) == 10
+    # Counter Read noise floor — every configured ticker, sized per ticker.
+    assert set(c["richness_floors"]) == set(c["tickers"])
+    assert c["richness_floors"]["NDX"] == 0.05
+    assert c["richness_floors"]["SPY"] == 0.02
 
 
 async def test_analyze_endpoint():
