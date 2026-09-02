@@ -495,6 +495,51 @@ Iron Condor/Fly, because only the pairs have a genuine "counter" to fix on:</p>
   redesign specifically fixes: the number shown always matches whatever name is bold above it.
 </div>
 
+<h4>How to read the band — per strategy, and how to use it</h4>
+
+<table>
+  <tr><th>Strategy tab</th><th>What green/red tells you</th><th>How to use it</th></tr>
+  <tr>
+    <td>Long Call / Long Put<br>Bull Call / Bear Put<br>Call Fly / Put Fly<br><em>(debit pairs)</em></td>
+    <td>The counter is a separate, buyable play. Green = the counter is getting richer
+    (more speculative demand there); red = it's fading.</td>
+    <td>A rich, <strong>committed</strong> counter — especially one <strong>confirmed
+    by price</strong> — is a cue that the *other* directional debit might be the
+    better entry right now, not the one you're on.</td>
+  </tr>
+  <tr>
+    <td>Bull Put / Bear Call<br><em>(credit pair)</em></td>
+    <td>Same mechanic, but you're a seller here. A rich, committed counter side is
+    where the market's paying more to sell premium — not automatically "sell that
+    instead," see the credit-pair framing further up this doc.</td>
+    <td>Use it to sanity-check which side of the credit trade the market currently
+    favors before you commit strikes.</td>
+  </tr>
+  <tr>
+    <td>Iron Condor / Iron Fly<br><em>(self-split)</em></td>
+    <td>The name flips to whichever wing is currently pulling. Green "Call legs" =
+    call side richening; red "Put legs" = put side richening.</td>
+    <td>A committed lean toward one wing is a cue to widen that wing (or narrow the
+    other) before sending, rather than leaving the condor symmetric into a book
+    that's already leaning.</td>
+  </tr>
+</table>
+
+<div class="card">
+  <div><span class="icon" style="color:var(--accent)">"Contested" can last a while — that's not a bug</span></div>
+  The neutral/grey zone is <strong>16 points wide</strong> (42–58%), by design generous
+  enough that ordinary noise doesn't flip the color every tick. On a calm, range-bound
+  morning — especially with a <strong>symmetric</strong> Iron Condor (equal-width wings
+  both sides) — the two sides can sit close to even for a long stretch with nothing
+  wrong at all: it just means <strong>today hasn't produced enough wing skew yet</strong>
+  to clear a fairly generous dead zone, not that the read is stuck or broken. Confirmed
+  live: an NDX IC sitting at "balanced" over an hour after open checked out as a
+  genuinely fresh 54% reading, still just inside the band — not frozen. If you'd rather
+  the color react faster (at the cost of more flip-flopping on noise), the 42/58
+  thresholds are a code constant, not a per-ticker config value today — ask if you want
+  that changed.
+</div>
+
 <h4>Confirms / diverging — checked against real price, not Lean</h4>
 <p>Whichever side the band favors has its own <strong>structural</strong> bull/bear bias — not
 measured, just definitional (a bull put spread wins if price holds up, full stop). Torque compares
