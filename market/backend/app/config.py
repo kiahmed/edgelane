@@ -1,8 +1,8 @@
 """Config loader for EdgeLane MARKET backend.
 
-Reads `edgelane_market.config` (KEY=VALUE shell-style format, same convention
-as the existing edge_lane_config.config). Parses inline `#` comments outside
-quoted values. Exposed as an immutable Pydantic settings object.
+Reads `edgelane_market.config` (KEY=VALUE shell-style format — the same
+convention the retired legacy single-file config used). Parses inline `#`
+comments outside quoted values. Exposed as an immutable Pydantic settings object.
 """
 from __future__ import annotations
 import os
