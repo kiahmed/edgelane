@@ -138,11 +138,11 @@ frontend-setup: ## One-time: create/link the Matrix + Simmer Vercel projects + E
 deploy-be: deploy-builder ## Backend → Docker container + tunnel (DEPLOY=local_container)
 	@BUILDX_BUILDER=$(BUILDER) $(DEPLOY_SH) -b --target $(DEPLOY) $(ARGS)
 
-deploy-fe: ## Market UI → Vercel
-	@$(DEPLOY_SH) -f $(ARGS)
+deploy-fe: ## Market UI → Vercel (CLEAN=1 to wipe first)
+	@$(DEPLOY_SH) -f $(CLEAN_FLAG) $(ARGS)
 
-deploy-prod: deploy-builder ## Backend + frontend together (pushes Supabase migrations first)
-	@BUILDX_BUILDER=$(BUILDER) $(DEPLOY_SH) --target $(DEPLOY) $(ARGS)
+deploy-prod: deploy-builder ## Backend + frontend together (pushes Supabase migrations first; CLEAN=1 to wipe first)
+	@BUILDX_BUILDER=$(BUILDER) $(DEPLOY_SH) --target $(DEPLOY) $(CLEAN_FLAG) $(ARGS)
 
 deploy-dry: ## Dry-run the full deploy (prints commands, runs nothing)
 	@$(DEPLOY_SH) --target $(DEPLOY) -n $(ARGS)

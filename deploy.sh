@@ -370,6 +370,16 @@ _sync_auth_allow_list() {
 }
 
 stage_frontend() {
+  # --clean: drop what a previous deploy left behind so nothing stale can survive
+  # into the upload. $DIST_DIR is rebuilt from scratch every run regardless (just
+  # below), so the only thing this adds is the Vercel build output — and
+  # .vercel/OUTPUT specifically, never .vercel/, which also holds project.json
+  # (the project link; deleting it unlinks the project). Mirrors stage_simmer.
+  if $DO_CLEAN; then
+    info "Clean build: removing previous build artifacts"
+    run rm -rf "$DIST_DIR" "$ROOT_DIR/.vercel/output"
+  fi
+
   info "Staging market UI -> $DIST_DIR"
   run rm -rf "$DIST_DIR"
   run mkdir -p "$DIST_DIR"
