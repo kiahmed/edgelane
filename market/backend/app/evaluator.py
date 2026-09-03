@@ -190,7 +190,7 @@ def _update_regime(symbol: str, result: str, settings) -> None:
     # 'neutral' result: counters untouched (noise shouldn't trigger/clear regime)
 
 
-def rehydrate_regime(db, settings) -> None:
+def rehydrate_regime(db, settings, quiet: bool = False) -> None:
     """Rebuild the in-memory regime counters from the outcomes table on startup.
 
     The consec-loss/win counters + alert flag live only on the `state` singleton
@@ -252,8 +252,10 @@ def rehydrate_regime(db, settings) -> None:
                 "confirming wins to resume)", symbol, cl, cw, clear_thresh,
             )
         else:
-            log.info("regime rehydrate: %s consec_losses=%d consec_wins=%d", symbol, cl, cw)
-    log.info("regime rehydrate complete: %d symbol(s), %d paused", len(by_symbol), restored)
+            (log.debug if quiet else log.info)(
+                "regime rehydrate: %s consec_losses=%d consec_wins=%d", symbol, cl, cw)
+    (log.debug if quiet else log.info)(
+        "regime rehydrate complete: %d symbol(s), %d paused", len(by_symbol), restored)
 
 
 def archive_completed_days(db) -> int:
@@ -412,7 +414,11 @@ async def evaluate_pending(db, poller_state, settings) -> int:
             log.exception("insert_outcome failed for decision_id=%s", decision_id)
             continue
 
-        _update_regime(symbol, result, settings)
+        # NOTE: the regime streak is deliberately NOT advanced here. This loop
+        # grades every poll, so a single held pick showing red at three
+        # consecutive re-checks (~48s) would have tripped "3 losses in a row"
+        # and paused the engine on one trade's noise. The counters are rebuilt
+        # below from episode-final results instead — one result per pick.
         n += 1
         log.info(
             "outcome decision_id=%s sym=%s strat=%s type=%s entry=%.3f now=%.3f "
@@ -420,6 +426,15 @@ async def evaluate_pending(db, poller_state, settings) -> int:
             decision_id, symbol, _pick_strategy, pick_spread_type,
             float(pick_entry_mid), net_now, fav, friction, result,
         )
+
+    if n:
+        # Replay this session's episode-final results through the same state
+        # machine used at startup, so the pause reflects picks that went wrong
+        # rather than how long any one of them was held.
+        try:
+            rehydrate_regime(db, settings, quiet=True)
+        except Exception:
+            log.exception("regime refresh after grading failed")
     return n
 
 

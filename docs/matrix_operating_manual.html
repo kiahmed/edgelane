@@ -385,7 +385,7 @@
 
         <div class="callout">
           <span class="lbl">The part no other product here does</span>
-          <p>Three minutes after Matrix publishes a pick, it re-prices <em>that exact spread</em> and records whether it made money. Those grades accumulate into a published win rate &mdash; and when the record turns, Matrix stops showing the number and says so. See <a href="#selfeval">Self-evaluation</a>.</p>
+          <p>Three minutes after Matrix publishes a pick, it re-prices <em>that exact spread</em> and records whether it made money. Each pick is scored once &mdash; on how it ended up, not on how many times it was re-checked &mdash; and those results accumulate into a published win rate. When the record turns, Matrix stops showing the number and says so. See <a href="#selfeval">Self-evaluation</a>.</p>
         </div>
       </section>
 
@@ -494,7 +494,7 @@
               <li><strong>Bilateral walls</strong> &mdash; put wall as magnet, call wall as resistance, each with its own strength</li>
               <li>Auto-poll with a user-set interval; a status row shows staleness</li>
               <li>Tabs labelled <strong>Engine pick</strong> and <strong>Lookup</strong></li>
-              <li>Every pick graded three minutes later; a rolling win rate and a regime-shift banner</li>
+              <li>Every pick graded three minutes later and scored once; a rolling win rate over recent picks and a regime-shift banner</li>
               <li>Deployed frontend on <code>matrix.facades.trade</code>, sign-in gated, talking to a live FastAPI + DuckDB service</li>
             </ul>
           </div>
@@ -943,6 +943,7 @@ composed: +$28 theta &middot; +$5 delta &middot; +$3 &gamma;/vega</pre>
           <li><b>Favorable delta</b> &mdash; premium movement in the spread's profit direction. A debit wins as it <em>expands</em>: <span class="mono">fav = mid_now &minus; mid_entry</span>. A credit wins as it <em>decays toward zero</em>: <span class="mono">fav = mid_entry &minus; mid_now</span>.</li>
           <li><b>Friction band</b> &mdash; half the current bid/ask width, so a quote bounce is never scored as a win.</li>
           <li><b>Result</b> &mdash; <span class="t-g">win</span> above the band, <span class="t-r">loss</span> below it, <span class="t-n">neutral</span> inside it.</li>
+          <li><b>Scored once per pick</b> &mdash; steps 1&ndash;5 repeat every poll for as long as the pick stands, which is what drives the live readout. The <em>score</em> takes only one result per pick: the last grade before the engine moved on. See <a href="#one-pick">One pick, one result</a>.</li>
         </ol>
 
         <div class="callout">
@@ -951,7 +952,46 @@ composed: +$28 theta &middot; +$5 delta &middot; +$3 &gamma;/vega</pre>
         </div>
 
         <h4>Cadence</h4>
-        <p>A decision is born every poll (~15&ndash;20&nbsp;s). The evaluator wakes every 30&nbsp;s only to ask whether any decision has passed the 3-minute window ungraded, grades those once, and sleeps. Thirty seconds is the check interval, not the grading frequency; nothing is ever re-graded.</p>
+        <p>A decision is born every poll (~15&nbsp;s). The evaluator wakes every 30&nbsp;s only to ask whether any decision has passed the 3-minute window ungraded, grades those once, and sleeps. Thirty seconds is the check interval, not the grading frequency; no individual decision is ever re-graded. A held pick does accumulate many graded decisions over its life &mdash; the score keeps only the last of them.</p>
+
+        <h3 id="one-pick">One pick, one result</h3>
+        <p>A decision row is written <strong>every poll</strong>, so a pick that stands for 45 minutes leaves ~170 graded rows while one that dies in 30 seconds leaves two. Counting each row as a separate trade made the win rate a measure of <em>how long a pick lingered</em> rather than how often the engine was right &mdash; and picks linger when conditions are calm, so the number flattered itself exactly when it was least informative.</p>
+
+        <p>The unit of scoring is therefore a <strong>pick</strong>, not a poll:</p>
+
+        <ul class="prose">
+          <li><strong>What counts as one pick</strong> &mdash; an unbroken run of polls holding the same legs. If the engine returns to the same strikes after picking something else in between, that is a second pick, not a continuation.</li>
+          <li><strong>When it is settled</strong> &mdash; the moment the engine switches away. Its result is the last grade it carried, i.e. how the idea ended up.</li>
+          <li><strong>The live pick is not counted</strong> &mdash; an idea still on screen has no final result yet. It appears in the score only once it is superseded.</li>
+        </ul>
+
+        <div class="ba">
+          <div class="ba-col old">
+            <h5>Before &mdash; scored per poll</h5>
+            <ul>
+              <li>One held pick re-checked 170 times counted as 170 trades</li>
+              <li>Half of every graded row came from ~7 of ~100 daily picks</li>
+              <li>&ldquo;Last 20&rdquo; was almost always the current pick's last five minutes</li>
+              <li>Three consecutive losses could be one trade red for ~48&nbsp;s</li>
+            </ul>
+          </div>
+          <div class="ba-col new">
+            <h5>Now &mdash; scored per pick</h5>
+            <ul>
+              <li>One pick contributes exactly one result, however long it stood</li>
+              <li>Every pick carries equal weight, calm session or fast one</li>
+              <li>&ldquo;Last 20&rdquo; is 20 real decisions &mdash; roughly the past hour</li>
+              <li>Three consecutive losses means three picks that went wrong</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout warn">
+          <span class="lbl">Expect a lower, truer number</span>
+          <p>This is not a cosmetic change. On real history the same session read <strong>70%</strong> per poll and <strong>15%</strong> per pick &mdash; the old figure was one favourable position sampled repeatedly. A falling percentage here is the metric getting honest, not the engine getting worse. Higher is not the goal; knowing is.</p>
+        </div>
+
+        <p>Nothing about grading itself changed &mdash; same legs, same repricing, same friction band, same three-minute window. Re-checking the held pick every poll still happens and still drives the live position readout. Only what the <em>score</em> counts has changed, so the whole existing history re-reads under the new definition with no migration.</p>
 
         <h3>Bias-trust state</h3>
         <p>Grades roll into a single state that governs what the page is allowed to show. Precedence runs <span class="mono">paused &rarr; low confidence &rarr; calibrating &rarr; in sync</span>. Regime evaluation keeps running in every state &mdash; only the display changes.</p>
@@ -960,17 +1000,17 @@ composed: +$28 theta &middot; +$5 delta &middot; +$3 &gamma;/vega</pre>
           <div class="state calib">
             <span class="nm">Calibrating</span>
             <div class="shows">Calibrating &mdash; 6/10 graded</div>
-            <p>Fewer than ten graded outcomes. No percentage published; the pick is tagged <em>confirming edge &mdash; sizing in</em>.</p>
+            <p>Fewer than ten settled picks. No percentage published; the pick is tagged <em>confirming edge &mdash; sizing in</em>. Early in a session this is the expected state &mdash; picks accrue at roughly 8&ndash;16 an hour, so the bar is cleared by mid-morning rather than in the first few minutes.</p>
           </div>
           <div class="state sync">
             <span class="nm">In sync</span>
             <div class="shows">64% win rate (37 graded)</div>
-            <p>Enough samples, no regime alert. The win rate is shown because it has been earned. No hint on the pick card.</p>
+            <p>Enough samples, no regime alert. The win rate is shown because it has been earned. No hint on the pick card. <em>37 graded</em> means 37 settled picks &mdash; at roughly 8&ndash;16 picks an hour, a few hours of trading.</p>
           </div>
           <div class="state paused">
             <span class="nm">Out of sync &mdash; paused</span>
             <div class="shows">&#9208; recalibrating &mdash; bias re-syncing (2 confirming wins to resume)</div>
-            <p>Three consecutive losses tripped the regime alert. The percentage is withheld until two confirming wins clear it. Grading continues silently underneath &mdash; those very evals are what clear the alert.</p>
+            <p>Three consecutive losing <em>picks</em> tripped the regime alert &mdash; three separate ideas that went wrong, not one trade wobbling. The percentage is withheld until two confirming wins clear it. Grading continues silently underneath &mdash; those very evals are what clear the alert.</p>
           </div>
           <div class="state lowconf">
             <span class="nm">Low confidence</span>
@@ -983,11 +1023,12 @@ composed: +$28 theta &middot; +$5 delta &middot; +$3 &gamma;/vega</pre>
           <table>
             <thead><tr><th>Knob</th><th>Default</th><th>Governs</th></tr></thead>
             <tbody>
-              <tr><td class="k">poll_interval_sec</td><td class="num">20</td><td>How often a decision is born.</td></tr>
+              <tr><td class="k">poll_interval_sec</td><td class="num">15</td><td>How often a decision is born (and a held pick re-checked).</td></tr>
               <tr><td class="k">eval_window_min</td><td class="num">3</td><td>How long a pick ages before it is graded.</td></tr>
-              <tr><td class="k">eval_min_graded</td><td class="num">10</td><td>Samples needed to leave <em>calibrating</em>.</td></tr>
-              <tr><td class="k">regime_alert_consec_losses</td><td class="num">3</td><td>Consecutive losses that trip the pause.</td></tr>
-              <tr><td class="k">regime_clear_consec_wins</td><td class="num">2</td><td>Confirming wins that clear it.</td></tr>
+              <tr><td class="k">eval_min_graded</td><td class="num">10</td><td>Settled <em>picks</em> needed to leave <em>calibrating</em>.</td></tr>
+              <tr><td class="k">regime_alert_consec_losses</td><td class="num">3</td><td>Consecutive losing <em>picks</em> that trip the pause.</td></tr>
+              <tr><td class="k">regime_clear_consec_wins</td><td class="num">2</td><td>Confirming winning <em>picks</em> that clear it.</td></tr>
+              <tr><td class="k">eval_rolling_window</td><td class="num">20</td><td>How many settled picks the published percentage covers.</td></tr>
             </tbody>
           </table>
         </div>
@@ -995,7 +1036,7 @@ composed: +$28 theta &middot; +$5 delta &middot; +$3 &gamma;/vega</pre>
         <p>Neutrals move neither counter. The pick-card hint is always confidence framing, never <em>don't trade</em> &mdash; the tool exists to find the winning play, and it says so even while it is re-syncing.</p>
 
         <h3>The archive underneath</h3>
-        <p>Raw decisions and outcomes are <strong>never flushed</strong> &mdash; they are the only labeled ground-truth dataset the system will ever have. Live reads are scoped instead (regime looks at today; accuracy at a rolling window), and each completed ET day is rolled up once into a daily summary: counts, win rate, session span, largest polling gap, coverage.</p>
+        <p>Raw decisions and outcomes are <strong>never flushed</strong> &mdash; they are the only labeled ground-truth dataset the system will ever have. Live reads are scoped instead (regime looks at today; accuracy at a rolling window of settled picks), and each completed ET day is rolled up once into a daily summary: counts, win rate, session span, largest polling gap, coverage.</p>
 
         <p>Each day carries a <span class="mono">complete</span> flag &mdash; true only when the day covered at least 75% of the 390-minute session with no gap over 15 minutes. Partial days are kept but flagged, so modeling can require full sessions rather than silently averaging in a morning when the backend was off.</p>
 

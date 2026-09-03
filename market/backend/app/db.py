@@ -366,6 +366,60 @@ _STRIKE_PROFILE_COLS = (
 )
 
 
+# One graded row per PICK EPISODE.
+#
+# The poller writes a bias_decisions row every poll, so a pick that stays on
+# screen for 45 minutes produces ~170 graded rows while one that dies in 30s
+# produces two. Counting each row as a separate trade makes the win rate a
+# measure of how long a pick lingered rather than how often the engine was
+# right — and picks linger when conditions are calm, so it flatters itself.
+# (Measured on a live session: 7 picks out of 103 supplied half of all rows.)
+#
+# An EPISODE is a contiguous run of polls holding the same pick. It is graded
+# ONCE, by its LAST grade before the pick changed — "how did this idea end up".
+# Re-grading every poll still happens and still drives the live position
+# readout; this view is only what the win rate and the regime counters read.
+#
+# Notes:
+#   * runs are cut over ALL decisions, including no-pick polls, so pick A →
+#     no pick → pick A counts as two ideas rather than one merged run;
+#   * the newest episode per symbol is EXCLUDED — it is the pick still on
+#     screen, and an idea in progress has no final result yet;
+#   * legacy spot-diff rows (NULL favorable_delta) stay excluded, as before.
+_EPISODE_CTE = """
+    WITH marked AS (
+        SELECT bd.id, bd.ts, bd.symbol, bd.pick_legs,
+               CASE WHEN bd.pick_legs IS DISTINCT FROM
+                         LAG(bd.pick_legs) OVER (PARTITION BY bd.symbol ORDER BY bd.ts)
+                    THEN 1 ELSE 0 END AS chg
+        FROM bias_decisions bd
+        {since_filter}
+    ),
+    episodes AS (
+        SELECT marked.*,
+               SUM(chg) OVER (PARTITION BY symbol ORDER BY ts
+                              ROWS UNBOUNDED PRECEDING) AS ep
+        FROM marked
+    ),
+    graded AS (
+        SELECT e.symbol, e.ep, e.ts, o.result
+        FROM episodes e
+        JOIN outcomes o ON o.decision_id = e.id
+        WHERE e.pick_legs IS NOT NULL AND o.favorable_delta IS NOT NULL
+    ),
+    live AS (SELECT symbol, MAX(ep) AS live_ep FROM episodes GROUP BY symbol),
+    episode_final AS (
+        SELECT g.symbol AS symbol,
+               ARG_MAX(g.result, g.ts) AS result,
+               MAX(g.ts) AS ts
+        FROM graded g
+        JOIN live l ON l.symbol = g.symbol
+        WHERE g.ep < l.live_ep
+        GROUP BY g.symbol, g.ep
+    )
+"""
+
+
 class Database:
     """Thin wrapper around a single DuckDB connection.
     DuckDB connections are NOT thread-safe; we serialize via Lock."""
@@ -534,19 +588,19 @@ class Database:
             return cur.fetchall()
 
     def fetch_accuracy(self, symbol: str, window: int) -> dict:
+        """Rolling win/loss/neutral over the last `window` PICK EPISODES.
+
+        One row per idea (see _EPISODE_CTE), not one per poll, so `window`
+        counts decisions the engine actually made rather than how many times
+        a single held pick was re-checked.
+        """
         with self._lock:
             cur = self.connect().execute(
-                """
-                WITH recent AS (
-                    SELECT bd.id, bd.label, o.result, bd.recommended_strategies
-                    FROM bias_decisions bd
-                    JOIN outcomes o ON o.decision_id = bd.id
-                    -- Count ONLY spread-outcome grades. Legacy spot-diff rows
-                    -- (graded before the premium-based eval) have a NULL
-                    -- favorable_delta; excluding them gives a clean start on the
-                    -- new metric without deleting the historical rows.
-                    WHERE bd.symbol = ? AND o.favorable_delta IS NOT NULL
-                    ORDER BY bd.ts DESC
+                _EPISODE_CTE.format(since_filter="") + """
+                , recent AS (
+                    SELECT result FROM episode_final
+                    WHERE symbol = ?
+                    ORDER BY ts DESC
                     LIMIT ?
                 )
                 SELECT
@@ -608,34 +662,31 @@ class Database:
             return out
 
     def fetch_regime_replay(self, per_symbol: int = 200, since=None) -> list[tuple]:
-        """Recent spread-outcome results per symbol, oldest→newest, for rebuilding
-        the in-memory regime counters after a restart (see evaluator.rehydrate_regime).
+        """Recent PICK-EPISODE results per symbol, oldest→newest, for rebuilding
+        the in-memory regime counters (see evaluator.rehydrate_regime).
 
-        Returns (symbol, result) tuples. `since` (a datetime) scopes the replay to
-        the current trading session — yesterday's streak belongs to a different
-        market regime and must not carry over (see evaluator.rehydrate_regime).
-        Only the last `per_symbol` graded outcomes of each ticker are replayed —
-        more than enough to reproduce the current consecutive-loss/win streak (any
-        opposite result resets the counter). Legacy spot-diff rows (NULL
-        favorable_delta) are excluded, matching fetch_accuracy.
+        Returns (symbol, result) tuples — one per idea, not one per poll. That
+        distinction is the whole point of the streak: "3 losses in a row" must
+        mean three picks that went wrong, not one held pick showing red at three
+        consecutive 15s re-checks (~48 seconds of a single trade).
+
+        `since` scopes the replay to the current session — yesterday's streak is
+        a different market regime. Only the last `per_symbol` episodes of each
+        ticker are replayed; any opposite result resets the counter, so that is
+        far more than enough to reproduce the live streak.
         """
-        where = "o.favorable_delta IS NOT NULL"
-        params: list = []
-        if since is not None:
-            where += " AND bd.ts >= ?"
-            params.append(since)
+        since_filter = "WHERE bd.ts >= ?" if since is not None else ""
+        params: list = [since] if since is not None else []
         params.append(per_symbol)
         with self._lock:
             cur = self.connect().execute(
-                f"""
+                _EPISODE_CTE.format(since_filter=since_filter) + """
                 SELECT symbol, result FROM (
-                    SELECT bd.symbol AS symbol, o.result AS result, bd.ts AS ts,
+                    SELECT symbol, result, ts,
                            ROW_NUMBER() OVER (
-                               PARTITION BY bd.symbol ORDER BY bd.ts DESC
+                               PARTITION BY symbol ORDER BY ts DESC
                            ) AS rn
-                    FROM bias_decisions bd
-                    JOIN outcomes o ON o.decision_id = bd.id
-                    WHERE {where}
+                    FROM episode_final
                 )
                 WHERE rn <= ?
                 ORDER BY symbol ASC, rn DESC
