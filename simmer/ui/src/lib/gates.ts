@@ -13,6 +13,8 @@ export interface GateCheck {
 	state: GateState;
 	/** matched raw reasons (human-formatted by the component) */
 	reasons: string[];
+	/** one-line explanation, shown only when this gate FAILS */
+	hint?: string;
 }
 
 const STRUCTURE_PREFIX = /^(bull_put|bear_call|iron_condor):/;
@@ -31,6 +33,7 @@ interface GateDef {
 	match: string[];
 	/** tokens that mean "we could not evaluate" rather than "you failed" */
 	unknown?: string[];
+	hint?: string;
 }
 
 // Order is the display order: locked safety gates first, then the tunables.
@@ -93,7 +96,11 @@ const GATES: GateDef[] = [
 		label: 'Short-delta band',
 		locked: false,
 		match: ['short_delta_band', 'short_delta:'],
-		unknown: ['short_delta:unavailable']
+		unknown: ['short_delta:unavailable'],
+		hint:
+			'Delta is recomputed from live spot each evaluation — the chain ships its own, but ' +
+			'vendor greeks lag the market and a stale delta would walk a deep in-the-money short ' +
+			'straight through this band.'
 	},
 	{
 		key: 'structure_eligibility',
@@ -129,10 +136,21 @@ export function gateChecklist(env: ReadinessEnvelope): GateCheck[] {
 			if (def.key === 'liquidity' && (dq.quote ?? 1) === 0 && env.decision === 'vetoed')
 				state = 'unknown';
 		}
-		return { key: def.key, label: def.label, locked: def.locked, state, reasons };
+		return { key: def.key, label: def.label, locked: def.locked, state, reasons, hint: def.hint };
 	});
 }
 
 export function failedCount(checks: GateCheck[]): number {
 	return checks.filter((c) => c.state === 'fail').length;
+}
+
+/** True when the short-delta veto is accompanied by a friction/liquidity veto.
+ *  These are not independent findings: delta, distance and credit are one fact
+ *  seen three ways. A low-delta short is a far-OTM short, and a far-OTM short
+ *  collects thin credit — so the round-trip cost eats it and those gates trip
+ *  together. Surfacing them as three problems sends people tuning three knobs
+ *  for what is really "too far out for the premium on offer". */
+export function isCoupledDeltaCreditVeto(checks: GateCheck[]): boolean {
+	const failed = new Set(checks.filter((c) => c.state === 'fail').map((c) => c.key));
+	return failed.has('short_delta') && (failed.has('dollar_friction') || failed.has('liquidity'));
 }

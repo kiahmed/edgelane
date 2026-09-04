@@ -219,7 +219,10 @@ class Settings(BaseModel):
     gemini_api_key: str = Field(default="")
     # Scores are NOT reproducible across models — the model id is recorded on
     # every scored row. flash-lite is the cheapest with thinking off by default.
-    gemini_model: str = Field(default="gemini-2.5-flash-lite")
+    # flash, not flash-lite: scoring now also classifies impact HORIZON ("does
+    # this land before my option expires?"), which is a reasoning judgment
+    # rather than a sentiment read. Override with GEMINI_MODEL.
+    gemini_model: str = Field(default="gemini-2.5-flash")
     # News source: alpaca (default; needs the keys above), rss (keyless wire
     # firehose, regex ticker match, weaker coverage), off.
     simmer_news_provider: str = Field(default="alpaca")

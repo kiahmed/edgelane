@@ -80,13 +80,16 @@ log = logging.getLogger("edgelane.simmer.news")
 ALPACA_NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
 PRNEWSWIRE_RSS_URL = "https://www.prnewswire.com/rss/news-releases-list.rss"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"   # keep in sync with config.gemini_model
 
 ALPACA_PAGE_LIMIT = 50          # the endpoint's own max per page
 ALPACA_MAX_PAGES = 10           # 500 articles/backfill — far beyond 24 h needs
 BACKFILL_HOURS = 24
 GEMINI_BATCH_SIZE = 25          # ~20 calls/day at 500 headlines/day (measured cost table)
 ALPACA_FAILOVER_AFTER = 3       # consecutive failures before the RSS fallback engages
+# Sentinel horizon: "no date attached". Large enough that no real tenor reaches
+# it, so an undated worry can never apply to a dated trade.
+UNDATED_HORIZON = 999
 
 #: How far back cluster counts are read for the velocity baseline. The
 #: negative-binomial baseline wants `lookback_days` TRADING days of same
@@ -419,10 +422,20 @@ def parse_gemini_scores(payload: Any) -> dict[str, dict]:
         if not rid or score is None:
             continue
         reason = str(row.get("reason") or "other")
+        # Horizon. Absent/garbage -> UNDATED_HORIZON, which makes the headline
+        # inert for short-dated trades rather than silently near-term. Failing
+        # open here would reintroduce exactly the bug this field exists to fix.
+        raw_h = row.get("impact_within_days")
+        try:
+            horizon = int(raw_h)
+        except (TypeError, ValueError):
+            horizon = UNDATED_HORIZON
+        horizon = max(0, min(horizon, UNDATED_HORIZON))
         out[rid] = {
             "score": score,
             "confidence": clamp(row.get("confidence"), 0.0, 1.0),
             "reason": reason if reason in REASON_CODES else "other",
+            "impact_within_days": horizon,
         }
     return out
 
@@ -439,7 +452,16 @@ def build_gemini_request(items: Sequence[dict], temperature: float = 0.0) -> dic
         "Return a JSON array with exactly one object per input line, echoing "
         "the given id. score: -1.0 (strongly negative) to 1.0 (strongly "
         "positive), 0 for neutral or irrelevant. confidence: 0.0 to 1.0. "
-        "reason: the single best-fitting category.\n\nHeadlines:\n"
+        "reason: the single best-fitting category.\n"
+        "impact_within_days: WHEN the price impact is expected to be felt — "
+        "the soonest number of days by which a trader would see it move. A "
+        "dated catalyst lands on its date; an earnings-day reaction is ~1; a "
+        "broker action or product launch reported today is ~1-3. A vague "
+        "structural worry with NO date (margin compression 'eventually', a "
+        "product that may be discontinued someday, a rival shipping next year) "
+        "is NOT a near-term event: use 999 for undated. This is not how "
+        "important the news is — a severe undated risk still gets 999.\n\n"
+        "Headlines:\n"
         + "\n".join(lines)
     )
     return {
@@ -456,8 +478,15 @@ def build_gemini_request(items: Sequence[dict], temperature: float = 0.0) -> dic
                         "score":      {"type": "NUMBER", "minimum": -1.0, "maximum": 1.0},
                         "confidence": {"type": "NUMBER", "minimum": 0.0, "maximum": 1.0},
                         "reason":     {"type": "STRING", "enum": list(REASON_CODES)},
+                        # Horizon, not magnitude. Gates whether this headline may
+                        # touch a trade at all: news that lands in a quarter is
+                        # irrelevant to an option expiring in two days, however
+                        # bearish it reads. 999 = undated.
+                        "impact_within_days": {"type": "INTEGER", "minimum": 0,
+                                               "maximum": 999},
                     },
-                    "required": ["id", "score", "confidence", "reason"],
+                    "required": ["id", "score", "confidence", "reason",
+                                 "impact_within_days"],
                 },
             },
         },
@@ -711,11 +740,13 @@ def update_news_scores(db: Any, scores: Mapping[str, dict], model: str,
     ts = scored_at or _now_naive_utc()
     conn = db.connect()
     lock = getattr(db, "_lock", None)
-    params = [[v.get("score"), v.get("confidence"), model, ts, str(aid)]
+    params = [[v.get("score"), v.get("confidence"),
+               v.get("impact_within_days", UNDATED_HORIZON), model, ts, str(aid)]
               for aid, v in scores.items()]
     with (lock if lock is not None else nullcontext()):
         conn.executemany(
-            "UPDATE simmer_news SET sentiment = ?, confidence = ?, model = ?, "
+            "UPDATE simmer_news SET sentiment = ?, confidence = ?, "
+            "impact_within_days = ?, model = ?, "
             "scored_at = ? WHERE article_id = ?", params)
     return len(params)
 
@@ -765,6 +796,7 @@ def _aggregate_symbol(db: Any, symbol: str, now: datetime,
     from the flat bucket-count history. Imported lazily so news ingestion
     still works (fields None, noted) if the math module is unavailable."""
     out: dict[str, Any] = {"sentiment_score": None, "sentiment_n": None,
+                           "sentiment_horizon_days": UNDATED_HORIZON,
                            "velocity_p": None, "velocity_tier": None}
     try:
         from . import simmer_velocity
@@ -790,6 +822,7 @@ def _aggregate_symbol(db: Any, symbol: str, now: datetime,
         "confidence": r.get("confidence"),
         "published_at": _utc_naive(r.get("published_at")),
         "breadth": sizes.get(r.get("cluster_key"), 1),
+        "impact_within_days": r.get("impact_within_days"),
     } for r in rows if r.get("sentiment") is not None]
 
     try:
@@ -797,6 +830,12 @@ def _aggregate_symbol(db: Any, symbol: str, now: datetime,
             scored, now, simmer_config.sentiment())
         out["sentiment_score"] = agg.get("score")
         out["sentiment_n"] = agg.get("n")
+        # Soonest impact across the scored window. MIN, not mean: if any one
+        # headline lands tomorrow, the aggregate is live for a 1-DTE trade even
+        # when the rest are quarters out. Undated when nothing carries a horizon.
+        horizons = [int(x["impact_within_days"]) for x in scored
+                    if x.get("impact_within_days") is not None]
+        out["sentiment_horizon_days"] = min(horizons) if horizons else UNDATED_HORIZON
     except Exception as e:
         notes.append(f"news:sentiment_aggregation_failed:{type(e).__name__}")
         log.warning("sentiment aggregation failed for %s: %s", symbol, e)

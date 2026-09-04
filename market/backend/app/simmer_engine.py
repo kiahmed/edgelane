@@ -563,12 +563,30 @@ def iv_at_strike(chain: Sequence[dict], side: str, strike: float) -> float | Non
 
 def row_abs_delta(row: dict, spot: float, t: float, side: str,
                   r: float = 0.0, q: float = 0.0) -> float | None:
-    """|delta| off the chain when present, else from Black-Scholes on the row's
-    own IV. Never used as a probability — see `prob_itm`."""
+    """|delta| computed from LIVE spot via Black-Scholes. Never used as a
+    probability — see `prob_itm`.
+
+    The vendor's `delta` field is deliberately DISCARDED, not preferred.
+    Tradier's greeks are ORATS-sourced and refresh on a slow cadence, so
+    intraday — and especially after an overnight gap — they describe a spot that
+    no longer exists, while `spot` here is live. That mismatch is not cosmetic:
+    it silently defeats the short-delta gate, because the gate compares a stale
+    delta against the 0.20-0.35 band.
+
+    Observed in production (2026-09-03, TSLA 1 DTE): the chain reported
+    delta 0.2551 for a 367.5 call while spot was 377.81. The true delta was
+    0.8216 — the greeks lagged spot by ~17.8 points. The gate passed, and the
+    engine sold a call that was already $10 in the money, reporting it as a
+    0.26-delta trade. The error is also directionally biased: a rising underlying
+    understates call delta, so it flatters bear calls exactly when they are most
+    dangerous.
+
+    Delta is far more sensitive to spot than to vol, so live-spot with a
+    slightly stale IV beats a wholly stale delta. If IV is missing there is
+    nothing to compute from and we return None, which trips the
+    `short_delta:unavailable` veto rather than guessing.
+    """
     _require_side(side)
-    d = _num(row.get("delta"))
-    if d is not None:
-        return abs(d)
     iv, k = _num(row.get("iv")), _num(row.get("strike"))
     if iv is None or k is None or iv <= 0:
         return None
@@ -1243,6 +1261,9 @@ def _component_liquidity(cand: dict, ctx: dict, cfg: dict) -> tuple[float, dict]
                            "min_size_at_touch": cand["min_size_at_touch"]}
 
 
+UNDATED_SENTIMENT_HORIZON = 999   # mirrors simmer_news.UNDATED_HORIZON
+
+
 def _component_sentiment(cand: dict, ctx: dict, cfg: dict) -> tuple[float, dict]:
     """**Side selection and veto only — never a promoter.**
 
@@ -1254,19 +1275,51 @@ def _component_sentiment(cand: dict, ctx: dict, cfg: dict) -> tuple[float, dict]
     s = ctx["research"].get("sentiment") or {}
     score = _num(s.get("score"))
     val, detail = 1.0, {"sentiment_score": score, "adverse": False}
-    if score is not None:
-        adverse = (score < 0 and cand["structure"] in ("bull_put", "iron_condor"))
-        if adverse:
-            # Negative sentiment persists (half-life ~7 weeks) and the drift runs
-            # AGAINST a put spread. Positive sentiment is NOT treated
-            # symmetrically: it is gone by week three.
+
+    # ── Horizon gate ────────────────────────────────────────────────────────
+    # WHEN the news is expected to land, versus when this trade expires. A
+    # structural worry with no date — "margin compression eventually", a rival
+    # shipping next year — is real but cannot move a contract expiring in two
+    # days, and penalising it there is just noise. Gemini classifies the soonest
+    # expected impact per headline; the aggregate takes the MIN across the
+    # window. Absent/unscored defaults to undated, so the gate fails CLOSED
+    # (sentiment inert) rather than silently near-term.
+    horizon = _num(s.get("horizon_days"))
+    if horizon is None:
+        horizon = float(UNDATED_SENTIMENT_HORIZON)
+    detail["horizon_days"] = horizon
+    # Gates the DIRECTIONAL penalty only — never the velocity burst below. A
+    # chatter spike is unpriced uncertainty happening NOW; it is not a dated
+    # fundamental and must suppress regardless of when any story is expected to
+    # land. An early return here silently disabled it.
+    horizon_gated = score is not None and horizon > float(ctx["dte"])
+    if horizon_gated:
+        detail.update({"horizon_gated": True, "dte": ctx["dte"]})
+
+    if score is not None and not horizon_gated:
+        # Adverse = the drift runs AGAINST the structure. Bearish news hurts a
+        # short put; bullish news hurts a short call. Both directions are
+        # checked — but they are NOT weighted the same, because they do not
+        # persist the same (Heston & Sinha).
+        bearish_hurts = score < 0 and cand["structure"] in ("bull_put", "iron_condor")
+        bullish_hurts = score > 0 and cand["structure"] in ("bear_call", "iron_condor")
+        if bearish_hurts or bullish_hurts:
+            # `sentiment_persistence` already carries the asymmetry: ~35-day
+            # half-life for negative, ~5 for positive. Applying it to bullish
+            # news on a bear call therefore self-scales by tenor — ~87% of the
+            # penalty at 1 DTE, ~50% at 5, ~2% by 30 — which honours "positive
+            # sentiment is gone by week three" instead of using that as a reason
+            # to ignore it entirely. Before this, a bear call could not be
+            # penalised by bullish news at ANY tenor, so a runaway underlying was
+            # invisible on exactly the trade it threatens most.
             pers = sentiment_persistence(
                 score, ctx["dte"] * (252.0 / 365.0), cs,
                 is_index=bool(ctx["rule"].get("is_index")),
                 earnings_inside_tenor=bool(ctx["research"].get("earnings_inside_tenor", True)),
             )
-            val = _clamp01(1.0 + score * pers)
-            detail.update({"adverse": True, "persistence": pers})
+            val = _clamp01(1.0 - abs(score) * pers)
+            detail.update({"adverse": True, "persistence": pers,
+                           "adverse_direction": "bullish" if bullish_hurts else "bearish"})
     p = _num(s.get("velocity_p"))
     if p is not None and p <= float(cfg["velocity"]["alert_p"]):
         val *= float(cs.get("velocity_suppression", 0.5))
@@ -1649,7 +1702,14 @@ def _data_quality(ctx: dict, cand: dict | None, cfg: dict) -> tuple[dict, float]
         iv_q = 0.0
     rv_q = 0.0 if m.get("rv_yang_zhang") is None else (1.0 if m.get("rv_agrees") else 0.4)
     walls_q = 1.0 if (res.get("walls") or {}).get("put_wall") is not None else 0.5
-    news_q = 1.0 if res.get("sentiment") else 0.7      # absence isn't fatal
+    # Key on an actual SCORE, not on the container. `research["sentiment"]` is a
+    # populated dict whose fields are None when no articles were fetched — and a
+    # non-empty dict is truthy, so the old `if res.get("sentiment")` reported
+    # news quality 1.0 (perfect) while the feed was completely dark. That is how
+    # an Alpaca outage stayed invisible for days: nothing failed, so nothing was
+    # reported, and confidence (10% weighted on news) was silently inflated.
+    _sent = res.get("sentiment") or {}
+    news_q = 1.0 if _num(_sent.get("score")) is not None else 0.0
     if cand and cand.get("credit_mid") and cand.get("package_spread") is not None:
         gate = float(cfg["gates"]["liquidity_spread_pct_of_credit"])
         quote_q = _clamp01(1.0 - (100.0 * cand["package_spread"] / cand["credit_mid"]) / gate)

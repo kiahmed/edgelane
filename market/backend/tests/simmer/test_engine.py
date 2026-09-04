@@ -584,13 +584,18 @@ def test_sentiment_never_promotes():
     adverse sentiment lowers it."""
     neutral = se.evaluate_readiness(clean_inputs())
     inp_pos = clean_inputs()
-    inp_pos["research"]["sentiment"] = {"score": 0.95, "velocity_p": 0.4}
+    # horizon_days is REQUIRED to express intent now: sentiment with no horizon
+    # is treated as undated and gated out of a short tenor entirely. 0 = lands
+    # today, so the directional logic is what is under test here.
+    inp_pos["research"]["sentiment"] = {"score": 0.95, "velocity_p": 0.4,
+                                        "horizon_days": 0}
     positive = se.evaluate_readiness(inp_pos)
     assert positive["score"] <= neutral["score"] + 1e-9
     assert positive["components"]["sentiment_lean"]["score"] == pytest.approx(1.0)
 
     inp_neg = clean_inputs()
-    inp_neg["research"]["sentiment"] = {"score": -0.20, "velocity_p": 0.4}
+    inp_neg["research"]["sentiment"] = {"score": -0.20, "velocity_p": 0.4,
+                                        "horizon_days": 0}
     negative = se.evaluate_readiness(inp_neg)
     assert negative["components"]["sentiment_lean"]["score"] < 1.0
     assert negative["score"] < neutral["score"]
@@ -731,3 +736,49 @@ def test_earnings_vrp_avoid_if_absent_without_event():
     assert m["vrp_earnings_pp"] == 0.0
     assert m["vrp_ex_earnings_pp"] == pytest.approx(m["vrp_total_pp"])
     assert m["max_pain"] is not None                       # rides the envelope
+
+
+def test_undated_sentiment_cannot_move_a_short_dated_trade():
+    """A structural worry with no date must not touch a trade expiring first.
+
+    "Margin compression eventually", "a rival ships next year" — real, bearish,
+    and irrelevant to a contract that expires in a day or two. Before the horizon
+    gate these were penalised identically to a same-day event, so the engine
+    reacted to news it could not possibly be exposed to.
+    """
+    base = clean_inputs()
+    dte = float(base.get("dte") or 1)
+
+    far = clean_inputs()
+    # Severity kept ABOVE simmer_config negative_veto (-0.35): a stronger score
+    # blocks the bull put outright and the engine switches to a bear call, for
+    # which bearish news is not adverse — that would test structure selection,
+    # not the horizon gate.
+    far["research"]["sentiment"] = {"score": -0.20, "velocity_p": 0.4,
+                                    "horizon_days": dte + 30}
+    near = clean_inputs()
+    near["research"]["sentiment"] = {"score": -0.20, "velocity_p": 0.4,
+                                     "horizon_days": 0}
+
+    far_out = se.evaluate_readiness(far)
+    near_out = se.evaluate_readiness(near)
+    assert far_out["components"]["sentiment_lean"]["score"] == pytest.approx(1.0)
+    assert far_out["components"]["sentiment_lean"]["horizon_gated"] is True
+    # Same headline, same severity, but dated inside the tenor -> it bites.
+    assert near_out["components"]["sentiment_lean"]["score"] < 1.0
+    assert near_out["score"] < far_out["score"]
+
+
+def test_velocity_burst_survives_the_horizon_gate():
+    """A chatter spike is unpriced uncertainty NOW, not a dated fundamental.
+
+    Regression: gating the directional penalty with an early return also skipped
+    velocity suppression, so an undated story silently disabled burst detection.
+    """
+    inp = clean_inputs()
+    inp["research"]["sentiment"] = {"score": -0.60, "velocity_p": 0.001,
+                                    "horizon_days": 999}
+    comp = se.evaluate_readiness(inp)["components"]["sentiment_lean"]
+    assert comp["horizon_gated"] is True      # directional penalty gated out
+    assert comp["velocity_burst"] is True     # burst still suppresses
+    assert comp["score"] < 1.0

@@ -202,7 +202,12 @@ PROVIDER_TARGET_URL=
 # on flash-lite). Without a key, headlines are still ingested and deduped but
 # never scored.
 # GEMINI_API_KEY=
-# Model for scoring. gemini-2.5-flash-lite (default) is the cheapest and the
-# only one with thinking OFF by default. Scores are not reproducible across
-# models; the model id is recorded on every scored row.
-# GEMINI_MODEL=gemini-2.5-flash-lite
+# Model for scoring. gemini-2.5-flash (default). Scoring now also classifies
+# impact HORIZON — a reasoning judgment, not just a sentiment read — so flash
+# earns its keep: on the same batch it returned notably stronger, better-
+# calibrated sentiment than flash-lite (-0.60/-0.70/+0.80 vs -0.20/-0.50/+0.40).
+# Cost: flash has thinking ON by default (~1k thought tokens/batch, ~6s vs ~4s);
+# flash-lite has it off. Set GEMINI_MODEL=gemini-2.5-flash-lite to trade
+# calibration for cost. Scores are not reproducible across models; the model id
+# is recorded on every scored row.
+# GEMINI_MODEL=gemini-2.5-flash

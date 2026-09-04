@@ -465,6 +465,21 @@
       measurably negative-EV, so they're refused.</p>
       <p class="detail">Default band <strong>0.20–0.35</strong> (target 0.275). Your clamps keep both bounds
       inside 0.15–0.40.</p>
+      <p class="detail"><strong>Delta is computed, never taken from the feed.</strong> The option chain
+      ships its own delta, but vendor greeks refresh on a slow cadence — intraday, and especially after
+      an overnight gap, they describe a spot that no longer exists. Simmer recomputes delta from
+      <em>live</em> spot, the strike and the row's IV on every evaluation and discards the supplied
+      value. This is not cosmetic: on 2026-09-03 a chain reported 0.26Δ for a strike whose true delta
+      was 0.82, which would have walked a deep in-the-money short straight through this band. Delta is
+      far more sensitive to spot than to vol, so live spot with a slightly stale IV beats a wholly
+      stale delta. No IV, no delta — the gate refuses rather than guesses.</p>
+      <p class="detail"><strong>This gate rarely fails alone.</strong> Delta, distance and credit are
+      the same fact seen three ways: a low-delta short is a far-OTM short, and a far-OTM short collects
+      thin credit. So a strike drifting under the band usually trips the dollar-friction and liquidity
+      gates in the same breath — the round-trip cost eats a credit that got too small. Reading a
+      <code>short_delta_band</code> veto next to <code>dollar_friction</code> is not three
+      independent problems; it is one problem — <em>too far out for the premium on offer</em> —
+      reported by the three gates that each measure a different face of it.</p>
       <p class="tokens">Tokens: <code>short_delta_band</code>, <code>short_delta:unavailable</code> (unknown)</p>
     </div>
 

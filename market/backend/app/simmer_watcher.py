@@ -976,7 +976,12 @@ async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None
             "walls": walls,
             "catalysts": research.get("_catalysts") or [],
             "macro_valid_through_dte": _macro_valid_dte(),
+            # horizon_days: soonest expected impact across the scored window
+            # (simmer_news aggregates MIN). The engine gates sentiment OUT when
+            # this exceeds the tenor — undated worries must not move a 2-DTE
+            # verdict. Missing => undated => inert, which fails closed.
             "sentiment": {"score": research.get("sentiment_score"),
+                          "horizon_days": research.get("sentiment_horizon_days"),
                           "velocity_p": research.get("velocity_p")},
             "days_to_cover": research.get("days_to_cover"),
             "earnings_inside_tenor": _earnings_inside_tenor(research, dte),

@@ -219,6 +219,10 @@ CREATE TABLE IF NOT EXISTS simmer_research_cache (
     sentiment_score    DOUBLE,      -- trailing 5-session weighted mean, -1..+1
     sentiment_n        INTEGER,     -- headline count: distinguishes "0.0 balanced"
                                     -- from "0.0 no news"
+    sentiment_horizon_days INTEGER, -- soonest expected impact across the window
+                                    -- (MIN over headlines); 999 = undated. The
+                                    -- engine gates sentiment out when this
+                                    -- exceeds the tenor.
     velocity_p         DOUBLE,      -- NB upper-tail p-value
     velocity_tier      VARCHAR,     -- none | warn | alert
     catalyst_flags     VARCHAR,     -- JSON: earnings/ex-div/8-K items in window
@@ -311,6 +315,10 @@ CREATE TABLE IF NOT EXISTS simmer_news (
     published_at   TIMESTAMP,
     sentiment      DOUBLE,             -- -1..+1, clamped server-side
     confidence     DOUBLE,
+    impact_within_days INTEGER,      -- soonest day count the impact is expected;
+                                     -- 999 = undated. Gates a headline OUT of
+                                     -- short-dated trades: a quarters-away worry
+                                     -- must not move a 2-DTE verdict.
     model          VARCHAR,            -- model id: scores are NOT reproducible
     scored_at      TIMESTAMP
 );
@@ -436,11 +444,23 @@ class Database:
             self.migrate()
         return self._conn
 
+    # Additive column migrations. `_SCHEMA` is all CREATE TABLE IF NOT EXISTS,
+    # so a column added to an existing table there is invisible to any database
+    # that already ran it — i.e. every production DB. These run every boot and
+    # are no-ops once applied.
+    _ADDITIVE_COLUMNS = (
+        ("simmer_news", "impact_within_days", "INTEGER"),
+        ("simmer_research_cache", "sentiment_horizon_days", "INTEGER"),
+    )
+
     def migrate(self) -> None:
         if self._conn is None:
             self._conn = duckdb.connect(str(self.path))
         with self._lock:
             self._conn.execute(_SCHEMA)
+            for table, col, coltype in self._ADDITIVE_COLUMNS:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {coltype}")
         self._seed_strike_profiles()
 
     # ── Strike profiles (debit smart-picker config) ──────────────────────────
@@ -734,7 +754,8 @@ class Database:
     # ────────────────────────────────────────────────────────────────────────
 
     _SIMMER_RESEARCH_COLS = (
-        "symbol", "sentiment_score", "sentiment_n", "velocity_p", "velocity_tier",
+        "symbol", "sentiment_score", "sentiment_n", "sentiment_horizon_days",
+        "velocity_p", "velocity_tier",
         "catalyst_flags", "catalyst_blocking", "iv_rank", "iv_percentile",
         "iv_rv_ratio", "vrp_xsect_pct", "vol_oi_ratio", "oi_delta", "pcr_volume",
         "short_interest", "days_to_cover", "news_at", "catalyst_at", "daily_at",

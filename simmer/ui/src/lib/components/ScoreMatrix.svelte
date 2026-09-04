@@ -41,7 +41,14 @@
 				const weight = c?.weight ?? LABELS[key].fallback;
 				const s = Math.max(0, Math.min(1, c?.score ?? 0));
 				const max = 100 * weight; // ceiling for this factor (regime ×1)
-				return { key, label: LABELS[key].label, weight, s, max, pts: max * s * mult };
+				// Sentiment is veto-only: with no articles it scores a full 1.0
+				// ("nothing to penalise"), which rendered as a full green bar and
+				// read as a measured bullish signal. Flag the no-data case so an
+				// unmeasured factor never looks like a strong one.
+				const noData =
+					key === 'sentiment_lean' && c?.sentiment_score == null;
+				return { key, label: LABELS[key].label, weight, s, max, noData,
+				         pts: max * s * mult };
 			})
 			.sort((a, b) => b.weight - a.weight)
 	);
@@ -63,10 +70,21 @@
 	</div>
 	<div class="space-y-1">
 		{#each rows as r (r.key)}
-			<div class="matrix-row" title={`weight ${(r.weight * 100).toFixed(0)}% · factor ${r.s.toFixed(2)} → ${fmt(r.pts)} of ${fmt(r.max)} pts`}>
-				<span class="matrix-label">{r.label}</span>
+			<div
+				class="matrix-row"
+				title={r.noData
+					? 'No news scored in the window — sentiment can only subtract, so with nothing to weigh it takes no points off. This is an UNMEASURED factor, not a positive read.'
+					: `weight ${(r.weight * 100).toFixed(0)}% · factor ${r.s.toFixed(2)} → ${fmt(r.pts)} of ${fmt(r.max)} pts`}
+			>
+				<span class="matrix-label">
+					{r.label}{#if r.noData}<span class="matrix-nodata">no data</span>{/if}
+				</span>
 				<span class="matrix-bar">
-					<span class="matrix-fill matrix-fill--{tone(r.s)}" style="width:{r.s * 100}%"></span>
+					<span
+						class="matrix-fill matrix-fill--{tone(r.s)}"
+						class:matrix-fill--nodata={r.noData}
+						style="width:{r.s * 100}%"
+					></span>
 				</span>
 				<span class="matrix-pts">
 					<span class="font-mono">{fmt(r.pts)}</span><span class="text-slate-600">/{fmt(r.max)}</span>
@@ -125,6 +143,23 @@
 	}
 	.matrix-fill--low {
 		background: rgb(251 113 133); /* rose-400 */
+	}
+	/* Unmeasured, not strong: hatched + desaturated so a full-width bar earned by
+	   "nothing to penalise" cannot be mistaken for a measured positive. */
+	.matrix-fill--nodata {
+		background-image: repeating-linear-gradient(
+			45deg,
+			rgb(100 116 139) 0 3px,
+			transparent 3px 6px
+		);
+		background-color: rgba(100, 116, 139, 0.28);
+	}
+	.matrix-nodata {
+		margin-left: 0.35rem;
+		font-size: 0.58rem;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		color: #64748b;
 	}
 	.matrix-pts {
 		text-align: right;

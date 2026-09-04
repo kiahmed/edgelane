@@ -238,10 +238,34 @@ def test_estimator_disagreement_vetoes_the_apparent_edge():
 # Short-delta band — 5–10Δ shorts are measurably negative-EV
 # ═══════════════════════════════════════════════════════════════════════════
 def test_short_delta_outside_the_band_vetoes():
+    """Drives the gate through the BAND, not through `row["delta"]`.
+
+    The engine no longer reads the chain's delta field at all — it computes
+    delta from live spot, so overwriting `row["delta"]` is a no-op and the old
+    version of this test silently asserted nothing. Squashing IV instead is not
+    an option either: low delta means far-OTM means thin credit, so the friction
+    and liquidity gates trip first and the assertion stops isolating this gate.
+    Moving the band under a clean fixture isolates it exactly.
+    """
+    cfg = copy.deepcopy(simmer_config.resolved("NVDA"))
+    cfg["gates"]["short_delta_min"] = 0.90     # clean fixture sits ~0.25
+    cfg["gates"]["short_delta_max"] = 0.95
+    assert reason_kinds(run(clean_inputs(), cfg)) == {"short_delta_band"}
+
+
+def test_chain_delta_field_is_ignored_in_favour_of_live_spot():
+    """Regression: a stale vendor delta must not be able to pass the gate.
+
+    Production, 2026-09-03: Tradier reported delta 0.2551 on a TSLA 367.5 call
+    while spot was 377.81 — greeks lagging spot by ~18 points. True delta was
+    0.8216, but the gate compared the stale 0.2551 against 0.20-0.35, passed,
+    and the engine sold a call that was already $10 ITM. Poisoning the chain's
+    delta field must now change nothing.
+    """
     inp = clean_inputs()
-    for row in inp["chain"]:                 # squash every delta far below 0.20
-        row["delta"] = round(row["delta"] * 0.30, 4)
-    assert reason_kinds(run(inp)) == {"short_delta_band"}
+    for row in inp["chain"]:
+        row["delta"] = 0.99                   # absurd, and deliberately ignored
+    assert reason_kinds(run(inp)) == set()
 
 
 def test_short_delta_band_edges():

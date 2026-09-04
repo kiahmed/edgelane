@@ -2,7 +2,7 @@
 	// Refusal-first lead element: every gate with its pass/fail/unknown state
 	// and the engine's actual reason strings. The default state of this product
 	// is "vetoed — here's why", so this renders before any score.
-	import { gateChecklist, failedCount, type GateCheck } from '$lib/gates';
+	import { gateChecklist, failedCount, type GateCheck, isCoupledDeltaCreditVeto} from '$lib/gates';
 	import { humanizeReason } from '$lib/fmt';
 	import type { ReadinessEnvelope } from '$lib/types';
 
@@ -55,7 +55,18 @@
 						{detailsOf(c.reasons).join(' · ')}
 					</span>
 				{/if}
+				{#if c.hint && c.state === 'fail'}
+					<span class="gate-hint">{c.hint}</span>
+				{/if}
 			</div>
 		{/each}
 	</div>
+	{#if isCoupledDeltaCreditVeto(checks)}
+		<!-- Three vetoes, one cause. Without this, a reader tunes three knobs. -->
+		<p class="gate-coupled">
+			These are one problem, not three: a low-delta short is a far-OTM short, and a far-OTM short
+			collects thin credit — so the round-trip cost eats it. Read it as
+			<strong>too far out for the premium on offer</strong>.
+		</p>
+	{/if}
 </div>

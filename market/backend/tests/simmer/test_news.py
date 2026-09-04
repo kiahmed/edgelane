@@ -281,7 +281,8 @@ def test_cluster_counts_by_bucket_counts_clusters_not_articles():
 def test_gemini_scores_clamped_server_side_regardless_of_schema():
     scores = sn.parse_gemini_scores(_load("gemini_scores.json"))
     assert scores["a1"] == {"score": 0.62, "confidence": 0.85,
-                            "reason": "earnings"}
+                            "reason": "earnings",
+                            "impact_within_days": 999}
     assert scores["a2"]["score"] == 1.0                # 1.7 clamped down
     assert scores["a2"]["confidence"] == 1.0           # 1.4 clamped down
     assert scores["a3"]["score"] == -1.0               # -3.0 clamped up
@@ -312,7 +313,7 @@ async def test_gemini_request_pins_schema_and_temperature_zero():
     props = gc["responseSchema"]["items"]["properties"]
     assert props["score"] == {"type": "NUMBER", "minimum": -1.0, "maximum": 1.0}
     assert fake.requests[0].url.path.endswith(
-        "/models/gemini-2.5-flash-lite:generateContent")
+        "/models/gemini-2.5-flash:generateContent")
     assert fake.requests[0].headers["x-goog-api-key"] == "gm-key"
 
 
@@ -356,7 +357,7 @@ async def test_refresh_ingests_dedupes_and_scores_only_new(fresh_db):
     # every new row was scored, clamped range, model recorded
     for r in rows:
         assert r["sentiment"] == 0.5
-        assert r["model"] == "gemini-2.5-flash-lite"
+        assert r["model"] == "gemini-2.5-flash"
         assert r["scored_at"] is not None
     gemini_calls_after_first = len(gemini.requests)
     assert gemini_calls_after_first == 1               # 6 headlines, one batch
@@ -521,13 +522,13 @@ def _seed_news(db) -> None:
          "headline": "NVIDIA Announces Record Q2 Results",
          "source": "benzinga", "url": "https://x/a1", "published_at": t,
          "sentiment": 0.6, "confidence": 0.9,
-         "model": "gemini-2.5-flash-lite", "scored_at": t},
+         "model": "gemini-2.5-flash", "scored_at": t},
         {"article_id": "a2", "symbol": "NVDA", "cluster_key": "wave",
          "headline": "NVIDIA announces record Q2 results - Reuters",
          "source": "reuters", "url": "https://x/a2",
          "published_at": t + timedelta(minutes=3),
          "sentiment": 0.4, "confidence": 0.8,
-         "model": "gemini-2.5-flash-lite", "scored_at": t},
+         "model": "gemini-2.5-flash", "scored_at": t},
         {"article_id": "b1", "symbol": "NVDA", "cluster_key": "solo",
          "headline": "NVIDIA Partners With Automaker",
          "source": "benzinga", "url": "https://x/b1",
@@ -539,7 +540,7 @@ def _seed_news(db) -> None:
          "headline": "Old story", "source": "benzinga", "url": "https://x/old",
          "published_at": _now() - timedelta(hours=30),
          "sentiment": 0.1, "confidence": 0.5,
-         "model": "gemini-2.5-flash-lite", "scored_at": t},
+         "model": "gemini-2.5-flash", "scored_at": t},
     ])
     db.upsert_simmer_research({"symbol": "NVDA", "sentiment_score": 0.31,
                                "sentiment_n": 2, "velocity_p": 0.2,
