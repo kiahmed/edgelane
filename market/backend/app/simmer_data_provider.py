@@ -152,6 +152,7 @@ class SimmerDataProvider(Protocol):
     async def quote(self, symbol: str) -> dict: ...
     async def expirations(self, symbol: str) -> list[str]: ...
     async def daily_bars(self, symbol: str, days: int) -> list[dict]: ...
+    async def intraday_ohlc(self, symbol: str) -> list[dict]: ...
     def take_data_quality_notes(self) -> list[str]: ...
 
 
@@ -199,6 +200,13 @@ class TradierDataProvider(_NotesMixin):
         # abstraction's ground rules we do not add one). Callers keep their
         # pre-provider fallback behavior: close-to-close RV, touched=NULL.
         self._note("daily_bars:unsupported_by_tradier_client")
+        return []
+
+    async def intraday_ohlc(self, symbol: str) -> list[dict]:
+        # No intraday history endpoint on TradierClient (same posture as
+        # daily_bars). The short-tier intraday branch simply falls back to the
+        # daily vol reference when this is empty — never an error.
+        self._note("intraday_ohlc:unsupported_by_tradier_client")
         return []
 
 
@@ -534,6 +542,50 @@ class YahooDataProvider(_NotesMixin):
                                             row["low"], row["close"]):
                 bars.append(row)
         return bars[-int(days):] if days and days > 0 else bars
+
+    async def intraday_ohlc(self, symbol: str) -> list[dict]:
+        """Today's session OHLC bars via the v8 chart endpoint
+        (range=1d, interval=5m), oldest→newest, for the short-tier intraday
+        realized-vol estimate (docs/simmer_dte_tiers.md §1). Rows:
+        {t, open, high, low, close, volume} with `t` the bar's UTC ISO time.
+
+        Degrades SOFT: any failure — network, throttle, auth, non-JSON, empty
+        result — returns [] and stamps a data_quality note, never raises. The
+        engine then falls back to the daily vol reference, so a bad intraday
+        fetch during market hours costs nothing but the intraday branch."""
+        try:
+            payload = await self._get_json(
+                _YAHOO_CHART_URL.format(sym=_yahoo_symbol(symbol)),
+                {"range": "1d", "interval": "5m"})
+            result = self._result0(payload, "chart")
+        except ProviderError:
+            self._note(f"yahoo:intraday_unavailable:{(symbol or '').upper()}")
+            return []
+        stamps = result.get("timestamp") or []
+        quote = ((result.get("indicators") or {}).get("quote") or [{}])[0] or {}
+        opens = quote.get("open") or []
+        highs = quote.get("high") or []
+        lows = quote.get("low") or []
+        closes = quote.get("close") or []
+        vols = quote.get("volume") or []
+        bars: list[dict] = []
+        for idx, ts in enumerate(stamps):
+            o = opens[idx] if idx < len(opens) else None
+            h = highs[idx] if idx < len(highs) else None
+            lo = lows[idx] if idx < len(lows) else None
+            c = closes[idx] if idx < len(closes) else None
+            # Yahoo pads forming/halted 5-min buckets with nulls — skip them so a
+            # partial last bar never injects a bogus return.
+            if None in (o, h, lo, c):
+                continue
+            iso = None
+            try:
+                iso = datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+            except (TypeError, ValueError, OSError, OverflowError):
+                pass
+            bars.append({"t": iso, "open": o, "high": h, "low": lo, "close": c,
+                         "volume": vols[idx] if idx < len(vols) else None})
+        return bars
 
 
 # ─────────────────────────────────────────────────────────────────────────────

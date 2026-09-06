@@ -894,6 +894,62 @@ def _persist_readiness(db, env: dict) -> int:
     })
 
 
+def _iv_change_from_snaps(snaps: Sequence[dict], icfg: dict) -> float | None:
+    """iv_change from today's ATM-IV snapshots (oldest→newest). Needs ≥ 2
+    snapshots; >0 means IV richened since the session's first snapshot. Baseline
+    per config: normalized fractional change (default) or absolute vol points."""
+    vals = [v for v in (_num(s.get("atm_iv")) for s in snaps or [])
+            if v is not None and v > 0]
+    if len(vals) < 2:
+        return None
+    first, latest = vals[0], vals[-1]
+    if str(icfg.get("iv_change_baseline", "session_first")) == "vol_points":
+        return latest - first
+    return (latest - first) / first
+
+
+async def _intraday_signals(db, provider, symbol: str, atm_iv: float | None,
+                            session_date: str, persist: bool) -> dict:
+    """Live short-tier inputs (docs/simmer_dte_tiers.md §1), computed only during
+    market hours by the caller. Returns {"rv_intraday", "iv_change"} — either may
+    be None, which the engine reads as "absent" and falls back to the daily vol
+    reference. NEVER raises and NEVER fabricates: every fetch/DB failure leaves
+    the field None.
+
+    `rv_intraday` = annualized realized vol of today's intraday OHLC.
+    `iv_change`   = change vs the session's first ATM-IV snapshot; this sweep
+                    APPENDS the current snapshot first (only when `persist`, so
+                    the on-demand route never writes), then reads the session."""
+    icfg = simmer_config.intraday()
+    out: dict[str, Any] = {"rv_intraday": None, "iv_change": None}
+
+    if hasattr(provider, "intraday_ohlc"):
+        try:
+            bars = await provider.intraday_ohlc(symbol)
+        except Exception as e:                      # defensive — provider owns soft-fail
+            log.warning("intraday_ohlc failed for %s: %s", symbol, e)
+            bars = []
+        if bars:
+            out["rv_intraday"] = simmer_engine.intraday_realized_vol(
+                bars, bars_per_day=int(icfg.get("bars_per_day", 78)),
+                annualization=int(simmer_config.vol()["annualization_days"]),
+                min_bars=int(icfg.get("min_bars", 4)))
+
+    if db is not None and atm_iv is not None:
+        snaps: list[dict] = []
+        try:
+            if persist:
+                await asyncio.to_thread(db.insert_simmer_iv_intraday, symbol,
+                                        _now_naive_utc(), atm_iv)
+            snaps = await asyncio.to_thread(
+                db.fetch_simmer_iv_intraday_today, symbol, session_date)
+        except Exception as e:
+            log.warning("intraday IV snapshot failed for %s: %s", symbol, e)
+            snaps = []
+        out["iv_change"] = _iv_change_from_snaps(snaps, icfg)
+    return out
+
+
 async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None,
                          user_settings: dict | None = None,
                          regime: dict | None = None,
@@ -950,6 +1006,20 @@ async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None
     earnings_vrp_event = _earnings_within_days(
         research, far_window * 365.0 if far_window else None)
 
+    # Short-tier intraday feed (docs/simmer_dte_tiers.md §1) — ONLY during market
+    # hours. Off-hours we do NOT fetch intraday (the closed-hours freeze stays
+    # intact and short tiers fall back to the daily vol reference). A snapshot is
+    # appended only on the persisted sweep path (persist=True), never on-demand.
+    intraday_sig: dict[str, Any] = {"rv_intraday": None, "iv_change": None}
+    if state.market_open and simmer_config.intraday().get("intraday_feed_enabled", True):
+        # Session keyed on the UTC calendar day: snapshots are stored with a UTC
+        # ts, and US regular trading hours (13:30–20:00 UTC) never span a UTC
+        # midnight, so the whole session shares one UTC date — the filter and the
+        # stored ts can never disagree at a timezone boundary.
+        intraday_sig = await _intraday_signals(
+            db, provider, symbol, iv_near,
+            datetime.now(timezone.utc).date().isoformat(), persist)
+
     inputs: dict[str, Any] = {
         "symbol": symbol,
         "spot": spot,
@@ -964,6 +1034,10 @@ async def analyze_symbol(tradier, db, symbol: str, expiration: str | None = None
             "rv_yang_zhang": research.get("_rv_yz"),
             "rv_close_to_close": research.get("_rv_cc"),
             "ohlc": research.get("_ohlc") or [],
+            # Short-tier live vol inputs — None off-hours / on any failure, which
+            # the engine reads as absent and falls back to the daily reference.
+            "rv_intraday": intraday_sig.get("rv_intraday"),
+            "iv_change": intraday_sig.get("iv_change"),
             "peer_vrp_ratios": list(peer_vrp or []),
             # Per-ticker term structure (real single-name slope, not the index
             # VIX/VIX3M overlay) + the far-expiry legs the earnings-VRP

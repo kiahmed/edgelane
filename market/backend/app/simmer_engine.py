@@ -305,6 +305,39 @@ def close_to_close_rv(rows: Iterable[Any], annualization: int = 252,
     return math.sqrt(var) * math.sqrt(annualization)
 
 
+def intraday_realized_vol(rows: Iterable[Any], bars_per_day: int = 78,
+                          annualization: int = 252,
+                          min_bars: int = 4) -> float | None:
+    """Annualized realized vol from TODAY's intraday bars (docs/simmer_dte_tiers.md
+    §1) — the short-tenor VRP's realized reference.
+
+    Zero-mean close-to-close variance of the intraday bars, scaled to annual:
+
+        σ_annual = sqrt( Σ rᵢ² / n ) × sqrt(bars_per_day × annualization)
+
+    where `rᵢ = ln(cᵢ / cᵢ₋₁)` over the session's bars and `bars_per_day` is the
+    count of bars in a full regular session (≈78 for 5-min bars in 6.5h). This is
+    deliberately the close-to-close estimator, NOT Yang-Zhang: intraday bars have
+    no meaningful overnight leg, and the whole point of the short-tenor branch is
+    that a *stale multi-day* RV must not gate a 0DTE — a same-session estimate on
+    the right timeframe is what the 0-1 tier needs. Zero-mean because intraday
+    drift over one session is noise. Accepts intraday_ohlc rows (o/h/l/c dicts or
+    tuples) or a bare list of closes; returns None below `min_bars` bars."""
+    bars = _bars(rows)
+    closes = [b["close"] for b in bars]
+    if len(closes) < 2:
+        closes = [c for c in (_num(x) for x in rows or []) if c and c > 0]
+    if len(closes) < max(2, int(min_bars)):
+        return None
+    rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
+    n = len(rets)
+    var = sum(x * x for x in rets) / n          # zero-mean
+    if var <= 0:
+        return None
+    periods_per_year = float(bars_per_day) * float(annualization)
+    return math.sqrt(var) * math.sqrt(periods_per_year)
+
+
 def parkinson_rv(rows: Iterable[Any], annualization: int = 252) -> float | None:
     """⚠ **Reference implementation only — never gate on this.** Parkinson (and
     Garman-Klass) run ~23% biased LOW in the presence of overnight gaps, which
@@ -1004,6 +1037,48 @@ def sentiment_persistence(score: float, horizon_days: float, cfg_sent: dict,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DTE tiers (docs/simmer_dte_tiers.md)
+# ─────────────────────────────────────────────────────────────────────────────
+def classify_dte_tier(dte: Any, cfg: dict | None = None) -> str:
+    """Map a tenor to its DTE tier: ``"0-1"``, ``"2-5"``, ``"6-21"``,
+    ``"22-45"`` or ``"long"``.
+
+    Boundaries live in ``simmer_config.DTE_TIERS`` (deep-merge-overridable),
+    never hardcoded here — the seams are judgment calls to be re-cut from
+    calibration. `cfg` is the resolved engine config, so this stays a pure
+    function of it; when omitted the module defaults are read, which is what lets
+    a caller or test invoke ``classify_dte_tier(3)`` directly."""
+    tiers = (cfg.get("dte_tiers") if cfg else None) or simmer_config.dte_tiers()
+    d = _num(dte)
+    d = 0.0 if d is None else d
+    for band in tiers.get("bounds") or []:
+        mx = _num(band.get("max_dte"))
+        if mx is not None and d <= mx:
+            return str(band.get("tier"))
+    return str(tiers.get("long_tier", "long"))
+
+
+def catalyst_dte_weight(dte: Any, cfg: dict | None = None) -> float:
+    """Tenor multiplier on the catalyst contribution (docs §5).
+
+    Heaviest at 0 DTE (``max_weight``), decaying LINEARLY to exactly 1.0 at
+    ``neutral_dte`` and staying 1.0 beyond it. Monotonically non-increasing and
+    never below 1.0 — it only ever amplifies a penalty, so catalyst can steer and
+    veto harder at short tenor while still never promoting a credit sell on its
+    own. Being 1.0 across the whole 6-45 DTE range is what keeps the theta sweet
+    spot byte-identical to the current engine."""
+    c = (cfg.get("catalyst") if cfg else None) or simmer_config.catalyst()
+    d = _num(dte)
+    d = 0.0 if d is None else max(0.0, d)
+    max_w = float(c.get("max_weight", 3.0))
+    neutral = float(c.get("neutral_dte", 6.0))
+    if neutral <= 0 or d >= neutral:
+        return 1.0
+    frac = (neutral - d) / neutral        # 1.0 at dte=0 → 0.0 at dte=neutral
+    return 1.0 + (max_w - 1.0) * frac
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Gates
 # ─────────────────────────────────────────────────────────────────────────────
 def _to_days(value: Any) -> float | None:
@@ -1075,12 +1150,26 @@ def global_gates(ctx: dict, cfg: dict) -> list[str]:
         out.append("dte_window")
 
     # ── Volatility floor: gate on PERCENTILE, display rank ─────────────────
-    ivp = ctx["metrics"].get("iv_percentile_effective")
-    if ivp is None:
-        out.append("volatility_history_unavailable")
-    elif ivp < float(g["iv_percentile_floor"]):
-        # Below IVR ~20 the forward IV/RV is 0.95 — negative-EV before costs.
-        out.append("iv_percentile_floor")
+    # Short-tenor branch (docs §1): at 0-5 DTE with a live IV-change signal, gate
+    # on whether IV is richening into the catalyst rather than on the 252-day
+    # percentile — a rising IV is a GO, not a veto, and a stale annual rank
+    # cannot see today's richening. `iv_gate_mode` is set by compute_metrics ONLY
+    # for a short tier that actually has the signal; otherwise this is the exact
+    # daily path as before (medium tiers stay byte-identical).
+    if ctx["metrics"].get("iv_gate_mode") == "iv_change":
+        iv_chg = ctx["metrics"].get("iv_change")
+        if iv_chg is None:
+            out.append("volatility_history_unavailable")
+        elif iv_chg < float(g.get("iv_change_floor", 0.0)):
+            # IV bleeding out post-event → premium is deflating, not building.
+            out.append("iv_change_floor")
+    else:
+        ivp = ctx["metrics"].get("iv_percentile_effective")
+        if ivp is None:
+            out.append("volatility_history_unavailable")
+        elif ivp < float(g["iv_percentile_floor"]):
+            # Below IVR ~20 the forward IV/RV is 0.95 — negative-EV before costs.
+            out.append("iv_percentile_floor")
 
     # ── VRP floor — a RATIO, never vol points ──────────────────────────────
     vrp = ctx["metrics"].get("vrp")
@@ -1317,8 +1406,15 @@ def _component_sentiment(cand: dict, ctx: dict, cfg: dict) -> tuple[float, dict]
                 is_index=bool(ctx["rule"].get("is_index")),
                 earnings_inside_tenor=bool(ctx["research"].get("earnings_inside_tenor", True)),
             )
-            val = _clamp01(1.0 - abs(score) * pers)
+            # Catalyst matters more at short tenor (docs §5): amplify the PENALTY
+            # by the DTE weight. The weight is ≥ 1.0 and this only subtracts, so a
+            # positive/aligned catalyst can never lift the component above 1.0 —
+            # catalyst still never promotes. Weight is 1.0 at ≥ 6 DTE, so medium
+            # tiers are unchanged.
+            weight = catalyst_dte_weight(ctx["dte"], cfg)
+            val = _clamp01(1.0 - abs(score) * pers * weight)
             detail.update({"adverse": True, "persistence": pers,
+                           "catalyst_dte_weight": weight,
                            "adverse_direction": "bullish" if bullish_hurts else "bearish"})
     p = _num(s.get("velocity_p"))
     if p is not None and p <= float(cfg["velocity"]["alert_p"]):
@@ -1622,6 +1718,52 @@ def compute_metrics(ctx: dict, cfg: dict) -> dict[str, Any]:
         if (yz is not None and cc is not None) else True
     vrp = vrp_ratio(iv, yz)
 
+    # ── Tier-branched vol reference (docs/simmer_dte_tiers.md §1-2) ──────────
+    # SHORT tiers (0-1, 2-5) prefer an intraday realized vol and an IV-change
+    # signal WHEN the caller injects them (`research.rv_intraday`, an annualized
+    # same-session RV; `research.iv_change`, the ATM-IV richening signal). These
+    # arrive only from a future intraday data path — for now, tests / an explicit
+    # caller. When absent, or for any medium/long tier, this block is a NO-OP and
+    # the daily 20d-YZ VRP + 252d IVP path above stands unchanged, so 6-21 and
+    # 22-45 stay byte-identical to today (parity). `vol_reference` / `iv_gate_mode`
+    # are surfaced so a reader (and the gate) knows which lens produced `vrp`.
+    tier = classify_dte_tier(dte, cfg)
+    tiers_cfg = cfg.get("dte_tiers") or {}
+    short_tiers = tiers_cfg.get("short_tiers") or []
+    rv_intraday = _num(res.get("rv_intraday"))
+    iv_change = _num(res.get("iv_change"))
+    vol_reference = "daily"
+    iv_gate_mode: str | None = None
+    iv_change_out: float | None = None
+    rv_short_ref: float | None = None      # the intraday RV that drove the gate
+    if tier in short_tiers:
+        if rv_intraday is not None and rv_intraday > 0 and iv is not None:
+            if tier == "2-5" and yz is not None and yz > 0:
+                # Blend intraday with the daily YZ so one catalyst bar can't
+                # dominate but recent movement still counts (§2).
+                blend = float(tiers_cfg.get("short_rv_blend", 0.5))
+                rv_short = blend * rv_intraday + (1.0 - blend) * yz
+            else:
+                rv_short = rv_intraday
+            vrp = vrp_ratio(iv, rv_short)
+            vol_reference = "intraday" if tier == "0-1" else "blended"
+            rv_short_ref = rv_short
+        if iv_change is not None:
+            # IV-change gate replaces the 252-day percentile for the veto (§1).
+            iv_gate_mode = "iv_change"
+            iv_change_out = iv_change
+
+    # rv_forecast drives EV / POP-edge / credit_quality. On a short tier it must
+    # follow the SAME intraday RV the VRP gate used (consistency, not
+    # outcome-fitting) — otherwise the gate reads intraday but the score reads the
+    # stale 20-day YZ, which manufactures a `no_forecast_edge_over_market_iv`
+    # even where the intraday gate found edge. An EXPLICITLY injected
+    # `research.rv_forecast` still wins (a caller override is never clobbered);
+    # medium/long tiers keep the daily YZ forecast, byte-identical to today.
+    rv_forecast = _num(res.get("rv_forecast"))
+    if rv_forecast is None or rv_forecast <= 0:      # matches the prior `or yz`
+        rv_forecast = rv_short_ref if rv_short_ref is not None else yz
+
     # Cold start: rank IV30/RV20 across the watchlist TODAY — zero history, and
     # on par with 252-day IVR. Blend once history exists.
     xs = cross_sectional_percentile(vrp, res.get("peer_vrp_ratios") or []) \
@@ -1670,8 +1812,12 @@ def compute_metrics(ctx: dict, cfg: dict) -> dict[str, Any]:
         "rv_yang_zhang": yz,
         "rv_close_to_close": cc,
         "rv_agrees": agrees,
-        "rv_forecast": _num(res.get("rv_forecast")) or yz,
+        "rv_forecast": rv_forecast,
         "vrp": vrp,
+        "dte_tier": tier,
+        "vol_reference": vol_reference,   # daily | intraday | blended
+        "iv_gate_mode": iv_gate_mode,     # None (percentile) | "iv_change"
+        "iv_change": iv_change_out,       # echoed only when it drives the gate
         "term_slope": ts,
         "term_slope_pp": ts_pp,
         "vrp_total_pp": decomp["vrp_total_pp"],
@@ -1729,6 +1875,67 @@ def _data_quality(ctx: dict, cand: dict | None, cfg: dict) -> tuple[dict, float]
     conf = _clamp01(0.30 * iv_q + 0.25 * rv_q + 0.20 * quote_q +
                     0.15 * walls_q + 0.10 * news_q)
     return dq, conf
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Catalyst-driven tier logic (docs/simmer_dte_tiers.md §4, §6)
+# ─────────────────────────────────────────────────────────────────────────────
+def _catalyst_sign(ctx: dict, cfg: dict) -> int:
+    """Directional read for short-tier steering: +1 bullish, −1 bearish, 0
+    neutral. Earnings direction (when the expiry is in an earnings window) wins
+    over the news lean; otherwise the news sentiment sign outside a deadband."""
+    earn = ctx.get("earnings") or {}
+    if earn.get("in_window"):
+        _dir = str(earn.get("direction") or "neutral")
+        if _dir == "bullish":
+            return 1
+        if _dir == "bearish":
+            return -1
+    score = _num((ctx["research"].get("sentiment") or {}).get("score"))
+    band = float(cfg.get("catalyst", {}).get("neutral_band", 0.10))
+    if score is None or abs(score) <= band:
+        return 0
+    return 1 if score > 0 else -1
+
+
+def _preferred_short_structure(ctx: dict, cfg: dict) -> str | None:
+    """Which structure a short-tier catalyst steers toward (§1, §4):
+    positive → bull_put, negative → bear_call, neutral + rich IV → iron_condor.
+    Returns None when steering is off, the tier is not short, or the read gives
+    no lean (neutral without rich IV). Selection-only — it reorders already-built,
+    already-gated candidates and never fabricates or promotes one."""
+    cat = cfg.get("catalyst", {})
+    if not cat.get("steer_short_tiers", True):
+        return None
+    if ctx["metrics"].get("dte_tier") not in (cfg.get("dte_tiers", {}).get("short_tiers") or []):
+        return None
+    sign = _catalyst_sign(ctx, cfg)
+    if sign > 0:
+        return "bull_put"
+    if sign < 0:
+        return "bear_call"
+    vrp = ctx["metrics"].get("vrp")
+    if vrp is not None and vrp >= float(cat.get("iron_condor_min_vrp", 1.35)):
+        return "iron_condor"
+    return None
+
+
+def _debit_handoff_notice(ctx: dict, cfg: dict) -> list[str]:
+    """Section 6: at a LONG tenor, the same cheap-IV / live-catalyst conditions
+    Simmer would otherwise veto on are a DEBIT (directional) setup, not "nothing
+    here." Surface a non-blocking `avoid_if` token — never a veto, never an order.
+    The direction call itself is deliberately NOT Simmer's to make (that is
+    Matrix's dealer-GEX bias engine); this is only the warning + handoff trigger."""
+    tiers_cfg = cfg.get("dte_tiers", {})
+    if ctx["metrics"].get("dte_tier") != tiers_cfg.get("debit_handoff_tier", "long"):
+        return []
+    m = ctx["metrics"]
+    vrp = m.get("vrp")
+    ivp = m.get("iv_percentile_effective")
+    cheap_iv = (vrp is not None and vrp < float(tiers_cfg.get("debit_handoff_vrp", 1.0))) or \
+               (ivp is not None and ivp < float(cfg["gates"]["iv_percentile_floor"]))
+    directional = _catalyst_sign(ctx, cfg) != 0
+    return ["consider_debit_structure_long_dte"] if (cheap_iv or directional) else []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1836,6 +2043,13 @@ def evaluate_readiness(inputs: dict, cfg: dict | None = None) -> dict[str, Any]:
     reg = market_regime(research.get("index"), cfg["regime"])
     envelope["regime"] = reg
 
+    # §6 debit handoff — computed BEFORE the gates so it rides out even a hard
+    # veto (a long-tenor credit is usually vetoed on the DTE window; the whole
+    # point is to replace that bare veto with a "consider debit" pointer). It is
+    # a no-op for every non-long tier, so medium tiers are untouched.
+    debit_notice = _debit_handoff_notice(ctx, cfg)
+    envelope["avoid_if"] = list(debit_notice)
+
     vetoes = global_gates(ctx, cfg)
     dq, conf = _data_quality(ctx, None, cfg)
     envelope["data_quality"], envelope["confidence"] = dq, conf
@@ -1846,7 +2060,7 @@ def evaluate_readiness(inputs: dict, cfg: dict | None = None) -> dict[str, Any]:
     # ── Which structures are even eligible (side selection) ────────────────
     allowed = [s for s in (settings.get("structures_enabled")
                            or rule.get("structures") or STRUCTURES) if s in STRUCTURES]
-    avoid_if: list[str] = []
+    avoid_if: list[str] = list(debit_notice)
     for s in reg["suppress"]:
         if s in allowed:
             allowed.remove(s)
@@ -1937,7 +2151,20 @@ def evaluate_readiness(inputs: dict, cfg: dict | None = None) -> dict[str, Any]:
         envelope["avoid_if"] = avoid_if
         return envelope
 
+    # Default: the top-scoring survivor. Short tiers then let the catalyst STEER
+    # the side (§1, §4) — prefer the catalyst-aligned structure when it survived
+    # the gates, even if another structure edged it on raw score. This only
+    # reorders already-built candidates; it never fabricates or promotes one, and
+    # is inert for medium/long tiers (preferred is None there).
     score, cand, comps, _ = max(scored, key=lambda x: x[0])
+    catalyst_steer = None
+    preferred = _preferred_short_structure(ctx, cfg)
+    if preferred and preferred != cand["structure"]:
+        for sc, c, cm, _r in scored:
+            if c["structure"] == preferred:
+                score, cand, comps = sc, c, cm
+                catalyst_steer = preferred
+                break
     dq, conf = _data_quality(ctx, cand, cfg)
 
     # Soft warnings that inform but never veto.
@@ -1992,10 +2219,14 @@ def evaluate_readiness(inputs: dict, cfg: dict | None = None) -> dict[str, Any]:
             _align = _lean * _sign
             if _dir == "neutral" and cand["structure"] == "iron_condor":
                 _align = 1.0
+            # Same tenor amplification as the news lean (docs §5): the earnings
+            # fold steers harder at short tenor and fades to today's behavior by
+            # 6 DTE (weight 1.0), so 6-45 DTE earnings folds are unchanged.
+            _cat_w = catalyst_dte_weight(ctx["dte"], cfg)
             if _go:
-                _lift = round(_align * _conf * _max_lift, 2)
+                _lift = round(_align * _conf * _max_lift * _cat_w, 2)
             else:
-                _lift = round(-abs(_conf) * _max_lift, 2)
+                _lift = round(-abs(_conf) * _max_lift * _cat_w, 2)
                 _held_back = True
             score = max(0.0, min(100.0, score + _lift))
             if _held_back:
@@ -2040,6 +2271,7 @@ def evaluate_readiness(inputs: dict, cfg: dict | None = None) -> dict[str, Any]:
         "data_quality": dq,
         "earnings": earn_block,
         "candidate": cand,
+        "catalyst_steer": catalyst_steer,   # short-tier side steering, else None
         "rejected": sorted(set(all_reasons)),
     })
     return envelope

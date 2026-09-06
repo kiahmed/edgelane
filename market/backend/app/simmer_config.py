@@ -83,6 +83,12 @@ GATES: dict[str, Any] = {
     "iv_percentile_floor":            40.0,  # IVP < 40 → veto (gate on this)
     "iv_rank_floor":                  25.0,  # advisory alternate, displayed not gated
     "vrp_ratio_floor":                1.15,  # IV / RV_YangZhang
+    # Short-tenor IV gate (docs/simmer_dte_tiers.md §1). At 0-5 DTE, when a live
+    # IV-change signal is present, the engine gates on it INSTEAD of the 252-day
+    # percentile: IV richening into a catalyst (change ≥ this) is a GO, not a
+    # veto. A negative change (premium bleeding out post-event) still vetoes.
+    # 0.0 = "IV must not be falling." Paper-calibration pending (per docs §7).
+    "iv_change_floor":                0.0,
     # Structure
     "short_delta_min":                0.20,
     "short_delta_max":                0.35,
@@ -207,6 +213,92 @@ VOL: dict[str, Any] = {
     "ev_integration_step":  0.01,  # $0.01 payoff integration increments
     "ev_max_steps":         200_000,
     "days_per_year":        365.0, # EM/DTE are CALENDAR days — IV30 is 30 calendar days
+}
+
+# ── DTE tiers (docs/simmer_dte_tiers.md) ───────────────────────────────────
+# A 0DTE and a 45DTE are different trades that today pass through the SAME vol
+# gates. These tiers make the vol reference and the catalyst weight depend on
+# tenor. Every boundary here is tunable so the seams (0-1 vs 2-5 vs 6-21) can be
+# re-cut from calibration without a code change — they are judgment calls today
+# (docs §"Open decisions"). Paper-calibration pending before any tier promotes
+# from advisory to gating.
+#
+# CRITICAL invariant: the 6-21 and 22-45 tiers are NOT listed in `short_tiers`,
+# so they never take the intraday branch and stay byte-identical to the current
+# daily engine — the theta sweet spot the doc says explicitly not to touch (§3).
+DTE_TIERS: dict[str, Any] = {
+    # Inclusive upper DTE bound per tier, ascending. A DTE above the last bound
+    # falls to `long_tier`. Calendar DTE, matching the engine's `dte`.
+    "bounds": [
+        {"tier": "0-1",   "max_dte": 1},
+        {"tier": "2-5",   "max_dte": 5},
+        {"tier": "6-21",  "max_dte": 21},
+        {"tier": "22-45", "max_dte": 45},
+    ],
+    "long_tier": "long",
+    # Tiers that take the short-tenor vol branch (intraday RV + IV-change),
+    # and ONLY when those inputs are actually injected — otherwise they fall back
+    # to the daily path, so a missing-data 0-5DTE behaves exactly as today.
+    "short_tiers": ["0-1", "2-5"],
+    # 2-5 blends the intraday RV estimate with the daily 20d YZ so a single
+    # catalyst bar can't dominate but recent movement still counts (§2). Weight
+    # on rv_intraday; the remainder on YZ. Reasoned split, not a fit.
+    "short_rv_blend": 0.5,
+    # §6 debit handoff: the tier at which a cheap-IV / live-catalyst setup earns
+    # a non-blocking "consider debit" notice instead of a bare veto. Governed by
+    # the bounds above (default: the "long" bucket, i.e. DTE > 45).
+    "debit_handoff_tier": "long",
+    # Cheap IV for the handoff: VRP below this (premium not compensating) OR IVP
+    # below the gate floor counts as "cheap". VRP<1 = IV under realized.
+    "debit_handoff_vrp": 1.0,
+}
+
+# ── Catalyst weight by DTE (docs/simmer_dte_tiers.md §5) ────────────────────
+# A catalyst's relevance to a CREDIT trade is inversely related to tenor: it is
+# the whole trade at 0DTE and mostly priced by 45DTE. This multiplier scales the
+# news `sentiment_lean` PENALTY and the earnings fold up at short tenor.
+#
+# It is 1.0 (today's behavior) at and beyond `neutral_dte`, so 6-21 / 22-45 stay
+# byte-identical to the current engine. The doc's illustrative ">21 tapering to
+# ~0 by 45" is deliberately NOT applied to the medium-tier weight (doing so would
+# retune the theta sweet spot and break parity); at long tenor that intent is
+# instead expressed by the §6 debit handoff. The multiplier only ever amplifies a
+# penalty — it can never lift a component above its neutral 1.0, so catalyst can
+# steer/veto harder but still NEVER promotes a credit sell on its own.
+# Paper-calibration pending.
+CATALYST: dict[str, Any] = {
+    "max_weight":   3.0,   # multiplier at 0 DTE (heaviest)
+    "neutral_dte":  6.0,   # at/after this DTE the multiplier is exactly 1.0
+    # Short-tier side steering (§1, §4): wire the catalyst SIGN into side
+    # selection for 0-5 DTE. Positive → prefer bull_put, negative → bear_call,
+    # neutral + rich IV → iron_condor. Steering only reorders the already-built,
+    # already-gated candidates; it never fabricates or promotes one.
+    "steer_short_tiers": True,
+    "neutral_band":      0.10,   # |sentiment| ≤ this → treated as neutral
+    "iron_condor_min_vrp": 1.35, # neutral + VRP ≥ this → prefer the condor
+}
+
+# ── Intraday feed (docs/simmer_dte_tiers.md "Prerequisite") ────────────────
+# The live data path that populates `research.rv_intraday` and
+# `research.iv_change` during market hours, so the short (0-1 / 2-5 DTE) tiers
+# activate for real instead of falling back to the daily gates. Off-hours and on
+# any provider failure the fields stay absent and the engine uses the daily vol
+# reference — the short tiers never gate on stale intraday data.
+INTRADAY: dict[str, Any] = {
+    "intraday_feed_enabled": True,   # master switch; False = daily-only, as before
+    "interval":             "5m",    # Yahoo v8 chart interval for the session bars
+    # Bars in a full 6.5h regular session at `interval` — the intraday-RV
+    # annualization is `bars_per_day × annualization_days`. 78 = 5-min bars.
+    # Retune alongside `interval`.
+    "bars_per_day":         78,
+    "min_bars":             4,       # need ≥ this many intraday bars for an RV
+    # iv_change definition (must match what the short-tier gate expects: >0 =
+    # richening). "session_first" = (latest − first)/first, a NORMALIZED
+    # fractional change vs the session's opening ATM-IV snapshot (unitless, so a
+    # $50 and a $500 name share one floor). Alternative "vol_points" = latest −
+    # first in absolute IV. Needs ≥ 2 snapshots today, else None. The gate floor
+    # itself lives in GATES["iv_change_floor"]. Paper-calibration pending.
+    "iv_change_baseline":   "session_first",
 }
 
 # ── Watcher cadence + two-tier cache TTLs (seconds; 0 = sweep-only) ────────
@@ -431,6 +523,18 @@ def vol() -> dict[str, Any]:
     return _merged("vol", VOL)
 
 
+def dte_tiers() -> dict[str, Any]:
+    return _merged("dte_tiers", DTE_TIERS)
+
+
+def catalyst() -> dict[str, Any]:
+    return _merged("catalyst", CATALYST)
+
+
+def intraday() -> dict[str, Any]:
+    return _merged("intraday", INTRADAY)
+
+
 def cadence() -> dict[str, int]:
     return _merged("cadence", CADENCE)
 
@@ -540,6 +644,8 @@ def resolved(symbol: str | None = None) -> dict[str, Any]:
         "earnings":       earnings(),
         "management":     management(),
         "vol":            vol(),
+        "dte_tiers":      dte_tiers(),
+        "catalyst":       catalyst(),
         "cadence":        cadence(),
         "ttl":            ttls(),
         "velocity":       velocity(),

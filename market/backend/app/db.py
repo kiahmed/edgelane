@@ -365,6 +365,20 @@ CREATE TABLE IF NOT EXISTS simmer_outcomes (
 );
 CREATE INDEX IF NOT EXISTS idx_simmer_outcomes_symbol
     ON simmer_outcomes (symbol, expiration);
+
+-- Intraday ATM-IV snapshots — one row per market-hours sweep, per symbol.
+-- Powers the short-tier `iv_change` signal (docs/simmer_dte_tiers.md §1): is IV
+-- richening into a catalyst (GO) or bleeding out post-event (veto)? DISTINCT
+-- from the once-a-day simmer_iv_history (an end-of-day rank) — this is
+-- timestamped, same-session, and only written while the market is open.
+CREATE TABLE IF NOT EXISTS simmer_iv_intraday (
+    symbol   VARCHAR   NOT NULL,
+    ts       TIMESTAMP NOT NULL,   -- snapshot instant (UTC)
+    atm_iv   DOUBLE,               -- ATM IV at spot, same measure as iv_history.atm_iv
+    PRIMARY KEY (symbol, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_simmer_iv_intraday_symbol
+    ON simmer_iv_intraday (symbol, ts);
 """
 
 _STRIKE_PROFILE_COLS = (
@@ -992,6 +1006,43 @@ class Database:
             rows = cur.fetchall()
         out = [dict(zip(self._SIMMER_IV_COLS, r)) for r in rows]
         out.reverse()
+        return out
+
+    def insert_simmer_iv_intraday(self, symbol: str, ts, atm_iv) -> None:
+        """Append one intraday ATM-IV snapshot. INSERT OR REPLACE on
+        (symbol, ts) so a re-run at the same instant is idempotent. `ts` may be a
+        datetime (preferred) or an ISO string; DuckDB coerces either to
+        TIMESTAMP."""
+        conn = self.connect()
+        with self._lock:
+            conn.execute(
+                "INSERT OR REPLACE INTO simmer_iv_intraday (symbol, ts, atm_iv) "
+                "VALUES (?, ?, ?)",
+                [str(symbol).upper(), ts, atm_iv],
+            )
+
+    def fetch_simmer_iv_intraday_today(self, symbol: str,
+                                       session_date=None) -> list[dict]:
+        """Today's snapshots for `symbol`, OLDEST→NEWEST. Rows are matched by the
+        DATE of their `ts`; `session_date` (a date or ISO string) defaults to the
+        current UTC date. During US market hours the UTC date equals the Eastern
+        session date, so a caller may pass the Eastern date to be explicit."""
+        conn = self.connect()
+        day = (str(session_date)[:10] if session_date
+               else datetime.now(timezone.utc).date().isoformat())
+        with self._lock:
+            cur = conn.execute(
+                "SELECT symbol, ts, atm_iv FROM simmer_iv_intraday "
+                "WHERE symbol = ? AND CAST(ts AS DATE) = CAST(? AS DATE) "
+                "ORDER BY ts ASC",
+                [str(symbol).upper(), day],
+            )
+            rows = cur.fetchall()
+        out = []
+        for r in rows:
+            d = dict(zip(("symbol", "ts", "atm_iv"), r))
+            d["ts"] = _utc_iso(d.get("ts"))
+            out.append(d)
         return out
 
     _SIMMER_OUTCOME_COLS = (
