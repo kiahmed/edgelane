@@ -64,6 +64,7 @@ from . import emailer
 from . import simmer_config
 from . import simmer_email
 from . import simmer_engine
+from . import simmer_events
 from . import supabase_admin
 from .config import get_settings
 from .dealer_exposures import compute_dealer_exposures
@@ -105,6 +106,13 @@ class SimmerState:
         # Alert machine: key -> {"state": cold|ready|cooling|vetoed, "since": epoch}
         self.alert_states: dict[str, dict] = {}
         self.alerts_fired: int = 0
+        # Upstream-event band per key: cold|watch|ready. Tracks the last band an
+        # (symbol, expiration) occupied so `event_transitions` can fire a Pub/Sub
+        # event only on an UPWARD crossing (watch_entered / ready). Separate from
+        # `alert_states` on purpose — the user-facing alert has hysteresis/dwell;
+        # the upstream event is a plain edge detector deduped downstream by a
+        # per-UTC-day event_id.
+        self.event_bands: dict[str, str] = {}
         # Slow loops
         self.last_outcome_run_at: str | None = None
         self.last_outcome_run_ts: float | None = None
@@ -1250,6 +1258,39 @@ def update_alert_state(key: str, env: dict, threshold: float,
     return fire
 
 
+_EVENT_BAND_RANK = {"cold": 0, "watch": 1, "ready": 2}
+_EVENT_FOR_RANK = {1: "watch_entered", 2: "ready"}
+
+
+def event_transitions(key: str, env: dict, watch_threshold: float,
+                      ready_threshold: float) -> list[str]:
+    """Upstream Pub/Sub edge detector (docs/simmer_dte_tiers.md sibling contract).
+
+    Returns the state(s) to publish for THIS sweep of one (symbol, expiration):
+    a `watch_entered` when the score first crosses the watch threshold upward and
+    a `ready` when it crosses the ready threshold upward. A jump that skips the
+    watch band (cold→ready in one sweep) still crossed the watch threshold, so it
+    emits BOTH — each boundary crossed upward yields its event. Downward moves and
+    a vetoed/suppressed verdict update the band silently (no event). Distinct from
+    `update_alert_state`: no hysteresis here — same-day re-crossings are collapsed
+    downstream by the per-UTC-day `event_id`, so a plain edge detector is right."""
+    vetoed = bool(env.get("veto_reasons"))
+    suppressed = bool(env.get("sector_dispersion_suppressed"))
+    score = float(env.get("score") or 0.0)
+    if vetoed or suppressed:
+        new_band = "cold"
+    elif score >= ready_threshold:
+        new_band = "ready"
+    elif score >= watch_threshold:
+        new_band = "watch"
+    else:
+        new_band = "cold"
+    prev_rank = _EVENT_BAND_RANK.get(state.event_bands.get(key, "cold"), 0)
+    new_rank = _EVENT_BAND_RANK[new_band]
+    state.event_bands[key] = new_band
+    return [_EVENT_FOR_RANK[r] for r in range(prev_rank + 1, new_rank + 1)]
+
+
 def _passes_user_filters(env: dict, user_settings: dict, regime: dict | None) -> bool:
     """EACH user's ALERT bar over the shared verdict, applied at WRITE time.
 
@@ -1360,8 +1401,11 @@ async def fanout_alert(env: dict, regime: dict | None) -> int:
     return written
 
 
-async def process_alerts(results: dict[str, dict], regime: dict | None) -> None:
-    threshold = float(simmer_config.decision_bands()["ready"])
+async def process_alerts(results: dict[str, dict], regime: dict | None,
+                         db=None) -> None:
+    bands = simmer_config.decision_bands()
+    threshold = float(bands["ready"])
+    watch_threshold = float(bands.get("watch", 50.0))
     for key, env in results.items():
         try:
             # Fire on a genuine transition into "ready". Earnings-window names
@@ -1373,6 +1417,20 @@ async def process_alerts(results: dict[str, dict], regime: dict | None) -> None:
             # banner in simmer_email and the earnings block in the payload).
             if update_alert_state(key, env, threshold):
                 await fanout_alert(env, regime)
+            # Upstream posting pipeline: publish watch_entered / ready transitions
+            # (best-effort, dark until provisioned; same market-hours gating as
+            # alerts since process_alerts only runs when open).
+            for st in event_transitions(key, env, watch_threshold, threshold):
+                await simmer_events.publish_transition(
+                    env.get("symbol"), st, env.get("expiration"), db=db,
+                    takeaways={
+                        "symbol": str(env.get("symbol") or "").upper(),
+                        "expiry": env.get("expiration"),
+                        "state": st,
+                        "score": env.get("score"),
+                        "structure": env.get("structure"),
+                        "decision": env.get("decision"),
+                    })
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1776,7 +1834,7 @@ async def sweep(tradier, db, edgar=None) -> dict[str, dict]:
     # The next open sweep recomputes live and fires any genuine new transition.
     apply_dispersion(results, regime)
     if state.market_open:
-        await process_alerts(results, regime)
+        await process_alerts(results, regime, db)
 
     # Prune per-key state for pairs no longer WATCHED — without this,
     # latest_by_key / alert_states / the error map grow forever as users add

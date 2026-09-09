@@ -8,6 +8,7 @@ Tables:
                        + data-quality flag (see evaluator.archive_completed_days)
 """
 from __future__ import annotations
+import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -379,6 +380,20 @@ CREATE TABLE IF NOT EXISTS simmer_iv_intraday (
 );
 CREATE INDEX IF NOT EXISTS idx_simmer_iv_intraday_symbol
     ON simmer_iv_intraday (symbol, ts);
+
+-- Exactly-once ledger for Pub/Sub topic publishes (app/simmer_events.py). Keyed
+-- on the DETERMINISTIC event_id (SMR-<SYM>-<YYMMDD>-<expiryYYMMDD>-<state>), so a
+-- transition re-seen across sweeps or watched by many users publishes to the
+-- topic ONCE per (symbol, expiry, state, UTC day). Email fan-out is per-user and
+-- is NOT gated by this table.
+CREATE TABLE IF NOT EXISTS simmer_published_events (
+    event_id    VARCHAR PRIMARY KEY,
+    symbol      VARCHAR,
+    expiration  VARCHAR,
+    state       VARCHAR,          -- watch_entered | ready
+    fired_at    TIMESTAMP,
+    takeaways   VARCHAR           -- JSON: {symbol, expiry, state, score, structure, decision}
+);
 """
 
 _STRIKE_PROFILE_COLS = (
@@ -1044,6 +1059,34 @@ class Database:
             d["ts"] = _utc_iso(d.get("ts"))
             out.append(d)
         return out
+
+    def insert_simmer_published_event(self, row: dict) -> None:
+        """Record one topic publish as the exactly-once key. INSERT OR REPLACE so
+        a forced re-fire (admin tool) refreshes fired_at/takeaways rather than
+        erroring on the PK."""
+        conn = self.connect()
+        takeaways = row.get("takeaways")
+        if not isinstance(takeaways, str):
+            takeaways = json.dumps(takeaways or {}, default=str)
+        with self._lock:
+            conn.execute(
+                "INSERT OR REPLACE INTO simmer_published_events "
+                "(event_id, symbol, expiration, state, fired_at, takeaways) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [str(row["event_id"]),
+                 (str(row["symbol"]).upper() if row.get("symbol") else None),
+                 row.get("expiration"), row.get("state"),
+                 row.get("fired_at"), takeaways],
+            )
+
+    def simmer_published_event_exists(self, event_id: str) -> bool:
+        """True when this event_id has already been published to the topic."""
+        conn = self.connect()
+        with self._lock:
+            cur = conn.execute(
+                "SELECT 1 FROM simmer_published_events WHERE event_id = ? LIMIT 1",
+                [str(event_id)])
+            return cur.fetchone() is not None
 
     _SIMMER_OUTCOME_COLS = (
         "readiness_id", "symbol", "expiration", "evaluated_at", "spot_at_expiry",

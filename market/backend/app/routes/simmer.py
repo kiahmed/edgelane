@@ -29,12 +29,13 @@ silent ignore.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from ..auth import get_current_user
@@ -77,6 +78,131 @@ def _dte(exp_iso: str) -> int:
         return (date.fromisoformat(str(exp_iso)[:10]) - date.today()).days
     except (TypeError, ValueError):
         return 0
+
+
+# ── Read-only integration API (soljet-postiz upstream contract) ─────────────
+# A SEPARATE surface from the browser API above: bearer-token auth via
+# SIMMER_API_TOKEN (Secret Manager `simmer-api-token`), no user JWT. Read-only —
+# it exposes the sweep's already-computed verdicts to the posting pipeline and
+# never writes. Blank token ⇒ 401 (dark until provisioned).
+_SIMMER_SYM_RE = re.compile(r"^[A-Z.\-]{1,10}$")
+_SIMMER_STATE_BLOCKS = ("card", "score", "gates", "sentiment", "evolution")
+
+
+def require_simmer_api_token(authorization: str | None = Header(default=None)) -> None:
+    """Bearer-token gate for the integration API. 401 when the server token is
+    unset (feature closed) or the presented token is missing / mismatched.
+    Constant-time compare so a mismatch can't be timed."""
+    token = (get_settings().simmer_api_token or "").strip()
+    if not token:
+        raise HTTPException(401, "simmer integration API not configured")
+    presented = ""
+    if authorization and authorization[:7].lower() == "bearer ":
+        presented = authorization[7:].strip()
+    if not presented or not hmac.compare_digest(presented, token):
+        raise HTTPException(401, "invalid or missing bearer token")
+
+
+_API_TOKEN_GATE = [Depends(require_simmer_api_token)]
+
+
+def _parse_iso(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _ready_summary(env: dict) -> dict:
+    return {
+        "symbol": str(env.get("symbol") or "").upper(),
+        "expiration": env.get("expiration"),
+        "score": env.get("score"),
+        "structure": env.get("structure"),
+        "decision": env.get("decision"),
+        "computed_at": env.get("computed_at"),
+    }
+
+
+def _state_block(env: dict, block: str, db) -> dict:
+    """Slice one block out of the latest envelope. Read-only projections; never
+    recomputes."""
+    if block == "card":
+        return {
+            "symbol": str(env.get("symbol") or "").upper(),
+            "expiration": env.get("expiration"),
+            "decision": env.get("decision"),
+            "score": env.get("score"),
+            "structure": env.get("structure"),
+            "strikes": env.get("strikes"),
+            "credit_fill": env.get("credit_fill"),
+            "max_loss": env.get("max_loss"),
+            "pop_breakeven": env.get("pop_breakeven"),
+            "spot": env.get("spot"),
+            "regime": (env.get("regime") or {}).get("state"),
+            "computed_at": env.get("computed_at"),
+        }
+    if block == "score":
+        return {"score": env.get("score"), "decision": env.get("decision"),
+                "components": env.get("components") or {}}
+    if block == "gates":
+        return {"vetoed": bool(env.get("veto_reasons")),
+                "veto_reasons": env.get("veto_reasons") or [],
+                "avoid_if": env.get("avoid_if") or []}
+    if block == "sentiment":
+        comps = env.get("components") or {}
+        return {"sentiment_lean": comps.get("sentiment_lean") or {}}
+    if block == "evolution":
+        sym = str(env.get("symbol") or "").upper()
+        hist: list = []
+        if db is not None:
+            try:
+                hist = db.simmer_readiness_history(sym) or []
+            except Exception:
+                hist = []
+        if not hist:      # fall back to the single current point
+            hist = [{"ts": env.get("computed_at"), "score": env.get("score"),
+                     "decision": env.get("decision")}]
+        return {"history": hist}
+    return {}
+
+
+@router.get("/simmer/ready", dependencies=_API_TOKEN_GATE)
+async def simmer_ready(since: str | None = Query(default=None)):
+    """Names currently `ready`, optionally only those computed after `since`
+    (ISO-8601). Reads the in-memory readiness cache the sweep maintains."""
+    since_dt = _parse_iso(since)
+    out: list[dict] = []
+    for env in simmer_state.latest_by_key.values():
+        if str(env.get("decision")) != "ready":
+            continue
+        if since_dt is not None:
+            computed = _parse_iso(env.get("computed_at"))
+            if computed is not None and computed <= since_dt:
+                continue
+        out.append(_ready_summary(env))
+    out.sort(key=lambda r: (r["symbol"], str(r.get("expiration") or "")))
+    return {"ready": out, "count": len(out), "since": since}
+
+
+@router.get("/simmer/state/{symbol}", dependencies=_API_TOKEN_GATE)
+async def simmer_state_block(symbol: str, request: Request,
+                             block: str = Query(default="card")):
+    """One block of a symbol's latest envelope (card|score|gates|sentiment|
+    evolution)."""
+    sym = (symbol or "").upper()
+    if not _SIMMER_SYM_RE.match(sym):
+        raise HTTPException(422, f"invalid symbol {symbol!r}")
+    if block not in _SIMMER_STATE_BLOCKS:
+        raise HTTPException(422, f"invalid block {block!r}; allowed: "
+                            f"{', '.join(_SIMMER_STATE_BLOCKS)}")
+    env = _readiness_for(sym, None)
+    if env is None:
+        raise HTTPException(404, f"no readiness for {sym}")
+    return {"symbol": sym, "block": block, "data": _state_block(env, block, _db(request))}
 
 
 # ── Config / status ─────────────────────────────────────────────────────────

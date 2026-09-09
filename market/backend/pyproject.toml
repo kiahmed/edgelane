@@ -19,6 +19,10 @@ dependencies = [
     # modern crypto for PyJWT). Verified: SDK + option preview + ES256 all work.
     "webull-openapi-python-sdk>=2.0",
     "defusedxml>=0.7",   # hardened XML parse for untrusted wire-RSS feeds
+    # Simmer → Facades posting pipeline: publishes ticker state-transition events
+    # to Pub/Sub (app/simmer_events.py). Imported lazily and best-effort, so a
+    # missing client only disables events — it never breaks the sweep.
+    "google-cloud-pubsub>=2.18",
     "tzdata; sys_platform == 'win32'",
 ]
 

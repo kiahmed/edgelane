@@ -297,6 +297,7 @@ def _reset_watcher_state():
         sw.state.watchlist_source = "unknown"
         sw.state.dispersion = None
         sw.state.alert_states.clear()
+        sw.state.event_bands.clear()
         sw.state.alerts_fired = 0
         sw.state.last_outcome_run_at = None
         sw.state.last_outcome_run_ts = None

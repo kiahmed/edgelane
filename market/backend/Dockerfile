@@ -30,6 +30,10 @@ RUN apt-get update \
 COPY pyproject.toml ./
 COPY app ./app
 COPY ui ./ui
+# Admin ops scripts (e.g. the Simmer test-fire tool `make simmer-fire-event`
+# docker-execs). Not packaged — run by path with `app` importable via the
+# editable install below.
+COPY tools ./tools
 RUN pip install -e . \
  # The Webull SDK declares cryptography<42, but only its UNUSED RSA private-key
  # signer imports cryptography — our app-key auth path (and PyJWT's Supabase

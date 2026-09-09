@@ -208,6 +208,20 @@ class Settings(BaseModel):
     # personal-use posture; see app/simmer_data_provider.py. Needs no key.
     simmer_data_provider: str = Field(default="tradier")
 
+    # --- Simmer upstream contract (soljet-postiz posting pipeline) ---
+    # Read-only API bearer token, SEPARATE from the user JWT / admin token. The
+    # postiz poster mounts it from Secret Manager as `simmer-api-token`. Blank ⇒
+    # the read-only /simmer/ready + /simmer/state/{sym} endpoints stay CLOSED
+    # (401), so the surface is dark until a token is provisioned.
+    simmer_api_token: str = Field(default="")
+    # Pub/Sub state-transition events → topic `facades.ticker-events`, consumed by
+    # the postiz pipeline. Best-effort and DARK by default (never breaks the
+    # sweep); flip on only once the topic + publisher IAM binding exist and GCP
+    # creds are mounted. `gcp_project` is also the Pub/Sub project.
+    simmer_events_enabled: bool = Field(default=False)
+    facades_events_topic: str = Field(default="facades.ticker-events")
+    gcp_project: str = Field(default="")
+
     # --- Simmer news + sentiment (Phase 3a — see app/simmer_news.py) ---
     # Alpaca Market Data news (free with a paper account at alpaca.markets).
     # Both keys blank → the news refresh is a clean no-op with a data_quality
@@ -405,6 +419,12 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
     if "SIMMER_DATA_PROVIDER" in raw:
         v = raw["SIMMER_DATA_PROVIDER"].strip().lower()
         out["simmer_data_provider"] = v if v in ("tradier", "yahoo") else "tradier"
+
+    if "SIMMER_API_TOKEN" in raw:            out["simmer_api_token"] = raw["SIMMER_API_TOKEN"].strip()
+    if "SIMMER_EVENTS_ENABLED" in raw:
+        out["simmer_events_enabled"] = raw["SIMMER_EVENTS_ENABLED"].strip().lower() in ("true", "1", "yes", "on")
+    if "FACADES_EVENTS_TOPIC" in raw:        out["facades_events_topic"] = raw["FACADES_EVENTS_TOPIC"].strip()
+    if "GCP_PROJECT" in raw:                 out["gcp_project"] = raw["GCP_PROJECT"].strip()
 
     if "ALPACA_KEY_ID" in raw:               out["alpaca_key_id"] = raw["ALPACA_KEY_ID"].strip()
     if "ALPACA_SECRET_KEY" in raw:           out["alpaca_secret_key"] = raw["ALPACA_SECRET_KEY"].strip()

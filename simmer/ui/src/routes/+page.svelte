@@ -8,8 +8,18 @@
 	import { watchlist } from '$lib/stores/watchlist.svelte';
 	import { settingsStore } from '$lib/stores/settings.svelte';
 	import type { WatchlistRow } from '$lib/types';
+	import { readSnap, snapOgImage, snapHref } from '$lib/snap';
 
 	let selected = $state<string | null>(null);
+
+	// `?snap=1&symbol=SYM`: render just that symbol's card for the screenshot
+	// service. The layout has already stripped the nav/toasts/social chrome.
+	const snap = readSnap();
+	const snapRow = $derived.by(() => {
+		if (!snap.snap) return null;
+		const rows = watchlist.rows.filter((r) => r.readiness);
+		return (snap.symbol ? rows.find((r) => r.symbol === snap.symbol) : rows[0]) ?? null;
+	});
 
 	const withEnv = $derived(watchlist.rows.filter((r) => r.readiness));
 	const readyCount = $derived(withEnv.filter((r) => r.readiness!.decision === 'ready').length);
@@ -38,6 +48,38 @@
 	}
 </script>
 
+<svelte:head>
+	{#if snap.snap}
+		{@const sym = snapRow?.symbol ?? snap.symbol ?? 'Simmer'}
+		<title>{sym} — Simmer readiness</title>
+		<meta property="og:title" content={`${sym} — Simmer readiness`} />
+		<meta
+			property="og:description"
+			content="Refusal-first premium-selling readiness. Most days the right trade is no trade."
+		/>
+		{#if snapRow}<meta property="og:image" content={snapOgImage(sym)} />{/if}
+	{/if}
+</svelte:head>
+
+{#if snap.snap}
+	{@const sym = snapRow?.symbol ?? snap.symbol ?? 'Simmer'}
+	<!-- Click-through back to the full board; the crop targets the wrapper. -->
+	<a href={snapHref(sym)} class="block max-w-xl">
+		{#if snapRow?.readiness}
+			<ReadinessCard
+				env={snapRow.readiness}
+				readyBand={bands.ready}
+				watchBand={bands.watch}
+				activeOverrides={settingsStore.activeGateOverrides}
+				pinnedExpiration={snapRow.expiration}
+			/>
+		{:else}
+			<div class="card p-6 text-center text-sm text-slate-500">
+				{sym}: no analysis yet.
+			</div>
+		{/if}
+	</a>
+{:else}
 <div class="grid gap-4 lg:grid-cols-[minmax(280px,1fr)_2fr]">
 	<div class="space-y-4">
 		<WatchlistManager {selected} onselect={select} />
@@ -94,3 +136,4 @@
 		{/if}
 	</div>
 </div>
+{/if}

@@ -20,6 +20,13 @@ ARGS         ?=
 # Vercel's --force — is what guarantees a from-scratch frontend build.
 CLEAN        ?=
 CLEAN_FLAG    = $(if $(CLEAN),--clean,)
+# GCP identity for Facades Pub/Sub work — SOURCED FROM edgelane_market.config
+# (single source of truth), with an env override taking precedence. The ops
+# scripts read the same config, so setting them here is only for `make` echo.
+MARKET_CONFIG ?= edgelane_market.config
+GCP_PROJECT  ?= $(shell grep -E '^GCP_PROJECT=' $(MARKET_CONFIG) 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]')
+GCP_SA_EMAIL ?= $(shell grep -E '^GCP_SA_EMAIL=' $(MARKET_CONFIG) 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]')
+export GCP_PROJECT GCP_SA_EMAIL MARKET_CONFIG
 COMPOSE      = docker compose -f deploy/docker-compose.yml --env-file deploy/.env
 # Dedicated buildx builder for THIS repo. The docker-container driver gives it a
 # private cache pool, so `make deploy-prune` reclaims only EdgeLane's build cache
@@ -40,7 +47,7 @@ DATA_DUMP    = deploy/edgelane-data.tar.gz
         db-push db-push-dry deploy-data-dump deploy-data-restore \
         doctor vercel-setup check-tunnel vercel-clean \
         simmer-ui-install simmer-ui-dev simmer-ui-build simmer-ui-check \
-        simmer-ui-test deploy-simmer
+        simmer-ui-test deploy-simmer simmer-postiz-integrate simmer-fire-event gcloud-setup
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} \
@@ -58,8 +65,12 @@ help: ## Show this help
 
 # ---- Backend — setup ----
 
-setup: ## One-time venv + pip install (market/backend)
+setup: ## Idempotent: venv + pip (only if missing) + gcloud/GCP readiness check
 	@$(MAKE) -C $(BACKEND) setup
+	@bash ops/gcloud_bootstrap.sh || echo "!! gcloud/GCP not ready — Simmer↔postiz stays dark until fixed (non-fatal for local dev)"
+
+gcloud-setup: ## Just the gcloud/GCP readiness check (install + auth account + project + roles)
+	@bash ops/gcloud_bootstrap.sh
 
 clean: ## Clear __pycache__ under the backend
 	@$(MAKE) -C $(BACKEND) clean
@@ -267,3 +278,10 @@ simmer-ui-test: ## Vitest unit tests (api pointer resolution, fmt)
 
 deploy-simmer: ## Simmer UI → Vercel project edgelane-simmer (CLEAN=1 to wipe first)
 	@$(DEPLOY_SH) -s $(CLEAN_FLAG) $(ARGS)
+
+simmer-postiz-integrate: ## Provision the Simmer→postiz Pub/Sub topic/IAM/secret (idempotent; DRY=1 to print)
+	@bash ops/simmer/edgelane_provision.sh
+
+simmer-fire-event: ## Fire a test Simmer alert end-to-end in the running container (STATE=READY|WATCH)
+	@docker exec edgelane-backend python /srv/tools/simmer_fire_event.py \
+		--state $(shell echo "$(or $(STATE),READY)" | tr '[:upper:]' '[:lower:]') $(ARGS)

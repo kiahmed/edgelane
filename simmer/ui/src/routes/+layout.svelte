@@ -12,8 +12,14 @@
 	import { watchlist } from '$lib/stores/watchlist.svelte';
 	import { settingsStore } from '$lib/stores/settings.svelte';
 	import { Poller } from '$lib/stores/poll.svelte';
+	import { readSnap } from '$lib/snap';
 
 	let { children }: { children: Snippet } = $props();
+
+	// `?snap=1`: the screenshot crop. No AppShell nav, no toasts, no social —
+	// just the board crop the +page marks with [data-snap="card"]. Behind the
+	// flag, so the normal UI below is unchanged.
+	const isSnap = readSnap().snap;
 
 	const poller = new Poller();
 
@@ -41,10 +47,16 @@
 	<div class="flex min-h-screen items-center justify-center text-slate-500">Checking access…</div>
 {:else if !auth.hasSimmer}
 	<ProductGate />
+{:else if isSnap}
+	<div data-snap="card">
+		{@render children()}
+	</div>
 {:else}
 	<AppShell>
 		{@render children()}
 	</AppShell>
 {/if}
 
-<Toast />
+{#if !isSnap}
+	<Toast />
+{/if}
