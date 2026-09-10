@@ -33,11 +33,20 @@ services:
       EDGELANE_MARKET_CONFIG: /config/edgelane_market.config
       # Admin-global Simmer engine overrides (DTE/delta/IV floors etc.).
       SIMMER_TICKERS_CONFIG: /config/simmer_tickers.json
+      # GCP creds for Pub/Sub event publishing. One variable, two namespaces:
+      # deploy/.env holds the HOST path, and this is the CONTAINER path the
+      # Google client library reads. Empty unless the host path is set, so the
+      # publisher stays dark (events are opt-in via SIMMER_EVENTS_ENABLED).
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:+/config/gcp-sa-key.json}
     volumes:
       # Live config (Tradier tokens, DEVMODE, symbols) — read-only.
       - ../edgelane_market.config:/config/edgelane_market.config:ro
       # Admin-global engine tuning — edit + restart to retune for everyone.
       - ../simmer/simmer_tickers.json:/config/simmer_tickers.json:ro
+      # GCP service-account key for Pub/Sub (read-only). Defaults to /dev/null
+      # when the host path is unset so compose never errors; the empty
+      # GOOGLE_APPLICATION_CREDENTIALS above then leaves it unused.
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-/dev/null}:/config/gcp-sa-key.json:ro
       # Persist the DuckDB store across container recreates (DB_PATH defaults
       # to ~/.edgelane/market.duckdb → /root/.edgelane inside the container).
       - edgelane-data:/root/.edgelane
