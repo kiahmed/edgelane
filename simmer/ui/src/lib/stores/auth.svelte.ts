@@ -2,8 +2,10 @@
 // endpoints (app/routes/auth_proxy.py). The browser NEVER talks to Supabase:
 // the backend is the identity surface, Supabase sits behind it. The only
 // identity artifacts held client-side are the JWT + refresh token, kept in
-// sessionStorage (per-tab isolation, same intent as the old supabase-js
-// sessionStorage config).
+// localStorage so a signed-in session is SHARED across tabs of the same origin
+// (open a deep link like /?symbol=NVDA in a new tab and it inherits the login
+// instead of re-challenging). localStorage is same-origin only — the token
+// never leaves this browser profile.
 //
 // Entitlement is inferred from the API, not read from any table:
 //   GET /simmer/status → 200 entitled · 403 signed in but not entitled
@@ -58,7 +60,7 @@ export function decodeJwtPayload(
 
 function loadStoredSession(): AuthSession | null {
 	try {
-		const raw = sessionStorage.getItem(SESSION_KEY);
+		const raw = localStorage.getItem(SESSION_KEY);
 		if (!raw) return null;
 		const s = JSON.parse(raw) as AuthSession;
 		return s?.access_token && s?.refresh_token ? s : null;
@@ -138,7 +140,7 @@ class AuthStore {
 		}
 		this.session = normalized;
 		try {
-			sessionStorage.setItem(SESSION_KEY, JSON.stringify(normalized));
+			localStorage.setItem(SESSION_KEY, JSON.stringify(normalized));
 		} catch {
 			/* storage unavailable — session lives in memory only */
 		}
@@ -279,7 +281,7 @@ class AuthStore {
 		this.session = null;
 		this.toolsEnabled = null;
 		try {
-			sessionStorage.removeItem(SESSION_KEY);
+			localStorage.removeItem(SESSION_KEY);
 		} catch {
 			/* storage unavailable */
 		}

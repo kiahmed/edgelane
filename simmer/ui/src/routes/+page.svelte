@@ -9,6 +9,7 @@
 	import { settingsStore } from '$lib/stores/settings.svelte';
 	import type { WatchlistRow } from '$lib/types';
 	import { readSnap, snapOgImage, snapHref } from '$lib/snap';
+	import { page } from '$app/state';
 
 	let selected = $state<string | null>(null);
 
@@ -19,6 +20,20 @@
 		if (!snap.snap) return null;
 		const rows = watchlist.rows.filter((r) => r.readiness);
 		return (snap.symbol ? rows.find((r) => r.symbol === snap.symbol) : rows[0]) ?? null;
+	});
+
+	// `?symbol=SYM` (non-snap) deep link — the click-through from a social post.
+	// Focus that ticker and open its card. One-shot so a later "show all" or a
+	// manual selection isn't overridden on re-render.
+	const deepSymbol = $derived(
+		snap.snap ? null : (page.url.searchParams.get('symbol') || '').toUpperCase() || null
+	);
+	let deepApplied = false;
+	$effect(() => {
+		if (!deepApplied && deepSymbol) {
+			selected = deepSymbol;
+			deepApplied = true;
+		}
 	});
 
 	const withEnv = $derived(watchlist.rows.filter((r) => r.readiness));
@@ -118,6 +133,7 @@
 					watchBand={bands.watch}
 					activeOverrides={settingsStore.activeGateOverrides}
 					pinnedExpiration={row.expiration}
+					startExpanded={row.symbol === deepSymbol}
 				/>
 			{:else}
 				<div class="card p-4 text-sm text-slate-500">

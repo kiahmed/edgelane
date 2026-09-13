@@ -3,6 +3,7 @@
 	// supporting horizontal bar, and the trade block only appears when the
 	// engine says "ready". credit_fill is labeled ACHIEVABLE vs credit_mid's
 	// ADVERTISED — the gap is the fill-slippage honesty the docs demand.
+	import { onMount } from 'svelte';
 	import GateChecklist from './GateChecklist.svelte';
 	import ScoreMatrix from './ScoreMatrix.svelte';
 	import ReadinessHistory from './ReadinessHistory.svelte';
@@ -29,7 +30,8 @@
 		readyBand = 70,
 		watchBand = 50,
 		activeOverrides = [],
-		pinnedExpiration = null
+		pinnedExpiration = null,
+		startExpanded = false
 	}: {
 		env: ReadinessEnvelope;
 		readyBand?: number;
@@ -38,12 +40,18 @@
 		 *  per-ticker) — must surface HERE, not buried in settings. */
 		activeOverrides?: string[];
 		pinnedExpiration?: string | null;
+		/** Open on first render (e.g. a ?symbol= deep link lands on this card). */
+		startExpanded?: boolean;
 	} = $props();
 
 	// Cards start collapsed — the watchlist can grow long, and the header's
 	// summary chip already carries the one thing that matters at a glance (the
 	// sell target, or the veto count). Expand to see the full evaluation.
 	let expanded = $state(false);
+	// A deep link (?symbol=SYM) opens this card once, on mount.
+	onMount(() => {
+		if (startExpanded) expanded = true;
+	});
 
 	const isReady = $derived(env.decision === 'ready');
 	const condor = $derived(
