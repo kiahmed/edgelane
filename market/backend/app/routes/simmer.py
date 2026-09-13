@@ -36,6 +36,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from ..auth import get_current_user
@@ -203,6 +204,25 @@ async def simmer_state_block(symbol: str, request: Request,
     if env is None:
         raise HTTPException(404, f"no readiness for {sym}")
     return {"symbol": sym, "block": block, "data": _state_block(env, block, _db(request))}
+
+
+@router.get("/simmer/snap/{symbol}", dependencies=_API_TOKEN_GATE,
+            response_class=HTMLResponse)
+async def simmer_snap(symbol: str):
+    """Server-rendered card as standalone HTML for the snapshot service to
+    screenshot — the SPA is behind user login and a headless browser has no
+    session, so `simmer-snap` sets `Authorization: Bearer <SIMMER_API_TOKEN>`
+    and hits THIS instead. Read-only; renders the cached envelope, no user JWT."""
+    from .. import simmer_snap as snap
+    sym = (symbol or "").upper()
+    if not _SIMMER_SYM_RE.match(sym):
+        raise HTTPException(422, f"invalid symbol {symbol!r}")
+    env = _readiness_for(sym, None)
+    if env is None:
+        raise HTTPException(404, f"no readiness for {sym}")
+    bands = simmer_config.decision_bands()
+    return HTMLResponse(snap.render_snap_card(
+        env, ready=float(bands.get("ready", 70.0)), watch=float(bands.get("watch", 50.0))))
 
 
 # ── Config / status ─────────────────────────────────────────────────────────

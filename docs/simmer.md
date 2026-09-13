@@ -47,6 +47,7 @@ for the risk.
 - [Auth, product gating, and cross-app SSO](#auth-product-gating-and-cross-app-sso)
 - [Data model](#data-model)
 - [Backend API surface](#backend-api-surface)
+- [Snapshot render endpoint (simmer-snap)](#snapshot-render-endpoint-simmer-snap)
 - [The readiness engine](#the-readiness-engine)
 - [Data sourcing](#data-sourcing)
 - [The watcher loop](#the-watcher-loop)
@@ -438,6 +439,47 @@ plain dicts.
 inputs** — the same function the watcher loop calls, so the on-demand and
 scheduled paths can never diverge. This mirrors how `engine.compute_engine_output`
 serves both the poller and `/snapshot`.
+
+---
+
+## Snapshot render endpoint (simmer-snap)
+
+The soljet-postiz snapshot service (`simmer-snap`, headless Chromium) screenshots
+a Simmer card to attach to a social post. It **must not** screenshot the SPA at
+`simmer.facades.trade` — that page is behind user login and a headless browser
+has no session, so it only captures the sign-in dialog. Instead it hits a
+dedicated, server-rendered endpoint on the backend:
+
+| Method | Path | Auth | Returns |
+|---|---|---|---|
+| `GET` | `/simmer/snap/{SYM}` | **Bearer `SIMMER_API_TOKEN`** (machine, read-only) | Standalone HTML card (inline CSS) |
+
+- **Source:** `app/simmer_snap.py::render_snap_card` renders the **cached readiness
+  envelope** (same data the read-only API exposes) into a self-contained document
+  — no SPA, no user JWT. The secret stays server-side.
+- **Crop target:** a single `[data-snap="card"]` element (600px wide). Shows
+  READY (full trade block: structure/strikes/credit/POP/EV) or the refusal card
+  (NO TRADE + gate count) exactly as the dashboard would.
+- **Bearer** is the same read-only `SIMMER_API_TOKEN` the integration API uses
+  (Secret Manager `simmer-api-token`) — not a user session.
+
+### What the postiz `simmer-snap` side must set (two changes, in that repo)
+
+1. **Config/env** — point the snap URL template at
+   `https://edge.facades.trade/simmer/snap/<SYM>` (was the SPA `?snap=1&symbol=`).
+2. **Code** — a plain page-open won't carry the token, so set the header before
+   navigating and crop the element:
+   ```js
+   await page.setExtraHTTPHeaders({ Authorization: `Bearer ${SIMMER_API_TOKEN}` });
+   await page.goto(`https://edge.facades.trade/simmer/snap/${sym}`);
+   await page.locator('[data-snap="card"]').screenshot({ path: out });
+   ```
+   The token is already available on that side (Secret Manager `simmer-api-token`).
+
+> The SPA's `?snap=1` mode still exists but is **superseded** for the poster by
+> this endpoint (login-free, secret server-side). Sibling read-only endpoints for
+> the poster's data fetch: `GET /simmer/ready?since=` and
+> `GET /simmer/state/{SYM}?block=…`, same bearer.
 
 ---
 
