@@ -1706,11 +1706,12 @@
   let supa = null;
   let authChannel = null;   // BroadcastChannel for cross-tab sign-out (same origin)
 
-  // Cross-tab sign-out: with per-tab sessionStorage sessions, Supabase's
-  // localStorage-based multi-tab sync doesn't fire. So we broadcast our own
-  // signout, SCOPED to the user id — signing out user A's tab must not log out
-  // a different user B signed in elsewhere. Duplicated tabs share the same
-  // user id, so they follow each other out.
+  // Cross-tab sign-out. Sessions live in localStorage, so Supabase's own
+  // multi-tab sync already propagates a sign-out; this BroadcastChannel is the
+  // immediate signal on top of it (the storage event can lag, and some browsers
+  // suppress it for the originating tab). Still SCOPED to the user id, which is
+  // now belt-and-braces rather than load-bearing — every tab on this origin
+  // shares one session.
   function _initAuthChannel(ref) {
     if (typeof window.BroadcastChannel === 'undefined') return;
     try {
@@ -1757,21 +1758,35 @@
       return;
     }
     try {
-      // Per-TAB session isolation: persist the Supabase session in
-      // sessionStorage, not the default localStorage. Consequences (all wanted):
-      //   • two different users in two tabs of the SAME origin never overwrite
-      //     each other's token (localStorage is shared per-origin; sessionStorage
-      //     is per-tab);
-      //   • duplicating a signed-in tab carries the session — browsers copy
-      //     sessionStorage into the duplicate, so it auto-signs-in;
-      //   • a brand-new tab starts signed-out (the per-tab model).
-      // Local (localhost) vs prod (deployed domain) are already isolated because
-      // they are different origins. The storageKey is scoped by Supabase URL so
-      // two EdgeLane deployments sharing one origin still don't collide.
+      // Session storage is localStorage, so a signed-in session is SHARED across
+      // tabs of the same origin: open a second tab (or follow a link into one)
+      // and it inherits the login instead of re-challenging. Matches Simmer,
+      // which moved off per-tab storage for exactly this reason.
+      //
+      // This REPLACES an earlier per-tab (sessionStorage) model. That model
+      // isolated two different users in two tabs of one browser profile — a real
+      // but rare case, bought at the cost of re-authenticating every ordinary new
+      // tab, which is the common one. Signing out still propagates to every tab
+      // (Supabase's own storage-event sync, plus the BroadcastChannel above).
+      //
+      // localStorage is same-origin only, so the token never leaves this browser
+      // profile; localhost vs the deployed domain stay isolated as different
+      // origins. The storageKey is scoped by Supabase project ref so two
+      // deployments sharing an origin still don't collide.
       let store;
-      try { window.sessionStorage.setItem('__el_probe', '1'); window.sessionStorage.removeItem('__el_probe'); store = window.sessionStorage; }
-      catch (_) { store = undefined; }   // sandboxed context → let Supabase default to localStorage
+      try { window.localStorage.setItem('__el_probe', '1'); window.localStorage.removeItem('__el_probe'); store = window.localStorage; }
+      catch (_) { store = undefined; }   // sandboxed context → let Supabase pick its default
       const ref = (cfg.url.match(/https?:\/\/([^.]+)\./) || [])[1] || 'edgelane';
+
+      // One-time carry-over: a user already signed in under the old per-tab
+      // model has their token in sessionStorage. Move it across so the switch
+      // doesn't sign everyone out once.
+      try {
+        const k = `edgelane-auth-${ref}`;
+        const legacy = window.sessionStorage.getItem(k);
+        if (legacy && store && !store.getItem(k)) store.setItem(k, legacy);
+        if (legacy) window.sessionStorage.removeItem(k);
+      } catch (_) {}
       supa = window.supabase.createClient(cfg.url, cfg.anon, {
         auth: {
           storage: store,

@@ -221,6 +221,13 @@ class Settings(BaseModel):
     simmer_events_enabled: bool = Field(default=False)
     facades_events_topic: str = Field(default="facades.ticker-events")
     gcp_project: str = Field(default="")
+    # Matrix → postiz integration (docs/matrix_events_update.md). Its OWN topic
+    # and token, separate from Simmer's. Same best-effort/dark-by-default posture.
+    matrix_events_enabled: bool = Field(default=False)
+    matrix_events_topic: str = Field(default="facades.matrix-events")
+    # Bearer for the read-only /matrix/state + /matrix/snap endpoints (Secret
+    # Manager `matrix-api-token`). Blank ⇒ those endpoints stay CLOSED (401).
+    matrix_api_token: str = Field(default="")
 
     # --- Simmer news + sentiment (Phase 3a — see app/simmer_news.py) ---
     # Alpaca Market Data news (free with a paper account at alpaca.markets).
@@ -433,6 +440,10 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
         out["simmer_events_enabled"] = raw["SIMMER_EVENTS_ENABLED"].strip().lower() in ("true", "1", "yes", "on")
     if "FACADES_EVENTS_TOPIC" in raw:        out["facades_events_topic"] = raw["FACADES_EVENTS_TOPIC"].strip()
     if "GCP_PROJECT" in raw:                 out["gcp_project"] = raw["GCP_PROJECT"].strip()
+    if "MATRIX_EVENTS_ENABLED" in raw:
+        out["matrix_events_enabled"] = raw["MATRIX_EVENTS_ENABLED"].strip().lower() in ("true", "1", "yes", "on")
+    if "MATRIX_EVENTS_TOPIC" in raw:         out["matrix_events_topic"] = raw["MATRIX_EVENTS_TOPIC"].strip()
+    if "MATRIX_API_TOKEN" in raw:            out["matrix_api_token"] = raw["MATRIX_API_TOKEN"].strip()
 
     if "ALPACA_KEY_ID" in raw:               out["alpaca_key_id"] = raw["ALPACA_KEY_ID"].strip()
     if "ALPACA_SECRET_KEY" in raw:           out["alpaca_secret_key"] = raw["ALPACA_SECRET_KEY"].strip()

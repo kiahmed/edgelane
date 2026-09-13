@@ -435,6 +435,15 @@ async def evaluate_pending(db, poller_state, settings) -> int:
             rehydrate_regime(db, settings, quiet=True)
         except Exception:
             log.exception("regime refresh after grading failed")
+
+    # Matrix -> postiz chips for the signals GRADING owns: the bias-trust
+    # relationship flipping, a win rate that was earned, the end-of-day recap.
+    # Deliberately inside this sweep rather than a watcher of its own — this is
+    # the only place holding the before/after of the regime counters
+    # (docs/matrix_events_update.md §3). Runs even when n == 0 so a day rollover
+    # still recaps on a quiet sweep. Best-effort: on_evaluation never raises.
+    from . import matrix_signals
+    await matrix_signals.on_evaluation(db, poller_state, settings)
     return n
 
 

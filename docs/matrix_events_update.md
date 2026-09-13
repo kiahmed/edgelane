@@ -126,6 +126,41 @@ grid); `bias_chip`, `walls_chip`, `win_eval_grid` render data that already
 exists (`accuracy.py`, `dealer_exposures.py`, the eval grid) but has no
 standalone crop view yet.
 
+## Status — shipped 2026-09-13
+
+All of it is now in the repo; this section is the map, the rest of the doc stays
+as the rationale.
+
+| Piece | Where |
+|---|---|
+| §1 publisher | `app/matrix_events.py` + `matrix_events_*` / `matrix_api_token` in `config.py` |
+| §2 six states | `app/matrix_signals.py` — transition detection, one publish per real change |
+| §3 evaluator hook | end of `evaluator.py::evaluate_pending` (no separate watcher, as specified) |
+| poll-side hook | end of `poller.py::poll_symbol`, gated on `persist` |
+| §4 read-only API | `app/routes/matrix.py` → `GET /matrix/state/{SYM}?block=` |
+| §5 snap render | `app/matrix_snap.py` + `GET /matrix/snap/{SYM}?view=` |
+| provisioning | `ops/matrix/edgelane_provision.sh`, `make matrix-postiz-integrate` |
+| tests | `market/backend/tests/matrix/` |
+
+Config to set in `edgelane_market.config` (all dark by default — the publisher
+stays off and the API returns 401 until these are filled):
+
+```
+MATRIX_EVENTS_ENABLED=true
+MATRIX_EVENTS_TOPIC=facades.matrix-events
+MATRIX_API_TOKEN=<Secret Manager: matrix-api-token>
+GCP_PROJECT=<project>
+```
+
+Two notes for the Postiz side:
+
+* **`pick_selected` keys on the structure, not the score.** Strategy + label +
+  strikes. Composite score drifts every poll, so including it would make every
+  poll look like a new pick.
+* **`grid_digest` needs both a cooldown and a real change** (~60h, ≥3 of the 8
+  cards). Cadence alone posts a grid nobody is looking at; change alone fires
+  several times on a choppy session.
+
 ## Summary for whoever picks this up
 
 Net new in this repo: `app/matrix_events.py`, the `matrix_events_*` config

@@ -271,6 +271,14 @@ async def poll_symbol(symbol: str, tradier_client, db, settings, persist: bool =
         except Exception as e:
             log.warning("persist failed for %s: %s", symbol, e)
 
+        # Matrix -> postiz chips for the signals the POLL owns: the pick
+        # changing, the day's first walls, the periodic grid digest. Gated on
+        # `persist` so a display-only off-hours poll never fires one. Imported
+        # here (like the engine above) to keep module import order simple;
+        # on_snapshot swallows its own errors, so this can never cost a poll.
+        from . import matrix_signals
+        await matrix_signals.on_snapshot(output, settings)
+
     return output
 
 

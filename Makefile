@@ -282,6 +282,9 @@ deploy-simmer: ## Simmer UI → Vercel project edgelane-simmer (CLEAN=1 to wipe 
 simmer-postiz-integrate: ## Provision the Simmer→postiz Pub/Sub topic/IAM/secret (idempotent; DRY=1 to print)
 	@bash ops/simmer/edgelane_provision.sh
 
+matrix-postiz-integrate: ## Provision the Matrix→postiz Pub/Sub topic/IAM/secret (idempotent; DRY=1 to print)
+	@bash ops/matrix/edgelane_provision.sh
+
 simmer-fire-event: ## Fire a test Simmer alert end-to-end in the running container (STATE=READY|WATCH)
 	@docker exec edgelane-backend python /srv/tools/simmer_fire_event.py \
 		--state $(shell echo "$(or $(STATE),READY)" | tr '[:upper:]' '[:lower:]') $(ARGS)
