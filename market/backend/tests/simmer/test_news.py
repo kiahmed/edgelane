@@ -326,7 +326,8 @@ async def test_missing_keys_is_a_clean_noop_with_note(fresh_db):
     assert upd["sentiment_score"] is None and upd["sentiment_n"] is None
     assert upd["velocity_p"] is None and upd["velocity_tier"] is None
     assert isinstance(upd["news_at"], datetime)        # TTL machinery still cycles
-    assert "news:alpaca_credentials_missing" in upd["_news_notes"]
+    # default primary is now finnhub → its credentials are the missing ones
+    assert "news:finnhub_credentials_missing" in upd["_news_notes"]
     assert sn.fetch_news_since(fresh_db, "NVDA", _now() - timedelta(days=2)) == []
 
 

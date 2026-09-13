@@ -3,12 +3,18 @@
 
 Pipeline, per 15-minute news refresh (TTL `ticker_sentiment` in simmer_config):
 
-    Alpaca REST /v1beta1/news  ──┐
-    (or wire-RSS fallback)       ├─▶ dedup/cluster ─▶ persist NEW rows
-                                 │   (3-shingle Jaccard ≥ 0.70, 6 h window)
-                                 └─▶ Gemini scores ONLY new article ids
-                                     ─▶ aggregate (simmer_velocity) ─▶
-                                     simmer_research_cache fields
+    PRIMARY news (Finnhub company-news, default)  ──┐
+    → thin? widen 24h→36h → still thin? MERGE the   ├─▶ dedup/cluster ─▶ persist
+      FALLBACK provider (Alpaca, default)           │   NEW rows (3-shingle
+    (wire-RSS firehose on persistent primary error) │   Jaccard ≥ 0.70, 6 h)
+                                                    └─▶ Gemini scores ONLY new
+                                     article ids ─▶ aggregate (simmer_velocity)
+                                     ─▶ simmer_research_cache fields
+
+    Provider layer is config-driven and swappable: SIMMER_NEWS_PROVIDER (primary,
+    default finnhub) + SIMMER_NEWS_FALLBACK (secondary, default alpaca). The
+    per-symbol escalation windows are simmer_config.NEWS (primary_hours=24,
+    widen_hours=36), calibration-pending.
 
 Four load-bearing decisions, all from docs/simmer.md:
 
@@ -78,6 +84,10 @@ log = logging.getLogger("edgelane.simmer.news")
 # --- Endpoints / constants ---------------------------------------------------
 
 ALPACA_NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
+#: Finnhub company-news (free tier). `?symbol=&from=YYYY-MM-DD&to=YYYY-MM-DD&token=`.
+#: Per-symbol, fresh, symbol-specific. The premium `news-sentiment` and
+#: `stock/price-target` endpoints are 403 on free — NEVER call them here.
+FINNHUB_NEWS_URL = "https://finnhub.io/api/v1/company-news"
 PRNEWSWIRE_RSS_URL = "https://www.prnewswire.com/rss/news-releases-list.rss"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"   # keep in sync with config.gemini_model
@@ -160,6 +170,20 @@ def parse_iso_utc(raw: Any) -> datetime | None:
         return None
 
 
+def parse_epoch_utc(raw: Any) -> datetime | None:
+    """Unix epoch seconds (Finnhub `datetime`) → naive UTC. Bad input → None."""
+    try:
+        secs = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if secs <= 0 or secs != secs:              # non-positive / NaN
+        return None
+    try:
+        return datetime.fromtimestamp(secs, tz=timezone.utc).replace(tzinfo=None)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def parse_rfc822_utc(raw: Any) -> datetime | None:
     """RSS pubDate (`Fri, 15 Aug 2026 09:30:00 -0400`) → naive UTC."""
     if not raw:
@@ -201,6 +225,38 @@ def parse_alpaca_news(payload: Any) -> tuple[list[dict], str | None]:
         })
     token = payload.get("next_page_token")
     return out, (str(token) if token else None)
+
+
+# --- Pure parsers: Finnhub ---------------------------------------------------
+
+def parse_finnhub_news(payload: Any, symbol: str) -> list[dict]:
+    """`GET /company-news` (a JSON array) → the SAME article shape
+    `parse_alpaca_news` yields, tagged to `symbol` (the endpoint is per-symbol).
+
+    Only headline-level fields survive — `summary` is dropped here at the parse
+    boundary, the same licensing posture as Alpaca (bodies never transit)."""
+    sym = str(symbol or "").strip().upper()
+    if not isinstance(payload, (list, tuple)) or not sym:
+        return []
+    out: list[dict] = []
+    for row in payload:
+        if not isinstance(row, Mapping):
+            continue
+        rid = row.get("id")
+        headline = str(row.get("headline") or "").strip()
+        if rid is None or not headline:
+            continue
+        out.append({
+            "id": f"fh-{rid}",           # namespaced: Finnhub ids are numeric and
+                                         # would otherwise risk colliding with an
+                                         # Alpaca id in the shared PK.
+            "headline": headline,
+            "source": str(row.get("source") or "finnhub").strip().lower(),
+            "url": str(row.get("url") or "").strip(),
+            "symbols": [sym],
+            "published_at": parse_epoch_utc(row.get("datetime")),
+        })
+    return out
 
 
 # --- Pure parsers: wire RSS --------------------------------------------------
@@ -623,6 +679,61 @@ class AlpacaNewsClient(_HttpShell):
         return out
 
 
+class FinnhubNewsClient(_HttpShell):
+    """Finnhub company-news, REST (`GET /company-news`). Free tier: fresh,
+    symbol-specific articles. Per-symbol (no batch), so `fetch_news` loops the
+    watchlist. Best-effort by contract: a per-symbol failure is swallowed
+    (that symbol yields nothing) and the call NEVER raises — the escalation in
+    `refresh_news` then widens / falls back rather than erroring.
+
+    Deliberately does NOT touch `news-sentiment` or `stock/price-target` — both
+    are 403 premium; sentiment is Gemini's job here."""
+
+    def __init__(self, api_key: str, timeout: float = 20.0,
+                 base_url: str = FINNHUB_NEWS_URL,
+                 transport: httpx.AsyncBaseTransport | None = None):
+        # Key rides the X-Finnhub-Token HEADER, not the documented `?token=`
+        # query param. Both authenticate, but a query string is part of the
+        # request line, so the key would be copied into every proxy/CDN access
+        # log along the way — headers aren't. Matches how the Alpaca and Gemini
+        # clients above pass their credentials.
+        super().__init__(timeout=timeout, transport=transport,
+                         headers={"Accept": "application/json",
+                                  "X-Finnhub-Token": api_key})
+        self.api_key = api_key
+        self.base_url = base_url
+
+    async def _fetch_one(self, symbol: str, start: datetime, end: datetime) -> list[dict]:
+        params = {
+            "symbol": symbol,
+            "from": start.date().isoformat(),   # Finnhub windows are DATE-granular
+            "to": end.date().isoformat(),
+        }
+        resp = await self._request("GET", self.base_url, params=params)
+        try:
+            payload = resp.json()
+        except ValueError as e:
+            raise NewsError(f"finnhub news: bad JSON — {e!s}") from e
+        return parse_finnhub_news(payload, symbol)
+
+    async def fetch_news(self, symbols: Sequence[str],
+                         start: datetime | None = None,
+                         end: datetime | None = None,
+                         **_ignored) -> list[dict]:
+        end = end or _now_naive_utc()
+        start = start or (end - timedelta(hours=BACKFILL_HOURS))
+        syms = sorted({str(s).strip().upper() for s in symbols if str(s).strip()})
+        out: list[dict] = []
+        for sym in syms:
+            try:
+                out.extend(await self._fetch_one(sym, start, end))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:              # best-effort: one symbol never sinks the rest
+                log.warning("finnhub news fetch failed for %s: %s", sym, e)
+        return out
+
+
 class RssNewsClient(_HttpShell):
     """Wire-RSS fallback (PRNewswire firehose). Keyless; tickers extracted by
     regex from the item text. Engaged only when Alpaca credentials are absent
@@ -881,8 +992,11 @@ def _article_rows_for_symbol(articles: Iterable[dict], symbol: str) -> list[dict
 
 def _news_settings(settings: Any) -> dict[str, str]:
     return {
-        "provider": str(getattr(settings, "simmer_news_provider", "alpaca")
+        "provider": str(getattr(settings, "simmer_news_provider", "finnhub")
+                        or "finnhub").lower(),
+        "fallback": str(getattr(settings, "simmer_news_fallback", "alpaca")
                         or "alpaca").lower(),
+        "finnhub_api_key": str(getattr(settings, "finnhub_api_key", "") or ""),
         "alpaca_key_id": str(getattr(settings, "alpaca_key_id", "") or ""),
         "alpaca_secret_key": str(getattr(settings, "alpaca_secret_key", "") or ""),
         "gemini_api_key": str(getattr(settings, "gemini_api_key", "") or ""),
@@ -891,19 +1005,38 @@ def _news_settings(settings: Any) -> dict[str, str]:
     }
 
 
-def build_news_client(settings: Any) -> tuple[Any | None, list[str]]:
-    """Provider selection per config. Returns (client, notes). None = clean
-    no-op (missing keys / provider off) — with the reason noted, never silent."""
-    cfg = _news_settings(settings)
-    provider = cfg["provider"]
-    if provider == "off":
-        return None, ["news:provider_off"]
-    if provider == "rss":
+def _build_provider(name: str, cfg: dict[str, str]) -> tuple[Any | None, list[str]]:
+    """Construct one provider by name. None = clean no-op (off / missing keys),
+    reason noted. Shared by the primary (`build_news_client`) and the secondary
+    (`build_fallback_client`) so both are swappable from config the same way."""
+    name = (name or "").lower()
+    if name in ("off", "none", ""):
+        return None, ["news:provider_off" if name == "off" else "news:fallback_none"]
+    if name == "rss":
         return RssNewsClient(), ["news:rss_provider"]
-    # alpaca (default)
-    if not cfg["alpaca_key_id"] or not cfg["alpaca_secret_key"]:
-        return None, ["news:alpaca_credentials_missing"]
-    return AlpacaNewsClient(cfg["alpaca_key_id"], cfg["alpaca_secret_key"]), []
+    if name == "finnhub":
+        if not cfg["finnhub_api_key"]:
+            return None, ["news:finnhub_credentials_missing"]
+        return FinnhubNewsClient(cfg["finnhub_api_key"]), []
+    if name == "alpaca":
+        if not cfg["alpaca_key_id"] or not cfg["alpaca_secret_key"]:
+            return None, ["news:alpaca_credentials_missing"]
+        return AlpacaNewsClient(cfg["alpaca_key_id"], cfg["alpaca_secret_key"]), []
+    return None, [f"news:unknown_provider:{name}"]
+
+
+def build_news_client(settings: Any) -> tuple[Any | None, list[str]]:
+    """PRIMARY provider per config. Returns (client, notes). None = clean no-op
+    (missing keys / provider off) — with the reason noted, never silent."""
+    cfg = _news_settings(settings)
+    return _build_provider(cfg["provider"], cfg)
+
+
+def build_fallback_client(settings: Any) -> tuple[Any | None, list[str]]:
+    """SECONDARY provider (SIMMER_NEWS_FALLBACK), merged in when the primary is
+    thin for a symbol. `none` → no fallback (clean no-op, noted)."""
+    cfg = _news_settings(settings)
+    return _build_provider(cfg["fallback"], cfg)
 
 
 def build_scorer(settings: Any) -> tuple[GeminiScorer | None, list[str]]:
@@ -959,9 +1092,119 @@ async def _ingest_and_score(db: Any, symbols: Sequence[str], articles: list[dict
         notes.append(f"news:unscored_headlines:{missed}")
 
 
+# --- Fetch escalation (primary → widen → fallback) ---------------------------
+
+def _has_heavy(pool: Sequence[dict], symbol: str, now: datetime,
+               hours: float) -> bool:
+    """Is there a "heavy" (fresh AND on-topic) article for `symbol` in `pool`?
+
+    Proxy for "will produce a non-null Gemini score for THIS symbol": a fresh
+    (published within `hours`), symbol-tagged article with a real headline. That
+    is exactly what Gemini scores non-null — a generic market-roundup that never
+    names the symbol is dropped by `_article_rows_for_symbol` anyway. Kept
+    Gemini-independent on purpose: it also serves as the "any fresh article"
+    stop when Gemini is unavailable, so escalation never widens forever. Simple
+    and calibration-pending by design (docs/simmer.md)."""
+    sym = str(symbol).upper()
+    cutoff = now - timedelta(hours=float(hours))
+    for a in pool or []:
+        if sym not in (a.get("symbols") or []):
+            continue
+        if not str(a.get("headline") or "").strip():
+            continue
+        ts = _utc_naive(a.get("published_at"))
+        if ts is None or ts >= cutoff:          # None = undated → treat as fresh
+            return True
+    return False
+
+
+def _merge_dedupe(pool: list[dict], incoming: Sequence[dict]) -> list[dict]:
+    """Merge `incoming` into `pool`, dropping cross-source duplicates by
+    article id, url, and normalized-headline cluster (same story from two
+    providers with different ids/urls but the same headline)."""
+    ids = {str(a.get("id")) for a in pool if a.get("id")}
+    urls = {str(a.get("url")) for a in pool if str(a.get("url") or "").strip()}
+    norms = {normalize_headline(a.get("headline")) for a in pool if a.get("headline")}
+    for a in incoming or []:
+        aid = str(a.get("id") or "")
+        url = str(a.get("url") or "").strip()
+        norm = normalize_headline(a.get("headline"))
+        if (aid and aid in ids) or (url and url in urls) or (norm and norm in norms):
+            continue
+        pool.append(a)
+        if aid:
+            ids.add(aid)
+        if url:
+            urls.add(url)
+        if norm:
+            norms.add(norm)
+    return pool
+
+
+async def _escalate_thin_symbols(primary_client: Any, settings: Any,
+                                 symbols: Sequence[str], articles: list[dict],
+                                 now: datetime, notes: list[str],
+                                 fallback_client: Any = None) -> list[dict]:
+    """Per symbol: if the primary's 24h pull is thin, widen the PRIMARY to 36h,
+    then (still thin) merge the FALLBACK provider's 24h pull. Union is deduped
+    across sources; the per-row `source` records who contributed. Best-effort —
+    any fetch error is noted and skipped, never raised. An injected
+    `fallback_client` is reused across symbols and left open for the caller."""
+    ncfg = simmer_config.news()
+    primary_h = float(ncfg.get("primary_hours", 24))
+    widen_h = float(ncfg.get("widen_hours", 36))
+    pool = list(articles)
+    fallback = fallback_client
+    fallback_built = fallback_client is not None
+    own_fallback = False
+    try:
+        for sym in symbols:
+            if _has_heavy(pool, sym, now, primary_h):
+                continue
+            # (b) widen the PRIMARY window.
+            try:
+                widened = await primary_client.fetch_news(
+                    [sym], start=now - timedelta(hours=widen_h), end=now)
+                if widened:
+                    pool = _merge_dedupe(pool, widened)
+                    notes.append(f"news:widened:{sym}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                notes.append(f"news:widen_failed:{sym}:{type(e).__name__}")
+            if _has_heavy(pool, sym, now, widen_h):
+                continue
+            # (c) pull the FALLBACK provider (built once, lazily) over 24h.
+            if not fallback_built:
+                fallback, fb_notes = build_fallback_client(settings)
+                notes.extend(fb_notes)
+                fallback_built = True
+                own_fallback = fallback is not None
+            if fallback is None:
+                continue
+            try:
+                fb_arts = await fallback.fetch_news(
+                    [sym], start=now - timedelta(hours=primary_h), end=now)
+                if fb_arts:
+                    pool = _merge_dedupe(pool, fb_arts)
+                    notes.append(f"news:fallback_merged:{sym}:"
+                                 f"{type(fallback).__name__}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                notes.append(f"news:fallback_failed:{sym}:{type(e).__name__}")
+    finally:
+        if own_fallback and fallback is not None:
+            try:
+                await fallback.close()
+            except Exception:
+                pass
+    return pool
+
+
 async def refresh_news(db: Any, symbols: list[str], settings: Any, *,
                        client: Any = None, scorer: Any = None,
-                       rss_fallback: Any = None,
+                       rss_fallback: Any = None, fallback_client: Any = None,
                        persist_research: bool = True,
                        now: datetime | None = None) -> dict[str, dict]:
     """THE news entry point (watcher tier-1 + operator calls).
@@ -1036,6 +1279,20 @@ async def refresh_news(db: Any, symbols: list[str], settings: Any, *,
                             await fb.close()
 
         if not fetch_failed:
+            # Per-symbol thinness escalation: widen the primary to 36h, then merge
+            # the fallback provider, for any symbol the 24h primary pull left thin.
+            # Runs on the primary client (skipped only for the RSS firehose, which
+            # has no per-symbol/window fetch). Best-effort — never raises.
+            if not isinstance(client, RssNewsClient):
+                try:
+                    articles = await _escalate_thin_symbols(
+                        client, settings, syms, articles, now, base_notes,
+                        fallback_client=fallback_client)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    base_notes.append(f"news:escalation_failed:{type(e).__name__}")
+                    log.warning("news escalation failed: %s", e)
             try:
                 await _ingest_and_score(db, syms, articles, scorer, now, base_notes)
             except asyncio.CancelledError:

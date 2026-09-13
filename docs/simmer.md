@@ -2548,6 +2548,25 @@ ones and puts the results on screen.
     ⚠️ Don't mistake this for a Simmer-only gap: adding the widget to Simmer's
     gate *without* the server-side check buys nothing but a spinner.
 
+40. **Finnhub webhook (real-time news push).** Finnhub can POST new articles to
+    a public endpoint signed with a webhook secret, giving instant news→alert
+    instead of waiting for the 15-minute news refresh. Needs an inbound
+    `/webhook/finnhub_news` route + signature verification (the webhook secret
+    exists in config but is unused for now). Deferred — the poll path
+    (`SIMMER_NEWS_PROVIDER=finnhub`, primary→fallback) already covers coverage;
+    this is a latency upgrade.
+
+    **Key unknown to resolve when built — ticker attribution.** The callback must
+    determine WHICH ticker(s)/company each pushed article is about before
+    scoring/bucketing. Preferred: read the symbol(s) from the callback request
+    body IF Finnhub provides them — *verify the webhook payload schema first*, it
+    may carry `symbol`/`related`. If the payload does NOT carry the symbol,
+    EdgeLane must derive it — entity-extract from the headline/summary and match
+    against the active watchlist symbols (Gemini is already entity-aware) — then
+    bucket the article to that ticker, **dropping articles that map to no watched
+    symbol**. This attribution step is the key open question; the poll path
+    sidesteps it because `company-news` is queried per-symbol.
+
 ### Sequencing note
 
 Phases 0–2 deliver a working engine with **zero external dependencies beyond

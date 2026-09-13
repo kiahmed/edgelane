@@ -185,16 +185,23 @@ PROVIDER_TARGET_URL=
 
 # ── Simmer news + sentiment (Phase 3a) ──
 # News source for the Simmer watcher's 15-minute news refresh:
-#   alpaca = Alpaca Market Data news (Benzinga-sourced). FREE with a paper
-#            account — sign up at alpaca.markets (email only, no funding),
-#            then Dashboard → API Keys (paper). 200 req/min free tier.
-#   rss    = keyless wire-RSS fallback (PRNewswire firehose, regex ticker
-#            match). Weaker coverage; used automatically if Alpaca keeps
-#            failing.
-#   off    = disable news ingestion entirely.
-# With no keys configured the refresh is a clean no-op (sentiment fields stay
-# NULL with a data_quality note) — nothing else in Simmer is affected.
-# SIMMER_NEWS_PROVIDER=alpaca
+#   finnhub = Finnhub company-news (DEFAULT). Per-symbol, fresh, symbol-specific.
+#             FREE key from finnhub.io → FINNHUB_API_KEY below. (Its premium
+#             news-sentiment / price-target endpoints are 403 and never called.)
+#   alpaca  = Alpaca Market Data news (Benzinga-sourced). FREE with a paper
+#             account — sign up at alpaca.markets (email only, no funding),
+#             then Dashboard → API Keys (paper). 200 req/min free tier.
+#   rss     = keyless wire-RSS fallback (PRNewswire firehose, regex ticker
+#             match). Weaker coverage; also used automatically if the primary
+#             keeps failing.
+#   off     = disable news ingestion entirely.
+# The news layer is primary→fallback: SIMMER_NEWS_PROVIDER is primary; if its
+# 24h pull is thin for a symbol the window widens to 36h, then SIMMER_NEWS_FALLBACK
+# (finnhub|alpaca|rss|none; default alpaca) is merged in and deduped. With no keys
+# configured the refresh is a clean no-op (sentiment fields stay NULL with a
+# data_quality note) — nothing else in Simmer is affected.
+# SIMMER_NEWS_PROVIDER=finnhub
+# SIMMER_NEWS_FALLBACK=alpaca
 # ALPACA_KEY_ID=
 # ALPACA_SECRET_KEY=
 # Gemini headline sentiment scoring. Get a key at aistudio.google.com (free

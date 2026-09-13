@@ -366,6 +366,15 @@ VELOCITY: dict[str, Any] = {
 # negative sentiment is still significant at week 13. Sentiment SELECTS THE SIDE
 # and CAN VETO — it never promotes. The half-lives are fits to published
 # coefficient decay, not numbers any paper states.
+# ── News fetch escalation (docs/simmer.md "News, sentiment, and catalysts") ──
+# Per-symbol, per-refresh window widen before falling back to the secondary
+# provider (simmer_news.refresh_news). Reasoned starting points, calibration-
+# pending — not fitted.
+NEWS: dict[str, Any] = {
+    "primary_hours": 24,   # primary provider's first look-back window
+    "widen_hours":   36,   # widen the PRIMARY to this before pulling the fallback
+}
+
 SENTIMENT: dict[str, Any] = {
     "halflife_pos_days":  5,     # trading days
     "halflife_neg_days":  35,
@@ -545,6 +554,10 @@ def ttls() -> dict[str, int]:
 
 def velocity() -> dict[str, Any]:
     return _merged("velocity", VELOCITY)
+
+
+def news() -> dict[str, Any]:
+    return _merged("news", NEWS)
 
 
 def sentiment() -> dict[str, Any]:

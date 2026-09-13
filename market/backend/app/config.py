@@ -228,15 +228,23 @@ class Settings(BaseModel):
     # note (nothing breaks; sentiment fields stay NULL).
     alpaca_key_id: str = Field(default="")
     alpaca_secret_key: str = Field(default="")
+    # Finnhub — secondary news source (fallback when Alpaca has nothing fresh).
+    # Free key from finnhub.io. Empty = fallback disabled.
+    finnhub_api_key: str = Field(default="")
     # Gemini headline scoring (aistudio.google.com). No key → headlines are
     # still ingested/deduped, just never scored (sentiment stays NULL, noted).
     gemini_api_key: str = Field(default="")
     # Scores are NOT reproducible across models — the model id is recorded on
     # every scored row. flash-lite is the cheapest with thinking off by default.
     gemini_model: str = Field(default="gemini-2.5-flash-lite")
-    # News source: alpaca (default; needs the keys above), rss (keyless wire
-    # firehose, regex ticker match, weaker coverage), off.
-    simmer_news_provider: str = Field(default="alpaca")
+    # News layer, primary→fallback (both swappable). PRIMARY:
+    #   finnhub (default; per-symbol company-news, fresh + symbol-specific),
+    #   alpaca (batch, needs the keys above), rss (keyless wire firehose), off.
+    simmer_news_provider: str = Field(default="finnhub")
+    # SECONDARY, merged in when the primary is thin for a symbol (see the
+    # per-symbol escalation in simmer_news.refresh_news): finnhub | alpaca | rss |
+    # none. Default alpaca (complements finnhub's coverage).
+    simmer_news_fallback: str = Field(default="alpaca")
     # Future-earnings-DATE source (the SEC feed only confirms PAST earnings).
     # yahoo (reuses the Simmer data provider's crumb session, no key), nasdaq
     # (free but undocumented/grey-ToS and often blocked), off (default —
@@ -428,6 +436,7 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
 
     if "ALPACA_KEY_ID" in raw:               out["alpaca_key_id"] = raw["ALPACA_KEY_ID"].strip()
     if "ALPACA_SECRET_KEY" in raw:           out["alpaca_secret_key"] = raw["ALPACA_SECRET_KEY"].strip()
+    if "FINNHUB_API_KEY" in raw:             out["finnhub_api_key"] = raw["FINNHUB_API_KEY"].strip()
     if "GEMINI_API_KEY" in raw:              out["gemini_api_key"] = raw["GEMINI_API_KEY"].strip()
     if "GEMINI_MODEL" in raw:
         v = raw["GEMINI_MODEL"].strip()
@@ -435,7 +444,10 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
             out["gemini_model"] = v
     if "SIMMER_NEWS_PROVIDER" in raw:
         v = raw["SIMMER_NEWS_PROVIDER"].strip().lower()
-        out["simmer_news_provider"] = v if v in ("alpaca", "rss", "off") else "alpaca"
+        out["simmer_news_provider"] = v if v in ("finnhub", "alpaca", "rss", "off") else "finnhub"
+    if "SIMMER_NEWS_FALLBACK" in raw:
+        v = raw["SIMMER_NEWS_FALLBACK"].strip().lower()
+        out["simmer_news_fallback"] = v if v in ("finnhub", "alpaca", "rss", "none") else "alpaca"
     if "SIMMER_EARNINGS_PROVIDER" in raw:
         v = raw["SIMMER_EARNINGS_PROVIDER"].strip().lower()
         out["simmer_earnings_provider"] = v if v in ("off", "yahoo", "nasdaq") else "off"
