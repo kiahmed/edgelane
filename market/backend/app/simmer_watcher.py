@@ -1437,6 +1437,72 @@ async def process_alerts(results: dict[str, dict], regime: dict | None,
             log.exception("alert processing failed for %s", key)
 
 
+def _off_hours_catalyst(env: dict) -> bool:
+    """True when an off-hours ready/watch name carries a catalyst worth posting.
+
+    An earnings run-up in the window is the ONE catalyst that can reach ready/
+    watch off-hours: confirmed material catalysts (8-K, macro) hard-veto the name
+    so they never surface here, and news sentiment never *promotes* a score to
+    ready. So the earnings block is the honest, engine-set signal — the same
+    detector the in-hours path uses, read the other direction
+    (docs/simmer_off_hours_catalyst.md §1).
+
+    But `in_window` alone is not enough: a NO-GO read (or a cold cache with no
+    analyzer read at all) is `held_back`, capped by the engine at ready−0.01 =
+    69.99 — which still clears the WATCH band. Posting that publicly as a catalyst
+    would broadcast a name the analyzer explicitly REJECTED (or never judged). So
+    require an affirmative `go` read and exclude `held_back`. The engine is the
+    only thing that can make this call; the poster never decides it itself."""
+    earn = env.get("earnings") or {}
+    return bool(earn.get("in_window") and earn.get("go") and not earn.get("held_back"))
+
+
+async def process_off_hours_catalyst_events(results: dict[str, dict],
+                                            regime: dict | None, db=None) -> None:
+    """Off-hours counterpart to `process_alerts` — the catalyst exception only.
+
+    Publishes a `ready` / `watch_entered` event with `off_hours_catalyst="true"`
+    for a name that is in the ready/watch band AND has a live catalyst, so the
+    postiz poster (which skips un-flagged off-hours events) posts it with the
+    closed-market disclaimer. Deliberately minimal: NO email, NO `update_alert_state`,
+    and it does NOT call `event_transitions` (mutating `state.event_bands` off-hours
+    would swallow the next genuine in-hours transition). Band membership is read
+    from the score; the per-UTC-day `event_id` collapses re-publishes across
+    closed-hours sweeps."""
+    bands = simmer_config.decision_bands()
+    ready = float(bands["ready"])
+    watch = float(bands.get("watch", 50.0))
+    for key, env in results.items():
+        try:
+            if env.get("veto_reasons") or env.get("sector_dispersion_suppressed"):
+                continue
+            if not _off_hours_catalyst(env):
+                continue
+            score = float(env.get("score") or 0.0)
+            if score >= ready:
+                st = "ready"
+            elif score >= watch:
+                st = "watch_entered"
+            else:
+                continue
+            await simmer_events.publish_transition(
+                env.get("symbol"), st, env.get("expiration"), db=db,
+                extra_attributes={"off_hours_catalyst": "true"},
+                takeaways={
+                    "symbol": str(env.get("symbol") or "").upper(),
+                    "expiry": env.get("expiration"),
+                    "state": st,
+                    "score": env.get("score"),
+                    "structure": env.get("structure"),
+                    "decision": env.get("decision"),
+                    "off_hours_catalyst": True,
+                })
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("off-hours catalyst processing failed for %s", key)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Daily IV-history job
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1835,6 +1901,14 @@ async def sweep(tradier, db, edgar=None) -> dict[str, dict]:
     apply_dispersion(results, regime)
     if state.market_open:
         await process_alerts(results, regime, db)
+    else:
+        # Off-hours exception (docs/simmer_off_hours_catalyst.md): the market is
+        # closed, so the normal alert/event path is silent — EXCEPT a ready/watch
+        # name with a live catalyst (an earnings run-up), which publishes with the
+        # `off_hours_catalyst=true` attribute so the postiz poster posts it with a
+        # "generated while markets were closed" disclaimer. No email, no alert
+        # state change, no event-band mutation — just the flagged topic event.
+        await process_off_hours_catalyst_events(results, regime, db)
 
     # Prune per-key state for pairs no longer WATCHED — without this,
     # latest_by_key / alert_states / the error map grow forever as users add

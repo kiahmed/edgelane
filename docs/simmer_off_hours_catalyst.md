@@ -1,5 +1,12 @@
 # Simmer → Postiz: the off-hours catalyst exception
 
+> **Status (shipped 2026-09-15):** the EdgeLane side is built —
+> `simmer_watcher.process_off_hours_catalyst_events` publishes a ready/watch
+> event with `off_hours_catalyst="true"` when the market is closed and the name
+> has a live catalyst (`_off_hours_catalyst`, read from the engine's earnings
+> block). No email/alert-state, no event-band mutation; the closed-hours freeze
+> is untouched. See §"What this repo would need" for the design.
+
 **Written for the Postiz integration, not a change request against Simmer's
 own product** — same posture as `docs/matrix_events_update.md`. Nothing here
 needs to ship immediately; it documents the flag Postiz's poster now honors,
