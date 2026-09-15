@@ -22,6 +22,7 @@ and asks only "is this different from what we last published?".
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -71,6 +72,42 @@ class MatrixSignalState:
 
 
 state = MatrixSignalState()
+
+
+# Publishing is handed to the BACKGROUND; the poll only decides whether there is
+# something to say. `publish_transition` waits on a Pub/Sub ack (up to 10s), and
+# the poll path is the wrong place to wait for that: `_poll_all` awaits each
+# symbol in turn and the UI only sees a snapshot once poll_symbol returns, so a
+# degraded topic would stretch the poll cycle and stall the page behind it.
+#
+# Safe to fire and forget because the last-published markers above are updated
+# from the DECISION, not from the publish result — a dropped message can't cause
+# a re-fire storm, and the deterministic event_id dedupes any retry downstream.
+_INFLIGHT: set[asyncio.Task] = set()
+
+
+def _fire(symbol: str, state_name: str, expiry: Any = None,
+          attrs: dict[str, str] | None = None) -> str:
+    """Queue one publish and return immediately. Returns the state name, so
+    callers report what was HANDED OFF — not what was confirmed sent."""
+    async def _run() -> None:
+        try:
+            await matrix_events.publish_transition(
+                symbol, state_name, expiry, extra_attributes=attrs)
+        except Exception:                      # publish_transition swallows its own,
+            log.exception("[matrix-signals] publish task failed")   # this is belt-and-braces
+    task = asyncio.create_task(_run())
+    _INFLIGHT.add(task)                        # hold a ref; asyncio only weakrefs tasks
+    task.add_done_callback(_INFLIGHT.discard)
+    return state_name
+
+
+async def drain(timeout: float = 10.0) -> None:
+    """Await any in-flight publishes. For tests and orderly shutdown — never
+    called on the poll path, which is the whole point."""
+    pending = set(_INFLIGHT)
+    if pending:
+        await asyncio.wait(pending, timeout=timeout)
 
 
 def _et_date() -> str:
@@ -173,9 +210,7 @@ async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
             key = _pick_key(pick)
             if key and state.last_pick_key.get(sym) != key:
                 state.last_pick_key[sym] = key
-                if await matrix_events.publish_transition(
-                        sym, "pick_selected", expiry, extra_attributes=_pick_summary(pick)):
-                    published.append("pick_selected")
+                published.append(_fire(sym, "pick_selected", expiry, _pick_summary(pick)))
 
         # 2. session_open — first persisted poll of a new ET day that has walls
         #    worth a chip.
@@ -184,9 +219,7 @@ async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
             attrs = {k: str(bias.get(k)) for k in
                      ("call_wall_strike", "put_wall_strike", "vex_wall_strike", "tex_wall_strike")
                      if bias.get(k) is not None}
-            if await matrix_events.publish_transition(sym, "session_open", expiry,
-                                                      extra_attributes=attrs):
-                published.append("session_open")
+            published.append(_fire(sym, "session_open", expiry, attrs))
 
         # 3. grid_digest — enough of the grid moved, and it has been long enough.
         sig = _grid_signature(snap.get("strategies") or {})
@@ -203,8 +236,7 @@ async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
             if due and _changed_cards(state.last_digest_grid.get(sym, ""), sig) >= _DIGEST_MIN_CHANGED:
                 state.last_digest_at[sym] = datetime.now(timezone.utc).isoformat()
                 state.last_digest_grid[sym] = sig
-                if await matrix_events.publish_transition(sym, "grid_digest", expiry):
-                    published.append("grid_digest")
+                published.append(_fire(sym, "grid_digest", expiry))
     except Exception:
         log.exception("[matrix-signals] on_snapshot failed (ignored)")
     return published
@@ -249,15 +281,13 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
                 was, now = prev_state == "in_sync", cur_state == "in_sync"
                 if was != now:
                     ev = "bias_aligned" if now else "bias_diverged"
-                    if await matrix_events.publish_transition(
-                            sym, ev, expiry, extra_attributes={
-                                "trust_state": cur_state,
-                                "previous_state": prev_state,
-                                "win_rate": str(trust.get("win_rate") or ""),
-                                "graded": str(graded),
-                                "hint": str(trust.get("hint_text") or ""),
-                            }):
-                        published.append(ev)
+                    published.append(_fire(sym, ev, expiry, {
+                        "trust_state": cur_state,
+                        "previous_state": prev_state,
+                        "win_rate": str(trust.get("win_rate") or ""),
+                        "graded": str(graded),
+                        "hint": str(trust.get("hint_text") or ""),
+                    }))
             state.last_trust_state[sym] = cur_state
 
             # 6. win_rate_notable — only when earned (§3). Either rule suffices.
@@ -271,16 +301,14 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
                              and tier == "green" and graded >= min_graded)
             if recovered or crossed_green:
                 reason = "recovery" if recovered else "win_streak"
-                if await matrix_events.publish_transition(
-                        sym, "win_rate_notable", expiry, extra_attributes={
-                            "reason": reason,
-                            "win_rate": f"{pct:.0f}",
-                            "graded": str(graded),
-                            "wins": str(stats.get("wins") or 0),
-                            "losses": str(stats.get("losses") or 0),
-                            "consec_wins": str(evaluator_state.consec_wins_by_symbol.get(sym, 0)),
-                        }):
-                    published.append("win_rate_notable")
+                published.append(_fire(sym, "win_rate_notable", expiry, {
+                    "reason": reason,
+                    "win_rate": f"{pct:.0f}",
+                    "graded": str(graded),
+                    "wins": str(stats.get("wins") or 0),
+                    "losses": str(stats.get("losses") or 0),
+                    "consec_wins": str(evaluator_state.consec_wins_by_symbol.get(sym, 0)),
+                }))
             state.last_regime_alert[sym] = alert
             state.last_win_tier[sym] = tier
 
@@ -297,9 +325,7 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
                     attrs = {"session_date": recap_for}
                     attrs.update({f"best_{k}": v for k, v in best.items()})
                     attrs.update({f"worst_{k}": v for k, v in worst.items()})
-                    if await matrix_events.publish_transition(
-                            sym, "daily_recap", expiry, extra_attributes=attrs):
-                        published.append("daily_recap")
+                    published.append(_fire(sym, "daily_recap", expiry, attrs))
     except Exception:
         log.exception("[matrix-signals] on_evaluation failed (ignored)")
     return published

@@ -162,6 +162,17 @@ async def lifespan(app: FastAPI):
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
+        # Matrix chips are published as detached background tasks so the poll
+        # never waits on a Pub/Sub ack. Give any still in flight a moment to
+        # land before the loop goes away — bounded, and best-effort: a dropped
+        # message is harmless (the deterministic event_id means the next
+        # transition re-fires cleanly), but losing one on every deploy restart
+        # is avoidable.
+        try:
+            from . import matrix_signals
+            await matrix_signals.drain(timeout=5.0)
+        except Exception:
+            pass
         try:
             await client.close()
         except Exception:

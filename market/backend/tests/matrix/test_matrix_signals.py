@@ -60,34 +60,41 @@ def _states(calls) -> list[str]:
 
 async def test_pick_selected_fires_once_then_stays_quiet(sent):
     await ms.on_snapshot(_snap(), None)
+    await ms.drain()
     assert "pick_selected" in _states(sent)
 
     sent.clear()
     await ms.on_snapshot(_snap(), None)          # identical pick, next poll
+    await ms.drain()
     assert "pick_selected" not in _states(sent)
 
 
 async def test_a_drifting_score_is_not_a_new_pick(sent):
     """Composite score moves every poll; only the structure defines the call."""
     await ms.on_snapshot(_snap(), None)
+    await ms.drain()
     sent.clear()
     snap = _snap()
     snap["engine_pick"]["composite_score"] = 71.4      # same legs, new score
     await ms.on_snapshot(snap, None)
+    await ms.drain()
     assert "pick_selected" not in _states(sent)
 
 
 async def test_changed_strikes_are_a_new_pick(sent):
     await ms.on_snapshot(_snap(), None)
+    await ms.drain()
     sent.clear()
     snap = _snap()
     snap["engine_pick"]["strikes"] = [7690.0, 7730.0]
     await ms.on_snapshot(snap, None)
+    await ms.drain()
     assert "pick_selected" in _states(sent)
 
 
 async def test_pick_attributes_carry_the_copy_fields(sent):
     await ms.on_snapshot(_snap(), None)
+    await ms.drain()
     attrs = next(c for c in sent if c["state"] == "pick_selected")["attrs"]
     assert attrs["strategy"] == "bear_call"
     assert attrs["verdict"] == "tradeable on limit"
@@ -98,9 +105,11 @@ async def test_pick_attributes_carry_the_copy_fields(sent):
 
 async def test_session_open_fires_once_per_day(sent):
     await ms.on_snapshot(_snap(), None)
+    await ms.drain()
     assert "session_open" in _states(sent)
     sent.clear()
     await ms.on_snapshot(_snap(), None)
+    await ms.drain()
     assert "session_open" not in _states(sent)
 
 
@@ -108,6 +117,7 @@ async def test_session_open_is_skipped_with_no_walls(sent):
     """§2: skip silently rather than post an empty frame."""
     snap = _snap(bias={"bias_label": "neutral", "directional_score": 0})
     await ms.on_snapshot(snap, None)
+    await ms.drain()
     assert "session_open" not in _states(sent)
 
 
@@ -115,6 +125,7 @@ async def test_session_open_is_skipped_with_no_walls(sent):
 
 async def test_grid_digest_respects_its_cooldown(sent):
     await ms.on_snapshot(_snap(), None)           # first ever → fires
+    await ms.drain()
     assert "grid_digest" in _states(sent)
 
     sent.clear()
@@ -122,38 +133,70 @@ async def test_grid_digest_respects_its_cooldown(sent):
     for i in range(8):
         snap["strategies"][f"s{i}"]["best"]["health"] = "broken"
     await ms.on_snapshot(snap, None)               # ...but minutes later
+    await ms.drain()
     assert "grid_digest" not in _states(sent), "cooldown must hold"
 
 
 async def test_grid_digest_needs_a_real_change_after_the_cooldown(sent):
     await ms.on_snapshot(_snap(), None)
+    await ms.drain()
     sent.clear()
     # Pretend the last digest was days ago.
     ms.state.last_digest_at["SPX"] = (
         datetime.now(timezone.utc) - timedelta(hours=ms._DIGEST_MIN_HOURS + 1)).isoformat()
 
     await ms.on_snapshot(_snap(), None)            # same grid → still quiet
+    await ms.drain()
     assert "grid_digest" not in _states(sent)
 
     snap = _snap()
     for i in range(ms._DIGEST_MIN_CHANGED):
         snap["strategies"][f"s{i}"]["best"]["health"] = "broken"
     await ms.on_snapshot(snap, None)               # enough cards moved → fires
+    await ms.drain()
     assert "grid_digest" in _states(sent)
 
 
 # ── never raises ────────────────────────────────────────────────────────────
 
-async def test_on_snapshot_swallows_a_publisher_failure(monkeypatch):
+async def test_a_publisher_failure_never_reaches_the_poll(monkeypatch, caplog):
+    """Publishes are queued, so the poll path returns BEFORE the topic answers.
+    A failing publish must therefore surface as a logged background error and
+    nothing else — never an exception on the caller, never a stalled poll."""
     async def _boom(*a, **k):
         raise RuntimeError("pubsub down")
 
     monkeypatch.setattr(ms.matrix_events, "publish_transition", _boom)
-    assert await ms.on_snapshot(_snap(), None) == []      # no exception escapes
+
+    # The return value reports what was HANDED OFF, not what was delivered —
+    # that is the point of not waiting for the ack.
+    handed_off = await ms.on_snapshot(_snap(), None)
+    assert "pick_selected" in handed_off
+
+    await ms.drain()          # let the doomed tasks finish; must not raise
+    assert "publish task failed" in caplog.text
+
+
+async def test_the_poll_does_not_wait_for_the_topic(monkeypatch):
+    """The whole reason publishing is backgrounded: a slow topic must not add
+    its latency to the poll cycle."""
+    import asyncio, time
+
+    async def _slow(*a, **k):
+        await asyncio.sleep(0.5)
+        return True
+
+    monkeypatch.setattr(ms.matrix_events, "publish_transition", _slow)
+    t0 = time.monotonic()
+    await ms.on_snapshot(_snap(), None)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 0.1, f"on_snapshot waited {elapsed:.2f}s on the publish"
+    await ms.drain()
 
 
 async def test_a_snapshot_without_a_symbol_is_ignored(sent):
     assert await ms.on_snapshot({}, None) == []
+    await ms.drain()
 
 
 # ── evaluator-side: bias + win_rate + recap ────────────────────────────────
@@ -196,8 +239,10 @@ async def test_bias_transition_fires_only_on_a_flip(sent, evaluator_state):
     db, poller, cfg = _FakeDB(), _FakePoller(_snap()), _Settings()
 
     await ms.on_evaluation(db, poller, cfg)        # first pass seeds the baseline
+    await ms.drain()
     sent.clear()
     await ms.on_evaluation(db, poller, cfg)        # unchanged → silent
+    await ms.drain()
     assert not [s for s in _states(sent) if s.startswith("bias_")]
 
 
@@ -206,10 +251,12 @@ async def test_win_rate_notable_on_recovery(sent, evaluator_state):
     db, poller, cfg = _FakeDB(), _FakePoller(_snap()), _Settings()
     evaluator_state.regime_alert_active_by_symbol["SPX"] = True
     await ms.on_evaluation(db, poller, cfg)        # seed: alert active
+    await ms.drain()
     sent.clear()
 
     evaluator_state.regime_alert_active_by_symbol["SPX"] = False   # recovered
     await ms.on_evaluation(db, poller, cfg)
+    await ms.drain()
     hit = [c for c in sent if c["state"] == "win_rate_notable"]
     assert hit and hit[0]["attrs"]["reason"] == "recovery"
 
@@ -218,9 +265,11 @@ async def test_win_rate_notable_on_crossing_into_green(sent, evaluator_state):
     """Rule 2 (§3): crossing pill_green_pct from below, with enough graded."""
     poller, cfg = _FakePoller(_snap()), _Settings()
     await ms.on_evaluation(_FakeDB(pct=45.0), poller, cfg)   # seed below green
+    await ms.drain()
     sent.clear()
 
     await ms.on_evaluation(_FakeDB(pct=72.0), poller, cfg)   # crosses up
+    await ms.drain()
     hit = [c for c in sent if c["state"] == "win_rate_notable"]
     assert hit and hit[0]["attrs"]["reason"] == "win_streak"
     assert hit[0]["attrs"]["win_rate"] == "72"
@@ -230,8 +279,10 @@ async def test_a_small_sample_cannot_trigger_a_win_streak(sent, evaluator_state)
     """Below eval_min_graded it is noise, not an achievement."""
     poller, cfg = _FakePoller(_snap()), _Settings()
     await ms.on_evaluation(_FakeDB(n=4, pct=25.0), poller, cfg)
+    await ms.drain()
     sent.clear()
     await ms.on_evaluation(_FakeDB(n=4, pct=100.0), poller, cfg)
+    await ms.drain()
     assert "win_rate_notable" not in _states(sent)
 
 
@@ -239,13 +290,16 @@ async def test_daily_recap_fires_once_for_the_finished_day(sent, evaluator_state
     db, poller, cfg = _FakeDB(), _FakePoller(_snap()), _Settings()
     # A day's worth of picks, recorded by the poll side.
     await ms.on_snapshot(_snap(), None)
+    await ms.drain()
     low = _snap()
     low["engine_pick"] = dict(low["engine_pick"], strikes=[1.0, 2.0], composite_score=12.0)
     await ms.on_snapshot(low, None)
+    await ms.drain()
     ms.state.day_date["SPX"] = "2026-09-12"        # that day is now over
     sent.clear()
 
     await ms.on_evaluation(db, poller, cfg)
+    await ms.drain()
     hit = [c for c in sent if c["state"] == "daily_recap"]
     assert hit, "a finished day must recap"
     attrs = hit[0]["attrs"]
@@ -255,6 +309,7 @@ async def test_daily_recap_fires_once_for_the_finished_day(sent, evaluator_state
 
     sent.clear()
     await ms.on_evaluation(db, poller, cfg)        # same day must not recap twice
+    await ms.drain()
     assert "daily_recap" not in _states(sent)
 
 
@@ -264,3 +319,4 @@ async def test_on_evaluation_swallows_a_broken_db(sent, evaluator_state):
             raise RuntimeError("db gone")
 
     assert await ms.on_evaluation(_Boom(), _FakePoller(_snap()), _Settings()) == []
+    await ms.drain()
