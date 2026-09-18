@@ -101,7 +101,8 @@ def get_accuracy(symbol: str):
     if db is None:
         raise HTTPException(503, "db not ready")
     settings = get_settings()
-    stats = db.fetch_accuracy(sym, settings.eval_rolling_window)
+    stats = db.fetch_accuracy(sym, settings.eval_rolling_window,
+                              min_dwell=int(getattr(settings, "pick_min_dwell_polls", 1)))
     recent = db.fetch_recent_outcomes(sym, 10)
     pct = float(stats.get("accuracy_pct") or 0.0)
     n = int(stats.get("n") or 0)

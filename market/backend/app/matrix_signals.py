@@ -23,6 +23,7 @@ and asks only "is this different from what we last published?".
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -48,7 +49,19 @@ class MatrixSignalState:
     day). Mirrors how `EvaluatorState` holds the regime counters."""
 
     def __init__(self) -> None:
-        self.last_pick_key: dict[str, str] = {}
+        self.last_pick_key: dict[str, str] = {}      # last ANNOUNCED pick
+        # The pick currently on screen and how many consecutive polls it has
+        # held. A pick must survive `pick_min_dwell_polls` before it is
+        # announced — the engine's top pick flickers, and a 30-second flicker is
+        # not a call worth posting (and is not graded either).
+        self.cur_pick_key: dict[str, str] = {}
+        self.cur_pick_polls: dict[str, int] = {}
+        # True once a pick has been SUPPRESSED (broken structure / bias out of
+        # sync). Resuming needs more than the flag clearing — see _recovery_earned.
+        self.pick_blocked: dict[str, bool] = {}
+        # Last published win rate, carried onto the pick chip as its takeaway.
+        self.last_win_rate: dict[str, float | None] = {}
+        self.last_graded: dict[str, int] = {}
         self.last_trust_state: dict[str, str] = {}
         self.last_win_tier: dict[str, str] = {}
         self.last_regime_alert: dict[str, bool] = {}
@@ -64,7 +77,9 @@ class MatrixSignalState:
         self.day_worst: dict[str, dict] = {}
 
     def reset(self) -> None:
-        for d in (self.last_pick_key, self.last_trust_state, self.last_win_tier,
+        for d in (self.last_pick_key, self.cur_pick_key, self.cur_pick_polls,
+                  self.pick_blocked, self.last_win_rate, self.last_graded,
+                  self.last_trust_state, self.last_win_tier,
                   self.last_regime_alert, self.session_open_date, self.last_digest_at,
                   self.last_digest_grid, self.last_recap_date, self.day_date,
                   self.day_best, self.day_worst):
@@ -87,13 +102,16 @@ _INFLIGHT: set[asyncio.Task] = set()
 
 
 def _fire(symbol: str, state_name: str, expiry: Any = None,
-          attrs: dict[str, str] | None = None) -> str:
+          attrs: dict[str, str] | None = None, disc: str | None = None) -> str:
     """Queue one publish and return immediately. Returns the state name, so
-    callers report what was HANDED OFF — not what was confirmed sent."""
+    callers report what was HANDED OFF — not what was confirmed sent.
+
+    `disc` distinguishes repeat occurrences of a state within one day (see
+    matrix_events.event_id). Omit it for states that happen once a day."""
     async def _run() -> None:
         try:
             await matrix_events.publish_transition(
-                symbol, state_name, expiry, extra_attributes=attrs)
+                symbol, state_name, expiry, discriminator=disc, extra_attributes=attrs)
         except Exception:                      # publish_transition swallows its own,
             log.exception("[matrix-signals] publish task failed")   # this is belt-and-braces
     task = asyncio.create_task(_run())
@@ -115,9 +133,21 @@ def _et_date() -> str:
 
 
 def _pick_key(pick: dict) -> str:
-    """Identity of an engine pick: the structure a reader would recognize as
-    'the same call'. Composite score drifts every poll, so it is deliberately
-    NOT part of the key — otherwise every poll would look like a new pick."""
+    """Identity of an engine pick — the SAME notion the win rate uses.
+
+    The poller persists `pick_legs = json.dumps(pick["legs"])` and the grader
+    cuts episodes wherever that value changes (db._EPISODE_CTE), so keying on
+    the legs here means a chip and a graded episode describe the same thing.
+    Falls back to strategy/label/strikes when a snapshot carries no legs.
+
+    Composite score is deliberately excluded: it drifts every poll, so folding
+    it in would make every single poll look like a brand-new pick."""
+    legs = pick.get("legs")
+    if legs:
+        try:
+            return json.dumps(legs)
+        except (TypeError, ValueError):
+            pass
     strikes = pick.get("strikes")
     if isinstance(strikes, (list, tuple)):
         strikes = "/".join(str(s) for s in strikes)
@@ -126,10 +156,76 @@ def _pick_key(pick: dict) -> str:
     ))
 
 
-def _pick_summary(pick: dict) -> dict[str, str]:
-    """Compact attributes carried alongside a pick chip."""
+def _dwell(settings: Any) -> int:
+    """Polls a pick must hold before it counts. One knob, shared with the win
+    rate (see config.pick_min_dwell_polls)."""
+    try:
+        return max(1, int(getattr(settings, "pick_min_dwell_polls", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+# A pick_selected chip is a claim that the tool found something worth seeing.
+# These are the states where that claim would be false. `health` comes from
+# strategy_engine (lowercase: healthy | thin | directional | broken |
+# capital_trap); "broken" and "capital_trap" are the two it scores as
+# disqualifying, and "do not trade" is the composite verdict below the skip
+# threshold. Compared case-insensitively — the UI renders them upper-case.
+_UNPOSTABLE_HEALTH = {"broken", "capital_trap", "do_not_trade"}
+_UNPOSTABLE_VERDICT = ("do not trade", "skip")
+
+
+def _recovery_earned(sym: str) -> bool:
+    """Has the engine actually proven itself since it was last suppressed?
+
+    Deliberately NOT just "the flag flipped back to good": a bias that
+    re-syncs on one poll can un-sync on the next, and announcing on that edge
+    is how you end up posting the same broken idea repeatedly. Mirrors the
+    earned-recovery rule `win_rate_notable` already uses — the pause must be
+    off AND there must be a real graded win behind it."""
+    from .evaluator import state as evaluator_state
+    if evaluator_state.regime_alert_active_by_symbol.get(sym, False):
+        return False
+    return int(evaluator_state.consec_wins_by_symbol.get(sym, 0) or 0) >= 1
+
+
+def _pick_block_reason(sym: str, pick: dict) -> str | None:
+    """Why this pick must NOT be announced, or None if it may be.
+
+    pick_selected is not a raw signal feed. It exists to show the tool is
+    sharp, so a structurally-new pick is not automatically a postable one: a
+    re-strike of a losing idea is still a losing idea (see the 2026-09-17
+    incident in docs/matrix_events_update.md)."""
+    health = str(pick.get("health") or "").strip().lower().replace(" ", "_")
+    if health in _UNPOSTABLE_HEALTH:
+        return f"health={health}"
     verdict = pick.get("composite_verdict") or {}
-    return {
+    label = str((verdict.get("label") if isinstance(verdict, dict) else "") or "").lower()
+    if any(bad in label for bad in _UNPOSTABLE_VERDICT):
+        return f"verdict={label}"
+    # Bias must be IN SYNC. Unknown counts as not-in-sync: before the grader has
+    # an opinion there is no performance to show, so there is nothing to claim.
+    trust = state.last_trust_state.get(sym)
+    if trust != "in_sync":
+        return f"bias={trust or 'unknown'}"
+    if state.pick_blocked.get(sym) and not _recovery_earned(sym):
+        return "awaiting-confirming-win"
+    return None
+
+def _pick_summary(pick: dict, sym: str = "") -> dict[str, str]:
+    """Compact attributes carried alongside a pick chip.
+
+    Includes the current win rate so the post has a TAKEAWAY — "here is the
+    call, and here is how this engine has been doing" — rather than being a
+    bare signal with nothing to judge it by."""
+    verdict = pick.get("composite_verdict") or {}
+    wr = state.last_win_rate.get(sym)
+    extra = {
+        "win_rate": ("" if wr is None else f"{float(wr):.0f}"),
+        "graded": str(state.last_graded.get(sym, "") or ""),
+        "trust_state": str(state.last_trust_state.get(sym) or ""),
+    } if sym else {}
+    return {**extra,
         "strategy": str(pick.get("strategy") or ""),
         "label": str(pick.get("label") or ""),
         "composite_score": str(pick.get("composite_score") if pick.get("composite_score") is not None else ""),
@@ -208,9 +304,33 @@ async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
         if pick:
             _track_day_extremes(sym, pick, today)
             key = _pick_key(pick)
-            if key and state.last_pick_key.get(sym) != key:
-                state.last_pick_key[sym] = key
-                published.append(_fire(sym, "pick_selected", expiry, _pick_summary(pick)))
+            if key:
+                # Count how long this exact pick has held.
+                if state.cur_pick_key.get(sym) != key:
+                    state.cur_pick_key[sym] = key
+                    state.cur_pick_polls[sym] = 1
+                else:
+                    state.cur_pick_polls[sym] = state.cur_pick_polls.get(sym, 0) + 1
+                # Announce once it has earned it, and only once per run —
+                # and only when the pick is worth showing at all.
+                if (state.cur_pick_polls[sym] >= _dwell(settings)
+                        and state.last_pick_key.get(sym) != key):
+                    reason = _pick_block_reason(sym, pick)
+                    if reason:
+                        # Suppressed. The RUN bookkeeping above still advanced,
+                        # but `last_pick_key` deliberately does NOT — it means
+                        # "last announced", so leaving it alone lets this very
+                        # pick be announced later if it recovers, instead of
+                        # being swallowed as already-said.
+                        state.pick_blocked[sym] = True
+                        log.info("[matrix-signals] %s pick_selected suppressed (%s)",
+                                 sym, reason)
+                    else:
+                        state.last_pick_key[sym] = key
+                        state.pick_blocked[sym] = False
+                        published.append(_fire(
+                            sym, "pick_selected", expiry, _pick_summary(pick, sym),
+                            disc=matrix_events.discriminator(key)))
 
         # 2. session_open — first persisted poll of a new ET day that has walls
         #    worth a chip.
@@ -259,12 +379,13 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
         green = float(getattr(settings, "pill_green_pct", 60.0))
         red = float(getattr(settings, "pill_red_pct", 40.0))
         window = int(getattr(settings, "eval_rolling_window", 20))
+        dwell = int(getattr(settings, "pick_min_dwell_polls", 1))
 
         for sym in symbols:
             snap = (getattr(poller_state, "latest_by_symbol", {}) or {}).get(sym) or {}
             expiry = snap.get("expiration")
             try:
-                stats = db.fetch_accuracy(sym, window)
+                stats = db.fetch_accuracy(sym, window, min_dwell=dwell)
             except Exception:
                 log.exception("[matrix-signals] fetch_accuracy failed for %s", sym)
                 continue
@@ -281,7 +402,8 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
                 was, now = prev_state == "in_sync", cur_state == "in_sync"
                 if was != now:
                     ev = "bias_aligned" if now else "bias_diverged"
-                    published.append(_fire(sym, ev, expiry, {
+                    published.append(_fire(sym, ev, expiry, disc=matrix_events.discriminator(
+                        f"{prev_state}>{cur_state}"), attrs={
                         "trust_state": cur_state,
                         "previous_state": prev_state,
                         "win_rate": str(trust.get("win_rate") or ""),
@@ -289,6 +411,8 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
                         "hint": str(trust.get("hint_text") or ""),
                     }))
             state.last_trust_state[sym] = cur_state
+            state.last_win_rate[sym] = trust.get("win_rate")
+            state.last_graded[sym] = graded
 
             # 6. win_rate_notable — only when earned (§3). Either rule suffices.
             alert = bool(evaluator_state.regime_alert_active_by_symbol.get(sym, False))
@@ -301,7 +425,8 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
                              and tier == "green" and graded >= min_graded)
             if recovered or crossed_green:
                 reason = "recovery" if recovered else "win_streak"
-                published.append(_fire(sym, "win_rate_notable", expiry, {
+                published.append(_fire(sym, "win_rate_notable", expiry,
+                                       disc=matrix_events.discriminator(reason), attrs={
                     "reason": reason,
                     "win_rate": f"{pct:.0f}",
                     "graded": str(graded),
@@ -312,17 +437,28 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
             state.last_regime_alert[sym] = alert
             state.last_win_tier[sym] = tier
 
-            # 7. daily_recap — once per ET day, the day's best and worst pick.
+            # 7. daily_recap — once per ET day, headlined by the day's BEST pick.
             #    Fires on the first sweep of a NEW day, recapping the day just
             #    finished (that is when the extremes are final).
+            #
+            #    `headline="best"` is explicit: the post leads with the best
+            #    pick, and the worst rides along as context rather than as the
+            #    story. Leading with the worst would sit badly beside the
+            #    pick_selected gate, which refuses to announce weak picks live —
+            #    but dropping it entirely would be cherry-picking, and the whole
+            #    point of the self-eval is that the number is believable. Note
+            #    these are composite SCORES, so "worst" is the weakest idea the
+            #    engine surfaced, not its biggest loss.
             recap_for = state.day_date.get(sym)
             if (recap_for and recap_for != today
                     and state.last_recap_date.get(sym) != recap_for):
                 best = state.day_best.get(sym) or {}
                 worst = state.day_worst.get(sym) or {}
                 state.last_recap_date[sym] = recap_for
-                if best or worst:
-                    attrs = {"session_date": recap_for}
+                # No best ⇒ no headline ⇒ nothing to post. Skip silently, the
+                # way session_open skips a day with no walls worth showing.
+                if best:
+                    attrs = {"session_date": recap_for, "headline": "best"}
                     attrs.update({f"best_{k}": v for k, v in best.items()})
                     attrs.update({f"worst_{k}": v for k, v in worst.items()})
                     published.append(_fire(sym, "daily_recap", expiry, attrs))

@@ -70,7 +70,8 @@ def _accuracy_view(sym: str) -> tuple[dict, dict]:
     if db is None:
         return {}, {}
     try:
-        stats = db.fetch_accuracy(sym, int(settings.eval_rolling_window))
+        stats = db.fetch_accuracy(sym, int(settings.eval_rolling_window),
+                                  min_dwell=int(getattr(settings, "pick_min_dwell_polls", 1)))
     except Exception:
         return {}, {}
     n = int(stats.get("n") or 0)

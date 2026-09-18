@@ -157,9 +157,81 @@ Two notes for the Postiz side:
 * **`pick_selected` keys on the structure, not the score.** Strategy + label +
   strikes. Composite score drifts every poll, so including it would make every
   poll look like a new pick.
+* **`event_id` can now carry a discriminator** — `MTX-<SYM>-<YYMMDD>-<state>`
+  optionally followed by `-<8 hex>`. States that truly happen once a day
+  (`session_open`, `daily_recap`, `grid_digest`) keep the bare id. States that
+  can legitimately recur carry one: `pick_selected` hashes the pick's legs,
+  `win_rate_notable` the milestone reason, `bias_*` the transition. The suffix
+  is stable for the same real event, so a retry still dedupes — but the day's
+  second genuine pick is no longer swallowed as a duplicate of the first, which
+  is what happened before this.
+* **A pick must hold `pick_min_dwell_polls` (default 3, ~48s) to count.** The
+  engine's top pick flickers — it can change and change back inside a minute.
+  The same knob gates the win rate (`db._EPISODE_CTE`) and the `pick_selected`
+  chip, so Matrix never posts a pick its own score ignores. Measured on real
+  history the win rate is unchanged by it (44–53% W/(W+L) at every threshold
+  from 1 to 8 polls); it only removes flickers.
 * **`grid_digest` needs both a cooldown and a real change** (~60h, ≥3 of the 8
   cards). Cadence alone posts a grid nobody is looking at; change alone fires
   several times on a choppy session.
+
+## Closed (2026-09-17): `pick_selected` fired on a BROKEN/diverged pick
+
+**Incident:** on 2026-09-17 SPX sat in a losing Bear Put with bias diverged.
+The engine kept re-striking new legs on it every poll — legitimately a new
+`_pick_key` each time (legs/strikes changed, which is exactly what that key
+is supposed to catch) — so `pick_selected` fired repeatedly, each post
+carrying `health: "BROKEN"` and the same "edge assumption didn't hold up /
+Bias re-syncing" copy, just a different composite score (61.3, then 59.0).
+Postiz has a local min-gap backstop now (`MATRIX_MIN_GAP_HOURS_PICK_SELECTED`
+in `soljet-postiz/products/facades/matrix_tier.config`), but that's insurance
+only — the real fix belongs here.
+
+**Root cause:** `on_snapshot()`'s `# 1. pick_selected` block gates purely on
+`_pick_key` changing + `pick_min_dwell_polls`. It never looks at the pick's
+own `health` field (`strategy_engine.py` sets `"HEALTHY"` / `"BROKEN"` / `"DO
+NOT TRADE"` / etc. — see `routes/matrix.py:104`) or at bias-trust state
+(`state.last_trust_state[sym]`, already tracked in this same module, updated
+by `on_evaluation()` a few lines below). So a structurally "new" pick posts
+regardless of whether it's actually any good.
+
+**Policy decision:** `pick_selected` should not be a raw signal feed — it
+exists to show the tool is sharp, not to broadcast every re-strike. Target is
+a couple of these a day, not one per poll.
+
+**Fix needed, in `on_snapshot()`'s pick_selected block:**
+1. Skip firing (still update `cur_pick_key`/`cur_pick_polls`/`last_pick_key`
+   bookkeeping so a later recovery isn't swallowed as "already announced",
+   just don't call `_fire`) whenever `pick.get("health")` is `"BROKEN"` or
+   `"DO NOT TRADE"`, **or** `state.last_trust_state.get(sym) != "in_sync"`.
+2. Prefer not to fire the instant health/bias flips back to good either —
+   reuse the earned-recovery pattern `win_rate_notable` already has
+   (`recovered` / `crossed_green`, gated on real graded wins, not just a
+   state flip) so a pick only gets announced once it's proven itself again,
+   not the moment it re-syncs.
+
+**Fixed as specified** (`matrix_signals._pick_block_reason`). A pick is now
+announced only when ALL of these hold:
+
+| gate | suppressed when |
+|---|---|
+| structure | `health` is `broken` / `capital_trap`, or the verdict is `do not trade` |
+| bias | `last_trust_state[sym] != "in_sync"` — **unknown counts as not in sync**, so nothing posts before the grader has an opinion |
+| recovery | previously suppressed and `_recovery_earned()` is false: the regime pause must be off AND `consec_wins >= 1` — a real graded win, not a flag flip |
+
+Two deliberate choices worth knowing:
+
+* **`last_pick_key` is only set when a chip actually fires.** It means "last
+  ANNOUNCED", so a pick held back while broken can still be announced later if
+  it recovers, rather than being swallowed as already-said. The run counters
+  (`cur_pick_key` / `cur_pick_polls`) do advance while suppressed, as specified.
+* **The chip now carries the takeaway** — `win_rate`, `graded` and
+  `trust_state` ride along as attributes, so the post can say how the engine has
+  been doing rather than being a bare signal with nothing to judge it against.
+
+Every suppression logs its reason (`pick_selected suppressed (health=broken)`),
+so the quiet is auditable rather than mysterious. Postiz's
+`MATRIX_MIN_GAP_HOURS_PICK_SELECTED` backstop can stay as insurance.
 
 ## Summary for whoever picks this up
 

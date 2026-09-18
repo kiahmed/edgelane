@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app import matrix_events as me
 from app import matrix_signals as ms
 
 
@@ -13,6 +14,10 @@ from app import matrix_signals as ms
 
 @pytest.fixture(autouse=True)
 def _clean_state():
+    from app.evaluator import state as est
+    for d in (est.regime_alert_active_by_symbol, est.consec_wins_by_symbol,
+              est.consec_losses_by_symbol):
+        d.clear()
     ms.state.reset()
     yield
     ms.state.reset()
@@ -23,9 +28,11 @@ def sent(monkeypatch):
     """Capture publishes instead of hitting Pub/Sub."""
     calls: list[dict] = []
 
-    async def _fake(symbol, state, expiry=None, *, day=None, extra_attributes=None):
+    async def _fake(symbol, state, expiry=None, *, day=None, discriminator=None,
+                    extra_attributes=None):
         calls.append({"symbol": symbol, "state": state, "expiry": expiry,
-                      "attrs": extra_attributes or {}})
+                      "disc": discriminator, "attrs": extra_attributes or {},
+                      "event_id": me.event_id(symbol, state, None, discriminator)})
         return True
 
     monkeypatch.setattr(ms.matrix_events, "publish_transition", _fake)
@@ -41,6 +48,8 @@ def _snap(**over) -> dict:
                  "confidence": "high", "call_wall_strike": 7800.0,
                  "put_wall_strike": 7700.0},
         "engine_pick": {"strategy": "bear_call", "label": "Aggressive",
+                        "legs": [{"strike": 7680.0, "side": "call", "long_short": -1},
+                                 {"strike": 7720.0, "side": "call", "long_short": 1}],
                         "strikes": [7680.0, 7720.0], "composite_score": 86.1,
                         "structure_text": "Short 7680C / Long 7720C",
                         "composite_verdict": {"label": "tradeable on limit"}},
@@ -59,6 +68,7 @@ def _states(calls) -> list[str]:
 # ── pick_selected ───────────────────────────────────────────────────────────
 
 async def test_pick_selected_fires_once_then_stays_quiet(sent):
+    _good()
     await ms.on_snapshot(_snap(), None)
     await ms.drain()
     assert "pick_selected" in _states(sent)
@@ -71,6 +81,7 @@ async def test_pick_selected_fires_once_then_stays_quiet(sent):
 
 async def test_a_drifting_score_is_not_a_new_pick(sent):
     """Composite score moves every poll; only the structure defines the call."""
+    _good()
     await ms.on_snapshot(_snap(), None)
     await ms.drain()
     sent.clear()
@@ -81,18 +92,20 @@ async def test_a_drifting_score_is_not_a_new_pick(sent):
     assert "pick_selected" not in _states(sent)
 
 
-async def test_changed_strikes_are_a_new_pick(sent):
+async def test_different_legs_are_a_new_pick(sent):
+    _good()
     await ms.on_snapshot(_snap(), None)
     await ms.drain()
     sent.clear()
     snap = _snap()
-    snap["engine_pick"]["strikes"] = [7690.0, 7730.0]
+    snap["engine_pick"]["legs"] = [{"strike": 7690.0, "side": "call", "long_short": -1}]
     await ms.on_snapshot(snap, None)
     await ms.drain()
     assert "pick_selected" in _states(sent)
 
 
 async def test_pick_attributes_carry_the_copy_fields(sent):
+    _good()
     await ms.on_snapshot(_snap(), None)
     await ms.drain()
     attrs = next(c for c in sent if c["state"] == "pick_selected")["attrs"]
@@ -167,6 +180,7 @@ async def test_a_publisher_failure_never_reaches_the_poll(monkeypatch, caplog):
         raise RuntimeError("pubsub down")
 
     monkeypatch.setattr(ms.matrix_events, "publish_transition", _boom)
+    _good()
 
     # The return value reports what was HANDED OFF, not what was delivered —
     # that is the point of not waiting for the ack.
@@ -187,6 +201,7 @@ async def test_the_poll_does_not_wait_for_the_topic(monkeypatch):
         return True
 
     monkeypatch.setattr(ms.matrix_events, "publish_transition", _slow)
+    _good()
     t0 = time.monotonic()
     await ms.on_snapshot(_snap(), None)
     elapsed = time.monotonic() - t0
@@ -206,7 +221,7 @@ class _FakeDB:
         self._s = {"n": n, "wins": wins, "losses": losses,
                    "neutrals": neutrals, "accuracy_pct": pct}
 
-    def fetch_accuracy(self, sym, window):
+    def fetch_accuracy(self, sym, window, min_dwell=1):
         return dict(self._s)
 
 
@@ -320,3 +335,250 @@ async def test_on_evaluation_swallows_a_broken_db(sent, evaluator_state):
 
     assert await ms.on_evaluation(_Boom(), _FakePoller(_snap()), _Settings()) == []
     await ms.drain()
+
+
+# ── dwell: the chip and the win rate count the same picks ──────────────────
+
+class _Dwell3:
+    pick_min_dwell_polls = 3
+
+
+async def test_a_flicker_is_never_announced(sent):
+    """The engine's top pick changes and changes back inside a minute. A run
+    that short is not graded, so it must not be posted either."""
+    _good()
+    a, b = _snap(), _snap()
+    b["engine_pick"] = dict(b["engine_pick"], legs=[{"strike": 1}])
+
+    await ms.on_snapshot(a, _Dwell3()); await ms.drain()      # poll 1 of A
+    await ms.on_snapshot(b, _Dwell3()); await ms.drain()      # A flickered away
+    await ms.on_snapshot(a, _Dwell3()); await ms.drain()      # and back
+    assert "pick_selected" not in _states(sent), "no run reached the dwell"
+
+
+async def test_a_pick_that_holds_is_announced_once(sent):
+    _good()
+    snap = _snap()
+    for _ in range(6):                       # six consecutive polls, same pick
+        await ms.on_snapshot(snap, _Dwell3())
+        await ms.drain()
+    assert _states(sent).count("pick_selected") == 1, "announce once, on earning it"
+
+
+async def test_the_announcement_waits_for_the_dwell(sent):
+    _good()
+    snap = _snap()
+    await ms.on_snapshot(snap, _Dwell3()); await ms.drain()
+    assert "pick_selected" not in _states(sent)      # poll 1
+    await ms.on_snapshot(snap, _Dwell3()); await ms.drain()
+    assert "pick_selected" not in _states(sent)      # poll 2
+    await ms.on_snapshot(snap, _Dwell3()); await ms.drain()
+    assert "pick_selected" in _states(sent)          # poll 3 — earned
+
+
+async def test_pick_identity_is_the_legs_the_grader_uses(sent):
+    """Keyed on legs, matching db._EPISODE_CTE — so a chip and a graded episode
+    describe the same pick. Strategy/label churn alone is not a new pick."""
+    _good()
+    a = _snap()
+    b = _snap()
+    b["engine_pick"] = dict(b["engine_pick"], label="Balanced")   # same legs
+
+    for _ in range(3):
+        await ms.on_snapshot(a, _Dwell3()); await ms.drain()
+    sent.clear()
+    for _ in range(3):
+        await ms.on_snapshot(b, _Dwell3()); await ms.drain()
+    assert "pick_selected" not in _states(sent), "same legs = same pick"
+
+
+# ── event_id granularity ───────────────────────────────────────────────────
+
+async def test_each_distinct_pick_gets_its_own_event_id(sent):
+    """Without this, every pick after the day's first deduped away downstream
+    and was never posted."""
+    _good()
+    a, b = _snap(), _snap()
+    b["engine_pick"] = dict(b["engine_pick"],
+                            legs=[{"strike": 7690.0, "side": "call", "long_short": -1}])
+    await ms.on_snapshot(a, None); await ms.drain()
+    await ms.on_snapshot(b, None); await ms.drain()
+
+    ids = [c["event_id"] for c in sent if c["state"] == "pick_selected"]
+    assert len(ids) == 2 and ids[0] != ids[1], ids
+
+
+async def test_the_same_pick_keeps_one_event_id(sent):
+    """A retry of the SAME pick must still dedupe — that is why the
+    discriminator is a hash of the pick, not a counter."""
+    key = ms._pick_key(_snap()["engine_pick"])
+    first = me.event_id("SPX", "pick_selected", None, me.discriminator(key))
+    again = me.event_id("SPX", "pick_selected", None, me.discriminator(key))
+    assert first == again
+
+
+async def test_once_a_day_states_keep_a_bare_id(sent):
+    """session_open really does happen once a day — it must NOT gain a
+    discriminator, or a restart would re-announce the open."""
+    _good()
+    await ms.on_snapshot(_snap(), None); await ms.drain()
+    ev = next(c for c in sent if c["state"] == "session_open")
+    assert ev["disc"] is None
+    assert ev["event_id"].endswith("-session_open")
+
+
+# ── only a pick worth showing gets posted ──────────────────────────────────
+#
+# The 2026-09-17 incident: SPX sat in a losing Bear Put with bias diverged, the
+# engine re-struck new legs every poll, and each re-strike posted as a "new
+# pick" carrying health=BROKEN. pick_selected is a claim the tool found
+# something sharp — these tests pin that it only makes that claim when true.
+
+def _good(sym="SPX"):
+    """Baseline: bias in sync, and a confirming win behind it."""
+    from app.evaluator import state as est
+    ms.state.last_trust_state[sym] = "in_sync"
+    est.regime_alert_active_by_symbol[sym] = False
+    est.consec_wins_by_symbol[sym] = 1
+
+
+@pytest.mark.parametrize("health", ["broken", "BROKEN", "capital_trap"])
+async def test_a_broken_pick_is_never_announced(sent, evaluator_state, health):
+    _good()
+    snap = _snap()
+    snap["engine_pick"] = dict(snap["engine_pick"], health=health)
+    await ms.on_snapshot(snap, None); await ms.drain()
+    assert "pick_selected" not in _states(sent)
+
+
+async def test_a_do_not_trade_verdict_is_never_announced(sent, evaluator_state):
+    _good()
+    snap = _snap()
+    snap["engine_pick"] = dict(snap["engine_pick"],
+                               composite_verdict={"label": "do not trade"})
+    await ms.on_snapshot(snap, None); await ms.drain()
+    assert "pick_selected" not in _states(sent)
+
+
+async def test_a_diverged_bias_suppresses_the_pick(sent, evaluator_state):
+    """The incident's other half: don't post a call while the bias that
+    produced it is out of sync."""
+    _good()
+    ms.state.last_trust_state["SPX"] = "paused"
+    await ms.on_snapshot(_snap(), None); await ms.drain()
+    assert "pick_selected" not in _states(sent)
+
+
+async def test_an_unknown_bias_suppresses_the_pick(sent, evaluator_state):
+    """Before the grader has an opinion there is no performance to show."""
+    ms.state.last_trust_state.pop("SPX", None)
+    await ms.on_snapshot(_snap(), None); await ms.drain()
+    assert "pick_selected" not in _states(sent)
+
+
+async def test_a_healthy_in_sync_pick_is_announced(sent, evaluator_state):
+    _good()
+    await ms.on_snapshot(_snap(), None); await ms.drain()
+    assert "pick_selected" in _states(sent)
+
+
+async def test_recovery_needs_a_confirming_win_not_just_a_flag_flip(
+        sent, evaluator_state):
+    """A bias that re-syncs on one poll can un-sync on the next. Announcing on
+    that edge is how the same broken idea gets posted over and over."""
+    # Suppressed while broken.
+    _good()
+    broken = _snap()
+    broken["engine_pick"] = dict(broken["engine_pick"], health="broken")
+    await ms.on_snapshot(broken, None); await ms.drain()
+    assert ms.state.pick_blocked["SPX"] is True
+
+    # Structure recovers, but nothing has been graded a win since.
+    evaluator_state.consec_wins_by_symbol["SPX"] = 0
+    fresh = _snap()
+    fresh["engine_pick"] = dict(fresh["engine_pick"],
+                                legs=[{"strike": 7700.0, "side": "call"}])
+    await ms.on_snapshot(fresh, None); await ms.drain()
+    assert "pick_selected" not in _states(sent), "flag flip alone is not recovery"
+
+    # A real graded win lands → the next pick may be announced.
+    evaluator_state.consec_wins_by_symbol["SPX"] = 1
+    fresh2 = _snap()
+    fresh2["engine_pick"] = dict(fresh2["engine_pick"],
+                                 legs=[{"strike": 7710.0, "side": "call"}])
+    await ms.on_snapshot(fresh2, None); await ms.drain()
+    assert "pick_selected" in _states(sent)
+
+
+async def test_a_regime_pause_blocks_recovery(sent, evaluator_state):
+    _good()
+    broken = _snap()
+    broken["engine_pick"] = dict(broken["engine_pick"], health="broken")
+    await ms.on_snapshot(broken, None); await ms.drain()
+
+    evaluator_state.regime_alert_active_by_symbol["SPX"] = True
+    evaluator_state.consec_wins_by_symbol["SPX"] = 5      # wins, but still paused
+    nxt = _snap()
+    nxt["engine_pick"] = dict(nxt["engine_pick"], legs=[{"strike": 7730.0}])
+    await ms.on_snapshot(nxt, None); await ms.drain()
+    assert "pick_selected" not in _states(sent)
+
+
+async def test_a_suppressed_pick_can_still_be_announced_if_it_recovers(
+        sent, evaluator_state):
+    """`last_pick_key` means 'last ANNOUNCED'. A pick held back while broken
+    must not be swallowed later as already-said."""
+    _good()
+    snap = _snap()
+    snap["engine_pick"] = dict(snap["engine_pick"], health="broken")
+    await ms.on_snapshot(snap, None); await ms.drain()
+    assert "pick_selected" not in _states(sent)
+    assert ms.state.last_pick_key.get("SPX") is None
+
+    await ms.on_snapshot(_snap(), None); await ms.drain()   # same legs, healthy
+    assert "pick_selected" in _states(sent)
+
+
+async def test_the_chip_carries_the_win_rate_as_its_takeaway(sent, evaluator_state):
+    """A pick with no track record beside it is a signal, not a takeaway."""
+    _good()
+    ms.state.last_win_rate["SPX"] = 64.0
+    ms.state.last_graded["SPX"] = 22
+    await ms.on_snapshot(_snap(), None); await ms.drain()
+    attrs = next(c for c in sent if c["state"] == "pick_selected")["attrs"]
+    assert attrs["win_rate"] == "64" and attrs["graded"] == "22"
+    assert attrs["trust_state"] == "in_sync"
+
+
+async def test_the_recap_leads_with_the_best_and_keeps_the_worst_as_context(
+        sent, evaluator_state):
+    """Composite SCORES, so 'worst' is the weakest idea surfaced, not the
+    biggest loss — it stays available without becoming the story."""
+    _good()
+    await ms.on_snapshot(_snap(), None)
+    low = _snap()
+    low["engine_pick"] = dict(low["engine_pick"], legs=[{"strike": 1.0}],
+                              composite_score=12.0)
+    await ms.on_snapshot(low, None)
+    await ms.drain()
+    ms.state.day_date["SPX"] = "2026-09-17"
+    sent.clear()
+
+    await ms.on_evaluation(_FakeDB(), _FakePoller(_snap()), _Settings())
+    await ms.drain()
+    attrs = next(c for c in sent if c["state"] == "daily_recap")["attrs"]
+    assert attrs["headline"] == "best"
+    assert attrs["best_composite_score"] == "86.1"
+    assert attrs["worst_composite_score"] == "12.0"
+
+
+async def test_a_day_with_no_best_does_not_recap(sent, evaluator_state):
+    """No headline, no post — the same silence session_open keeps when there
+    are no walls worth showing."""
+    ms.state.day_date["SPX"] = "2026-09-17"
+    ms.state.day_best.pop("SPX", None)
+    ms.state.day_worst["SPX"] = {"composite_score": "12.0"}
+
+    await ms.on_evaluation(_FakeDB(), _FakePoller(_snap()), _Settings())
+    await ms.drain()
+    assert "daily_recap" not in _states(sent)

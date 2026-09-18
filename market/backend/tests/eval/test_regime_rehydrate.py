@@ -29,7 +29,7 @@ class _FakeDB:
         self._rows = rows
         self.since = "unset"
 
-    def fetch_regime_replay(self, per_symbol: int = 200, since=None):
+    def fetch_regime_replay(self, per_symbol: int = 200, since=None, min_dwell: int = 1):
         # Caller expects (symbol, result), symbol ASC then oldest→newest.
         self.since = since
         return list(self._rows)
@@ -106,7 +106,7 @@ def test_counters_are_independent_per_ticker():
 
 def test_fetch_failure_is_non_fatal():
     class _Boom:
-        def fetch_regime_replay(self, per_symbol: int = 200, since=None):
+        def fetch_regime_replay(self, per_symbol: int = 200, since=None, min_dwell: int = 1):
             raise RuntimeError("db down")
 
     rehydrate_regime(_Boom(), SETTINGS)  # must not raise

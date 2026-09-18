@@ -19,11 +19,14 @@ Message shape (attributes only; body empty):
     symbol    e.g. "NVDA"
     state     one of the 6 in docs/matrix_events_update.md §2
     expiry    option expiration (YYYY-MM-DD), or "" when unknown
-    event_id  MTX-<SYM>-<YYMMDD>-<state>   (deterministic per symbol+UTC day+state)
+    event_id  MTX-<SYM>-<YYMMDD>-<state>[-<disc>]  (deterministic; the optional
+              discriminator lets a state that can recur — a new pick, a second
+              milestone — publish more than once a day without colliding)
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from datetime import date, datetime, timezone
 from typing import Any
@@ -36,11 +39,28 @@ log = logging.getLogger("edgelane.matrix.events")
 _publisher: Any = None
 
 
-def event_id(symbol: str, state: str, day: date | None = None) -> str:
-    """Deterministic id per (symbol, UTC day, state). Same inputs ⇒ same id, so a
-    re-published transition the same UTC day dedupes downstream."""
+def event_id(symbol: str, state: str, day: date | None = None,
+             discriminator: str | None = None) -> str:
+    """Deterministic id per (symbol, UTC day, state[, discriminator]).
+
+    Same inputs ⇒ same id, so a re-published transition dedupes downstream.
+
+    Without a discriminator the id is one-per-day-per-state, which is right for
+    states that genuinely happen once a day (session_open, daily_recap). For
+    states that can legitimately recur — a new pick, a second win-rate
+    milestone — that would silently swallow every occurrence after the first,
+    so callers pass a short discriminator that is STABLE for the same real event
+    and different for a different one: retries still dedupe, distinct events
+    don't collide."""
     d = (day or datetime.now(timezone.utc).date()).strftime("%y%m%d")
-    return f"MTX-{str(symbol or '').upper()}-{d}-{state}"
+    base = f"MTX-{str(symbol or '').upper()}-{d}-{state}"
+    return f"{base}-{discriminator}" if discriminator else base
+
+
+def discriminator(value: str) -> str:
+    """Short, stable tag for an event_id suffix — 8 hex of sha1. Keeps the id
+    readable while staying deterministic for the same input."""
+    return hashlib.sha1(str(value).encode()).hexdigest()[:8]
 
 
 def _iso_expiry(value: Any) -> str:
@@ -70,6 +90,7 @@ def _publish_blocking(topic_path: str, attributes: dict[str, str]) -> None:
 
 async def publish_transition(symbol: str, state: str, expiry: Any = None,
                              *, day: date | None = None,
+                             discriminator: str | None = None,
                              extra_attributes: dict[str, str] | None = None) -> bool:
     """Publish one Matrix state transition. Returns True only if actually sent.
 
@@ -86,7 +107,7 @@ async def publish_transition(symbol: str, state: str, expiry: Any = None,
         log.info("[matrix-events] topic/project unset — %s %s not published", symbol, state)
         return False
 
-    eid = event_id(symbol, state, day)
+    eid = event_id(symbol, state, day, discriminator)
     attributes = {
         "product": "matrix",
         "symbol": str(symbol or "").upper(),

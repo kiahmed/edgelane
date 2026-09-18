@@ -95,6 +95,12 @@ class Settings(BaseModel):
     # Minimum graded outcomes before the bias-trust state leaves "calibrating"
     # and a win-rate is published (see docs/spread_outcome_eval.md).
     eval_min_graded: int = Field(default=10)
+    # How long the engine's top pick must HOLD before it counts as a real call.
+    # The pick flickers — it can change and change back inside a minute — so a
+    # run shorter than this is neither graded nor announced. One number, read by
+    # both the win rate (db._EPISODE_CTE) and the Matrix pick_selected chip
+    # (matrix_signals), so the product never posts a pick the score ignores.
+    pick_min_dwell_polls: int = Field(default=3)
     pill_green_pct: float = Field(default=60.0)
     pill_red_pct: float = Field(default=40.0)
     neutral_band_pct: float = Field(default=0.05)
@@ -375,6 +381,7 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
     if "EVAL_WINDOW_MIN" in raw:             out["eval_window_min"] = int(raw["EVAL_WINDOW_MIN"])
     if "EVAL_ROLLING_WINDOW" in raw:         out["eval_rolling_window"] = int(raw["EVAL_ROLLING_WINDOW"])
     if "EVAL_MIN_GRADED" in raw:             out["eval_min_graded"] = int(raw["EVAL_MIN_GRADED"])
+    if "PICK_MIN_DWELL_POLLS" in raw:        out["pick_min_dwell_polls"] = int(raw["PICK_MIN_DWELL_POLLS"])
     if "PILL_GREEN_PCT" in raw:              out["pill_green_pct"] = float(raw["PILL_GREEN_PCT"])
     if "PILL_RED_PCT" in raw:                out["pill_red_pct"] = float(raw["PILL_RED_PCT"])
     if "NEUTRAL_BAND_PCT" in raw:            out["neutral_band_pct"] = float(raw["NEUTRAL_BAND_PCT"])

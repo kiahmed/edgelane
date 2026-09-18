@@ -216,7 +216,9 @@ def rehydrate_regime(db, settings, quiet: bool = False) -> None:
         hour=0, minute=0, second=0, microsecond=0
     ).astimezone(timezone.utc)
     try:
-        rows = db.fetch_regime_replay(since=session_start)
+        rows = db.fetch_regime_replay(
+            since=session_start,
+            min_dwell=int(getattr(settings, "pick_min_dwell_polls", 1)))
     except Exception:
         log.exception("regime rehydrate: fetch failed; starting with empty counters")
         return

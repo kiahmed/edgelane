@@ -422,7 +422,12 @@ _STRIKE_PROFILE_COLS = (
 #     no pick → pick A counts as two ideas rather than one merged run;
 #   * the newest episode per symbol is EXCLUDED — it is the pick still on
 #     screen, and an idea in progress has no final result yet;
-#   * legacy spot-diff rows (NULL favorable_delta) stay excluded, as before.
+#   * legacy spot-diff rows (NULL favorable_delta) stay excluded, as before;
+#   * a run shorter than `min_dwell` polls is DROPPED. The engine's top pick
+#     flickers — it can change and change back within a minute — and grading a
+#     32-second flicker scores a trade nobody could have taken. The same dwell
+#     gates the Matrix `pick_selected` chip (app/matrix_signals.py), so what the
+#     product announces and what the win rate counts are the same population.
 _EPISODE_CTE = """
     WITH marked AS (
         SELECT bd.id, bd.ts, bd.symbol, bd.pick_legs,
@@ -445,13 +450,20 @@ _EPISODE_CTE = """
         WHERE e.pick_legs IS NOT NULL AND o.favorable_delta IS NOT NULL
     ),
     live AS (SELECT symbol, MAX(ep) AS live_ep FROM episodes GROUP BY symbol),
+    -- How long each pick actually stood, counted over ALL polls in the run
+    -- (graded or not) — the dwell filter below is about how long the engine
+    -- held the idea, not how much of it happened to be graded.
+    ep_len AS (
+        SELECT symbol, ep, COUNT(*) AS polls FROM episodes GROUP BY symbol, ep
+    ),
     episode_final AS (
         SELECT g.symbol AS symbol,
                ARG_MAX(g.result, g.ts) AS result,
                MAX(g.ts) AS ts
         FROM graded g
         JOIN live l ON l.symbol = g.symbol
-        WHERE g.ep < l.live_ep
+        JOIN ep_len n ON n.symbol = g.symbol AND n.ep = g.ep
+        WHERE g.ep < l.live_ep AND n.polls >= {min_dwell}
         GROUP BY g.symbol, g.ep
     )
 """
@@ -636,7 +648,7 @@ class Database:
             )
             return cur.fetchall()
 
-    def fetch_accuracy(self, symbol: str, window: int) -> dict:
+    def fetch_accuracy(self, symbol: str, window: int, min_dwell: int = 1) -> dict:
         """Rolling win/loss/neutral over the last `window` PICK EPISODES.
 
         One row per idea (see _EPISODE_CTE), not one per poll, so `window`
@@ -645,7 +657,7 @@ class Database:
         """
         with self._lock:
             cur = self.connect().execute(
-                _EPISODE_CTE.format(since_filter="") + """
+                _EPISODE_CTE.format(since_filter="", min_dwell=int(min_dwell)) + """
                 , recent AS (
                     SELECT result FROM episode_final
                     WHERE symbol = ?
@@ -710,7 +722,8 @@ class Database:
                     r[k] = _utc_iso(r.get(k))
             return out
 
-    def fetch_regime_replay(self, per_symbol: int = 200, since=None) -> list[tuple]:
+    def fetch_regime_replay(self, per_symbol: int = 200, since=None,
+                            min_dwell: int = 1) -> list[tuple]:
         """Recent PICK-EPISODE results per symbol, oldest→newest, for rebuilding
         the in-memory regime counters (see evaluator.rehydrate_regime).
 
@@ -729,7 +742,7 @@ class Database:
         params.append(per_symbol)
         with self._lock:
             cur = self.connect().execute(
-                _EPISODE_CTE.format(since_filter=since_filter) + """
+                _EPISODE_CTE.format(since_filter=since_filter, min_dwell=int(min_dwell)) + """
                 SELECT symbol, result FROM (
                     SELECT symbol, result, ts,
                            ROW_NUMBER() OVER (
