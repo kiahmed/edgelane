@@ -118,6 +118,7 @@
     <li><a href="#scheme">Flag scheme at a glance</a></li>
     <li><a href="#list">List positions</a> &nbsp;·&nbsp; <code>tp</code></li>
     <li><a href="#orders-list">List working orders</a> &nbsp;·&nbsp; <code>tp -O</code></li>
+    <li><a href="#balance">Account balance</a> &nbsp;·&nbsp; <code>tp -b</code></li>
     <li><a href="#close">Close (sell) a position</a> &nbsp;·&nbsp; <code>tp -S &lt;row&gt;</code></li>
     <li><a href="#add">Add to an existing position</a> &nbsp;·&nbsp; <code>tp -A &lt;row&gt; -Q &lt;qty&gt;</code></li>
     <li><a href="#new-single">Open new single-leg position</a> &nbsp;·&nbsp; <code>tp --buy / --sell SYM STRIKE EXP</code></li>
@@ -145,6 +146,7 @@
   <tbody>
     <tr><td>List positions</td><td class="yes">✓</td><td class="no">—</td><td><code>tp</code> (default)</td></tr>
     <tr><td>List working orders</td><td class="yes">✓</td><td class="no">—</td><td><code>tp -O</code></td></tr>
+    <tr><td>Account balance</td><td class="no">—</td><td class="no">—</td><td><code>tp -b</code></td></tr>
     <tr><td>Sell (close) position</td><td class="yes">✓</td><td class="no">—</td><td><code>tp -S &lt;row&gt;</code></td></tr>
     <tr><td>Add to position</td><td class="yes">✓</td><td class="no">—</td><td><code>tp -A &lt;row&gt; -Q &lt;qty&gt;</code></td></tr>
     <tr><td>Modify working order</td><td class="yes">✓</td><td class="no">—</td><td><code>tp -O &lt;row&gt; ...</code></td></tr>
@@ -210,8 +212,30 @@ Tradier orders  <span class="out-dim">env: production  account: 6YB79610</span>
   2   12345714  NVDA 220/225C                       DEBIT     $1.85     2  partially_filled  2026-05-21 10:02
   3   12345780  SPY 540C                            LIMIT     $2.30     1  open              2026-05-21 11:30</pre>
 
-<!-- ─── 4 Close ─────────────────────────────────────────────────────── -->
-<h2 id="close"><span class="num">4</span>Close (sell) a position</h2>
+<!-- ─── 4 Balance ────────────────────────────────────────────────────── -->
+<h2 id="balance"><span class="num">4</span>Account balance</h2>
+<p>Shows total equity, cash, market value, today's realized/unrealized P&amp;L, and buying power — stock and option — straight from Tradier's <code>/accounts/{id}/balances</code>. No row argument; nothing to target. Layout adapts to account type: margin/PDT accounts show stock + option buying power (plus fed/maintenance call if one is outstanding); cash accounts show cash available + unsettled funds instead.</p>
+
+<h3>Syntax</h3>
+<pre><span class="cmd">tp</span> <span class="flag">-b</span></pre>
+
+<h3>Example output</h3>
+<pre><span class="comment">$ tp -b</span>
+Tradier account balance  <span class="out-dim">env: production  account: 6YB79610</span>
+
+  <span class="out-dim">account type: MARGIN</span>
+
+  Total equity         $10,183.95
+  Total cash           $10,183.95
+  Market value         $0.00
+  Open P&amp;L             <span class="out-pos">+$0.00</span>
+  Closed P&amp;L (today)   <span class="out-pos">+$4.00</span>
+  Stock buying power   $367.90
+  Option buying power  $183.95
+  Uncleared funds      $10,000.00</pre>
+
+<!-- ─── 5 Close ─────────────────────────────────────────────────────── -->
+<h2 id="close"><span class="num">5</span>Close (sell) a position</h2>
 <p>Submit a closing order for a position by its row number from the list table. Defaults to a MARKET close at full quantity. Sides are flipped automatically (<code>buy_to_open</code> → <code>sell_to_close</code>, <code>sell_to_open</code> → <code>buy_to_close</code>).</p>
 
 <h3>Syntax</h3>
@@ -241,8 +265,8 @@ Tradier orders  <span class="out-dim">env: production  account: 6YB79610</span>
 <span class="comment"># Close 2 contracts at LIMIT $1.20 — live</span>
 <span class="cmd">tp</span> <span class="flag">-S</span> <span class="arg">3</span> <span class="flag">-L</span> <span class="arg">1.20</span> <span class="flag">-Q</span> <span class="arg">2</span> <span class="flag">--execute</span></pre>
 
-<!-- ─── 5 Add ───────────────────────────────────────────────────────── -->
-<h2 id="add"><span class="num">5</span>Add to an existing position</h2>
+<!-- ─── 6 Add ───────────────────────────────────────────────────────── -->
+<h2 id="add"><span class="num">6</span>Add to an existing position</h2>
 <p>Open more contracts of an existing position, repeating its original sides
 (<code>buy_to_open</code> stays <code>buy_to_open</code>; <code>sell_to_open</code> stays <code>sell_to_open</code>). Order type matches the existing position's direction: credit position → credit order; debit position → debit order. <strong><code>-Q</code> is required for add</strong> (number of contracts to add).</p>
 
@@ -274,8 +298,8 @@ Tradier orders  <span class="out-dim">env: production  account: 6YB79610</span>
 The original sides are inferred from the position's source order. For a bull-put credit spread, that means future adds will collect more credit (the short put resells; the long put rebuys), not flip into a debit. The order type also picks credit/debit automatically based on existing <code>cost_basis</code> sign.
 </div>
 
-<!-- ─── 6 New single-leg ──────────────────────────────────────────── -->
-<h2 id="new-single"><span class="num">6</span>Open new single-leg position</h2>
+<!-- ─── 7 New single-leg ──────────────────────────────────────────── -->
+<h2 id="new-single"><span class="num">7</span>Open new single-leg position</h2>
 <p>Open a single option contract directly without an EdgeLane ticket. Three positional args after <code>--buy</code> or <code>--sell</code>: symbol, strike+side, expiration. Canonical OCC root lookup runs automatically — NDX → NDXP, SPX → SPXW, etc. The parent symbol on the order body stays as user-typed (NDX); the <code>option_symbol</code> field gets the canonical variant (NDXP).</p>
 
 <h3>Syntax</h3>
@@ -334,8 +358,8 @@ has a tradeable chain and weekends/market holidays are skipped automatically
 (<code>+1</code> on a Thursday with a closed Friday lands on Monday).
 </div>
 
-<!-- ─── 7 New multi-leg ────────────────────────────────────────────── -->
-<h2 id="new-multi"><span class="num">7</span>Open new multi-leg position</h2>
+<!-- ─── 8 New multi-leg ────────────────────────────────────────────── -->
+<h2 id="new-multi"><span class="num">8</span>Open new multi-leg position</h2>
 <p>Multi-leg new positions use the same <code>--buy</code> / <code>--sell</code> flag with a single ticket-string argument — the exact format EdgeLane's "Copy ticket" button produces. Detection is automatic: if the first arg after <code>--buy</code> / <code>--sell</code> contains the <code>·</code> separator, it's parsed as a multi-leg ticket.</p>
 
 <p>The ticket's own verb (Buy/Sell at the start) determines the order direction. Use <code>--buy</code> for debit (long) spreads and <code>--sell</code> for credit (short) spreads.</p>
@@ -368,8 +392,8 @@ A <code>$</code> only works inside <strong>single quotes</strong>: in double quo
 NDX / SPX / RUT / XSP tickets auto-route to their canonical OCC root (NDXP, SPXW, etc.) and the parent symbol on the order body stays as user-typed. This is the combination Tradier's order endpoint requires for index options.
 </div>
 
-<!-- ─── 8 Modify ──────────────────────────────────────────────────── -->
-<h2 id="modify"><span class="num">8</span>Modify a working order</h2>
+<!-- ─── 9 Modify ──────────────────────────────────────────────────── -->
+<h2 id="modify"><span class="num">9</span>Modify a working order</h2>
 <p>Change the limit price, quantity, or order type on a still-working order. At least one of <code>-L</code>, <code>-Q</code>, or <code>-M</code> must be supplied. Tradier accepts the modify via PUT — the order ID stays the same.</p>
 
 <h3>Syntax</h3>
@@ -400,8 +424,8 @@ NDX / SPX / RUT / XSP tickets auto-route to their canonical OCC root (NDXP, SPXW
 <span class="comment"># Combine price + quantity, live</span>
 <span class="cmd">tp</span> <span class="flag">-O</span> <span class="arg">2</span> <span class="flag">-L</span> <span class="arg">1.30</span> <span class="flag">-Q</span> <span class="arg">2</span> <span class="flag">--execute</span></pre>
 
-<!-- ─── 9 Cancel ──────────────────────────────────────────────────── -->
-<h2 id="cancel"><span class="num">9</span>Cancel a working order</h2>
+<!-- ─── 10 Cancel ──────────────────────────────────────────────────── -->
+<h2 id="cancel"><span class="num">10</span>Cancel a working order</h2>
 <p>Submit a DELETE to Tradier to cancel the order. Cannot be undone — once the cancel reaches the venue, that order ID is gone.</p>
 
 <h3>Syntax</h3>
@@ -414,8 +438,8 @@ NDX / SPX / RUT / XSP tickets auto-route to their canonical OCC root (NDXP, SPXW
 <span class="comment"># Live cancel</span>
 <span class="cmd">tp</span> <span class="flag">-C</span> <span class="arg">2</span> <span class="flag">--execute</span></pre>
 
-<!-- ─── 10 Gainloss ─────────────────────────────────────────────────── -->
-<h2 id="gainloss"><span class="num">10</span>Closed-position P&amp;L (daily)</h2>
+<!-- ─── 11 Gainloss ─────────────────────────────────────────────────── -->
+<h2 id="gainloss"><span class="num">11</span>Closed-position P&amp;L (daily)</h2>
 <p>Realized P&amp;L on closures within a date range. Multi-leg spread closes are aggregated so a 4-leg iron condor close shows as one row, not four. The bottom of the table sums total cost, proceeds, and P&amp;L for the range.</p>
 
 <div class="card"><span class="icon">info</span>
@@ -483,8 +507,8 @@ Tradier closed-position P&amp;L  <span class="out-dim">env: production  account:
 This is purely informational — no row argument, no <code>--execute</code>, no destructive action. Safe to run at any frequency.
 </div>
 
-<!-- ─── 11 Modifiers ─────────────────────────────────────────────────── -->
-<h2 id="modifiers"><span class="num">11</span>Modifier flags &amp; conventions</h2>
+<!-- ─── 12 Modifiers ─────────────────────────────────────────────────── -->
+<h2 id="modifiers"><span class="num">12</span>Modifier flags &amp; conventions</h2>
 
 <h3>Modifier flags (apply to every operation)</h3>
 <table>
@@ -544,8 +568,8 @@ This makes the same command-line safe as a dry-run dispatcher: paste, inspect, t
 The <code>credit</code> / <code>debit</code> / <code>even</code> order types are valid only on <code>class=multileg</code>. Single-leg orders (<code>class=option</code> or <code>class=equity</code>) must use <code>type=limit</code>. The tool handles this correctly under the hood — if you ever see "Invalid parameter, type: is not valid" from Tradier, that's a regression worth reporting.
 </div>
 
-<!-- ─── 12 Install ────────────────────────────────────────────────────── -->
-<h2 id="install"><span class="num">12</span>Installation &amp; alias</h2>
+<!-- ─── 13 Install ────────────────────────────────────────────────────── -->
+<h2 id="install"><span class="num">13</span>Installation &amp; alias</h2>
 <p>Tradier credentials and DEVMODE flag live in
 <code>edgelane_market.config</code> at the repo root. The tool reads them via
 <code>tests/utils.py</code> — no additional setup required if EdgeLane itself

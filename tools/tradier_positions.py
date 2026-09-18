@@ -10,6 +10,7 @@ CLI summary
     List
         tp                                       # list positions (default)
         tp -O                                    # list working orders (w/ live bid/mid/ask)
+        tp -b                                    # account balance (equity, cash, stock/option buying power)
 
     Existing positions
         tp -S 3                                  # Sell (close) position #3 at MARKET
@@ -286,6 +287,17 @@ def fetch_quotes(token: str, base: str, symbols: list[str]) -> dict:
     if isinstance(qs, dict):
         qs = [qs]
     return {q["symbol"]: q for q in qs}
+
+
+def fetch_balances(token: str, base: str, account_id: str) -> dict:
+    """Tradier /accounts/{id}/balances → flat dict with top-level fields
+    (total_equity, total_cash, market_value, open_pl, close_pl, ...) plus one
+    of `margin` / `cash` / `pdt` depending on account_type, each carrying
+    stock_buying_power / option_buying_power (margin, pdt) or
+    cash_available (cash)."""
+    resp = tradier_get(f"accounts/{account_id}/balances", {}, token, base)
+    bal = resp.get("balances")
+    return bal if isinstance(bal, dict) else {}
 
 
 def fetch_gainloss(token: str, base: str, account_id: str,
@@ -1511,6 +1523,62 @@ def _sign_dollars(v):
     return f"−${abs(v):,.2f}"
 
 
+def _dollars(v):
+    try:
+        return f"${float(v):,.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def render_balance_table(bal: dict) -> None:
+    """Render account balance: total equity/cash/market value plus stock and
+    option buying power. Buying power lives under `margin` (margin accounts),
+    `pdt` (pattern-day-trader margin accounts), or `cash` (cash accounts) —
+    exactly one is present depending on account_type."""
+    if not bal:
+        print(f"{Y}No balance data returned.{N}")
+        return
+
+    acct_type = (bal.get("account_type") or "?").upper()
+    sub = bal.get("margin") or bal.get("pdt") or {}
+    is_cash = "margin" not in bal and "pdt" not in bal and "cash" in bal
+    cash_sub = bal.get("cash") or {}
+
+    open_pl = _num(bal.get("open_pl")) or 0.0
+    close_pl = _num(bal.get("close_pl")) or 0.0
+
+    rows = [
+        ("Total equity",   _dollars(bal.get("total_equity"))),
+        ("Total cash",     _dollars(bal.get("total_cash"))),
+        ("Market value",   _dollars(bal.get("market_value"))),
+        ("Open P&L",       f"{G if open_pl >= 0 else R}{_sign_dollars(open_pl)}{N}"),
+        ("Closed P&L (today)", f"{G if close_pl >= 0 else R}{_sign_dollars(close_pl)}{N}"),
+    ]
+
+    if is_cash:
+        rows.append(("Cash available", _dollars(cash_sub.get("cash_available"))))
+        rows.append(("Unsettled funds", _dollars(cash_sub.get("unsettled_funds"))))
+    else:
+        rows.append(("Stock buying power", _dollars(sub.get("stock_buying_power"))))
+        rows.append(("Option buying power", _dollars(sub.get("option_buying_power"))))
+        if sub.get("fed_call") not in (None, "", 0):
+            rows.append(("Fed call", _dollars(sub.get("fed_call"))))
+        if sub.get("maintenance_call") not in (None, "", 0):
+            rows.append(("Maintenance call", _dollars(sub.get("maintenance_call"))))
+
+    uncleared = bal.get("uncleared_funds")
+    if uncleared not in (None, "", 0):
+        rows.append(("Uncleared funds", _dollars(uncleared)))
+    pending = bal.get("pending_cash")
+    if pending not in (None, "", 0):
+        rows.append(("Pending cash", _dollars(pending)))
+
+    label_w = max(len(label) for label, _ in rows) + 2
+    print(f"  {D}account type: {acct_type}{N}\n")
+    for label, val in rows:
+        print(f"  {label.ljust(label_w)}{val}")
+
+
 # ─── Close (sell) order builder ───────────────────────────────────────────
 
 def build_close_order_body(row: PositionRow, limit_price: float | None, qty: int,
@@ -2011,6 +2079,8 @@ def parse_args(argv):
         elif a in ("-C", "--cancel"):
             args["row"] = _consume_int(a, it)
             args["mode"] = "cancel"
+        elif a in ("-b", "--balance"):
+            args["mode"] = "balance"
         elif a in ("-G", "--gainloss"):
             # Closed-position P&L. Optional positional date (YYYY-MM-DD), --since N,
             # --settled (use Tradier /gainloss endpoint — fully closed + settled only).
@@ -2297,6 +2367,14 @@ def main():
             sys.exit(f"  {R}✗ {e}{N}")
         co = resp.get("order") or resp
         print(f"  {G}✓ cancel accepted{N}  status: {co.get('status', '?')}")
+        return
+
+    # ── Account balance ──
+    if args["mode"] == "balance":
+        account_id = resolve_account_id(token, base)
+        print(f"{BOLD}Tradier account balance{N}  {D}env: {env}  account: {account_id}{N}\n")
+        bal = fetch_balances(token, base, account_id)
+        render_balance_table(bal)
         return
 
     # ── Closed-position P&L ──
