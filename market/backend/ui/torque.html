@@ -282,6 +282,13 @@ function App(){
   const [duration,setDuration]=useState('day');
   const [autoClose,setAutoClose]=useState(true);
   const [targetPct,setTargetPct]=useState(30);
+  // Stop-loss: same on-by-default pattern as auto-close — the backend has no
+  // global default of its own (a ticker with no explicit stop_loss config gets
+  // None/off unless a caller asks), so "on by default" lives entirely here,
+  // exactly like close_target_pct's own default already does. Sending 0
+  // explicitly disables it server-side (see PlaceRequest.stop_loss_pct).
+  const [stopLoss,setStopLoss]=useState(true);
+  const [stopPct,setStopPct]=useState(30);
   const [confirm,setConfirm]=useState(null);    // {order_type}
   const [placing,setPlacing]=useState(false);
   const [result,setResult]=useState(null);
@@ -317,6 +324,12 @@ function App(){
   // ticker's default on switch and don't let the input go below its floor.
   const ctgt=(cfg&&cfg.close_targets&&ticker&&cfg.close_targets[ticker])||null;
   useEffect(()=>{if(ctgt)setTargetPct(ctgt.default);},[ticker]);   // eslint-disable-line
+  // Same reactive-default pattern for stop-loss (DJX 50%, everyone else 30%) —
+  // without this the field would keep whatever % was set for the PREVIOUS
+  // ticker across a switch, silently sending e.g. a stale 30% for DJX instead
+  // of its own wider, noise-tolerant default.
+  const slDefault=(cfg&&cfg.stop_loss_defaults&&ticker&&cfg.stop_loss_defaults[ticker])||30;
+  useEffect(()=>{setStopPct(slDefault);},[ticker]);   // eslint-disable-line
 
   const sdef=cfg&&strategy?cfg.strategies.find(s=>s.key===strategy):null;
   // Options-data polling pauses outside market hours in PRODUCTION only; sandbox/dev
@@ -513,6 +526,10 @@ function App(){
       // DJX-class tickers: auto-close is mandatory, so always request it.
       auto_close:(price&&price.auto_close_required)?true:(autoClose&&!(price&&price.untradeable)),
       close_target_pct:Number(targetPct),
+      // 0 explicitly disables server-side (PlaceRequest.stop_loss_pct ge=0) —
+      // toggled off must send a real 0, not omit the field, since omitting it
+      // (null) means "use the ticker's own default" instead of "off".
+      stop_loss_pct:stopLoss?Number(stopPct):0,
       spread_type:build.type,confirm:!dry,dry_run:dry};
     j('/torque/place',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
       .then(r=>{setResult(r);if(!dry)refreshOrders();})   // pull the new order into the account-wide lists
@@ -656,6 +673,17 @@ function App(){
                   style={{width:54,padding:'4px 6px',fontSize:12}}/>%
                 {tgtMin>1&&<span className="muted" style={{fontSize:11,marginLeft:6}}>min {fmt0(tgtMin)}%</span>}
                 {acRequired&&<span className="muted" style={{fontSize:11,marginLeft:6,fontWeight:700}}>required</span>}
+              </div>
+              <div className={"toggle"+(stopLoss?' on':'')}
+                onClick={()=>setStopLoss(v=>!v)}
+                title="Auto sell at a drawdown from entry — a stop-loss, symmetric to auto-close's profit target. Single-leg orders get a native broker-held bracket (both exits resting on Tradier, survive this page being closed); spreads use an app-managed watcher, same mechanism as the profit-target close."
+                style={{alignSelf:'center',marginBottom:4,cursor:'pointer'}}>
+                <span className="sw"></span> stop-loss −
+                <input type="number" min="1" max="99" value={stopPct}
+                  onClick={e=>e.stopPropagation()}
+                  onChange={e=>setStopPct(e.target.value)}
+                  onBlur={e=>{const v=Number(e.target.value);if(!(v>=1))setStopPct(1);}}
+                  style={{width:54,padding:'4px 6px',fontSize:12}}/>%
               </div>
             </div>
 

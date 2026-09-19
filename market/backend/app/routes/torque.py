@@ -363,6 +363,10 @@ async def torque_cfg():
         # closed at the global 30% default) — the UI should prefill `default`
         # and refuse to submit below `min`.
         "close_targets": tcfg.close_targets_map(),
+        # Per-ticker stop-loss default — DJX 50%, everyone else 30% globally.
+        # See stop_loss_defaults_map()'s docstring for why the UI needs this
+        # rather than just always sending a flat 30%.
+        "stop_loss_defaults": tcfg.stop_loss_defaults_map(),
         # Per-ticker Counter Read noise floor — below this, both compared sides'
         # mids being under it means the reading is 0DTE-close penny noise, not a
         # real richness signal, so the UI suppresses it (see Counter Read docs).
@@ -561,8 +565,10 @@ class PlaceRequest(BaseModel):
     quantity: int = Field(default=1, ge=1, le=50)
     auto_close: bool = False
     close_target_pct: float = Field(default=tcfg.DEFAULT_CLOSE_TARGET_PCT, ge=1, le=500)
-    # None → use the ticker's configured default (DJX: 50%). 0/false → disable.
-    stop_loss_pct: float | None = Field(default=None, ge=1, le=99)
+    # None → use the ticker's configured default (30% globally, DJX 50%).
+    # 0 → explicitly disable. ge=0 (not 1) so 0 actually passes validation instead
+    # of being rejected before it ever reaches the "0 is falsy -> no stop" check.
+    stop_loss_pct: float | None = Field(default=None, ge=0, le=99)
     spread_type: str | None = None        # "debit"|"credit" (net direction of the entry)
     confirm: bool = False
     dry_run: bool = False                 # preview-only: validate entry+close, place nothing
@@ -860,31 +866,65 @@ async def torque_place(req: PlaceRequest, request: Request,
                 "spread_warning": spread_warning,
             }
 
-        # ── single-leg + limit + auto_close → native OTO bracket ──────────────
-        # ...but NOT when a stop is armed: the broker-held OTO has no stop leg and
-        # returns before the watcher exists, so the stop would be silently dropped.
-        # Fall through to the app-managed path, which owns both target and stop.
-        if is_single and req.auto_close and otype == "limit" and not stop_pct:
+        # ── single-leg + limit + auto_close → native broker-held bracket ───────
+        # No stop requested → plain 2-leg OTO (entry + profit), unchanged.
+        # Stop ALSO requested → try a native 3-leg OTOCO (entry + profit + stop)
+        # instead of the app-managed watcher: BOTH exits then live on Tradier's
+        # own book, and Tradier's own OCO logic cancels whichever exit doesn't
+        # fire — no app-side coordination code needed. Verified against a live
+        # Tradier sandbox preview (2026-09-18): plain "oto" flatly rejects a
+        # second leg priced below entry ("must be higher than price[0]") — it
+        # only understands entry+profit, never a stop — so the stop leg has to
+        # ride "otoco" with type=stop_limit specifically, and Tradier enforces a
+        # $0.10 minimum gap between the two exit prices. Below that floor (cheap
+        # 0DTE premium can land a 30/30 band closer than $0.10 apart) we don't
+        # submit a bracket we already know gets rejected — fall through to the
+        # app-managed watcher for both exits instead, same as multi-leg spreads.
+        if is_single and req.auto_close and otype == "limit":
             close_px = teng.close_target_price(float(req.limit_price), entry_type, req.close_target_pct, tick,
                                                 **_fee_kw(req.symbol, legs))
             close_side = "sell_to_close" if legs[0]["action"].startswith("buy") else "buy_to_close"
-            oto = {
-                "class": "oto", "duration": req.duration,
+            qty0 = str(int(legs[0]["quantity"]) * req.quantity)
+            leg0 = {
                 "symbol[0]": req.symbol.upper(), "option_symbol[0]": legs[0]["symbol"],
-                "side[0]": legs[0]["action"], "quantity[0]": str(int(legs[0]["quantity"]) * req.quantity),
+                "side[0]": legs[0]["action"], "quantity[0]": qty0,
                 "type[0]": "limit", "price[0]": f"{float(req.limit_price):.2f}",
+            }
+            leg1_profit = {
                 "symbol[1]": req.symbol.upper(), "option_symbol[1]": legs[0]["symbol"],
-                "side[1]": close_side, "quantity[1]": str(int(legs[0]["quantity"]) * req.quantity),
+                "side[1]": close_side, "quantity[1]": qty0,
                 "type[1]": "limit", "price[1]": f"{close_px:.2f}",
-                "tag": re.sub(r"[^a-zA-Z0-9]", "", tag)[:30],
             }
-            entry = await _submit(client, account_id, oto)
-            rej, why = _is_rejected(entry)
-            return {
-                "mode": "oto_bracket", "rejected": rej, "reason": why,
-                "entry": entry, "close_target_price": close_px,
-                "account_id": account_id, "auto_close": True,
-            }
+            if not stop_pct:
+                oto = {"class": "oto", "duration": req.duration, **leg0, **leg1_profit,
+                       "tag": re.sub(r"[^a-zA-Z0-9]", "", tag)[:30]}
+                entry = await _submit(client, account_id, oto)
+                rej, why = _is_rejected(entry)
+                return {
+                    "mode": "oto_bracket", "rejected": rej, "reason": why,
+                    "entry": entry, "close_target_price": close_px,
+                    "account_id": account_id, "auto_close": True,
+                }
+            stop_trigger, stop_limit = teng.stop_limit_leg_prices(
+                float(req.limit_price), entry_type, float(stop_pct), tick, tcfg.STOP_LIMIT_BUFFER_TICKS)
+            if abs(close_px - stop_trigger) >= tcfg.OCO_MIN_PRICE_GAP:
+                leg2_stop = {
+                    "symbol[2]": req.symbol.upper(), "option_symbol[2]": legs[0]["symbol"],
+                    "side[2]": close_side, "quantity[2]": qty0,
+                    "type[2]": "stop_limit", "stop[2]": f"{stop_trigger:.2f}", "price[2]": f"{stop_limit:.2f}",
+                }
+                otoco = {"class": "otoco", "duration": req.duration, **leg0, **leg1_profit, **leg2_stop,
+                         "tag": re.sub(r"[^a-zA-Z0-9]", "", tag)[:30]}
+                entry = await _submit(client, account_id, otoco)
+                rej, why = _is_rejected(entry)
+                return {
+                    "mode": "otoco_bracket", "rejected": rej, "reason": why,
+                    "entry": entry, "close_target_price": close_px,
+                    "stop_loss_price": stop_trigger, "stop_loss_pct": float(stop_pct),
+                    "account_id": account_id, "auto_close": True,
+                }
+            # gap too narrow for Tradier's OCO rule — fall through to the
+            # app-managed watcher below, which owns both exits reactively.
 
         # ── entry payload (single option or multileg spread) ──────────────────
         if is_single:

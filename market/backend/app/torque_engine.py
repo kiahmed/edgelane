@@ -429,6 +429,48 @@ def stop_exit_price(px: dict, order_type: str, tick: float) -> float | None:
     return round_to_tick(abs(float(raw)), tick)
 
 
+def stop_loss_price(entry_price: float, order_type: str, stop_pct: float, tick: float) -> float:
+    """Fixed stop-exit limit for a single-leg native OTO bracket, submitted
+    up front alongside the entry (no live watcher exists yet to compute it
+    reactively the way stop_exit_price() does for the app-managed path). Uses
+    the SAME plain %-of-entry-fill formula as stop_breached() — deliberately no
+    fee adjustment, so the two paths (native bracket vs app watcher) trigger at
+    the identical threshold regardless of which one a given order ends up on.
+
+      debit  → you paid `entry_price`; the stop sells for LESS (floor to tick,
+               so tick rounding can't push the exit price back above the true
+               stop level — a ceil here would let it fire slightly late).
+      credit → you received `entry_price`; the stop buys back for MORE (ceil to
+               tick, so rounding can't quietly loosen the stop either).
+    """
+    e = abs(float(entry_price))
+    f = float(stop_pct) / 100.0
+    if order_type == "credit":
+        return _ceil_tick(e * (1.0 + f), tick)
+    return _floor_tick(e * (1.0 - f), tick)
+
+
+def stop_limit_leg_prices(entry_price: float, order_type: str, stop_pct: float,
+                          tick: float, buffer_ticks: int) -> tuple[float, float]:
+    """(trigger, limit) for a native stop_limit OCO leg — verified against a
+    live Tradier sandbox preview that a stop_limit leg needs BOTH a `stop[N]`
+    trigger and a `price[N]` limit distinct from it (two plain limits on the
+    same side is rejected as OcoSameOrderTypeAndSideNotAllowed).
+
+    `trigger` = stop_loss_price() (the actual 30%-of-entry stop level — same
+    number the reactive watcher would trigger at). `limit` sits `buffer_ticks`
+    further out so the order is genuinely marketable the instant it trips
+    rather than resting exactly at a level the book may have already passed:
+      debit  → sell; limit is BELOW the trigger (still further down).
+      credit → buy back; limit is ABOVE the trigger (still further up).
+    """
+    trigger = stop_loss_price(entry_price, order_type, stop_pct, tick)
+    buf = float(tick) * int(buffer_ticks)
+    if order_type == "credit":
+        return trigger, _ceil_tick(trigger + buf, tick)
+    return trigger, _floor_tick(trigger - buf, tick)
+
+
 def _ceil_tick(price: float, tick: float) -> float:
     if not tick:
         return round(price, 2)

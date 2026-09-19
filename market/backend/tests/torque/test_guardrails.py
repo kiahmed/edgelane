@@ -30,6 +30,45 @@ def test_a_bid_based_stop_would_fire_instantly_on_djx_but_mid_does_not():
     assert teng.stop_breached(mid, entry, "debit", 50.0) is False  # mid → correctly quiet
 
 
+# ── stop_loss_price: fixed resting price for the native bracket ────────────
+def test_stop_loss_price_matches_stop_breached_threshold():
+    # the native bracket's fixed trigger must line up EXACTLY with where the
+    # reactive watcher would trigger — same 30% level regardless of which
+    # mechanism a given order ends up on.
+    entry, pct, tick = 1.00, 30.0, 0.05
+    trigger = teng.stop_loss_price(entry, "debit", pct, tick)
+    assert trigger == 0.70
+    assert teng.stop_breached(trigger, entry, "debit", pct) is True
+    assert teng.stop_breached(trigger + tick, entry, "debit", pct) is False
+
+
+def test_stop_loss_price_credit_rounds_up_debit_rounds_down():
+    # debit: floors (never rounds the exit price back ABOVE the true stop
+    # level, which would fire late). credit: ceils (never loosens the stop).
+    assert teng.stop_loss_price(1.00, "debit", 33.0, 0.05) == 0.65     # 0.67 floors to 0.65
+    assert teng.stop_loss_price(1.00, "credit", 33.0, 0.05) == 1.35    # 1.33 ceils to 1.35
+
+
+# ── stop_limit_leg_prices: trigger + a genuinely marketable limit ──────────
+def test_stop_limit_leg_prices_debit_limit_is_further_below_trigger():
+    trigger, limit = teng.stop_limit_leg_prices(1.00, "debit", 30.0, 0.05, 3)
+    assert trigger == 0.70
+    assert limit < trigger
+    assert round(trigger - limit, 4) == 0.15   # 3 ticks * 0.05
+
+
+def test_stop_limit_leg_prices_credit_limit_is_further_above_trigger():
+    trigger, limit = teng.stop_limit_leg_prices(1.00, "credit", 30.0, 0.05, 3)
+    assert trigger == 1.30
+    assert limit > trigger
+    assert round(limit - trigger, 4) == 0.15
+
+
+def test_stop_limit_leg_prices_zero_tick_falls_back_to_plain_rounding():
+    trigger, limit = teng.stop_limit_leg_prices(1.00, "debit", 30.0, 0.0, 3)
+    assert trigger == 0.70 and limit == 0.70   # buffer=0 when tick=0 (_ceil_tick/_floor_tick no-op)
+
+
 def test_stop_is_inert_without_an_entry_fill_or_pct():
     assert teng.stop_breached(0.1, 0.0, "debit", 50.0) is False
     assert teng.stop_breached(0.1, 1.0, "debit", None) is False
@@ -147,13 +186,64 @@ def test_stop_default_reaches_place_via_config():
     assert tc.stop_loss_default(req.symbol) == 50.0
 
 
-def test_stop_disables_the_native_oto_bracket_so_it_is_not_dropped():
-    """A broker-held OTO has no stop leg and returns before the watcher exists.
-    Single-leg + limit + auto_close must therefore NOT take the OTO path when a
-    stop is armed (DJX arms one by default)."""
-    import inspect
-    src = inspect.getsource(troute.torque_place)
-    assert 'if is_single and req.auto_close and otype == "limit" and not stop_pct:' in src
+def _single_leg_req(**kw):
+    base = dict(symbol="NDX", strategy="long_call", order_type="limit",
+                limit_price=70.0, quantity=1, confirm=True, auto_close=True,
+                close_target_pct=30, account_id="T",
+                legs=[{"side": "call", "strike": 22000.0, "action": "buy_to_open",
+                       "quantity": 1, "symbol": "NDXP260710C22000000"}])
+    base.update(kw)
+    return PlaceRequest(**base)
+
+
+async def test_single_leg_stop_plus_autoclose_uses_native_otoco():
+    """Single-leg + limit + auto_close + a stop with a normal (>= $0.10) gap
+    between the two exit prices submits ONE native 3-leg otoco bracket — both
+    exits broker-held, no app-managed watcher, no coordination code needed.
+    Verified against a live Tradier sandbox preview (2026-09-18) that "otoco"
+    is the only class accepting a lower-priced second exit leg, and that it
+    must be type=stop_limit (stop[N] trigger + price[N] limit), not a second
+    plain limit."""
+    client = FakeTradier(place_responses=[{"order": {"id": 1, "status": "ok"}}])
+    req = _single_leg_req(stop_loss_pct=30)
+    r = await torque_place(req, FakeRequest(client), user=DEV)
+    assert r["mode"] == "otoco_bracket"
+    assert r["close_target_price"] == 91.05          # unchanged math vs the plain-OTO case
+    assert r["stop_loss_price"] == 49.0               # 70 * 0.70, floored to tick
+    assert r["stop_loss_pct"] == 30.0
+    p = client.placed[0]
+    assert p["class"] == "otoco"
+    assert len(client.placed) == 1                    # still one atomic order, not two
+    assert p["side[0]"] == "buy_to_open" and p["type[0]"] == "limit"
+    assert p["side[1]"] == "sell_to_close" and p["type[1]"] == "limit" and p["price[1]"] == "91.05"
+    assert p["side[2]"] == "sell_to_close" and p["type[2]"] == "stop_limit"
+    assert p["stop[2]"] == "49.00"
+    assert float(p["price[2]"]) < 49.0                # limit sits further below the trigger (marketable once tripped)
+
+
+async def test_single_leg_stop_plus_autoclose_falls_back_when_gap_too_narrow():
+    """Tradier enforces a $0.10 minimum gap between the two OCO exit prices
+    (verified live: 'OCO price difference should be at least 0.1$'). On a cheap
+    enough entry, a 30%/30% profit/stop band lands narrower than that — submitting
+    the bracket anyway would just get rejected, so it must fall through to the
+    app-managed watcher (both exits reactive) instead, same as a multi-leg spread."""
+    entry = 0.02   # NDX's real configured tick is 0.05 (coarser than a hypothetical
+                    # 0.01) — at this entry both exit prices round to the SAME tick
+                    # grid closely enough to land inside the $0.10 floor.
+    close_px = teng.close_target_price(entry, "debit", 30, 0.05, legs=1, fee_per_contract=0.95)
+    stop_trigger = teng.stop_loss_price(entry, "debit", 30, 0.05)
+    assert (close_px - stop_trigger) < tc.OCO_MIN_PRICE_GAP, "test setup must actually be in the narrow-gap regime"
+    client = FakeTradier(place_responses=[
+        {"order": {"id": 1, "status": "ok"}},         # entry
+        {"order": {"id": 2, "status": "ok"}},          # app-managed profit close
+    ], order_status={"id": 1, "status": "filled", "avg_fill_price": entry,
+                     "exec_quantity": 1.0, "remaining_quantity": 0.0, "class": "option"})
+    req = _single_leg_req(limit_price=entry, stop_loss_pct=30)
+    r = await torque_place(req, FakeRequest(client), user=DEV)
+    assert r.get("mode") != "otoco_bracket"
+    assert r.get("mode") != "oto_bracket"
+    # first submitted payload is the plain entry, not an otoco/oto bracket
+    assert client.placed[0].get("class") not in ("otoco", "oto")
 
 
 def test_stop_only_watcher_does_not_advertise_a_close_target():

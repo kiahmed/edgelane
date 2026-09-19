@@ -190,12 +190,24 @@ CLOSE_TARGETS: dict[str, dict[str, float]] = {
 # refuse to arm auto-close rather than place an entry whose exit can never fill.
 MAX_AUTO_CLOSE_SPREAD_PCT = 100.0
 
-# ── Stop-loss (app-managed) ────────────────────────────────────────────────
-# The profit-target close is a PASSIVE resting limit: it never crosses, so it
-# never pays the exit half-spread. A stop is the opposite — it fires when the
-# trade is going wrong and must CROSS to get out, paying the half-spread it
-# would otherwise have avoided. On DJX that exit half can be ~90% of the
-# position's mid, so:
+# ── Stop-loss ────────────────────────────────────────────────────────────────
+# Global default 30%, mirroring DEFAULT_CLOSE_TARGET_PCT — every order gets both
+# a profit target and a stop by default now, not just DJX.
+#
+# Single-leg: the stop rides the native broker-held OTO bracket (protective side
+# gets the more durable mechanism — it must survive this process being down).
+# The profit target for that same order is then app-watched instead (missing a
+# profit tick if the backend is briefly down is a much smaller cost than missing
+# stop protection). Multi-leg spreads still can't use OTO at all (Tradier's legs
+# must share one option symbol), so both exits stay app-managed there, same as
+# always.
+#
+# The app-managed watcher path (spreads, or single-leg once the native stop
+# closes and we're watching for the profit side) is a PASSIVE resting limit for
+# the target — it never crosses, so it never pays the exit half-spread. The stop
+# is the opposite — it fires when the trade is going wrong and must CROSS to get
+# out, paying the half-spread it would otherwise have avoided. On DJX that exit
+# half can be ~90% of the position's mid, so:
 #   * the trigger is measured at MID (fair value), never at the bid — measuring
 #     at the bid would fire instantly, since a wide package is underwater by
 #     half the spread the moment it fills;
@@ -203,10 +215,34 @@ MAX_AUTO_CLOSE_SPREAD_PCT = 100.0
 #     NOT dump into it. Crossing a 180%-of-mid market hands back more than the
 #     stop was meant to save. The watcher flags `stop_blocked_wide_market` and
 #     keeps polling for a sane book instead.
+DEFAULT_STOP_LOSS_PCT = 30.0   # global default — same % as DEFAULT_CLOSE_TARGET_PCT,
+                                # symmetric protection alongside the profit target
 STOP_LOSS: dict[str, dict[str, float]] = {
-    "DJX": {"default": 50.0},
+    "DJX": {"default": 50.0},   # wider book needs a wider stop or it fires on noise
 }
 STOP_MAX_EXIT_SPREAD_PCT = 60.0
+
+# ── Native single-leg OTOCO (both exits broker-held) ─────────────────────────
+# Verified empirically against Tradier sandbox (2026-09-18), not assumed:
+#   * plain "oto" REJECTS a second leg priced below the entry ("must be higher
+#     than price[0]") — it only understands "oto" as entry+profit, never a stop.
+#   * "otoco" (3 legs: entry + profit limit + stop) is accepted, but Tradier
+#     requires the stop leg to be type=stop_limit (stop[N] trigger + price[N]
+#     limit) — two plain limits on the same side is rejected as
+#     "OcoSameOrderTypeAndSideNotAllowed".
+#   * Tradier enforces a MINIMUM $0.10 gap between the two OCO exit prices
+#     ("OCO price difference should be at least 0.1$") — on cheap 0DTE premium
+#     a 30%/30% profit/stop band can land narrower than that. Below the floor
+#     we don't submit a bracket we already know will be rejected; fall through
+#     to the app-managed watcher (both exits reactive) instead.
+OCO_MIN_PRICE_GAP = 0.10
+# Buffer between the stop's TRIGGER and its LIMIT once tripped, so the stop_limit
+# leg is actually marketable at the moment it fires rather than resting above/
+# below a market that's already moved on. A native bracket can't adapt this to
+# the live spread at trigger time the way the reactive watcher's stop_exit_price
+# does (it has no book to check until Tradier evaluates the trigger) — this is a
+# fixed, pre-committed buffer, the one real trade-off of going broker-native.
+STOP_LIMIT_BUFFER_TICKS = 3
 
 # ── Market orders ──────────────────────────────────────────────────────────
 # A market order crosses to whatever the book shows. On a penny-wide name that
@@ -268,6 +304,15 @@ def fee_per_contract(ticker: str) -> float:
 
 
 def stop_loss_default(ticker: str) -> float | None:
+    """Ticker-level default ONLY — None means "no stop unless the caller asks
+    for one," same as before. DEFAULT_STOP_LOSS_PCT is NOT folded in here: the
+    close_target_pct precedent (Field(default=DEFAULT_CLOSE_TARGET_PCT), always
+    sent explicitly by the UI's own default state) shows "on by default" belongs
+    in the caller, not this ticker-lookup. Folding it in here instead made EVERY
+    existing caller that omits stop_loss_pct — including every test built before
+    this feature — silently start getting a stop armed, which is exactly the
+    kind of surprise a live-order-placement default must not spring on a caller
+    that never asked for it."""
     f = _load_overrides_file().get("stop_loss", {}).get((ticker or "").upper(), {})
     sl = {**STOP_LOSS.get((ticker or "").upper(), {}), **(f if isinstance(f, dict) else {})}
     d = sl.get("default")
@@ -309,6 +354,19 @@ def close_targets_map() -> dict[str, dict[str, float]]:
                 "spread_scaled": close_target_spread_scaled(t),
                 "required": close_target_required(t)}
             for t in tickers()}
+
+
+def stop_loss_defaults_map() -> dict[str, float]:
+    """Per-ticker stop-loss default for the frontend — mirrors close_targets_map
+    so the UI's stop-loss % field can react to a ticker switch the same way
+    close_target_pct already does (see the [ticker]-keyed useEffect in
+    torque.html). Without this, once the UI always sends an explicit
+    stop_loss_pct (needed so 0 can mean "off"), the server's own ticker-aware
+    stop_loss_default() — DJX's wider 50%, specifically — would never be
+    consulted again; the UI would silently ship a flat 30% for every ticker,
+    tightening DJX's stop below the level it was configured not to fire on
+    noise at."""
+    return {t: (stop_loss_default(t) or DEFAULT_STOP_LOSS_PCT) for t in tickers()}
 
 
 # ── Counter Read noise floor ─────────────────────────────────────────────────

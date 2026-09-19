@@ -119,6 +119,19 @@ def test_richness_floors_map_covers_every_configured_ticker():
     assert m["SPY"] == 0.02
 
 
+def test_stop_loss_defaults_map_djx_keeps_its_own_wider_default():
+    # The UI now always sends an explicit stop_loss_pct (so 0 can mean "off"),
+    # which means the server's own per-ticker stop_loss_default() is never
+    # consulted from an omitted field anymore — this map is what lets the UI
+    # prefill DJX's wider 50% instead of silently flattening every ticker to
+    # the global 30%.
+    m = tc.stop_loss_defaults_map()
+    assert set(m) == set(tc.tickers())
+    assert m["DJX"] == 50.0
+    assert m["NDX"] == tc.DEFAULT_STOP_LOSS_PCT == 30.0
+    assert m["SPY"] == tc.DEFAULT_STOP_LOSS_PCT
+
+
 def test_richness_floor_file_override(tmp_path, monkeypatch):
     cfg = {"richness_floor": {"NDX": 0.09}}
     p = tmp_path / "torque_tickers.json"

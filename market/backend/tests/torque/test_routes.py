@@ -59,6 +59,10 @@ async def test_config_endpoint():
     assert set(c["richness_floors"]) == set(c["tickers"])
     assert c["richness_floors"]["NDX"] == 0.05
     assert c["richness_floors"]["SPY"] == 0.02
+    # Per-ticker stop-loss default — DJX keeps its own wider 50%.
+    assert set(c["stop_loss_defaults"]) == set(c["tickers"])
+    assert c["stop_loss_defaults"]["DJX"] == 50.0
+    assert c["stop_loss_defaults"]["NDX"] == 30.0
 
 
 async def test_analyze_endpoint():
