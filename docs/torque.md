@@ -157,31 +157,67 @@ dips).
   Read it as positioning context only. Full breakdown of every reading, label, and
   threshold: **[Operating Manual](torque_operating_manual.html)**.
 
-## Auto-close (hybrid, +30% target)
+## Auto-close + stop-loss (hybrid, ±30% default)
 
-The profit target is a **% return on the entry's debit/credit**:
-- **Debit** spreads/singles (Bull Call, Bear Put, flys, Long Call/Put): close =
-  sell-to-close at **1.30 × entry debit**.
-- **Credit** spreads (Bull Put, Bear Call, IC, Iron Fly): close = buy-to-close at
-  **0.70 × entry credit** (keep 30% of the credit).
+The profit target and stop-loss are both a **% return on the entry's debit/credit**:
+- **Debit** spreads/singles (Bull Call, Bear Put, flys, Long Call/Put): profit =
+  sell-to-close at **1.30 × entry debit**; stop = sell-to-close at
+  **0.70 × entry debit**.
+- **Credit** spreads (Bull Put, Bear Call, IC, Iron Fly): profit = buy-to-close at
+  **0.70 × entry credit** (keep 30% of the credit); stop = buy-to-close at
+  **1.30 × entry credit**.
 
-How the close is wired (Tradier has **no** native conditional bracket for
-*spreads* — OTO/OTOCO legs are single-symbol only):
-- **Single-leg + limit entry** → native Tradier **OTO** bracket (broker holds the
-  profit-target close; survives disconnects).
-- **Everything else** (all spreads, any market entry) → **app-managed background
-  watcher**: the place request submits the entry and **returns immediately**
-  (it does *not* block), then a background task polls
-  `GET /accounts/{id}/orders/{id}` until `status=filled` — for up to a full
-  trading day — and places the close then, **retrying** if the freshly-filled
-  position isn't settled yet. If the entry is rejected, canceled, or never fills,
-  **no close is placed**.
+Both default to 30% (`DEFAULT_CLOSE_TARGET_PCT` / `DEFAULT_STOP_LOSS_PCT`),
+overridable per ticker (`torque_tickers.json`) and per order (UI toggle,
+`close_target_pct` / `stop_loss_pct`). DJX keeps a wider 50% stop
+(`STOP_LOSS["DJX"]`) — its own package spread is wide enough that a 30% stop
+would fire on noise; `stop_loss_defaults_map()` feeds this to the UI so
+switching to DJX doesn't silently flatten it to 30%. `stop_loss_pct=0`
+explicitly disables the stop (the field is now always sent, so `0` — not
+omission — is what "off" means).
+
+How the close/stop are wired (Tradier has **no** native conditional bracket for
+*spreads* — OTO/OTOCO legs are single-symbol only; confirmed live against
+sandbox that `class=multileg` rejects `type=stop`/`stop_limit` outright,
+"Invalid parameter, type: is not valid."):
+- **Single-leg + limit entry, no stop requested** → native Tradier **OTO**
+  bracket (entry + profit leg; broker holds the close, survives disconnects).
+- **Single-leg + limit entry, stop requested, exit prices ≥ `OCO_MIN_PRICE_GAP`
+  ($0.10) apart** → native Tradier **OTOCO** bracket: entry + profit `limit`
+  leg + stop `stop_limit` leg, all three submitted together. Both exits rest on
+  Tradier's own book — whichever fires first cancels the other, no app-side
+  coordination, survives a backend restart. The stop leg's limit sits
+  `STOP_LIMIT_BUFFER_TICKS` (3 ticks) past its trigger so it's marketable the
+  instant it trips.
+- **Everything else** (all spreads, any market entry, or a single-leg stop too
+  narrow to clear the $0.10 OCO gap) → **app-managed background watcher**: the
+  place request submits the entry and **returns immediately** (it does *not*
+  block), then a background task polls `GET /accounts/{id}/orders/{id}` until
+  `status=filled` — for up to a full trading day — and places the profit-target
+  close then, **retrying** if the freshly-filled position isn't settled yet.
+  If a stop is also armed, a second loop (`_monitor_stop`, every
+  `STOP_INTERVAL`=10s) watches the **live package mid** and, on breach,
+  **cancels the resting profit close and submits a fresh stop-exit close** in
+  its place. This is reactive, not resting — the stop-exit order doesn't exist
+  on Tradier's book until the breach is detected and the cancel+resubmit
+  round-trip completes, so it carries more latency/slippage risk than the
+  native OTOCO's stop leg. If the entry is rejected, canceled, or never fills,
+  **no close/stop is placed**.
 
   > This replaced an earlier *synchronous* 30s poll: a limit entry that filled
   > after 30s got no close (and the request blocked 12-15s meanwhile). The
   > background watcher fixes both — fast response **and** a close on slow fills.
   > Watcher progress is visible in the **Orders panel** (`state`:
   > `watching_fill` → `close_placed` / `entry_not_filled` / `close_rejected`).
+
+**Scope**: both mechanisms only arm for orders placed through Torque's own
+`/torque/place` call — there is no background scanner that discovers or adopts
+existing positions/orders. An order placed by hand on Tradier, or through the
+separate `tp` CLI (`tools/tradier_positions.py`, which talks straight to
+Tradier's REST API and never calls into Torque), gets **no** auto-close and
+**no** stop-loss. It can still *show up* in Torque's Orders panel (`/torque/orders`
+lists every live order on the account, not just Torque's own), which is
+display-only and easy to mistake for tracking.
 
 ## Dry run (validate without placing)
 
@@ -482,8 +518,8 @@ account. Both Tradier and Webull connections are accepted, but Webull is
 | Torque feature | Tradier | Webull |
 |---|---|---|
 | Entry (single + multileg) | ✅ | ✅ (always `preview_option` first) |
-| Auto-close | ✅ | ❌ 501 — needs order-status polling |
-| Native OTO bracket | ✅ | ❌ (no OCO in this SDK surface) |
+| Auto-close / stop-loss | ✅ | ❌ 501 — needs order-status polling |
+| Native OTO/OTOCO bracket | ✅ | ❌ (no OCO in this SDK surface) |
 | Orders panel / cancel / modify | ✅ | ❌ 501 |
 
 Auto-close is **refused** (not silently dropped) on Webull: it is app-managed
@@ -506,5 +542,7 @@ returns HTTP 401 — refresh `TRADIER_TOKEN_SANDBOX` and run `make run-dev` to t
 placement on paper before going to production.
 
 Possible next steps: WebSocket quote streaming (vs. the current 2.5s poll);
-premium-optimized wing selection for condors/flys; a stop-loss leg (→ native
-OTOCO for single-leg).
+premium-optimized wing selection for condors/flys; a broker-native OCO
+substitute for spread stop-losses, if Tradier ever adds one (today the
+`_monitor_stop` reactive watcher is the only option — see
+[Auto-close + stop-loss](#auto-close--stop-loss-hybrid-30-default)).

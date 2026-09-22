@@ -275,6 +275,30 @@ async def test_credit_spread_close_is_debit_buyback():
     assert client.placed[1]["type"] == "debit"  # closing a credit spread is a debit
 
 
+async def test_credit_fill_reported_negative_by_broker_still_targets_correctly():
+    """Regression (live production, 2026-09-22): Tradier reports avg_fill_price
+    as NEGATIVE for a filled multileg credit order even though the submitted
+    price was positive (confirmed against a real SPX bear call: price=6.6,
+    avg_fill_price=-6.6). Fed unabsed into close_target_price(), the negative
+    entry drove the target negative, which tripped the "floor at one tick"
+    guard meant for pct>=100% — silently arming a close at the cheapest tick
+    ($0.05) instead of ~70% of the credit. Must produce the identical target
+    as the positive-avg_fill_price case above."""
+    client = FakeTradier(place_responses=[
+        {"order": {"id": 1, "status": "ok"}}, {"order": {"id": 2, "status": "ok"}},
+    ], order_status={"status": "filled", "avg_fill_price": -10.0, "remaining_quantity": 0.0})
+    legs, _ = await _build_legs(client, "NDX", "iron_condor")
+    req = PlaceRequest(symbol="NDX", strategy="iron_condor", legs=legs, order_type="limit",
+                       limit_price=10.0, auto_close=True, close_target_pct=30,
+                       account_id="T", confirm=True)
+    r = await torque_place(req, FakeRequest(client), user=DEV)
+    w = await _await_watch(r)
+    assert w["state"] == "close_placed"
+    assert w["close_target_price"] == 6.9          # same target as the positive-sign case
+    assert w["entry_fill"] == 10.0                 # sign corrected, not -10.0
+    assert client.placed[1]["type"] == "debit"
+
+
 # ── place: single-leg OTO bracket ──────────────────────────────────────────
 async def test_single_leg_limit_autoclose_uses_oto():
     client = FakeTradier(place_responses=[{"order": {"id": 1, "status": "ok"}}])

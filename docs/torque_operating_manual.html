@@ -170,9 +170,18 @@
   <span class="pill amber">required</span> — you can still edit the % but can't disarm it.</div>
 </div>
 <div class="btn-ref">
+  <div class="name">stop-loss −N% <span class="pill dim">toggle + %</span></div>
+  <div class="desc">Arms a stop-loss exit alongside auto-close — see
+  <a href="#autoclose">Auto-close</a>. Default 30%, editable; DJX keeps a wider 50% default (its
+  book is too wide for a tight stop to be meaningful). Toggle off (or set the field to 0) to trade
+  without a stop. For a single-leg limit entry with both toggles on, the profit and stop legs ride
+  together as one native broker bracket; everywhere else the stop is watched and exited
+  reactively — see below.</div>
+</div>
+<div class="btn-ref">
   <div class="name">SEND LIMIT <span class="pill dim">button</span></div>
-  <div class="desc">Places the entry at your typed limit price (with the auto-close close armed
-  behind it if the toggle is on).</div>
+  <div class="desc">Places the entry at your typed limit price (with auto-close and/or stop-loss
+  armed behind it if those toggles are on).</div>
 </div>
 <div class="btn-ref">
   <div class="name">SEND MARKET <span class="pill dim">button</span></div>
@@ -657,19 +666,34 @@ bar hardens solid off the flip and windows push past 70% one way.</p>
 <hr>
 
 <!-- ══════════════════════════════════════════════════════════════ -->
-<h2 id="autoclose"><span class="num">12</span>Auto-close &amp; Dry Run</h2>
+<h2 id="autoclose"><span class="num">12</span>Auto-close, Stop-loss &amp; Dry Run</h2>
 
-<h3>Auto-close</h3>
-<p>The profit target is a % return on the entry's debit/credit:</p>
+<h3>Auto-close &amp; stop-loss</h3>
+<p>Both are a % return on the entry's debit/credit, in opposite directions:</p>
 <ul>
-  <li><strong>Debit</strong> spreads/singles (Bull Call, Bear Put, flys, Long Call/Put) — close = sell-to-close at 1.30× entry debit (default 30% target).</li>
-  <li><strong>Credit</strong> spreads (Bull Put, Bear Call, IC, Iron Fly) — close = buy-to-close at 0.70× entry credit (keep 30% of the credit).</li>
+  <li><strong>Debit</strong> spreads/singles (Bull Call, Bear Put, flys, Long Call/Put) — profit = sell-to-close at 1.30× entry debit; stop = sell-to-close at 0.70× entry debit (both default 30%).</li>
+  <li><strong>Credit</strong> spreads (Bull Put, Bear Call, IC, Iron Fly) — profit = buy-to-close at 0.70× entry credit (keep 30% of the credit); stop = buy-to-close at 1.30× entry credit.</li>
 </ul>
-<p>Single-leg limit entries use a native broker OTO bracket (the exit survives disconnects).
-Everything else — all spreads, any market entry — uses an app-managed background watcher: the
+<p>DJX keeps a wider 50% stop by default — its own package spread is wide enough that a 30% stop
+would fire on noise, not a real move.</p>
+<p><strong>Single-leg limit entry, stop armed, exit prices ≥$0.10 apart:</strong> profit + stop ride
+together as one native broker <strong>OTOCO</strong> bracket — both exits rest on the broker's own
+book, whichever fires first cancels the other, and it survives a disconnect or backend restart. No
+stop requested → a plain <strong>OTO</strong> bracket (profit leg only).</p>
+<p><strong>Everything else</strong> (all spreads, any market entry, or a single-leg stop too close
+to the profit target to clear the broker's $0.10 minimum gap) — app-managed background watcher: the
 entry is submitted and the request returns immediately, then a background task waits for the fill
-and places the close only once it's confirmed. If the entry is rejected, canceled, or never fills,
-<strong>no close is placed</strong> — a rejected/unfilled entry never leaves a naked close behind.</p>
+and places the profit-target close once it's confirmed. If a stop is also armed, a second loop
+watches the live package price every ~10s and, on breach, <strong>cancels the resting profit close
+and submits a fresh stop-exit close</strong> in its place. This is why a spread's stop-loss is only
+as reliable as the backend process — the broker itself is not holding a resting stop order for it,
+because Tradier has no native stop-trigger order type for multi-leg spreads. If the entry is
+rejected, canceled, or never fills, <strong>no close or stop is placed</strong> — a rejected/unfilled
+entry never leaves a naked close behind.</p>
+<p><strong>Scope:</strong> both only arm for orders placed through Torque itself. An order placed by
+hand on the broker's site, or through a separate tool that talks to the broker directly, gets no
+auto-close and no stop-loss from Torque — it may still <em>appear</em> in the Orders panel (which
+lists every live order on the account), but that's just a read-only display, not tracking.</p>
 
 <h3>Dry Run</h3>
 <p>Submits entry <em>and</em> close to the broker with <code>preview=true</code> — validates

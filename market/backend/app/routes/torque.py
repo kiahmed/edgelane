@@ -1109,7 +1109,15 @@ async def _watch_and_close(client, account_id, entry_id, w, *, is_single, legs,
         if fst != "filled":
             w["state"] = "entry_not_filled"
             return
-        entry_fill = teng._f(filled.get("avg_fill_price")) or 0.0
+        # Tradier reports avg_fill_price as NEGATIVE for a filled multileg credit
+        # order (confirmed live 2026-09-22: submitted price=6.6, avg_fill_price=
+        # -6.6) even though every price this module computes is an unsigned
+        # premium (direction lives in entry_type, never in the sign). Fed
+        # unabsed into close_target_price()'s credit branch, a negative entry
+        # drives the target negative, which trips the "floor at one tick" guard
+        # meant for pct>=100% edge cases — silently returning the cheapest tick
+        # (e.g. $0.05) instead of the real ~70%-of-credit buyback.
+        entry_fill = abs(teng._f(filled.get("avg_fill_price")) or 0.0)
         w["entry_fill"] = entry_fill
         close_order_id = None
 
