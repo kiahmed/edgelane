@@ -14,7 +14,8 @@ with the logic that owns it.
     on_snapshot(...)    called from the poller after a persisted poll
                         → pick_selected, session_open, grid_digest
     on_evaluation(...)  called at the end of the evaluator sweep
-                        → bias_aligned / bias_diverged, win_rate_notable, daily_recap
+                        → bias_aligned / bias_diverged, win_rate_notable, daily_recap,
+                          pick_result (the outcome of each pick it announced)
 
 The six states and their sources are the table in §2 of that doc. Nothing here
 re-computes an opinion: it reads what the engine and the grader already decided
@@ -25,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -40,6 +41,23 @@ _SESSION_TZ = ZoneInfo("America/New_York")      # same trading day boundary as e
 # several times a day on a choppy session.
 _DIGEST_MIN_HOURS = 60.0          # ~2.5 days
 _DIGEST_MIN_CHANGED = 3           # of the 8 strategy cards
+
+# The bar a rolling win rate must clear before a "recovery" is worth announcing.
+# A losing streak ending is not by itself notable: two consecutive wins clear the
+# regime pause even when the 20-pick window still reads 10% (the 2026-09-22
+# incident — see docs/matrix_events_update.md). The post DISPLAYS the rolling
+# number, so the rolling number is what has to be good. 50% of graded picks won
+# (neutrals count against it) means wins at least match losses-plus-pushes.
+_NOTABLE_MIN_WIN_PCT = 50.0
+
+# pick_result: how long to keep waiting for a posted pick's outcome before
+# giving up (a run that never closes, or closes after the session and is never
+# graded). Generous — the cost of waiting is nothing; the cost of a wrong
+# result is credibility.
+_RESULT_MAX_WAIT_HOURS = 8.0
+# Once a run has closed, how long to wait for its final poll to be graded
+# before settling on the last grade it DID get (the grader lags ~3 min).
+_RESULT_GRADE_GRACE_MIN = 15.0
 
 
 class MatrixSignalState:
@@ -59,6 +77,12 @@ class MatrixSignalState:
         # True once a pick has been SUPPRESSED (broken structure / bias out of
         # sync). Resuming needs more than the flag clearing — see _recovery_earned.
         self.pick_blocked: dict[str, bool] = {}
+        # When the current run began (UTC) — where a posted pick's outcome is
+        # looked up from once the run ends.
+        self.cur_pick_since: dict[str, datetime] = {}
+        # Picks announced via pick_selected whose outcome hasn't been reported
+        # yet. Each closes the loop with one pick_result.
+        self.pending_results: dict[str, list[dict]] = {}
         # Last published win rate, carried onto the pick chip as its takeaway.
         self.last_win_rate: dict[str, float | None] = {}
         self.last_graded: dict[str, int] = {}
@@ -79,6 +103,7 @@ class MatrixSignalState:
     def reset(self) -> None:
         for d in (self.last_pick_key, self.cur_pick_key, self.cur_pick_polls,
                   self.pick_blocked, self.last_win_rate, self.last_graded,
+                  self.cur_pick_since, self.pending_results,
                   self.last_trust_state, self.last_win_tier,
                   self.last_regime_alert, self.session_open_date, self.last_digest_at,
                   self.last_digest_grid, self.last_recap_date, self.day_date,
@@ -286,6 +311,92 @@ def _track_day_extremes(sym: str, pick: dict, today: str) -> None:
         state.day_worst[sym] = row
 
 
+
+def _as_utc(ts: Any) -> datetime | None:
+    """A DuckDB TIMESTAMP back as an aware UTC datetime.
+
+    DuckDB stores an aware datetime as NAIVE LOCAL time (the process's TZ), so
+    a naive value must be read back as local — not stamped as UTC. In the
+    container (TZ=UTC) the two coincide; on a developer host they differ by
+    the UTC offset, which silently skewed every age check here by hours."""
+    if ts is None:
+        return None
+    return ts.astimezone(timezone.utc)        # naive ⇒ interpreted as local
+
+
+def _resolve_pick_results(sym: str, db: Any) -> list[str]:
+    """Report the outcome of each announced pick whose run has ended.
+
+    This is the loop the rest of the feed can't close on its own: a
+    pick_selected post says "the engine likes this", and pick_result says how
+    it actually went — graded exactly the way the win rate grades it (the
+    run's LAST grade before the engine moved on, db._EPISODE_CTE), so the two
+    can never disagree. Its event_id suffix is the same pick hash as the
+    announcement, so the poster can thread the result under the original post.
+
+    Neutrals are not posted: "it didn't move past the bid/ask noise" carries
+    no takeaway. Losses ARE posted — a feed that only reports its wins is
+    marketing, and the whole value of the self-eval is that it's believable.
+    """
+    published: list[str] = []
+    pending = state.pending_results.get(sym) or []
+    if not pending:
+        return published
+    now = datetime.now(timezone.utc)
+    keep: list[dict] = []
+    for p in pending:
+        age_h = (now - p["announced_at"]).total_seconds() / 3600.0
+        try:
+            # A little before the run start: the run's first decision row is
+            # written just before on_snapshot stamps `since`.
+            run = db.fetch_pick_run(sym, p["key"], p["since"] - timedelta(seconds=90))
+        except Exception:
+            log.exception("[matrix-signals] fetch_pick_run failed for %s", sym)
+            keep.append(p)
+            continue
+
+        if run is None or not run.get("closed"):
+            if age_h < _RESULT_MAX_WAIT_HOURS:
+                keep.append(p)          # still on screen — no result yet
+            else:
+                log.info("[matrix-signals] %s pick_result dropped (run never "
+                         "closed within %.0fh)", sym, _RESULT_MAX_WAIT_HOURS)
+            continue
+
+        final = run.get("final")
+        last_ts = _as_utc(run.get("last_ts"))
+        waited_min = ((now - last_ts).total_seconds() / 60.0) if last_ts else 1e9
+        if not run.get("last_graded") and waited_min < _RESULT_GRADE_GRACE_MIN:
+            keep.append(p)              # closed, final poll not graded yet
+            continue
+        if not final:
+            log.info("[matrix-signals] %s pick_result dropped (run ended ungraded)", sym)
+            continue
+
+        result = str(final.get("result") or "")
+        if result not in ("win", "loss"):
+            log.info("[matrix-signals] %s pick_result not posted (%s — no takeaway)",
+                     sym, result or "ungraded")
+            continue
+
+        first_ts = _as_utc(run.get("first_ts"))
+        held_min = ""
+        if first_ts is not None and last_ts is not None:
+            held_min = f"{(last_ts - first_ts).total_seconds() / 60.0:.0f}"
+        attrs = dict(p.get("summary") or {})
+        attrs.update({
+            "result": result,
+            "entry_premium": str(final.get("entry_net_premium") or ""),
+            "exit_premium": str(final.get("eval_net_premium") or ""),
+            "favorable_delta": str(final.get("favorable_delta") or ""),
+            "held_minutes": held_min,
+            "announced_at": p["announced_at"].isoformat(),
+        })
+        published.append(_fire(sym, "pick_result", p.get("expiry"), attrs,
+                               disc=matrix_events.discriminator(p["key"])))
+    state.pending_results[sym] = keep
+    return published
+
 async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
     """Poller-side transitions. Returns the states published (for tests/logs).
 
@@ -309,6 +420,7 @@ async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
                 if state.cur_pick_key.get(sym) != key:
                     state.cur_pick_key[sym] = key
                     state.cur_pick_polls[sym] = 1
+                    state.cur_pick_since[sym] = datetime.now(timezone.utc)
                 else:
                     state.cur_pick_polls[sym] = state.cur_pick_polls.get(sym, 0) + 1
                 # Announce once it has earned it, and only once per run —
@@ -328,9 +440,17 @@ async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
                     else:
                         state.last_pick_key[sym] = key
                         state.pick_blocked[sym] = False
+                        summary = _pick_summary(pick, sym)
                         published.append(_fire(
-                            sym, "pick_selected", expiry, _pick_summary(pick, sym),
+                            sym, "pick_selected", expiry, summary,
                             disc=matrix_events.discriminator(key)))
+                        # Close the loop later: report how THIS pick ended.
+                        state.pending_results.setdefault(sym, []).append({
+                            "key": key, "expiry": expiry, "summary": summary,
+                            "since": state.cur_pick_since.get(sym)
+                                     or datetime.now(timezone.utc),
+                            "announced_at": datetime.now(timezone.utc),
+                        })
 
         # 2. session_open — first persisted poll of a new ET day that has walls
         #    worth a chip.
@@ -420,9 +540,18 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
             tier = _tier(pct, graded, green, red)
             prev_tier = state.last_win_tier.get(sym)
 
-            recovered = prev_alert is True and alert is False
+            # Recovery = the pause just lifted AND the number the post will show
+            # is genuinely good on a real sample. Without the pct floor, 2 wins
+            # in a row could announce a 10% record as "notable".
+            lifted = prev_alert is True and alert is False
+            recovered = (lifted and graded >= min_graded
+                         and pct >= _NOTABLE_MIN_WIN_PCT)
             crossed_green = (prev_tier is not None and prev_tier != "green"
                              and tier == "green" and graded >= min_graded)
+            if lifted and not recovered:
+                log.info("[matrix-signals] %s win_rate_notable suppressed "
+                         "(recovery at %.0f%% over %d graded — below the %.0f%% bar)",
+                         sym, pct, graded, _NOTABLE_MIN_WIN_PCT)
             if recovered or crossed_green:
                 reason = "recovery" if recovered else "win_streak"
                 published.append(_fire(sym, "win_rate_notable", expiry,
@@ -436,6 +565,9 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
                 }))
             state.last_regime_alert[sym] = alert
             state.last_win_tier[sym] = tier
+
+            # 8. pick_result — how each posted pick actually ended.
+            published.extend(_resolve_pick_results(sym, db))
 
             # 7. daily_recap — once per ET day, headlined by the day's BEST pick.
             #    Fires on the first sweep of a NEW day, recapping the day just

@@ -582,3 +582,42 @@ async def test_a_day_with_no_best_does_not_recap(sent, evaluator_state):
     await ms.on_evaluation(_FakeDB(), _FakePoller(_snap()), _Settings())
     await ms.drain()
     assert "daily_recap" not in _states(sent)
+
+
+# ── win_rate_notable: the recovery must show a number worth showing ─────────
+#
+# 2026-09-22: three posts went out headlined 45% / 15% / 10%, all via the
+# recovery branch — two wins cleared the pause while the 20-pick window stayed
+# terrible. The post displays the rolling rate, so that rate is the gate.
+
+async def _recover_at(evaluator_state, pct, n=20):
+    poller, cfg = _FakePoller(_snap()), _Settings()
+    evaluator_state.regime_alert_active_by_symbol["SPX"] = True
+    await ms.on_evaluation(_FakeDB(n=n, pct=pct), poller, cfg)      # seed: paused
+    evaluator_state.regime_alert_active_by_symbol["SPX"] = False    # pause lifts
+
+
+@pytest.mark.parametrize("pct", [10.0, 15.0, 45.0])
+async def test_a_recovery_with_a_bad_record_is_not_notable(sent, evaluator_state, pct):
+    await _recover_at(evaluator_state, pct)
+    sent.clear()
+    await ms.on_evaluation(_FakeDB(pct=pct), _FakePoller(_snap()), _Settings())
+    await ms.drain()
+    assert "win_rate_notable" not in _states(sent), f"{pct}% must not be 'notable'"
+
+
+async def test_a_recovery_with_a_good_record_is_notable(sent, evaluator_state):
+    await _recover_at(evaluator_state, 55.0)
+    sent.clear()
+    await ms.on_evaluation(_FakeDB(pct=55.0), _FakePoller(_snap()), _Settings())
+    await ms.drain()
+    hit = [c for c in sent if c["state"] == "win_rate_notable"]
+    assert hit and hit[0]["attrs"]["reason"] == "recovery"
+
+
+async def test_a_recovery_on_a_tiny_sample_is_not_notable(sent, evaluator_state):
+    await _recover_at(evaluator_state, 80.0, n=4)
+    sent.clear()
+    await ms.on_evaluation(_FakeDB(n=4, pct=80.0), _FakePoller(_snap()), _Settings())
+    await ms.drain()
+    assert "win_rate_notable" not in _states(sent)

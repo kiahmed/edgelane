@@ -688,6 +688,65 @@ class Database:
                 "accuracy_pct": round(accuracy, 1),
             }
 
+    def fetch_pick_run(self, symbol: str, pick_legs: str, since,
+                       limit: int = 5000) -> dict | None:
+        """How one specific pick's run ended — the outcome of a pick Matrix
+        publicly announced (matrix_signals ``pick_result``).
+
+        Walks this symbol's decisions from ``since`` and takes the first
+        contiguous run whose ``pick_legs`` equals the given value — the same
+        run the win rate calls an episode (db._EPISODE_CTE). Returns None when
+        the pick never appears, else::
+
+            closed      the engine has moved to a different pick
+            polls       how many polls the run held
+            first_ts / last_ts
+            final       the LAST graded row of the run (same "how did this idea
+                        end up" grade the episode view uses), or None
+            last_graded whether the run's final poll has itself been graded yet
+                        — the result isn't final until it has
+        """
+        with self._lock:
+            cur = self.connect().execute(
+                """
+                SELECT bd.ts, bd.pick_legs, o.result, o.entry_net_premium,
+                       o.eval_net_premium, o.favorable_delta, o.evaluated_at
+                FROM bias_decisions bd
+                LEFT JOIN outcomes o
+                  ON o.decision_id = bd.id AND o.favorable_delta IS NOT NULL
+                WHERE bd.symbol = ? AND bd.ts >= ?
+                ORDER BY bd.ts ASC
+                LIMIT ?
+                """,
+                [symbol, since, limit],
+            )
+            rows = cur.fetchall()
+        run: list[tuple] = []
+        closed = False
+        for r in rows:
+            if r[1] == pick_legs:
+                run.append(r)
+            elif run:            # the pick changed after its run began
+                closed = True
+                break
+        if not run:
+            return None
+        graded = [r for r in run if r[2] is not None]
+        final = None
+        if graded:
+            g = graded[-1]
+            final = {"result": g[2], "entry_net_premium": g[3],
+                     "eval_net_premium": g[4], "favorable_delta": g[5],
+                     "evaluated_at": _utc_iso(g[6]), "decision_ts": _utc_iso(g[0])}
+        return {
+            "closed": closed,
+            "polls": len(run),
+            "first_ts": run[0][0],
+            "last_ts": run[-1][0],
+            "final": final,
+            "last_graded": run[-1][2] is not None,
+        }
+
     def fetch_recent_outcomes(self, symbol: str, limit: int = 10) -> list[dict]:
         with self._lock:
             cur = self.connect().execute(

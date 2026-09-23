@@ -233,6 +233,90 @@ Every suppression logs its reason (`pick_selected suppressed (health=broken)`),
 so the quiet is auditable rather than mysterious. Postiz's
 `MATRIX_MIN_GAP_HOURS_PICK_SELECTED` backstop can stay as insurance.
 
+## Closed (2026-09-22): `win_rate_notable` fired on a bad rolling win rate
+
+**Incident:** on 2026-09-22, three `win_rate_notable` posts went out with
+headline numbers of 45% (SPX), 15% (NDX), and 10% (NDX) — all over a 20-trade
+rolling window. `win_rate_notable` exists to show the tool proving itself
+("no daily obligation, only fire on something earned" — §3 above), and a 10%
+or 15% win rate is not that; announcing it as "notable" reads as the opposite
+of the intended showcase.
+
+**Root cause:** `matrix_signals.py::on_evaluation()`, the `# 6. win_rate_notable`
+block (currently ~lines 417–434):
+
+```python
+alert = bool(evaluator_state.regime_alert_active_by_symbol.get(sym, False))
+prev_alert = state.last_regime_alert.get(sym)
+tier = _tier(pct, graded, green, red)
+prev_tier = state.last_win_tier.get(sym)
+
+recovered = prev_alert is True and alert is False
+crossed_green = (prev_tier is not None and prev_tier != "green"
+                 and tier == "green" and graded >= min_graded)
+if recovered or crossed_green:
+    reason = "recovery" if recovered else "win_streak"
+    published.append(_fire(sym, "win_rate_notable", expiry, ...))
+```
+
+`recovered` only checks that `regime_alert_active_by_symbol` just flipped
+`True → False` — i.e. `consec_wins_by_symbol[sym]` reached
+`regime_clear_consec_wins` (default 2) after a losing streak. It never checks
+`pct` (the rolling `win_rate` over the `eval_rolling_window`, default 20
+trades). So a symbol can go 2-for-20 recently, clear the alert flag purely on
+those 2 consecutive wins, and get announced as "notable" while the actual
+20-trade win rate is still 10–15%. `crossed_green` doesn't have this problem
+(it explicitly requires `tier == "green"`, i.e. `pct >= pill_green_pct`) —
+only the `recovered` branch is unguarded on `pct`.
+
+**Fix needed:** add a floor on `pct` to the `recovered` condition — e.g.
+`recovered = prev_alert is True and alert is False and pct >= red` (using the
+same `pill_red_pct` threshold already in scope, default 40.0), or a fixed bar
+like `>= 50.0` if `red` is too low a bar for what counts as "notable." Either
+way, "the losing streak just ended" should not by itself be sufficient — the
+rolling number the post actually displays needs to clear some real bar too.
+Postiz's `compose_matrix()` win_rate_notable template just renders whatever
+`win_rate`/`graded` the card carries verbatim, so whatever bar is chosen here
+is the only gate — there's no downstream filtering on the Postiz side for this
+one (unlike `pick_selected`, which now also has a local min-gap backstop).
+
+**Fixed.** Confirmed from the logs first: all five `win_rate_notable` publishes
+on 2026-09-22 were the `recovery` branch (event-id suffix `8b60e9d7` =
+`sha1("recovery")`), none were `win_streak`. `recovered` now also requires
+`graded >= eval_min_graded` **and** `pct >= 50.0`
+(`matrix_signals._NOTABLE_MIN_WIN_PCT`). 50 rather than `pill_red_pct` (40):
+the post *headlines* this number, and a 41% "notable" is still not a showcase.
+Because `pct` is wins/n with neutrals in the denominator, 50% means wins at
+least match losses-plus-pushes. A lifted-but-unqualified recovery logs
+`win_rate_notable suppressed (recovery at 15% over 20 graded — below the 50% bar)`.
+`crossed_green` was already correct and is unchanged.
+
+## New state (2026-09-22): `pick_result` — closing the loop
+
+The feed announced picks but never said how they turned out, which is the one
+thing that actually shows the tool's performance. `pick_result` reports the
+outcome of **each pick that `pick_selected` announced**, once its run ends.
+
+| | |
+|---|---|
+| fires when | the announced pick's run closes (engine moves to a different pick) and its final poll is graded (grace: 15 min, then the last grade it did get) |
+| grade | the run's **last** grade before the engine moved on — identical to how the win rate grades an episode (`db._EPISODE_CTE`), so the two never disagree |
+| posts | `win` and `loss`. **Losses are posted on purpose** — a feed that only reports its wins is marketing. `neutral` is skipped: "didn't clear the bid/ask noise" has no takeaway |
+| event_id | `MTX-<SYM>-<YYMMDD>-pick_result-<8 hex>`, where the suffix is the **same pick hash as its `pick_selected`** — the poster can thread the result under the original post |
+| attributes | everything `pick_selected` carried, plus `result`, `entry_premium`, `exit_premium`, `favorable_delta`, `held_minutes`, `announced_at` |
+| gives up | if the run never closes within 8h (logged) |
+
+Only announced picks get a result — so it inherits every `pick_selected` gate
+(health, bias in sync, earned recovery, dwell). Nothing that wasn't posted is
+ever reported on.
+
+**Postiz side needs:** a `pick_result` template (it's a 7th state, beyond the
+§2 table), and there's no dedicated snap crop yet — the attributes carry the
+full story, but `engine_pick` shows the *current* pick, not the graded one.
+
+Known limitation: pending results live in memory, like `daily_recap`'s tally —
+a backend restart between announcement and outcome drops that result.
+
 ## Summary for whoever picks this up
 
 Net new in this repo: `app/matrix_events.py`, the `matrix_events_*` config
