@@ -308,6 +308,13 @@ CADENCE: dict[str, int] = {
     "catalyst_seconds":    86_400, # earnings dates move rarely
     "iv_rank_seconds":     86_400, # a rank over DAILY history; intraday recompute is meaningless
     "premarket_lead_min":  30,
+    # Age bound on the market-closed FREEZE: a stored readiness older than this
+    # is NOT served frozen — it's recomputed off the last chain instead. Without
+    # it, a pin that rolls onto a previously-seen expiry resurrects a weeks-old
+    # verdict (e.g. a month-old "watch"). 96h keeps "the last session" served
+    # across a normal weekend (Fri 16:00 → Mon 09:30 ET ≈ 65.5h) and a 3-day
+    # holiday weekend (Fri → Tue open ≈ 89.5h), but never a week-plus-old one.
+    "freeze_max_age_hours": 96,
 }
 
 # Tier 1 = research (expensive, `symbol`-keyed, amortised across users).

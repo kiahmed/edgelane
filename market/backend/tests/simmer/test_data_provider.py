@@ -228,16 +228,17 @@ async def test_quote_uses_torque_config_symbol_map_for_indices():
 
 async def test_chain_parses_v7_fixture_realistically():
     tr = _Transport(options_payload=_load("yahoo_options_v7.json"))
-    contracts = await tr.provider().chain("NVDA", "2026-09-18")
+    contracts = await tr.provider().chain("NVDA", EXP)
     assert len(contracts) == 4
     by_key = {(c["strike"], c["side"]): c for c in contracts}
     put94 = by_key[(94.0, "put")]
-    assert put94["expiration"] == "2026-09-18"
+    assert put94["expiration"] == EXP
     assert put94["open_interest"] == 2100
     assert put94["iv"] == pytest.approx(0.3510)
-    assert put94["delta"] < 0
+    assert put94["delta"] < 0          # greeks computed live → needs a future DTE
     # exact expiration requested → ?date=<unix midnight UTC>
-    assert any("date=1789689600" in u for u in tr.urls("/v7/finance/options/"))
+    exp_unix = int(datetime.fromisoformat(EXP).replace(tzinfo=timezone.utc).timestamp())
+    assert any(f"date={exp_unix}" in u for u in tr.urls("/v7/finance/options/"))
 
 
 async def test_daily_bars_skips_null_rows_and_trims():

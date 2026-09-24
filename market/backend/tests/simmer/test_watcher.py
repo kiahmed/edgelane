@@ -56,7 +56,8 @@ async def test_closed_sweep_freezes_existing_and_skips_alerts(fresh_db, monkeypa
     """Market CLOSED: a ticker with a stored readiness is NOT recomputed (frozen
     to its last verdict), and alerts do not fire off frozen/after-hours data."""
     frozen = readiness_env(score=88.0)          # would be "ready" if alerts ran
-    frozen.update(symbol="NVDA", expiration=EXP, decision="ready")
+    frozen.update(symbol="NVDA", expiration=EXP, decision="ready",
+                  computed_at=datetime.now(timezone.utc).isoformat())  # fresh → served frozen
     sw.state.latest_by_key[f"NVDA|{EXP}"] = frozen
     sw.state.market_open = False                # (already the default; explicit)
 
@@ -74,6 +75,66 @@ async def test_closed_sweep_freezes_existing_and_skips_alerts(fresh_db, monkeypa
 
     assert results[f"NVDA|{EXP}"]["score"] == 88.0   # served frozen, not recomputed
     assert fired["n"] == 0                            # no alert path when closed
+
+
+def test_readiness_too_old():
+    now = datetime.now(timezone.utc)
+    assert sw._readiness_too_old({"computed_at": now}, 48) is False
+    assert sw._readiness_too_old({"computed_at": now - timedelta(hours=3)}, 48) is False
+    assert sw._readiness_too_old({"computed_at": now - timedelta(days=3)}, 48) is True
+    # ISO string (the DuckDB-rehydrated form) — a month old → stale.
+    old_iso = (now - timedelta(days=29)).isoformat()
+    assert sw._readiness_too_old({"computed_at": old_iso}, 48) is True
+    # DuckDB-rehydrated rows carry `ts`, NOT `computed_at` — must be age-checked too.
+    assert sw._readiness_too_old({"ts": (now - timedelta(days=29)).isoformat()}, 48) is True
+    assert sw._readiness_too_old({"ts": (now - timedelta(hours=3)).isoformat()}, 48) is False
+    # unknown / missing timestamp → not discarded (serve it)
+    assert sw._readiness_too_old({"computed_at": None}, 48) is False
+    assert sw._readiness_too_old({}, 48) is False
+
+
+def test_frozen_readiness_age_checks_db_ts_row(monkeypatch):
+    """The real resurrection path: cache empty (post-restart), so the frozen
+    verdict comes from DuckDB, whose rows carry `ts` (not `computed_at`). A
+    ts-only row past the bound must NOT be served; a fresh one must be."""
+    monkeypatch.setattr(sw.state, "latest_by_key", {})    # cache cleared, DB-only
+
+    class _DB:
+        def __init__(self, iso): self._iso = iso
+        def latest_simmer_readiness(self, sym, exp):
+            return {"symbol": sym, "expiration": exp, "decision": "watch",
+                    "score": 53.7, "ts": self._iso}
+
+    now = datetime.now(timezone.utc)
+    stale = _DB((now - timedelta(days=29)).isoformat())
+    assert sw._frozen_readiness(stale, "NVDA", EXP) is None          # ts stale → recompute
+    fresh = _DB((now - timedelta(hours=2)).isoformat())
+    served = sw._frozen_readiness(fresh, "NVDA", EXP)
+    assert served is not None and served["decision"] == "watch"      # ts fresh → served
+
+
+async def test_closed_sweep_recomputes_stale_frozen(fresh_db, monkeypatch):
+    """The NVDA bug: a stored readiness older than freeze_max_age_hours must NOT
+    be served frozen — the sweep recomputes it (off the last chain) instead of
+    resurrecting a weeks-old verdict."""
+    stale = readiness_env(score=53.7)
+    stale.update(symbol="NVDA", expiration=EXP, decision="watch",
+                 computed_at=(datetime.now(timezone.utc) - timedelta(days=29)).isoformat())
+    sw.state.latest_by_key[f"NVDA|{EXP}"] = stale
+    sw.state.market_open = False
+
+    called = {"n": 0}
+    async def fresh_analyze(tradier, db, symbol, expiration=None, **kw):
+        called["n"] += 1
+        return {"symbol": "NVDA", "expiration": EXP, "decision": "vetoed", "score": None}
+
+    monkeypatch.setattr(sw, "watchlist_union", lambda: _union([("NVDA", EXP)]))
+    monkeypatch.setattr(sw, "analyze_symbol", fresh_analyze)
+    monkeypatch.setattr(sw, "process_alerts", lambda *a, **k: None)
+    results = await sw.sweep(FakeSimmerTradier(), fresh_db)
+
+    assert called["n"] == 1                                   # recomputed, not frozen
+    assert results[f"NVDA|{EXP}"]["decision"] == "vetoed"     # fresh verdict, not the stale watch
 
 
 def test_seconds_until_open_computes_next_bell():

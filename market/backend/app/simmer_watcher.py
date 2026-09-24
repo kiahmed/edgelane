@@ -1760,20 +1760,55 @@ async def evaluate_paper_outcomes(tradier, db, as_of: date | None = None) -> int
 # ─────────────────────────────────────────────────────────────────────────────
 # The sweep + loop
 # ─────────────────────────────────────────────────────────────────────────────
+def _readiness_too_old(env: dict | None, max_age_hours: float) -> bool:
+    """True if `env`'s timestamp is older than the freeze age bound. An
+    unknown/unparseable timestamp is treated as NOT too old (serve it) — the
+    bound targets clearly-dated stale rows, not missing ones.
+
+    Reads `computed_at` OR `ts`: in-memory cache envelopes carry `computed_at`,
+    but DuckDB-rehydrated rows (`db.latest_simmer_readiness`) carry only `ts`.
+    The DB path is precisely the resurrection case — after a restart the cache
+    is empty, so the month-old verdict comes back FROM DUCKDB — so it must be
+    age-checked too. Both are `_utc_iso` ('...Z') strings the parse below handles."""
+    if not env:
+        return False
+    ts = env.get("computed_at") or env.get("ts")
+    if ts is None:
+        return False
+    if isinstance(ts, str):
+        try:
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+    if not isinstance(ts, datetime):
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts).total_seconds() > max_age_hours * 3600.0
+
+
 def _frozen_readiness(db, sym: str, exp: str | None) -> dict | None:
     """The last STORED readiness for (sym, exp) — cache first, then DuckDB.
     exp None (auto-pick) → the newest cached entry for the symbol. Returns None
-    when nothing is stored (a freshly rolled / newly added name). Used by the
-    market-closed freeze so an existing card never recomputes off dead
-    after-hours quotes."""
+    when nothing is stored (a freshly rolled / newly added name) OR when the
+    stored value is STALE beyond `freeze_max_age_hours` — both cases make the
+    caller recompute off the last chain rather than serve a weeks-old verdict
+    (a pin rolling onto a previously-seen expiry resurrects the old row). Used by
+    the market-closed freeze so an existing card never recomputes off dead
+    after-hours quotes, but also never shows a month-old one."""
     sym_u = sym.upper()
+    max_age = float(simmer_config.cadence().get("freeze_max_age_hours", 96))
+
+    def _fresh(env: dict | None) -> dict | None:
+        return None if _readiness_too_old(env, max_age) else env
+
     if exp:
         env = state.latest_by_key.get(_key(sym, exp))
         if env is not None:
-            return env
+            return _fresh(env)
         if db is not None:
             try:
-                return db.latest_simmer_readiness(sym_u, exp)
+                return _fresh(db.latest_simmer_readiness(sym_u, exp))
             except Exception:
                 return None
         return None
@@ -1782,7 +1817,7 @@ def _frozen_readiness(db, sym: str, exp: str | None) -> dict | None:
         if k.startswith(f"{sym_u}|") and (
                 best is None or str(e.get("computed_at")) > str(best.get("computed_at"))):
             best = e
-    return best
+    return _fresh(best)
 
 
 async def sweep(tradier, db, edgar=None) -> dict[str, dict]:

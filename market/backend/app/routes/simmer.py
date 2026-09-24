@@ -464,9 +464,13 @@ async def analyze(symbol: str, request: Request,
         if last is None and expiration and db is not None:
             last = await asyncio.to_thread(
                 db.latest_simmer_readiness, symbol.upper(), expiration)
-        if last is not None:
+        # Age-bound the freeze: never serve a readiness older than
+        # freeze_max_age_hours (a pin rolled onto a previously-seen expiry can
+        # resurrect a weeks-old verdict). Too old → fall through and recompute.
+        max_age = float(simmer_config.cadence().get("freeze_max_age_hours", 96))
+        if last is not None and not simmer_watcher._readiness_too_old(last, max_age):
             return last                    # frozen: last in-hours verdict stands
-        # else: no stored row → fall through to a provisional (unpersisted) compute.
+        # else: no stored row, or stale → provisional (unpersisted) recompute.
 
     try:
         env = await simmer_watcher.analyze_symbol(

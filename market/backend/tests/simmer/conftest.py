@@ -20,6 +20,7 @@ from __future__ import annotations
 import copy
 import math
 import random
+from datetime import date, timedelta
 
 import pytest
 
@@ -175,7 +176,19 @@ def cfg() -> dict:
 # Phase 2 fixtures — watcher / routes / outcomes (no network, no Supabase)
 # ═══════════════════════════════════════════════════════════════════════════
 
-EXP = "2026-09-18"
+def _rolling_exp(min_dte: int = 28) -> str:
+    """A near-30-DTE Friday relative to *today*, snapped forward to the next
+    weekly, kept well inside the 0-45 DTE gate window. Rolling instead of a
+    hardcoded date so the suite's expiration never silently expires — the old
+    fixed 2026-09-18 rotted the day it passed (the sweep's _still_expired guard
+    dropped the pair, and every closed-market freeze/expirations test failed)."""
+    d = date.today() + timedelta(days=min_dte)
+    while d.weekday() != 4:       # Friday
+        d += timedelta(days=1)
+    return d.isoformat()
+
+
+EXP = _rolling_exp()
 
 
 def raw_tradier_chain(spot: float = SPOT, exp: str = EXP,
