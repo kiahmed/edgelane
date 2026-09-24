@@ -105,6 +105,77 @@ def _kv(label: str, value: str) -> str:
             f'<td class="mono" style="padding:5px 0;color:#e2e8f0;font-size:14px;">{value}</td></tr>')
 
 
+# ── Keeping the two worlds apart ────────────────────────────────────────────
+#
+# Matrix has two independent opinions and the cards must never blur them:
+#
+#   ENGINE  — the picked strategy, its composite (0–100), and the graded record
+#             of the engine's picks. Cards: engine_pick, bias_chip (a pick card
+#             for the bias posts), strategy_grid, win_eval_grid.
+#   MARKET  — the bias engine's direction read (signed −100…+100 from dealer
+#             walls), its confidence, GEX, and the walls. Card: walls_chip only
+#             (the session_open "market read").
+#
+# The composite never uses the market read. Mixing them on one card puts a
+# number or a word in front of the reader that they cannot trace back to the
+# thing the post is about.
+
+def _engine_state(trust: dict) -> str:
+    """The engine's own state for its record — paused | calibrating | active.
+
+    The accuracy route also has `low_conf`, but that comes from the BIAS
+    engine's confidence, not from how the picks have graded, so on an engine
+    card it is simply "active"."""
+    st = str((trust or {}).get("state") or "")
+    return st if st in ("paused", "calibrating") else ("active" if st else "")
+
+
+def _record_line(trust: dict, stats: dict | None = None) -> str:
+    """The engine's graded record in words — built from engine facts only.
+
+    Not `trust["display_text"]`: that string appends "— lower-conviction read"
+    when the BIAS confidence is low, which is market verbiage on an engine card."""
+    trust, stats = trust or {}, stats or {}
+    st = _engine_state(trust)
+    n = int(stats.get("n") or trust.get("graded") or 0)
+    if st == "paused":
+        return "Paused — recovering from a losing streak"
+    if st == "calibrating":
+        return f"Calibrating — {n} graded so far"
+    wr = trust.get("win_rate")
+    if wr is None:
+        return "—"
+    return f"{float(wr):.0f}% win rate ({n} graded picks)"
+
+
+def _gex(v: Any) -> str:
+    """Net GEX in readable units — a raw 31635942118938 means nothing to a reader."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    sign = "−" if x < 0 else "+"
+    x = abs(x)
+    for div, unit in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if x >= div:
+            return f"{sign}{x / div:.1f}{unit}"
+    return f"{sign}{x:.0f}"
+
+
+def _bias_strength(score: Any) -> tuple[str, str, str]:
+    """(headline, sub-label, direction) for the market-read gauge.
+
+    The directional score is signed (−100 max bearish … +100 max bullish). A raw
+    red "−90" reads like a failing grade, so the headline is the STRENGTH and the
+    direction goes underneath: "90" / "bearish · of 100"."""
+    try:
+        x = float(score)
+    except (TypeError, ValueError):
+        return "—", "direction", ""
+    direction = "bearish" if x < 0 else ("bullish" if x > 0 else "neutral")
+    return f"{abs(x):.0f}", f"{direction} · of 100", direction
+
+
 # ── Views ───────────────────────────────────────────────────────────────────
 
 def _render_engine_pick(snap: dict) -> str:
@@ -177,53 +248,84 @@ def _render_strategy_grid(snap: dict) -> str:
 
 
 def _render_bias_chip(snap: dict, trust: dict | None) -> str:
+    """Card for the bias_aligned / bias_diverged posts.
+
+    These posts are about the PICK ("the bias now agrees with the engine's
+    pick"), so every number on the card is the picked strategy's own — the
+    composite as the headline and the same stats the strategy-grid card shows
+    (structure, Net / Max P / Max L / POP / EV, health, liquidity, verdict) —
+    plus the engine's graded record on its picks.
+
+    Market-direction data (the bias engine's wall-based score, its label and
+    confidence, GEX, the walls themselves) is deliberately absent: the
+    composite never uses it, and a reader can't connect it to anything on the
+    card. That belongs only on a post that is ABOUT direction — the walls card.
+    """
     sym = str(snap.get("symbol") or "?").upper()
     exp = str(snap.get("expiration") or "")
-    bias = snap.get("bias") or {}
+    pick = snap.get("engine_pick") or {}
     trust = trust or {}
-    label = str(bias.get("bias_label") or "—").replace("_", " ")
-    score = bias.get("directional_score")
-    conf = str(bias.get("confidence") or "")
-    try:
-        accent = "#34d399" if float(score) >= 60 else ("#fb7185" if float(score) <= -60 else "#fbbf24")
-    except (TypeError, ValueError):
-        accent = _DIM
+    if not pick:
+        return _render_engine_pick(snap)              # "no pick" card, same crop semantics
+    health = str(pick.get("health") or "")
+    accent = _HEALTH_COLOR.get(health, "#34d399")
+    name = _STRATEGY_NAMES.get(str(pick.get("strategy") or ""), pick.get("name") or "—")
+    verdict = pick.get("composite_verdict") or {}
+    vlabel = verdict.get("label") if isinstance(verdict, dict) else ""
+    pills = " · ".join(x.upper() for x in (health, f"liq {pick.get('liquidity')}"
+                                          if pick.get("liquidity") else "", vlabel or "") if x)
     rows = "".join([
-        _kv("Bias", f'<span style="color:{accent};">{_esc(label.upper())}</span>'),
-        _kv("Confidence", _esc(conf)),
-        _kv("Net GEX", _num(bias.get("net_gex"), 0)),
-        _kv("Trust", _esc(trust.get("display_text") or "—")),
+        _kv("Structure", _esc(pick.get("structure_text"))),
+        _kv("Net", _money(pick.get("net_premium"))),
+        _kv("Max P / Max L", f"{_money(pick.get('max_profit'))} / {_money(pick.get('max_loss'))}"),
+        _kv("POP", f"{_num(pick.get('pop_pct'), 1)}%"),
+        _kv("EV / Adj EV", f"{_money(pick.get('ev'))} / {_money(pick.get('ev_adjusted'))}"),
+        _kv("Engine record", _esc(_record_line(trust))),
     ])
-    hint = trust.get("hint_text") if trust.get("show_hint") else ""
-    hint_html = (f'<div style="margin-top:12px;color:{_DIM};font-size:13px;line-height:1.5;">'
-                 f'{_esc(hint)}</div>') if hint else ""
-    inner = (_header(sym, exp, right_top=_num(score, 0), right_sub="bias score",
-                     accent=accent, eyebrow="BIAS") +
-             f'  <div style="padding:18px 22px;">'
+    sub = (f'<div style="color:{_DIM};font-size:13px;margin-bottom:12px;">'
+           f'{_esc(name)} · {_esc(pick.get("label") or "")} · '
+           f'<span style="color:{accent};">{_esc(pills)}</span></div>')
+    inner = (_header(sym, exp, right_top=_num(pick.get("composite_score"), 1),
+                     right_sub="composite", accent=accent, eyebrow="ENGINE PICK") +
+             f'  <div style="padding:18px 22px;">{sub}'
              f'<table style="border-collapse:collapse;width:100%;">{rows}</table>'
-             f'{hint_html}{_footer()}</div>')
-    return _doc(f"{sym} — Matrix bias", "bias_chip", inner)
+             f'{_footer()}</div>')
+    return _doc(f"{sym} — Matrix engine pick", "bias_chip", inner)
 
 
 def _render_walls_chip(snap: dict) -> str:
+    """The MARKET READ — the session_open card, and the only card that carries
+    market-direction data: the bias engine's direction and strength, its
+    confidence, net GEX, and the walls. Nothing about the engine's pick."""
     sym = str(snap.get("symbol") or "?").upper()
     exp = str(snap.get("expiration") or "")
     bias = snap.get("bias") or {}
-    spot = snap.get("spot")
+    headline, sub, direction = _bias_strength(bias.get("directional_score"))
+    accent = {"bearish": "#fb7185", "bullish": "#34d399"}.get(direction, "#fbbf24")
+    label = str(bias.get("bias_label") or "—").replace("_", " ")
+
+    def _wall(k: str, strength_key: str | None = None) -> str:
+        v = _num(bias.get(k), 0)
+        st = bias.get(strength_key) if strength_key else None
+        return v + (f' <span style="color:{_MUTE};">{_esc(st)}</span>' if st else "")
+
     rows = "".join([
-        _kv("Spot", _num(spot, 2)),
-        _kv("Call wall", f'{_num(bias.get("call_wall_strike"), 0)} '
-                         f'<span style="color:{_MUTE};">{_esc(bias.get("call_wall_strength") or "")}</span>'),
-        _kv("Put wall", f'{_num(bias.get("put_wall_strike"), 0)} '
-                        f'<span style="color:{_MUTE};">{_esc(bias.get("put_wall_strength") or "")}</span>'),
-        _kv("VEX wall", _num(bias.get("vex_wall_strike"), 0)),
-        _kv("TEX wall", _num(bias.get("tex_wall_strike"), 0)),
-        _kv("Expected move", _num(snap.get("expected_move"), 2)),
+        _kv("Direction", f'<span style="color:{accent};">{_esc(label.upper())}</span>'),
+        _kv("Confidence", _esc(str(bias.get("confidence") or "—"))),
+        _kv("Spot", _num(snap.get("spot"), 2)),
+        _kv("Call wall", _wall("call_wall_strike", "call_wall_strength")),
+        _kv("Put wall", _wall("put_wall_strike", "put_wall_strength")),
+        _kv("VEX / TEX wall", f'{_num(bias.get("vex_wall_strike"), 0)} / '
+                              f'{_num(bias.get("tex_wall_strike"), 0)}'),
+        _kv("Expected move", f'±{_num(snap.get("expected_move"), 2)}'),
+        _kv("Net GEX", _gex(bias.get("net_gex"))),
     ])
-    inner = (_header(sym, exp, eyebrow="KEY LEVELS", accent="#38bdf8") +
+    inner = (_header(sym, exp, right_top=headline, right_sub=sub,
+                     accent=accent, eyebrow="MARKET READ") +
              f'  <div style="padding:18px 22px;">'
-             f'<table style="border-collapse:collapse;width:100%;">{rows}</table>{_footer()}</div>')
-    return _doc(f"{sym} — Matrix key levels", "walls_chip", inner)
+             f'<table style="border-collapse:collapse;width:100%;">{rows}</table>'
+             f'{_footer("dealer positioning")}</div>')
+    return _doc(f"{sym} — Matrix market read", "walls_chip", inner)
 
 
 def _render_win_eval_grid(snap: dict, trust: dict | None, stats: dict | None) -> str:
@@ -245,9 +347,9 @@ def _render_win_eval_grid(snap: dict, trust: dict | None, stats: dict | None) ->
                       f'<span style="color:#fb7185;">{l}L</span> · '
                       f'<span style="color:{_DIM};">{nu}N</span>'),
         _kv("Graded picks", str(n)),
-        _kv("State", _esc(str(trust.get("state") or "").replace("_", " "))),
+        _kv("State", _esc(_engine_state(trust))),
     ])
-    note = trust.get("display_text") or ""
+    note = _record_line(trust, stats)
     inner = (_header(sym, exp, right_top=wr_s, right_sub="win rate",
                      accent=accent, eyebrow="SELF-EVALUATION") +
              f'  <div style="padding:18px 22px;">'

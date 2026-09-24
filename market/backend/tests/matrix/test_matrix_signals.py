@@ -438,6 +438,8 @@ def _good(sym="SPX"):
     """Baseline: bias in sync, and a confirming win behind it."""
     from app.evaluator import state as est
     ms.state.last_trust_state[sym] = "in_sync"
+    ms.state.last_win_rate[sym] = 64.0        # a record worth showing (> 55%)
+    ms.state.last_graded[sym] = 20
     est.regime_alert_active_by_symbol[sym] = False
     est.consec_wins_by_symbol[sym] = 1
 
@@ -547,7 +549,8 @@ async def test_the_chip_carries_the_win_rate_as_its_takeaway(sent, evaluator_sta
     await ms.on_snapshot(_snap(), None); await ms.drain()
     attrs = next(c for c in sent if c["state"] == "pick_selected")["attrs"]
     assert attrs["win_rate"] == "64" and attrs["graded"] == "22"
-    assert attrs["trust_state"] == "in_sync"
+    assert attrs["engine_state"] == "active"
+    assert "trust_state" not in attrs
 
 
 async def test_the_recap_leads_with_the_best_and_keeps_the_worst_as_context(
@@ -597,7 +600,7 @@ async def _recover_at(evaluator_state, pct, n=20):
     evaluator_state.regime_alert_active_by_symbol["SPX"] = False    # pause lifts
 
 
-@pytest.mark.parametrize("pct", [10.0, 15.0, 45.0])
+@pytest.mark.parametrize("pct", [10.0, 15.0, 45.0, 55.0])
 async def test_a_recovery_with_a_bad_record_is_not_notable(sent, evaluator_state, pct):
     await _recover_at(evaluator_state, pct)
     sent.clear()
@@ -607,9 +610,9 @@ async def test_a_recovery_with_a_bad_record_is_not_notable(sent, evaluator_state
 
 
 async def test_a_recovery_with_a_good_record_is_notable(sent, evaluator_state):
-    await _recover_at(evaluator_state, 55.0)
+    await _recover_at(evaluator_state, 60.0)
     sent.clear()
-    await ms.on_evaluation(_FakeDB(pct=55.0), _FakePoller(_snap()), _Settings())
+    await ms.on_evaluation(_FakeDB(pct=60.0), _FakePoller(_snap()), _Settings())
     await ms.drain()
     hit = [c for c in sent if c["state"] == "win_rate_notable"]
     assert hit and hit[0]["attrs"]["reason"] == "recovery"
@@ -621,3 +624,92 @@ async def test_a_recovery_on_a_tiny_sample_is_not_notable(sent, evaluator_state)
     await ms.on_evaluation(_FakeDB(n=4, pct=80.0), _FakePoller(_snap()), _Settings())
     await ms.drain()
     assert "win_rate_notable" not in _states(sent)
+
+
+
+# ── one quality bar: > 55% on a real sample, for anything showing a record ──
+
+async def test_a_pick_beside_a_losing_record_is_not_announced(sent, evaluator_state):
+    _good()
+    ms.state.last_win_rate["SPX"] = 45.0
+    await ms.on_snapshot(_snap(), None); await ms.drain()
+    assert "pick_selected" not in _states(sent)
+
+
+async def test_exactly_55_is_not_over_the_bar(sent, evaluator_state):
+    _good()
+    ms.state.last_win_rate["SPX"] = 55.0
+    await ms.on_snapshot(_snap(), None); await ms.drain()
+    assert "pick_selected" not in _states(sent)
+
+
+async def _flip(evaluator_state, prev, pct, cur_alert=False, prev_wr=None, n=20):
+    """Seed a previous trust state, then run one sweep that lands on the new one."""
+    ms.state.last_trust_state["SPX"] = prev
+    if prev_wr is not None:
+        ms.state.last_win_rate["SPX"] = prev_wr
+        ms.state.last_graded["SPX"] = n
+    evaluator_state.regime_alert_active_by_symbol["SPX"] = cur_alert
+    await ms.on_evaluation(_FakeDB(n=n, pct=pct), _FakePoller(_snap()), _Settings())
+    await ms.drain()
+
+
+async def test_bias_aligned_at_45_percent_is_not_posted(sent, evaluator_state):
+    """The 2026-09-23 card: 'the bias now agrees' beside a 45% record."""
+    await _flip(evaluator_state, "calibrating", 45.0)
+    assert "bias_aligned" not in _states(sent)
+
+
+async def test_bias_aligned_with_a_strong_record_is_posted(sent, evaluator_state):
+    await _flip(evaluator_state, "calibrating", 64.0)
+    assert "bias_aligned" in _states(sent)
+
+
+async def test_a_low_confidence_wobble_is_never_posted(sent, evaluator_state):
+    """Not every divergence — a confidence dip is noise, not news."""
+    from app.poller import state as ps
+    await _flip(evaluator_state, "in_sync", 64.0, prev_wr=64.0)   # baseline in sync
+    sent.clear()
+    snap = _snap()
+    snap["bias"] = dict(snap["bias"], confidence="low")
+    ps.latest_by_symbol["SPX"] = snap
+    try:
+        await ms.on_evaluation(_FakeDB(pct=64.0), _FakePoller(snap), _Settings())
+        await ms.drain()
+    finally:
+        ps.latest_by_symbol.pop("SPX", None)
+    assert "bias_diverged" not in _states(sent)
+
+
+async def test_a_real_pause_off_a_shown_record_is_posted(sent, evaluator_state):
+    """The one divergence worth saying out loud: we were showing a good record
+    and the engine has now paused itself on a genuine loss streak."""
+    await _flip(evaluator_state, "in_sync", 30.0, cur_alert=True, prev_wr=64.0)
+    assert "bias_diverged" in _states(sent)
+
+
+async def test_a_pause_with_no_shown_record_is_not_posted(sent, evaluator_state):
+    await _flip(evaluator_state, "in_sync", 30.0, cur_alert=True, prev_wr=40.0)
+    assert "bias_diverged" not in _states(sent)
+
+
+
+# ── engine vs market: never mixed ──────────────────────────────────────────
+
+async def test_a_low_bias_confidence_never_reaches_a_pick_event(sent, evaluator_state):
+    """low_conf is the BIAS engine's confidence — market data. On a pick event
+    the engine is simply active."""
+    _good()
+    ms.state.last_trust_state["SPX"] = "low_conf"
+    ms.state.pick_blocked["SPX"] = False
+    attrs = ms._pick_summary(_snap()["engine_pick"], "SPX")
+    assert attrs["engine_state"] == "active"
+    assert "low" not in " ".join(attrs.values()).lower()
+
+
+async def test_session_open_carries_the_market_read(sent):
+    await ms.on_snapshot(_snap(), None); await ms.drain()
+    attrs = next(c for c in sent if c["state"] == "session_open")["attrs"]
+    assert attrs["bias_direction"] == "bearish" and attrs["bias_strength"] == "80"
+    assert attrs["confidence"] == "high"
+    assert "composite_score" not in attrs            # no engine data on the market read

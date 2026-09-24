@@ -183,3 +183,41 @@ def test_rendered_values_are_escaped(client):
     r = client.get(f"/matrix/snap/{SYM}", headers=_auth())
     assert "<img src=x" not in r.text
     assert "&lt;img" in r.text
+
+
+def test_bias_chip_headlines_the_winning_cards_composite(client):
+    """The post is about the pick — its number is the pick's composite (0–100),
+    not the bias engine's signed wall reading."""
+    r = client.get(f"/matrix/snap/{SYM}", headers=_auth(), params={"view": "bias_chip"})
+    html = r.text
+    assert ">86.1<" in html and ">composite<" in html     # fixture pick composite
+    assert "-80" not in html and "−80" not in html          # fixture directional score
+    assert "Bear Call" in html
+    # the pick's own stats, not market-direction data
+    assert "Max P / Max L" in html and "POP" in html
+    assert "BEARISH" not in html and "Confidence" not in html and "Net GEX" not in html
+
+
+
+def test_market_read_card_has_direction_and_walls_but_no_pick(client):
+    html = client.get(f"/matrix/snap/{SYM}", headers=_auth(),
+                      params={"view": "walls_chip"}).text
+    assert "MARKET READ" in html and "bearish · of 100" in html and ">80<" in html
+    assert "7800" in html and "7700" in html                  # walls
+    assert "−1.2B" in html                                    # readable GEX
+    assert "composite" not in html.lower() and "Bear Call" not in html
+
+
+def test_engine_cards_carry_no_market_verbiage(client, monkeypatch):
+    """The accuracy route appends '— lower-conviction read' when BIAS confidence
+    is low. That must never land on an engine card."""
+    from app.routes import matrix as mroute
+    trust = {"state": "low_conf", "win_rate": 64.0, "graded": 20, "tier": "green",
+             "display_text": "64% win rate (20 graded) — lower-conviction read"}
+    stats = {"n": 20, "wins": 13, "losses": 3, "neutrals": 4}
+    monkeypatch.setattr(mroute, "_accuracy_view", lambda sym: (trust, stats))
+    for view in ("win_eval_grid", "bias_chip"):
+        html = client.get(f"/matrix/snap/{SYM}", headers=_auth(), params={"view": view}).text
+        assert "lower-conviction" not in html, view
+        assert "low conf" not in html and "low_conf" not in html, view
+        assert "64% win rate (20 graded picks)" in html, view

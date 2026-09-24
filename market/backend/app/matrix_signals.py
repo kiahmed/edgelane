@@ -42,13 +42,16 @@ _SESSION_TZ = ZoneInfo("America/New_York")      # same trading day boundary as e
 _DIGEST_MIN_HOURS = 60.0          # ~2.5 days
 _DIGEST_MIN_CHANGED = 3           # of the 8 strategy cards
 
-# The bar a rolling win rate must clear before a "recovery" is worth announcing.
-# A losing streak ending is not by itself notable: two consecutive wins clear the
-# regime pause even when the 20-pick window still reads 10% (the 2026-09-22
-# incident — see docs/matrix_events_update.md). The post DISPLAYS the rolling
-# number, so the rolling number is what has to be good. 50% of graded picks won
-# (neutrals count against it) means wins at least match losses-plus-pushes.
-_NOTABLE_MIN_WIN_PCT = 50.0
+# THE quality bar for any post that puts a win rate in front of the world.
+#
+# Policy (set by the product owner, 2026-09-23): the engine only speaks when it
+# has something worth showing. A win rate at or below this is not a showcase,
+# so no event that DISPLAYS one — a pick, a bias flip, a recovery — goes out
+# unless the rolling rate is strictly above it, on at least eval_min_graded
+# picks. (pct is wins/n with neutrals in the denominator, so this is a real bar.)
+# The 2026-09-22 incident (10% / 15% "notable" posts) and the 2026-09-23 one (a
+# bias_aligned card at 45%) are both what happens without it.
+_SHOW_MIN_WIN_PCT = 55.0
 
 # pick_result: how long to keep waiting for a posted pick's outcome before
 # giving up (a run that never closes, or closes after the session and is never
@@ -86,6 +89,7 @@ class MatrixSignalState:
         # Last published win rate, carried onto the pick chip as its takeaway.
         self.last_win_rate: dict[str, float | None] = {}
         self.last_graded: dict[str, int] = {}
+        self.min_graded: int = 10              # mirrors settings.eval_min_graded
         self.last_trust_state: dict[str, str] = {}
         self.last_win_tier: dict[str, str] = {}
         self.last_regime_alert: dict[str, bool] = {}
@@ -200,6 +204,15 @@ _UNPOSTABLE_HEALTH = {"broken", "capital_trap", "do_not_trade"}
 _UNPOSTABLE_VERDICT = ("do not trade", "skip")
 
 
+def _record_worth_showing(pct: Any, graded: Any, min_graded: int) -> bool:
+    """Is this track record something to show the world? Strictly above the bar,
+    on a real sample. Unknown ⇒ no."""
+    try:
+        return int(graded or 0) >= min_graded and float(pct) > _SHOW_MIN_WIN_PCT
+    except (TypeError, ValueError):
+        return False
+
+
 def _recovery_earned(sym: str) -> bool:
     """Has the engine actually proven itself since it was last suppressed?
 
@@ -235,7 +248,19 @@ def _pick_block_reason(sym: str, pick: dict) -> str | None:
         return f"bias={trust or 'unknown'}"
     if state.pick_blocked.get(sym) and not _recovery_earned(sym):
         return "awaiting-confirming-win"
+    # The chip's takeaway is the engine's record — a pick announced beside a
+    # losing record undercuts itself.
+    wr, graded = state.last_win_rate.get(sym), state.last_graded.get(sym)
+    if not _record_worth_showing(wr, graded, state.min_graded):
+        return f"record={wr if wr is not None else 'unknown'}% over {graded or 0}"
     return None
+
+def _engine_state(trust_state: Any) -> str:
+    """paused | calibrating | active — `low_conf` is bias-derived, so on anything
+    about the engine it counts as active."""
+    st = str(trust_state or "")
+    return st if st in ("paused", "calibrating") else ("active" if st else "")
+
 
 def _pick_summary(pick: dict, sym: str = "") -> dict[str, str]:
     """Compact attributes carried alongside a pick chip.
@@ -248,7 +273,10 @@ def _pick_summary(pick: dict, sym: str = "") -> dict[str, str]:
     extra = {
         "win_rate": ("" if wr is None else f"{float(wr):.0f}"),
         "graded": str(state.last_graded.get(sym, "") or ""),
-        "trust_state": str(state.last_trust_state.get(sym) or ""),
+        # The ENGINE's own state (paused | calibrating | active). Not the raw
+        # trust state: its `low_conf` comes from the bias engine's confidence —
+        # market data, which must not ride on a pick event.
+        "engine_state": _engine_state(state.last_trust_state.get(sym)),
     } if sym else {}
     return {**extra,
         "strategy": str(pick.get("strategy") or ""),
@@ -456,9 +484,20 @@ async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
         #    worth a chip.
         if state.session_open_date.get(sym) != today and _walls_worth_showing(bias):
             state.session_open_date[sym] = today
+            # The market read: walls + the bias engine's direction. This is the
+            # one event that is ABOUT direction, so it's the one that carries it.
             attrs = {k: str(bias.get(k)) for k in
-                     ("call_wall_strike", "put_wall_strike", "vex_wall_strike", "tex_wall_strike")
+                     ("call_wall_strike", "put_wall_strike", "vex_wall_strike", "tex_wall_strike",
+                      "bias_label", "confidence")
                      if bias.get(k) is not None}
+            try:
+                ds = float(bias.get("directional_score"))
+                attrs["bias_direction"] = "bearish" if ds < 0 else ("bullish" if ds > 0 else "neutral")
+                attrs["bias_strength"] = f"{abs(ds):.0f}"
+            except (TypeError, ValueError):
+                pass
+            if snap.get("expected_move") is not None:
+                attrs["expected_move"] = str(snap.get("expected_move"))
             published.append(_fire(sym, "session_open", expiry, attrs))
 
         # 3. grid_digest — enough of the grid moved, and it has been long enough.
@@ -496,6 +535,7 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
         symbols = list(getattr(poller_state, "latest_by_symbol", {}) or {})
         today = _et_date()
         min_graded = int(getattr(settings, "eval_min_graded", 10))
+        state.min_graded = min_graded
         green = float(getattr(settings, "pill_green_pct", 60.0))
         red = float(getattr(settings, "pill_red_pct", 40.0))
         window = int(getattr(settings, "eval_rolling_window", 20))
@@ -522,6 +562,30 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
                 was, now = prev_state == "in_sync", cur_state == "in_sync"
                 if was != now:
                     ev = "bias_aligned" if now else "bias_diverged"
+                    # Not every flip is news. The engine posts a bias change only
+                    # when it says something true and worth showing:
+                    #   aligned  — bias agrees AND the record behind it clears
+                    #              the show bar (else "it agrees" means nothing)
+                    #   diverged — only a real PAUSE (a genuine loss streak) off a
+                    #              record we had been showing. low_conf/calibrating
+                    #              wobbles are noise, never posted.
+                    good = _record_worth_showing(trust.get("win_rate") if now else pct,
+                                                 graded, min_graded)
+                    if now:
+                        meaningful = good
+                        why = "record below the show bar"
+                    else:
+                        prior_good = _record_worth_showing(
+                            state.last_win_rate.get(sym), state.last_graded.get(sym),
+                            min_graded)
+                        meaningful = cur_state == "paused" and prior_good
+                        why = ("not a real pause" if cur_state != "paused"
+                               else "no shown record to retract")
+                    if not meaningful:
+                        log.info("[matrix-signals] %s %s suppressed (%s>%s, %s)",
+                                 sym, ev, prev_state, cur_state, why)
+                        ev = None
+                if was != now and ev:
                     published.append(_fire(sym, ev, expiry, disc=matrix_events.discriminator(
                         f"{prev_state}>{cur_state}"), attrs={
                         "trust_state": cur_state,
@@ -545,13 +609,13 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
             # in a row could announce a 10% record as "notable".
             lifted = prev_alert is True and alert is False
             recovered = (lifted and graded >= min_graded
-                         and pct >= _NOTABLE_MIN_WIN_PCT)
+                         and pct > _SHOW_MIN_WIN_PCT)
             crossed_green = (prev_tier is not None and prev_tier != "green"
                              and tier == "green" and graded >= min_graded)
             if lifted and not recovered:
                 log.info("[matrix-signals] %s win_rate_notable suppressed "
                          "(recovery at %.0f%% over %d graded — below the %.0f%% bar)",
-                         sym, pct, graded, _NOTABLE_MIN_WIN_PCT)
+                         sym, pct, graded, _SHOW_MIN_WIN_PCT)
             if recovered or crossed_green:
                 reason = "recovery" if recovered else "win_streak"
                 published.append(_fire(sym, "win_rate_notable", expiry,

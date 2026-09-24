@@ -161,6 +161,8 @@ async def test_the_result_threads_under_its_announcement(sent, monkeypatch):
     est.regime_alert_active_by_symbol.clear()
     est.consec_wins_by_symbol["SPX"] = 1
     ms.state.last_trust_state["SPX"] = "in_sync"
+    ms.state.last_win_rate["SPX"] = 64.0
+    ms.state.last_graded["SPX"] = 20
 
     snap = {
         "symbol": SYM, "expiration": "2026-09-02",

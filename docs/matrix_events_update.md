@@ -324,3 +324,55 @@ keys, a hook in `evaluator.py`'s existing sweep, `app/matrix_snap.py`,
 `/matrix/state/*` + `/matrix/snap/*` routes, and the `matrix-api-token`
 equivalent of `simmer-api-token`. Nothing about Simmer's own topic, publisher,
 or endpoints changes.
+
+## Policy (2026-09-23): the engine only posts what's worth showing
+
+Set by the product owner after going round on this several times: **the engine
+itself judges whether an event is meaningful; only then does it post.** Not
+every flip, not every pick, not every recovery.
+
+One bar for anything that puts a track record in front of the world —
+`matrix_signals._SHOW_MIN_WIN_PCT = 55.0`, **strictly above**, on at least
+`eval_min_graded` picks:
+
+| event | posts only when |
+|---|---|
+| `pick_selected` | all earlier gates **and** the record it carries as its takeaway is > 55% |
+| `bias_aligned` | bias agrees **and** the record behind it is > 55% (the 2026-09-23 card went out at 45%) |
+| `bias_diverged` | a real **pause** (genuine loss streak) off a record we had been showing. `low_conf` / `calibrating` wobbles never post |
+| `win_rate_notable` | recovery now needs > 55% (was ≥ 50%); `crossed_green` is ≥ 60% already |
+| `pick_result` | unchanged — it reports on a pick we already posted, and gating that on the record would be cherry-picking |
+
+Every suppression logs why, e.g. `bias_aligned suppressed (calibrating>in_sync,
+record below the show bar)`.
+
+**Bias chip (corrected):** the `bias_aligned` / `bias_diverged` posts are about the PICK, so the card carries only the picked strategy's own numbers — composite as the headline, then structure, Net, Max P / Max L, POP, EV / Adj EV, health / liquidity / verdict, and the engine's graded record. No market-direction data (the bias engine's wall-based score, its label/confidence, GEX, walls): the composite never uses it. That belongs only on a post that is *about* direction — `walls_chip` / `session_open`.
+
+## Engine vs market — kept apart (2026-09-23)
+
+Matrix has two independent opinions, and no card or event mixes them:
+
+| | ENGINE | MARKET |
+|---|---|---|
+| what | the picked strategy, its composite (0–100), the graded record of picks | the bias engine's direction (signed −100…+100 from dealer walls), confidence, GEX, walls |
+| cards | `engine_pick`, `bias_chip` (a pick card for the bias posts), `strategy_grid`, `win_eval_grid` | `walls_chip` only — the **market read** |
+| events | `pick_selected`, `pick_result`, `win_rate_notable`, `grid_digest`, `daily_recap`, `bias_*` | `session_open` |
+
+The composite never uses the market read, so putting one on the other's card
+gives the reader a number or a word they can't trace to what the post is about.
+
+* **`walls_chip` is now the full market read** (the `session_open` card):
+  direction + strength headline (`90` / `bearish · of 100`, never a red `−90`),
+  confidence, spot, call/put walls with strength, VEX/TEX, expected move, net
+  GEX in readable units. Nothing about the pick. `session_open` carries the same
+  as attributes: `bias_label`, `bias_direction`, `bias_strength`, `confidence`,
+  `expected_move`, the walls.
+* **Leak fixed on the engine cards.** The accuracy route's `display_text`
+  appends "— lower-conviction read" when the **bias** confidence is low, and
+  its `state` can be `low_conf` for the same reason. `win_eval_grid` and the
+  pick card's record row now build their wording from engine facts only
+  (`paused` / `calibrating` / `active`).
+* **Pick events no longer carry `trust_state`** (it can be the bias-derived
+  `low_conf`); they carry `engine_state` instead. **Postiz: if a template reads
+  `trust_state` on `pick_selected` / `pick_result`, switch it to `engine_state`.**
+  The `bias_*` events keep `trust_state` — they are about that relationship.
