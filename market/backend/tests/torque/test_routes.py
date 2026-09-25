@@ -382,6 +382,20 @@ async def test_orders_endpoint_shows_pending_watcher():
     assert "uid" not in r["watchers"][0]        # caller identity is never leaked out
 
 
+async def test_orders_endpoint_surfaces_a_stop_needing_attention():
+    """stop_needs_attention means the ladder refused to resubmit rather than
+    risk an over-close — nothing is on the book, so the watcher itself is the
+    only place this is ever visible. It must not be filtered out just because
+    it's not "watching_fill" anymore."""
+    client = FakeTradier(orders=[])
+    troute._WATCHERS["77"] = {"entry_order_id": "77", "symbol": "NDX", "strategy": "bull_call",
+                              "state": "stop_needs_attention",
+                              "stop_note": "order 501 left an unconfirmed final state...",
+                              "done": True, "uid": DEV["id"]}
+    r = await torque_orders(FakeRequest(client), account_id="T", user=DEV)
+    assert len(r["watchers"]) == 1 and r["watchers"][0]["state"] == "stop_needs_attention"
+
+
 async def test_orders_endpoint_hides_other_users_watchers():
     # _WATCHERS is process-global; a watcher placed by another user must NOT show
     # up in this caller's orders panel (cross-user isolation).
@@ -410,14 +424,19 @@ async def test_place_stamps_caller_uid_on_watcher():
 
 
 async def test_cancel_endpoint():
-    client = FakeTradier()
+    # FakeTradier's cancel_order now mirrors real broker semantics (cancelling
+    # an already-filled order fails) — use a cancelable (non-filled) status so
+    # this test exercises the route's plumbing, not that specific edge case.
+    client = FakeTradier(order_status={"status": "open"})
     r = await torque_cancel("2", FakeRequest(client), account_id="T", user=DEV)
     assert r["order_id"] == "2"
 
 
 async def test_modify_endpoint_changes_price():
     from app.routes.torque import torque_modify, ModifyRequest
-    client = FakeTradier()
+    # FakeTradier's modify_order now mirrors real broker semantics (modifying
+    # an already-filled order fails) — use a modifiable (non-filled) status.
+    client = FakeTradier(order_status={"status": "open"})
     r = await torque_modify("2", ModifyRequest(price=24.5, account_id="T"), FakeRequest(client), user=DEV)
     assert r["order_id"] == "2"
     assert any(p.get("_modify") == "2" and p.get("price") == 24.5 for p in client.placed)

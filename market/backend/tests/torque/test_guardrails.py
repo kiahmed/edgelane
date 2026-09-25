@@ -99,6 +99,283 @@ def test_djx_has_a_stop_default_and_tight_names_do_not():
         assert tc.stop_loss_default(t) is None
 
 
+# ── stop-limit gap risk: a limit only guarantees price, never a fill ───────
+async def test_stalled_stop_limit_requotes_via_modify_before_touching_market(monkeypatch):
+    """A violent move can leave a stop-exit limit resting while the market
+    keeps running away — the old code submitted it once and never checked
+    again. It must now keep watching, and when a limit stalls, re-quote the
+    SAME resting order in place (MODIFY, not cancel-and-replace) at a fresh
+    bounded price rather than reaching for an unbounded market order — a
+    multileg market order has NO price protection and can clear worse than
+    the quoted book itself. Only after STOP_MAX_REQUOTES real re-quotes still
+    don't fill does it freeze and give up on price entirely."""
+    monkeypatch.setattr(tq, "_STOP_INTERVAL", 0.01)
+
+    async def _fake_price(client, symbol, legs):
+        return {"complete": True, "net_bid": 0.60, "net_ask": 0.64, "abs_mid": 0.62}
+    monkeypatch.setattr(tq, "_package_price", _fake_price)
+
+    client = FakeTradier(order_status={"status": "open"})   # every limit sits unfilled forever
+    w = {}
+    legs = [{"symbol": "NDXP123", "action": "buy_to_open", "quantity": 1}]
+    await tq._monitor_stop(
+        client, "T", w, legs=legs, symbol="NDX", strategy="long_call", is_single=True,
+        entry_type="debit", entry_fill=1.00, stop_pct=30.0, tick=0.05, quantity=1,
+        close_order_id=None)
+
+    assert w["state"] == "stop_market_placed"
+    assert w["stop_market_fallback"] is True
+    assert "no bounded fill after" in w["stop_note"]
+
+    modifies = [p for p in client.placed if "_modify" in p]
+    real_orders = [p for p in client.placed if "_modify" not in p]
+    # every stall re-quoted the SAME order via modify — never a new one — for
+    # exactly STOP_MAX_REQUOTES rounds, all still bounded to the live quote
+    assert len(modifies) == tc.STOP_MAX_REQUOTES
+    assert all(m["_modify"] == "1001" for m in modifies)
+    assert all(m["price"] == 0.60 for m in modifies)
+    # only two REAL orders ever hit the book: the initial bounded limit, and
+    # the final unbounded market fallback once every requote was exhausted
+    assert len(real_orders) == 2
+    assert real_orders[0]["type"] == "limit" and real_orders[0]["price"] == "0.60"
+    assert real_orders[1]["type"] == "market" and "price" not in real_orders[1]
+    assert real_orders[1]["tag"] == "torqueStopMktlongcall"   # distinct tag flags the fallback
+
+
+async def test_stop_limit_that_fills_promptly_never_escalates(monkeypatch):
+    """The escalation path must not fire on the ordinary case — a stop-limit
+    that fills quickly should never see a second order at all."""
+    monkeypatch.setattr(tq, "_STOP_INTERVAL", 0.01)
+
+    async def _fake_price(client, symbol, legs):
+        return {"complete": True, "net_bid": 0.60, "net_ask": 0.64, "abs_mid": 0.62}
+    monkeypatch.setattr(tq, "_package_price", _fake_price)
+
+    client = FakeTradier(order_status={"status": "filled"})
+    w = {}
+    legs = [{"symbol": "NDXP123", "action": "buy_to_open", "quantity": 1}]
+    await tq._monitor_stop(
+        client, "T", w, legs=legs, symbol="NDX", strategy="long_call", is_single=True,
+        entry_type="debit", entry_fill=1.00, stop_pct=30.0, tick=0.05, quantity=1,
+        close_order_id=None)
+
+    assert w["state"] == "stop_filled"
+    assert len(client.placed) == 1   # no requote, no market escalation needed
+
+
+async def test_wide_book_block_is_not_permanent_and_still_starts_with_a_limit(monkeypatch):
+    """STOP_MAX_EXIT_SPREAD_PCT refuses to cross a garbage book on the FIRST
+    breach tick, but that refusal must not be permanent — an open loss parked
+    forever while the book stays wide is worse than one bounded crossing.
+    Once it hands off, the FIRST attempt is still a bounded limit at the
+    quoted price, not an immediate blind market order."""
+    monkeypatch.setattr(tq, "_STOP_INTERVAL", 0.01)
+
+    async def _fake_wide_price(client, symbol, legs):
+        # mid well below the 30% stop threshold (entry 5.22 -> triggers at
+        # <=3.654) AND ~198% of mid wide — both breached and un-crossable.
+        return {"complete": True, "net_bid": 0.05, "net_ask": 6.00, "abs_mid": 3.00}
+    monkeypatch.setattr(tq, "_package_price", _fake_wide_price)
+
+    client = FakeTradier(order_status={"status": "open"})   # book stays bad; nothing ever fills
+    w = {}
+    legs = [{"symbol": "DJXW123", "action": "buy_to_open", "quantity": 1}]
+    await tq._monitor_stop(
+        client, "T", w, legs=legs, symbol="DJX", strategy="long_call", is_single=True,
+        entry_type="debit", entry_fill=5.22, stop_pct=30.0, tick=0.05, quantity=1,
+        close_order_id=None)
+
+    assert w["state"] == "stop_market_placed"          # still eventually escalates
+    assert w["stop_market_fallback"] is True
+    assert client.placed[0]["type"] == "limit"          # ...but starts bounded, not blind
+    assert client.placed[-1]["type"] == "market"        # market is the last resort, not the first
+
+
+# ── over-close safety: never resubmit blind after a stalled poll ───────────
+async def test_fill_landing_between_poll_and_cancel_does_not_over_close(monkeypatch):
+    """A fill can land in the window between the last status poll and the
+    cancel call — especially likely right when a stop fires, since a fast
+    move is exactly what triggers both the stop AND a fill. The old code only
+    logged a warning on a failed cancel and resubmitted anyway, sending a
+    duplicate closing order on top of a position that was already flat (which
+    fills into a fresh naked position the moment there's nothing left to
+    close against). The ladder must re-confirm the order's true state instead
+    of trusting that a timed-out poll means "still open"."""
+    monkeypatch.setattr(tq, "_STOP_INTERVAL", 0.01)
+
+    async def _fake_price(client, symbol, legs):
+        return {"complete": True, "net_bid": 0.60, "net_ask": 0.64, "abs_mid": 0.62}
+    monkeypatch.setattr(tq, "_package_price", _fake_price)
+
+    # id 1001 is the first (and only) order this run places — open for both
+    # polls inside the grace window, but has actually filled by the time
+    # _resolve_stalled_stop re-checks it (after the failed cancel attempt).
+    client = FakeTradier(order_status_by_id={
+        "1001": [{"status": "open"}, {"status": "open"}, {"status": "filled"}],
+    })
+    w = {}
+    legs = [{"symbol": "NDXP123", "action": "buy_to_open", "quantity": 1}]
+    await tq._monitor_stop(
+        client, "T", w, legs=legs, symbol="NDX", strategy="long_call", is_single=True,
+        entry_type="debit", entry_fill=1.00, stop_pct=30.0, tick=0.05, quantity=1,
+        close_order_id=None)
+
+    assert w["state"] == "stop_filled"
+    assert len(client.placed) == 1   # exactly one closing order — no duplicate on top of it
+
+
+async def test_partial_fill_only_replaces_the_remaining_quantity(monkeypatch):
+    """A stop order that filled 3 of 5 and stays resting for the remainder
+    keeps getting re-quoted via modify (the broker tracks its own remaining
+    open quantity) through every requote round. Only once requotes are
+    exhausted and the ladder must finally give up on that order does it need
+    to know how much is actually left — and it must size the market fallback
+    for exactly that (5 - 3 = 2), not the original full 5, which would close
+    2 contracts that no longer exist and open a fresh naked position on the
+    excess."""
+    monkeypatch.setattr(tq, "_STOP_INTERVAL", 0.01)
+
+    async def _fake_price(client, symbol, legs):
+        return {"complete": True, "net_bid": 0.60, "net_ask": 0.64, "abs_mid": 0.62}
+    monkeypatch.setattr(tq, "_package_price", _fake_price)
+
+    # order 1001 (the only order ever placed here) sits partially filled for
+    # every poll and every modify attempt — never fully fills on its own.
+    client = FakeTradier(
+        order_status_by_id={"1001": {"status": "partially_filled", "exec_quantity": 3.0}},
+    )
+    w = {}
+    legs = [{"symbol": "NDXP123", "action": "buy_to_open", "quantity": 1}]
+    await tq._monitor_stop(
+        client, "T", w, legs=legs, symbol="NDX", strategy="long_call", is_single=True,
+        entry_type="debit", entry_fill=1.00, stop_pct=30.0, tick=0.05, quantity=5,
+        close_order_id=None)
+
+    assert w["state"] == "stop_market_placed"
+    real_orders = [p for p in client.placed if "_modify" not in p]
+    modifies = [p for p in client.placed if "_modify" in p]
+    assert len(modifies) == tc.STOP_MAX_REQUOTES     # kept chasing the same order the whole time
+    assert len(real_orders) == 2                     # original attempt + the market fallback
+    assert real_orders[0]["quantity"] == "5"          # original was sized for the full position
+    assert real_orders[1]["quantity"] == "2"          # fallback only for what's left (5 - 3 filled)
+    assert real_orders[1]["type"] == "market"
+
+
+# ── TP → SL handoff: cancelling/racing the profit-target close ─────────────
+_VERTICAL_LEGS = [
+    {"symbol": "NDXP123C1", "side": "call", "strike": 22000.0, "action": "buy_to_open", "quantity": 1},
+    {"symbol": "NDXP123C2", "side": "call", "strike": 22100.0, "action": "sell_to_open", "quantity": 1},
+]
+
+
+async def test_manually_cancelled_tp_with_no_fill_still_lets_sl_fire_for_the_full_size(monkeypatch):
+    """Cancelling the resting profit-target close by hand (Orders panel) must
+    not silently disable the stop — it's a live concern the user raised after
+    observing what looked like a stop failing to fire post-cancel. A TP
+    cancelled with nothing filled must still protect the FULL original
+    multi-leg position, not a subset of its legs."""
+    monkeypatch.setattr(tq, "_STOP_INTERVAL", 0.01)
+
+    async def _fake_price(client, symbol, legs):
+        return {"complete": True, "net_bid": 0.60, "net_ask": 0.64, "abs_mid": 0.62}
+    monkeypatch.setattr(tq, "_package_price", _fake_price)
+
+    client = FakeTradier(
+        order_status_by_id={"9001": {"status": "canceled", "exec_quantity": 0.0}},
+        order_status={"status": "filled"},   # the SL order itself fills promptly
+    )
+    w = {}
+    await tq._monitor_stop(
+        client, "T", w, legs=_VERTICAL_LEGS, symbol="NDX", strategy="bull_call", is_single=False,
+        entry_type="debit", entry_fill=1.00, stop_pct=30.0, tick=0.05, quantity=5,
+        close_order_id="9001")
+
+    assert w["state"] == "stop_filled"
+    real_orders = [p for p in client.placed if "_modify" not in p]
+    assert len(real_orders) == 1
+    sl = real_orders[0]
+    assert sl["quantity[0]"] == "5" and sl["quantity[1]"] == "5"   # full size, both legs
+    assert sl["option_symbol[0]"] == "NDXP123C1" and sl["option_symbol[1]"] == "NDXP123C2"
+
+
+async def test_partially_filled_tp_hands_off_only_the_truly_remaining_quantity(monkeypatch):
+    """A resting TP that had already filled 2 of 5 units when the stop fires
+    (naturally, or right as the caller cancels it) must not have its 5 units
+    blindly re-closed — that closes 2 units that no longer exist. The stop
+    must protect only the 3 units TP left open, on every leg."""
+    monkeypatch.setattr(tq, "_STOP_INTERVAL", 0.01)
+
+    async def _fake_price(client, symbol, legs):
+        return {"complete": True, "net_bid": 0.60, "net_ask": 0.64, "abs_mid": 0.62}
+    monkeypatch.setattr(tq, "_package_price", _fake_price)
+
+    client = FakeTradier(
+        order_status_by_id={"9002": {"status": "partially_filled", "exec_quantity": 2.0}},
+        order_status={"status": "filled"},
+    )
+    w = {}
+    await tq._monitor_stop(
+        client, "T", w, legs=_VERTICAL_LEGS, symbol="NDX", strategy="bull_call", is_single=False,
+        entry_type="debit", entry_fill=1.00, stop_pct=30.0, tick=0.05, quantity=5,
+        close_order_id="9002")
+
+    assert w["state"] == "stop_filled"
+    real_orders = [p for p in client.placed if "_modify" not in p]
+    assert len(real_orders) == 1
+    sl = real_orders[0]
+    assert sl["quantity[0]"] == "3" and sl["quantity[1]"] == "3"   # 5 - 2 already filled by TP
+
+
+async def test_tp_that_actually_filled_right_at_breach_stands_down_without_a_stop(monkeypatch):
+    """A race where TP fills in the gap between the loop's own top-of-tick
+    check and the stop's takeover must be caught too — firing a stop-exit on
+    top of a position TP already fully closed opens a fresh naked position
+    from nothing."""
+    monkeypatch.setattr(tq, "_STOP_INTERVAL", 0.01)
+
+    async def _fake_price(client, symbol, legs):
+        return {"complete": True, "net_bid": 0.60, "net_ask": 0.64, "abs_mid": 0.62}
+    monkeypatch.setattr(tq, "_package_price", _fake_price)
+
+    # "open" for the loop's own top-of-tick check (doesn't trip the early
+    # return), "filled" by the time the takeover re-checks it.
+    client = FakeTradier(order_status_by_id={"9003": [{"status": "open"}, {"status": "filled"}]})
+    w = {}
+    await tq._monitor_stop(
+        client, "T", w, legs=_VERTICAL_LEGS, symbol="NDX", strategy="bull_call", is_single=False,
+        entry_type="debit", entry_fill=1.00, stop_pct=30.0, tick=0.05, quantity=5,
+        close_order_id="9003")
+
+    assert w["state"] == "closed_at_target"
+    assert len([p for p in client.placed if "_modify" not in p]) == 0   # no stop order ever placed
+
+
+async def test_tp_unconfirmable_before_handoff_freezes_instead_of_guessing(monkeypatch):
+    """If the TP order's true final state can't be confirmed at all (cancel
+    and the follow-up read both fail), the handoff must refuse to guess how
+    much is still open rather than risk an over-close either way."""
+    monkeypatch.setattr(tq, "_STOP_INTERVAL", 0.01)
+
+    async def _fake_price(client, symbol, legs):
+        return {"complete": True, "net_bid": 0.60, "net_ask": 0.64, "abs_mid": 0.62}
+    monkeypatch.setattr(tq, "_package_price", _fake_price)
+
+    client = FakeTradier(order_status_by_id={"9004": {"status": "open"}})
+
+    async def _boom(account_id, order_id):
+        raise RuntimeError("network blip")
+    monkeypatch.setattr(client, "get_order", _boom)
+
+    w = {}
+    await tq._monitor_stop(
+        client, "T", w, legs=_VERTICAL_LEGS, symbol="NDX", strategy="bull_call", is_single=False,
+        entry_type="debit", entry_fill=1.00, stop_pct=30.0, tick=0.05, quantity=5,
+        close_order_id="9004")
+
+    assert w["state"] == "stop_needs_attention"
+    assert len([p for p in client.placed if "_modify" not in p]) == 0
+
+
 # ── the orders-panel modify bypass ─────────────────────────────────────────
 @pytest.fixture(autouse=True)
 def _clean_guard():

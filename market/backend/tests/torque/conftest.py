@@ -56,7 +56,8 @@ def chain(spot):
 class FakeTradier:
     """Configurable async stand-in for TradierClient used in route tests."""
     def __init__(self, spot=22000.0, exp="2026-06-18", raw=None,
-                 place_responses=None, order_status=None, orders=None):
+                 place_responses=None, order_status=None, orders=None,
+                 order_status_by_id=None):
         self._spot = spot
         self._exp = exp
         self._raw = raw if raw is not None else raw_chain(spot, exp=exp)
@@ -66,7 +67,24 @@ class FakeTradier:
             "id": 1, "status": "filled", "avg_fill_price": 1.0,
             "exec_quantity": 1.0, "remaining_quantity": 0.0, "class": "multileg",
         }
+        # Per-order-id override (keyed by str(order_id)) for tests that need
+        # different orders to report different statuses in the same run — e.g.
+        # a stop-limit that never fills while the entry/profit-close did. A
+        # value can be a dict (static) or a list of dicts (advanced by each
+        # get_order call, holding the last entry once exhausted) — the list
+        # form simulates an order's status changing between polls, e.g. a fill
+        # landing after the last "open" check but before the next read.
+        self._order_status_by_id = dict(order_status_by_id or {})
+        self._status_call_idx = {}   # str(order_id) -> index into a list-type entry
         self.placed = []          # records every payload submitted
+
+    def _status_for(self, order_id):
+        key = str(order_id)
+        val = self._order_status_by_id.get(key)
+        if isinstance(val, list):
+            idx = min(self._status_call_idx.get(key, 0), len(val) - 1)
+            return val[idx]
+        return val if val is not None else self._order_status
 
     async def stock_quote(self, symbol):
         return {"symbol": symbol.upper(), "last": self._spot, "close": self._spot}
@@ -94,16 +112,39 @@ class FakeTradier:
         return {"order": {"id": 1000 + len(self.placed), "status": "ok"}}
 
     async def get_order(self, account_id, order_id):
-        return dict(self._order_status, id=order_id)
+        key = str(order_id)
+        st = self._status_for(order_id)
+        if isinstance(self._order_status_by_id.get(key), list):
+            self._status_call_idx[key] = self._status_call_idx.get(key, 0) + 1
+        return dict(st, id=order_id)
 
     async def get_orders(self, account_id):
         return list(getattr(self, "_orders", []) or [])
 
     async def cancel_order(self, account_id, order_id):
+        # Realistic broker semantics: cancelling an order that already filled
+        # fails (this is the race the stop-exit ladder must survive — a fill
+        # landing between the last status poll and the cancel call). Anything
+        # else actually gets canceled, updating what get_order reports next.
+        # exec_quantity (if any) is preserved through the transition, since a
+        # partial-fill-then-cancel must still be attributable afterward.
+        key = str(order_id)
+        current = self._status_for(order_id)
+        if str(current.get("status") or "").lower() == "filled":
+            raise RuntimeError(f"order {order_id} already filled, cannot cancel")
+        self._order_status_by_id[key] = {**current, "status": "canceled"}
+        self._status_call_idx.pop(key, None)   # collapses to a static dict from here on
         return {"order": {"id": order_id, "status": "ok"}}
 
     async def modify_order(self, account_id, order_id, price=None, order_type=None,
                            duration=None, stop=None):
+        # Same realistic semantics as cancel_order: modifying an order that
+        # already filled fails — this is the race the requote-via-modify path
+        # must survive too. A resting (or partially filled, still-open)
+        # order's price updates in place; its exec_quantity is untouched.
+        current = self._status_for(order_id)
+        if str(current.get("status") or "").lower() == "filled":
+            raise RuntimeError(f"order {order_id} already filled, cannot modify")
         self.placed.append({"_modify": order_id, "price": price})
         return {"order": {"id": order_id, "status": "ok", "price": price}}
 

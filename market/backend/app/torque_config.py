@@ -222,6 +222,30 @@ STOP_LOSS: dict[str, dict[str, float]] = {
 }
 STOP_MAX_EXIT_SPREAD_PCT = 60.0
 
+# A stop-LIMIT (the trigger converts to a limit order, never a market order)
+# only ever guarantees the exit PRICE, never the FILL — on a violent enough
+# move the market can keep running away from a resting limit while the loss
+# grows. A real broker-native "stop-market" order sidesteps this by giving up
+# price control entirely once triggered; the reactive watcher gets the same
+# guarantee by escalating: after a stop-exit limit sits unfilled for this many
+# _STOP_INTERVAL polls (or the book stays too wide to cross this many times
+# running), give up on price and resubmit as a genuine market order instead.
+# An open loss compounding forever is worse than one wide/marketable crossing.
+STOP_ESCALATE_AFTER_TICKS = 2
+
+# A genuine unbounded `type=market` multileg order has NO price protection at
+# all — on a thin/wide book it can clear worse than the quoted bid/ask itself,
+# which is the opposite of what a stop is for. So market is the LAST resort,
+# not the first escalation: each stall instead re-quotes the SAME resting
+# order in place (MODIFY, not cancel-and-replace — cheaper, and keeps one
+# order id the panel/history can track) at a fresh, bounded, real price (what
+# usually fills close to mid with price improvement on a multileg spread) —
+# this many times — before finally freezing, alerting, and guaranteeing the
+# exit at market. No limit, bounded or not, can ever guarantee a fill; a stop
+# that chases forever and never exits on a runaway move is worse than one
+# that eventually pays the spread to actually get out.
+STOP_MAX_REQUOTES = 5
+
 # ── Native single-leg OTOCO (both exits broker-held) ─────────────────────────
 # Verified empirically against Tradier sandbox (2026-09-18), not assumed:
 #   * plain "oto" REJECTS a second leg priced below the entry ("must be higher

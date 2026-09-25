@@ -204,6 +204,63 @@ sandbox that `class=multileg` rejects `type=stop`/`stop_limit` outright,
   native OTOCO's stop leg. If the entry is rejected, canceled, or never fills,
   **no close/stop is placed**.
 
+  **A stop-limit only ever guarantees price, never a fill** — a violent enough
+  move can leave it resting while the market keeps running away, with the loss
+  compounding the whole time. So the watcher doesn't submit-and-forget: once
+  the stop-exit limit is placed it keeps polling *that order's own status*. If
+  it's still unfilled after `STOP_ESCALATE_AFTER_TICKS` (2) more polls, it does
+  **not** jump straight to an unbounded market order — a multileg market order
+  has *no* price protection and on a thin/wide book can clear worse than the
+  quoted book itself. Instead it **re-quotes the SAME resting order in place**
+  via `modify_order` (not cancel-and-replace — cheaper, and the order id/tag
+  the Orders panel and history track never changes) at a fresh bounded price:
+  still a real limit, just refreshed — what usually fills close to mid with
+  price improvement on a multileg spread. Only after `STOP_MAX_REQUOTES` (5)
+  of those real re-quotes still haven't cleared does it **freeze** and finally
+  submit a genuine **market** order to guarantee the exit — because no limit,
+  bounded or not, can ever guarantee a fill, and a stop that chases forever
+  without ever exiting is worse than one that eventually pays the spread to
+  actually get out. That fallback order carries a distinct tag
+  (`torqueStopMkt…`) so it's visibly flagged in the Orders/Past-Orders table
+  as what it is, not a routine bounded fill. The `STOP_MAX_EXIT_SPREAD_PCT`
+  wide-book refusal (below) hands off to this same ladder rather than blocking
+  forever: it still won't cross a garbage book on the *first* breach tick, but
+  staying blocked for `STOP_ESCALATE_AFTER_TICKS` ticks running starts the
+  ladder anyway — an open loss parked indefinitely is worse than one bounded
+  crossing.
+
+  **Every stall re-confirms the order's true state before touching it again**
+  (`_resolve_stalled_stop`) — a timed-out poll does not mean the order is
+  still sitting untouched. A fill (or partial fill) can land in the window
+  between the last status check and the next requote, especially likely right
+  when a stop fires, since a fast move is exactly what triggers both the stop
+  AND a fill. Trusting a cancel or modify call's own success/failure isn't
+  enough either — both commonly *fail* because the order just filled. So
+  whenever a modify itself fails, the ladder re-reads the order fresh: fully
+  filled → stop, nothing left to protect; partially filled (still resting,
+  chased by modify like any other stall — the broker tracks its own remaining
+  open quantity) → once the ladder does finally have to walk away from that
+  order, the next one is sized for only what's actually still open
+  (`quantity − exec_quantity`), never the original full size; state
+  unconfirmable even after a cancel attempt → the ladder refuses to resubmit
+  at all and parks in `stop_needs_attention` (surfaced in the Orders panel's
+  watcher list, styled as a distinct alert) rather than risk closing more than
+  actually exists, which would open a fresh naked position on the excess.
+
+  **The TP → stop handoff gets the exact same ground-truth check.** Right
+  before the stop takes over, it cancels the resting profit-target close and
+  hands off to the ladder — but the profit-target order can just as easily be
+  sitting *partially filled* at that instant (naturally, or because the
+  caller cancelled it by hand at exactly the wrong moment), and blindly
+  sizing the stop-exit for the position's original full quantity closes units
+  the profit-target close already closed. So the handoff resolves the
+  profit-target order's true state first, the same way: fully filled → stand
+  down, nothing left to protect (`closed_at_target`); partially filled →
+  protect only what TP actually left open; unconfirmable → `stop_needs_attention`
+  rather than guess. A **manually cancelled TP with nothing filled** still
+  protects the full original position, on every leg — cancelling it does not
+  disable the stop.
+
   > This replaced an earlier *synchronous* 30s poll: a limit entry that filled
   > after 30s got no close (and the request blocked 12-15s meanwhile). The
   > background watcher fixes both — fast response **and** a close on slow fills.

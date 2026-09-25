@@ -1003,24 +1003,29 @@ async def torque_place(req: PlaceRequest, request: Request,
 
 def _build_close_payload(*, account_id, symbol, strategy, legs, is_single,
                          entry_type, close_px, quantity, duration="gtc",
-                         tag_prefix="torqueClose"):
-    """Closing order payload (single option or multileg), limit.
+                         tag_prefix="torqueClose", market=False):
+    """Closing order payload (single option or multileg), limit or market.
 
     `tag_prefix` distinguishes the passive profit-target close (torqueClose…)
     from a stop exit (torqueStop…) so the orders panel and the modify guard can
-    tell them apart. A stop uses duration=day and a marketable price."""
+    tell them apart. A stop uses duration=day and a marketable price.
+
+    `market=True` gives up price control entirely (no `close_px` needed) — the
+    escalation path once a stop-limit has sat unfilled too long: a limit can
+    only ever guarantee price, never a fill, on a fast enough move."""
     tag = f"{tag_prefix}{strategy}"
     if is_single:
         cs = "sell_to_close" if legs[0]["action"].startswith("buy") else "buy_to_close"
         return _single_option_payload(
             symbol=symbol, leg={"symbol": legs[0]["symbol"], "action": cs,
                                 "quantity": int(legs[0]["quantity"]) * quantity},
-            otype="limit", price=close_px, duration=duration, preview=False,
-            tag=tag, side_override=cs)
+            otype=("market" if market else "limit"), price=close_px, duration=duration,
+            preview=False, tag=tag, side_override=cs)
     c_legs = teng.legs_to_order_legs(teng.build_close_legs(legs), quantity)
     return build_tradier_order_payload(
         account_id=account_id, symbol=symbol, legs=c_legs,
-        order_type=_multileg_close_type(entry_type), limit_price=close_px,
+        order_type=("market" if market else _multileg_close_type(entry_type)),
+        limit_price=(None if market else close_px),
         duration=duration, preview=False, tag=tag)
 
 
@@ -1034,18 +1039,202 @@ async def _package_price(client, symbol: str, legs: list[dict]) -> dict | None:
     return px if px.get("complete") else None
 
 
+async def _submit_stop_exit(client, account_id, *, symbol, strategy, legs, is_single,
+                            entry_type, quantity, close_px=None, market=False,
+                            tag_prefix="torqueStop"):
+    """Build + submit a stop-exit close (resting limit, or escalated market).
+    Returns (order_id, rejected, reason). `tag_prefix` defaults to the normal
+    stop tag; the final market fallback uses a distinct one so it stands out
+    in the orders/history table as what it is — a guaranteed exit that gave
+    up price control, not a routine bounded fill."""
+    payload = _build_close_payload(
+        account_id=account_id, symbol=symbol, strategy=strategy, legs=legs,
+        is_single=is_single, entry_type=entry_type, close_px=close_px,
+        quantity=quantity, duration="day", tag_prefix=tag_prefix, market=market)
+    res = await _submit(client, account_id, payload)
+    rej, why = _is_rejected(res)
+    return str(res.get("id") or ""), rej, why
+
+
+async def _resolve_stalled_stop(client, account_id, order_id, quantity):
+    """Ground truth for a stop-exit order after its grace window expires —
+    called before the ladder is allowed to touch it again.
+
+    A timed-out poll does NOT mean the order didn't fill (or partially fill)
+    in between checks — polls are STOP_INTERVAL apart, and a fast move is
+    exactly when both a stop trigger and a fill are likely to land in that
+    window. Trusting `cancel_order`'s own success/failure is not enough
+    either: a cancel commonly throws BECAUSE the order just filled, and
+    treating that as "safe to resubmit for the full quantity" sends a second
+    closing order on top of a position that's already gone — which fills into
+    a fresh NAKED position the moment there's nothing left to close against.
+    So the cancel is best-effort; the decision is always made from a fresh
+    `get_order` read afterward, never from whether the cancel itself worked.
+
+    Returns one of:
+      ("filled", 0)                — fully filled; nothing left to protect
+      ("resubmit", remaining_qty)  — safe to replace, for exactly this many
+      ("needs_attention", 0)       — final state unknown/unsafe; do NOT resubmit
+    """
+    try:
+        await client.cancel_order(account_id, order_id)
+    except Exception as e:
+        log.warning("stop: cancel failed for %s (may have already filled): %s", order_id, e)
+    try:
+        o = await client.get_order(account_id, order_id)
+    except Exception as e:
+        log.warning("stop: could not confirm order %s's state after cancel: %s", order_id, e)
+        return "needs_attention", 0
+    st = str(o.get("status") or "").lower()
+    if st == "filled":
+        return "filled", 0    # trust the label alone — no dependency on exec_quantity being present
+    if st in ("partially_filled", "canceled", "rejected", "expired"):
+        # exec_quantity is read unconditionally, not gated on the status
+        # string being literally "partially_filled" — a broker reporting the
+        # post-cancel state of a partial fill as plain "canceled" while still
+        # carrying a nonzero exec_quantity must not fall through to a full-
+        # quantity resubmit; that is the exact over-close bug, just triggered
+        # by a different status label instead of a failed cancel.
+        exec_qty = teng._f(o.get("exec_quantity")) or 0.0
+        remaining = quantity - exec_qty
+        return ("filled", 0) if remaining <= 0 else ("resubmit", remaining)
+    # Still "open"/"pending" (or some status we don't recognize) even after a
+    # cancel attempt — that is not a state the ladder can safely act on.
+    return "needs_attention", 0
+
+
+async def _run_stop_exit_ladder(client, account_id, w, *, symbol, strategy, legs,
+                                is_single, entry_type, quantity, tick, first_price):
+    """Once the stop has fired: a fresh, live-quoted marketable limit first —
+    real, bounded prices, what usually clears close to mid with price
+    improvement on a multileg book. If it stalls, the SAME resting order is
+    re-quoted in place via MODIFY (not cancelled and replaced) — cheaper, and
+    it keeps one continuous order the orders panel/history can track — for up
+    to STOP_MAX_REQUOTES chases. Only after all of those still haven't
+    cleared does it freeze, alert, and guarantee the exit at a genuine
+    unbounded market order: no limit, bounded or not, can ever GUARANTEE a
+    fill, and a stop that never exits on a runaway move is worse than one
+    that pays the full spread to actually get out.
+
+    Every stall — a failed modify, a failed cancel, anything that isn't a
+    clean confirmed status — is resolved through _resolve_stalled_stop before
+    the next order goes out. Never a blind resubmit for the original
+    quantity, which can over-close a partially-filled position into a naked
+    one on the excess."""
+    order_id, rej, why = await _submit_stop_exit(
+        client, account_id, symbol=symbol, strategy=strategy, legs=legs,
+        is_single=is_single, entry_type=entry_type, quantity=quantity,
+        close_px=first_price)
+    w["stop_exit_price"] = first_price
+    w["stop_order_id"] = order_id
+    w["stop_market_fallback"] = False
+    if rej:
+        w["state"] = "stop_rejected"
+        w["stop_note"] = why
+        return
+    w["state"] = "stop_placed"
+    remaining = quantity
+
+    for _requote in range(tcfg.STOP_MAX_REQUOTES):
+        for _tick in range(tcfg.STOP_ESCALATE_AFTER_TICKS):
+            await asyncio.sleep(_STOP_INTERVAL)
+            try:
+                o = await client.get_order(account_id, order_id)
+            except Exception:
+                continue
+            st = str(o.get("status") or "").lower()
+            if st == "filled":
+                w["state"] = "stop_filled"
+                return
+            if st in ("rejected", "canceled", "expired"):
+                break   # dead order — resolve immediately rather than waiting out the tick budget
+
+        px = await _package_price(client, symbol, legs)
+        fresh_px = teng.stop_exit_price(px, entry_type, tick) if px else None
+        modify_ok = False
+        if fresh_px is not None:
+            try:
+                await client.modify_order(account_id, order_id, price=fresh_px)
+                modify_ok = True
+            except Exception as e:
+                log.warning("stop: modify failed for %s (may have already filled): %s", order_id, e)
+        if modify_ok:
+            w["stop_exit_price"] = fresh_px
+            w["state"] = "stop_requoted"
+            continue   # same order_id, same tracked order — just a fresh price
+
+        # Modify didn't happen (no live quote, or the modify call itself
+        # failed) — get ground truth before touching this order again.
+        outcome, remaining = await _resolve_stalled_stop(client, account_id, order_id, remaining)
+        if outcome == "filled":
+            w["state"] = "stop_filled"
+            return
+        if outcome == "needs_attention":
+            w["state"] = "stop_needs_attention"
+            w["stop_note"] = (f"order {order_id} left an unconfirmed final state while requoting — "
+                              f"refusing to resubmit and risk closing more than is actually open; "
+                              f"needs manual review")
+            return
+        # Confirmed dead (not filled) — the old order is gone, so this one
+        # requote has to be a fresh submission rather than a modify.
+        px = await _package_price(client, symbol, legs)
+        fresh_px = teng.stop_exit_price(px, entry_type, tick) if px else None
+        if fresh_px is None:
+            break   # no live quote left to re-cross against — freeze and go to market
+        order_id, rej, why = await _submit_stop_exit(
+            client, account_id, symbol=symbol, strategy=strategy, legs=legs,
+            is_single=is_single, entry_type=entry_type, quantity=remaining,
+            close_px=fresh_px)
+        w["stop_exit_price"] = fresh_px
+        w["stop_order_id"] = order_id
+        w["state"] = "stop_requoted"
+        if rej:
+            w["state"] = "stop_rejected"
+            w["stop_note"] = why
+            return
+
+    # Exhausted every bounded re-cross attempt. Freeze: stop trying to chase
+    # a moving book with a bounded price and guarantee the exit instead. The
+    # same ground-truth check still applies first — the market fallback must
+    # never risk closing an already-filled (or over-closed) position either —
+    # and the fallback itself gets a distinct tag so it's visibly flagged in
+    # the orders/history table as what it is, not a routine bounded fill.
+    outcome, remaining = await _resolve_stalled_stop(client, account_id, order_id, remaining)
+    if outcome == "filled":
+        w["state"] = "stop_filled"
+        return
+    if outcome == "needs_attention":
+        w["state"] = "stop_needs_attention"
+        w["stop_note"] = (f"order {order_id} left an unconfirmed final state before the market "
+                          f"fallback — refusing to submit and risk an over-close; needs manual review")
+        return
+    market_id, rej, why = await _submit_stop_exit(
+        client, account_id, symbol=symbol, strategy=strategy, legs=legs,
+        is_single=is_single, entry_type=entry_type, quantity=remaining, market=True,
+        tag_prefix="torqueStopMkt")
+    w["stop_order_id"] = market_id
+    w["stop_market_fallback"] = True
+    w["state"] = "stop_rejected" if rej else "stop_market_placed"
+    w["stop_note"] = (why if rej else
+                      f"no bounded fill after {tcfg.STOP_MAX_REQUOTES} re-quotes — exited at "
+                      f"market to guarantee the stop; verify the fill price")
+
+
 async def _monitor_stop(client, account_id, w, *, legs, symbol, strategy, is_single,
                         entry_type, entry_fill, stop_pct, tick, quantity, close_order_id):
     """Poll the package's fair value; cross out if it loses `stop_pct`% of entry.
 
-    Two deliberate refusals, both DJX-driven:
-      * the trigger reads the MID, not the bid — a wide package is underwater by
-        half its spread the moment it fills, and a bid-based stop fires instantly;
-      * if the book is wider than STOP_MAX_EXIT_SPREAD_PCT when the stop trips, we
-        do NOT dump into it (crossing a 180%-of-mid market costs more than the
-        stop saves). The watcher parks in `stop_blocked_wide_market` and re-checks.
+    One deliberate refusal, DJX-driven: the trigger reads the MID, not the bid
+    — a wide package is underwater by half its spread the moment it fills, and
+    a bid-based stop would fire instantly. If the book is wider than
+    STOP_MAX_EXIT_SPREAD_PCT when the stop trips, the first tick does NOT dump
+    into it — but this refusal isn't permanent: staying blocked for
+    STOP_ESCALATE_AFTER_TICKS ticks running hands off to the same bounded exit
+    ladder everyone else gets (see _run_stop_exit_ladder), because a loss
+    parked open indefinitely is worse than one bounded crossing.
     """
     deadline = time.time() + _WATCH_TIMEOUT
+    blocked_ticks = 0
     while time.time() < deadline:
         await asyncio.sleep(_STOP_INTERVAL)
         if close_order_id:                       # target already hit → nothing to protect
@@ -1063,32 +1252,50 @@ async def _monitor_stop(client, account_id, w, *, legs, symbol, strategy, is_sin
         w["mark"] = mark
         if not teng.stop_breached(mark, entry_fill, entry_type, stop_pct):
             continue
+
         sp = teng.package_spread_pct(px)
         if sp is not None and sp > tcfg.STOP_MAX_EXIT_SPREAD_PCT:
-            w["state"] = "stop_blocked_wide_market"
-            w["stop_note"] = (f"stop hit (mark {mark}) but the package bid/ask is {sp:.0f}% of mid — "
-                              f"crossing would cost more than the stop saves; holding and re-checking")
-            continue
+            blocked_ticks += 1
+            if blocked_ticks < tcfg.STOP_ESCALATE_AFTER_TICKS:
+                w["state"] = "stop_blocked_wide_market"
+                w["stop_note"] = (f"stop hit (mark {mark}) but the package bid/ask is {sp:.0f}% of mid — "
+                                  f"crossing would cost more than the stop saves; holding and re-checking")
+                continue
+            # stayed too wide too long — stop waiting for it to improve and
+            # start the same bounded ladder as any other breach
         exit_px = teng.stop_exit_price(px, entry_type, tick)
         if exit_px is None:
             continue
-        if close_order_id:                       # cancel the resting target, else double-close
-            try:
-                await client.cancel_order(account_id, close_order_id)
-                _CLOSE_GUARD.pop(str(close_order_id), None)
-            except Exception as e:
-                log.warning("stop: could not cancel target close %s: %s", close_order_id, e)
-        payload = _build_close_payload(
-            account_id=account_id, symbol=symbol, strategy=strategy, legs=legs,
-            is_single=is_single, entry_type=entry_type, close_px=exit_px,
-            quantity=quantity, duration="day", tag_prefix="torqueStop")
-        res = await _submit(client, account_id, payload)
-        rej, why = _is_rejected(res)
-        w["stop_exit_price"] = exit_px
-        w["stop_order_id"] = str(res.get("id") or "")
-        w["state"] = "stop_rejected" if rej else "stop_placed"
-        if rej:
-            w["stop_note"] = why
+
+        protect_qty = quantity
+        if close_order_id:
+            # The resting profit-target close might already be sitting
+            # partially filled (naturally, or because the caller cancelled it
+            # by hand right as the stop fired) — cancelling it blind and then
+            # sizing the stop-exit for the ORIGINAL full quantity closes
+            # units that TP already closed, over-closing into a fresh naked
+            # position on the excess. Same ground-truth resolution the ladder
+            # itself uses, applied here to the TP order before handing off.
+            outcome, protect_qty = await _resolve_stalled_stop(client, account_id, close_order_id, quantity)
+            _CLOSE_GUARD.pop(str(close_order_id), None)
+            if outcome == "filled":
+                # TP already fully closed the position (e.g. it filled in the
+                # same window the stop just breached in) — nothing left to
+                # protect, and a stop-exit here would open a naked position
+                # from nothing.
+                w["state"] = "closed_at_target"
+                return
+            if outcome == "needs_attention":
+                w["state"] = "stop_needs_attention"
+                w["stop_note"] = (f"could not confirm the profit-target close {close_order_id}'s "
+                                  f"final state before handing off to the stop — refusing to guess "
+                                  f"how much is actually still open; needs manual review")
+                return
+
+        await _run_stop_exit_ladder(
+            client, account_id, w, symbol=symbol, strategy=strategy, legs=legs,
+            is_single=is_single, entry_type=entry_type, quantity=protect_qty, tick=tick,
+            first_price=exit_px)
         return
 
 
@@ -1223,11 +1430,17 @@ async def torque_orders(request: Request, account_id: str | None = None,
         # shared across users, so scope by uid or another user's in-flight
         # auto-close would leak into this response. Once the close order is live
         # it shows as a working order above, so drop watchers that already placed
-        # their close. `task`/`uid` are internal — never returned to the client.
+        # their close. `stop_needs_attention` is a deliberate exception: it means
+        # the stop-exit ladder refused to resubmit rather than risk an over-close,
+        # so nothing is on the book to show as a working order — the watcher
+        # itself is the only place this ever becomes visible, and it must stay
+        # visible until a human clears it. `task`/`uid` are internal — never
+        # returned to the client.
         my_uid = user.get("id")
         watchers = [{k: v for k, v in w.items() if k not in ("task", "uid")}
                     for w in _WATCHERS.values()
-                    if w.get("state") in ("watching_fill",) and w.get("uid") == my_uid]
+                    if w.get("state") in ("watching_fill", "stop_needs_attention")
+                    and w.get("uid") == my_uid]
         return {"account_id": aid, "orders": orders, "watchers": watchers, "history": history}
     finally:
         if per_user:

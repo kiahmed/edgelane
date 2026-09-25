@@ -189,7 +189,9 @@
   .panel.orders{margin-top:14px}
   .watchers{margin:6px 0 10px}
   .watch{font-size:12px;color:var(--accent);padding:6px 10px;background:#10202b;border:1px solid var(--line2);border-radius:7px;margin-bottom:6px}
+  .watch.attn{color:var(--bad);background:#2a1414;border:1px solid var(--bad);box-shadow:0 0 10px -3px var(--bad)}
   .dotpulse{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent);margin-right:7px;animation:pulse 1.2s infinite}
+  .dotwarn{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--bad);margin-right:7px;animation:pulse .7s infinite}
   @keyframes pulse{0%,100%{opacity:.35}50%{opacity:1}}
   table.otable{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}
   table.otable th{text-align:left;color:var(--dim2);font-size:11px;letter-spacing:1px;text-transform:uppercase;padding:3px 8px;border-bottom:1px solid var(--line)}
@@ -881,17 +883,28 @@ function OrdersPanel({data,onCancel,onModify,busy}){
   const watchers=(data&&data.watchers)||[];
   const past=(data&&data.history)||[];        // account-wide Torque-tagged orders, any status
   const empty=orders.length===0&&watchers.length===0;
+  const needsAttn=watchers.filter(w=>w.state==='stop_needs_attention').length;
+  const arming=watchers.length-needsAttn;
   return <div className="panel orders">
     <div className="otabs">
       <button className={"otab"+(tab==='working'?' on':'')} onClick={()=>setTab('working')}>
-        Working{data?' · '+orders.length:''}{watchers.length?' · '+watchers.length+' arming':''}</button>
+        Working{data?' · '+orders.length:''}{arming?' · '+arming+' arming':''}
+        {needsAttn?<span style={{color:'var(--bad)'}}>{' · '+needsAttn+' NEEDS ATTENTION'}</span>:''}</button>
       <button className={"otab"+(tab==='past'?' on':'')} onClick={()=>setTab('past')}>
         Past Orders{past.length?' · '+past.length:''}</button>
     </div>
     <div className="oscroll">
     {tab==='past'?<PastList past={past}/>:<>
     {watchers.length>0&&<div className="watchers">
-      {watchers.map(w=><div key={w.entry_order_id} className="watch">
+      {watchers.map(w=>w.state==='stop_needs_attention'?
+        <div key={w.entry_order_id} className="watch attn">
+          <span className="dotwarn"></span> STOP NEEDS ATTENTION — {w.symbol} {w.strategy} (entry {w.entry_order_id})
+          <br/>the stop-exit ladder could not confirm the order's final state and refused to
+          resubmit rather than risk closing more than is actually open — check this position
+          and the broker's own order history directly.
+          {w.stop_note?<div style={{marginTop:4,opacity:.85}}>{w.stop_note}</div>:''}
+        </div>
+      :<div key={w.entry_order_id} className="watch">
         <span className="dotpulse"></span> auto-close armed — {w.symbol} {w.strategy} · waiting for entry {w.entry_order_id} to fill
         {w.close_target_price?(' → will sell/buy-to-close ~$'+fmt(w.close_target_price)+' GTC'):''}
         {w.close_reason?<span className="err"> ({w.close_reason})</span>:''}
