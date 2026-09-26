@@ -54,6 +54,8 @@ beforeEach(() => {
 	auth.session = null;
 	auth.toolsEnabled = null;
 	auth.devBypass = false;
+	auth.productDenied = false;
+	auth.pendingEmail = null;
 });
 
 describe('watchlist writes go through the API', () => {
@@ -156,6 +158,62 @@ describe('401 → refresh-once → replay (api.ts)', () => {
 		mockFetch(() => res(401, { detail: 'Invalid login credentials' }));
 		await expect(getJSON('/auth/login')).rejects.toThrow('Invalid login credentials');
 		expect(handler).not.toHaveBeenCalled();
+	});
+});
+
+describe('product entitlement carried through auth calls', () => {
+	const SESSION = { access_token: 'jwt', refresh_token: 'rt', expires_at: 4102444800 };
+
+	it('signIn sends product:simmer and, on 403, drops to ProductGate with no session', async () => {
+		mockFetch(() => res(403, { detail: "Simmer isn't enabled for this account. Contact the operator." }));
+		const err = await auth.signIn('pete@b.co', 'secret1');
+		expect(err).toBeNull(); // not an inline error — the gate speaks instead
+		expect(auth.productDenied).toBe(true);
+		expect(auth.session).toBeNull();
+		expect(auth.pendingEmail).toBe('pete@b.co');
+		expect(JSON.parse(String(calls[0].init?.body))).toEqual({
+			email: 'pete@b.co',
+			password: 'secret1',
+			product: 'simmer'
+		});
+	});
+
+	it('signIn success clears productDenied and probes entitlements', async () => {
+		auth.productDenied = true; // stale from a prior denied attempt
+		mockFetch((url, init) => {
+			const method = init?.method ?? 'GET';
+			if (method === 'POST' && url.endsWith('/auth/login')) return res(200, { session: SESSION });
+			return res(200, { alive: true }); // GET /simmer/status
+		});
+		const err = await auth.signIn('a@b.co', 'secret1');
+		expect(err).toBeNull();
+		expect(auth.productDenied).toBe(false);
+		expect(auth.session?.access_token).toBe('jwt');
+	});
+
+	it('signUp sends product:simmer', async () => {
+		mockFetch(() => res(200, { session: null, confirmation_required: true }));
+		const out = await auth.signUp('new@b.co', 'secret1');
+		expect(out.needsConfirmation).toBe(true);
+		expect(JSON.parse(String(calls[0].init?.body))).toEqual({
+			email: 'new@b.co',
+			password: 'secret1',
+			product: 'simmer'
+		});
+	});
+
+	it('refresh sends product:simmer and a 403 signs out into ProductGate', async () => {
+		auth.session = { ...SESSION };
+		mockFetch(() => res(403, { detail: "Simmer isn't enabled for this account." }));
+		const ok = await auth.tryRefresh();
+		expect(ok).toBe(false);
+		expect(auth.session).toBeNull();
+		expect(auth.productDenied).toBe(true);
+		expect(calls[0].url).toBe(`${BASE}/auth/refresh`);
+		expect(JSON.parse(String(calls[0].init?.body))).toEqual({
+			refresh_token: 'rt',
+			product: 'simmer'
+		});
 	});
 });
 

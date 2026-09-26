@@ -41,6 +41,9 @@
 
 {#if !auth.ready}
 	<div class="flex min-h-screen items-center justify-center text-slate-500">Loading…</div>
+{:else if auth.productDenied}
+	<!-- Login/refresh 403: no session issued, so ProductGate off the flag. -->
+	<ProductGate />
 {:else if !auth.isFull}
 	<AuthGate />
 {:else if !auth.toolsKnown}

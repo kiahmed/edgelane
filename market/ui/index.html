@@ -180,6 +180,12 @@
                              radial-gradient(900px 500px at 50% 120%, rgba(16,185,129,.08), transparent 60%);
                  padding: 1rem; overflow-y:auto; pointer-events: auto; }
     .gate-mask.show { display: flex; }
+    /* Signed in but not entitled: nothing of Matrix may show behind this one,
+       so unlike the sign-in gate (a blur over the free teaser) it is opaque. */
+    #productGateMask { background: #07090d; }
+    /* The contact modal opens FROM the product gate, so it must sit above it. */
+    .modal-mask.over-gate { z-index: 80; }
+    .gate-link { color:#34d399; text-decoration: underline; cursor:pointer; background:none; border:none; padding:0; font: inherit; }
     .gate-card { width: min(440px, calc(100vw - 2rem)); position: relative;
                  margin-top: 12vh; pointer-events: auto;
                  background: linear-gradient(180deg, rgba(17,24,42,.97), rgba(7,11,20,.98));
@@ -629,6 +635,26 @@
 </div>
 
 <!-- Auth gate — signup / signin overlay over the blurred dashboard ------- -->
+<!-- Product gate: signed in, but this account isn't entitled to Matrix.
+     Mirrors Simmer's ProductGate.svelte. No Matrix UI behind it. -->
+<div id="productGateMask" class="gate-mask" role="dialog" aria-modal="true" aria-label="Matrix isn't enabled for this account">
+  <div class="gate-card">
+    <div class="glow-orb"></div>
+    <div class="gate-logo">
+      <img src="assets/matrix-logo.png" alt="" aria-hidden="true" class="w-10 h-10 block flex-shrink-0" />
+      <div>
+        <div class="text-lg font-black tracking-[.06em] text-emerald-400">MATRIX</div>
+        <div class="brand-byline !mt-0.5">by Facades</div>
+      </div>
+    </div>
+    <p class="gate-eyebrow mt-6">Access</p>
+    <h2 id="pgTitle" class="mt-1 text-xl font-bold text-white">Checking your access…</h2>
+    <p id="pgBody" class="mt-1.5 text-sm leading-relaxed text-slate-400"></p>
+    <button id="pgRetry" type="button" class="gate-btn mt-5 hidden">Try again</button>
+    <button id="pgSignOut" type="button" class="gate-btn mt-5">Sign in with a different account</button>
+  </div>
+</div>
+
 <div id="gateMask" class="gate-mask" role="dialog" aria-modal="true" aria-label="Sign in to Matrix">
   <div class="gate-card">
     <div class="glow-orb"></div>
@@ -1702,6 +1728,10 @@
   const AUTH = {
     configured: false, devBypass: false, ready: false,
     session: null, user: null, anonToken: null, mode: 'signin', turnstileId: null,
+    // Matrix entitlement for the signed-in user: null = not yet known,
+    // true / false = profiles.tools_enabled has / lacks "market",
+    // 'error' = couldn't be read (fail closed — see _checkEntitlement).
+    entitled: null, entitledFor: null,
   };
   let supa = null;
   let authChannel = null;   // BroadcastChannel for cross-tab sign-out (same origin)
@@ -1729,7 +1759,7 @@
   // Clear this tab's auth state + stored token (no broadcast).
   function _localSignOut() {
     if (supa) { try { supa.auth.signOut(); } catch (_) {} }
-    AUTH.session = null; AUTH.user = null; _connCache = [];
+    AUTH.session = null; AUTH.user = null; AUTH.entitled = null; AUTH.entitledFor = null; _connCache = [];
     applyGate();
   }
 
@@ -1741,7 +1771,69 @@
       turnstile: s(window.__EDGELANE_TURNSTILE_SITE_KEY__),
     };
   }
-  function isFull() { return AUTH.devBypass || !!AUTH.session; }
+  // Full access = a session AND the Matrix tool. A session alone isn't enough:
+  // Matrix and Simmer share one identity pool, so a Simmer-only user has a
+  // perfectly valid session here too. The backend enforces the same rule
+  // (session_auth.require_teaser_session → 403), so this can't be bypassed by
+  // calling the API directly; this side only decides what to SHOW.
+  function isFull() { return AUTH.devBypass || (!!AUTH.session && AUTH.entitled === true); }
+
+  const MATRIX_TOOL = 'market';
+
+  // Read the signed-in user's tools_enabled (RLS profiles_select_own allows a
+  // user to read their own row). Runs on sign-in and on session restore — and
+  // again only when the USER changes, not on every hourly token refresh.
+  async function _checkEntitlement(force) {
+    if (!supa || !AUTH.user) { AUTH.entitled = null; AUTH.entitledFor = null; return; }
+    const uid = AUTH.user.id;
+    if (!force && AUTH.entitledFor === uid && AUTH.entitled !== 'error') return;
+    AUTH.entitled = null; AUTH.entitledFor = uid;
+    applyGate();
+    let result;
+    try {
+      const { data, error } = await supa.from('profiles')
+        .select('tools_enabled').eq('id', uid).maybeSingle();
+      if (error) throw error;
+      const tools = (data && Array.isArray(data.tools_enabled)) ? data.tools_enabled : [];
+      result = tools.includes(MATRIX_TOOL);
+    } catch (e) {
+      // Fail CLOSED: an unverifiable account doesn't get the product. Shown as
+      // a retryable error, not as "not enabled", so a transient network blip
+      // isn't mistaken for a missing entitlement.
+      console.warn('[auth] entitlement check failed', e);
+      result = 'error';
+    }
+    if (!AUTH.user || AUTH.user.id !== uid) return;   // user changed mid-flight
+    AUTH.entitled = result;
+    applyGate();
+    if (isFull()) { poll(); pollAccuracy(); }
+  }
+
+  function _renderProductGate() {
+    const email = (AUTH.user && AUTH.user.email) || 'unknown';
+    const esc = (v) => String(v).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    const retry = $('pgRetry');
+    if (AUTH.entitled === null) {
+      $('pgTitle').textContent = 'Checking your access…';
+      $('pgBody').textContent = '';
+      retry.classList.add('hidden');
+    } else if (AUTH.entitled === 'error') {
+      $('pgTitle').textContent = "Couldn't verify your access";
+      $('pgBody').innerHTML = `Signed in as <span class="text-slate-200">${esc(email)}</span>. We couldn't read your account's product access just now.`;
+      retry.classList.remove('hidden');
+    } else {
+      $('pgTitle').textContent = "Matrix isn't enabled for this account";
+      $('pgBody').innerHTML = `You're signed in as <span class="text-slate-200">${esc(email)}</span>, but Matrix isn't part of this account yet. <button id="pgContact" type="button" class="gate-link">Contact the operator</button> to get it switched on — access is per-account.`;
+      retry.classList.add('hidden');
+      const c = $('pgContact');
+      if (c) c.addEventListener('click', () => {
+        $('contactStatus').textContent = '';
+        if (AUTH.user && AUTH.user.email && !$('contactEmail').value) $('contactEmail').value = AUTH.user.email;
+        $('contactModal').classList.add('over-gate');
+        _openModal('contactModal');
+      });
+    }
+  }
   function _authHeaders() {
     if (AUTH.session && AUTH.session.access_token) return { Authorization: `Bearer ${AUTH.session.access_token}` };
     if (AUTH.anonToken) return { 'X-EdgeLane-Session': AUTH.anonToken };
@@ -1808,11 +1900,14 @@
       AUTH.user = AUTH.session ? AUTH.session.user : null;
     } catch (e) { console.warn('[auth] getSession failed', e); }
     AUTH.ready = true;
+    if (AUTH.user) _checkEntitlement(true);          // session restore
 
     supa.auth.onAuthStateChange((_evt, session) => {
       AUTH.session = session || null;
       AUTH.user = session ? session.user : null;
+      if (!AUTH.user) { AUTH.entitled = null; AUTH.entitledFor = null; }
       applyGate();
+      if (AUTH.user) _checkEntitlement(false);        // no-op unless the user changed
       if (isFull()) { poll(); pollAccuracy(); }
     });
 
@@ -1879,14 +1974,20 @@
 
   function applyGate() {
     const full = isFull();
-    const showGate = !full && !AUTH.devBypass;
+    // Two different screens: no session → the sign-in gate (over the free
+    // teaser); a session WITHOUT the Matrix tool → the product gate (opaque —
+    // nothing of Matrix behind it).
+    const showGate = !AUTH.session && !AUTH.devBypass;
+    const showProduct = !!AUTH.session && !AUTH.devBypass && AUTH.entitled !== true;
     document.querySelectorAll('[data-gated]').forEach(el => el.classList.toggle('locked-blur', !full));
     $('gateMask').classList.toggle('show', showGate);
-    // While gated there's no user, so hide the profile avatar + settings panel
-    // (a "Sign out" there is bogus) and lock background scroll — true modal.
-    $('profileWrap').classList.toggle('hidden', showGate);
-    if (showGate) toggleSettings(false);
-    document.body.style.overflow = showGate ? 'hidden' : '';
+    $('productGateMask').classList.toggle('show', showProduct);
+    if (showProduct) _renderProductGate();
+    // While gated, hide the profile avatar + settings panel and lock background
+    // scroll — true modal.
+    $('profileWrap').classList.toggle('hidden', showGate || showProduct);
+    if (showGate || showProduct) toggleSettings(false);
+    document.body.style.overflow = (showGate || showProduct) ? 'hidden' : '';
     renderProfile();
     if (full && supa && AUTH.user) { loadBrokerConnections(); loadNotifications(); }
   }
@@ -1942,7 +2043,7 @@
     try {
       await withBusy(async () => {
         if (AUTH.mode === 'signup') {
-          const { data, error } = await supa.auth.signUp({ email, password, options: { data: { full_name: name }, emailRedirectTo: location.origin + location.pathname } });
+          const { data, error } = await supa.auth.signUp({ email, password, options: { data: { full_name: name, signup_product: MATRIX_TOOL }, emailRedirectTo: location.origin + location.pathname } });
           if (error) { $('gateError').textContent = error.message; }
           else if (!data.session) {
             AUTH._pendingEmail = email;
@@ -2247,12 +2348,17 @@
     location.reload();
   });
 
+  // Product gate controls. "Different account" is a normal sign-out, which
+  // drops back to the sign-in gate.
+  $('pgSignOut').addEventListener('click', () => $('signOutBtn').click());
+  $('pgRetry').addEventListener('click', () => _checkEntitlement(true));
+
   $('signOutBtn').addEventListener('click', async () => {
     toggleSettings(false);
     const uid = AUTH.user && AUTH.user.id;   // capture before signOut clears it
     if (supa) { try { await supa.auth.signOut(); } catch {} }
     if (AUTH.devBypass) { toast('Dev session — no auth configured'); return; }
-    AUTH.session = null; AUTH.user = null; _connCache = [];
+    AUTH.session = null; AUTH.user = null; AUTH.entitled = null; AUTH.entitledFor = null; _connCache = [];
     applyGate();
     toast('Signed out');
     // Tell this user's other tabs (e.g. duplicates) to sign out too.
@@ -2323,6 +2429,11 @@
   $('aboutCloseBtn').addEventListener('click', () => _closeModal('aboutModal'));
   $('contactLink').addEventListener('click', () => { $('contactStatus').textContent = ''; _openModal('contactModal'); });
   $('contactCloseBtn').addEventListener('click', () => _closeModal('contactModal'));
+  // Opened from the product gate it sits above it; restore the normal stacking
+  // when it closes (however it closes — button, Escape, backdrop, auto-close).
+  new MutationObserver(() => {
+    if (!$('contactModal').classList.contains('show')) $('contactModal').classList.remove('over-gate');
+  }).observe($('contactModal'), { attributes: true, attributeFilter: ['class'] });
 
   // Share — native share sheet where available, clipboard fallback.
   $('shareBtn').addEventListener('click', async () => {

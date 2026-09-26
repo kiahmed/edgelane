@@ -36,6 +36,9 @@ export interface AuthSession {
 }
 
 const SESSION_KEY = 'simmer-session';
+/** This is the Simmer SPA — every auth call carries its product so the backend
+ *  grants the right tool at signup and refuses accounts without it at login. */
+const PRODUCT = 'simmer';
 /** Refresh the JWT this long before it expires. */
 const REFRESH_LEAD_MS = 60_000;
 /** Re-probe /simmer/status after a transient (network/5xx) failure. */
@@ -79,6 +82,10 @@ class AuthStore {
 	toolsEnabled = $state<string[] | null>(null);
 	toolsLoading = $state(false);
 	pendingEmail = $state<string | null>(null);
+	/** Backend refused the login/refresh with 403 (account lacks the 'simmer'
+	 *  tool). There is NO session in this case, so the layout shows ProductGate
+	 *  off this flag rather than the post-login /simmer/status 403 path. */
+	productDenied = $state(false);
 
 	private refreshTimer: ReturnType<typeof setTimeout> | null = null;
 	private entitlementTimer: ReturnType<typeof setTimeout> | null = null;
@@ -166,12 +173,23 @@ class AuthStore {
 		this.refreshing = (async () => {
 			try {
 				const res = await postJSON<{ session: AuthSession }>('/auth/refresh', {
-					refresh_token
+					refresh_token,
+					product: PRODUCT
 				});
 				if (!res?.session?.access_token) throw new Error('no session in refresh response');
 				this.setSession(res.session);
 				return true;
 			} catch (e) {
+				// 403 = the 'simmer' tool was revoked mid-session; the backend
+				// already killed the token. Drop to ProductGate, not a silent
+				// sign-out, so the user learns why.
+				if (e instanceof ApiError && e.status === 403) {
+					const email = this.user?.email ?? this.pendingEmail;
+					await this.signOut({ revoke: false });
+					this.pendingEmail = email;
+					this.productDenied = true;
+					return false;
+				}
 				console.warn('[auth] token refresh failed — signing out', e);
 				await this.signOut({ revoke: false });
 				return false;
@@ -219,13 +237,23 @@ class AuthStore {
 		try {
 			const res = await postJSON<{ session: AuthSession }>('/auth/login', {
 				email,
-				password
+				password,
+				product: PRODUCT
 			});
 			this.setSession(res.session);
+			this.productDenied = false;
 			this.toolsEnabled = null;
 			void this.loadEntitlements();
 			return null;
 		} catch (e) {
+			// 403 = backend refused: the account lacks the 'simmer' tool and NO
+			// session was issued. Show ProductGate (via productDenied), not an
+			// inline auth error.
+			if (e instanceof ApiError && e.status === 403) {
+				this.pendingEmail = email;
+				this.productDenied = true;
+				return null;
+			}
 			const msg = errorMessage(e);
 			// Surface unconfirmed-email as a resend opportunity, like Matrix.
 			if (/confirm/i.test(msg)) this.pendingEmail = email;
@@ -242,12 +270,13 @@ class AuthStore {
 			const res = await postJSON<{
 				session?: AuthSession | null;
 				confirmation_required?: boolean;
-			}>('/auth/signup', { email, password });
+			}>('/auth/signup', { email, password, product: PRODUCT });
 			if (res.confirmation_required || !res.session) {
 				this.pendingEmail = email;
 				return { needsConfirmation: true };
 			}
 			this.setSession(res.session);
+			this.productDenied = false;
 			this.toolsEnabled = null;
 			void this.loadEntitlements();
 			return {};
@@ -280,6 +309,7 @@ class AuthStore {
 		this.refreshTimer = null;
 		this.session = null;
 		this.toolsEnabled = null;
+		this.productDenied = false;
 		try {
 			localStorage.removeItem(SESSION_KEY);
 		} catch {

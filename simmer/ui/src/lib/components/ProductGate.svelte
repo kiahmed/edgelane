@@ -25,7 +25,8 @@
 
 		<h2 class="mb-2 text-base font-bold text-slate-100">Simmer isn't enabled for this account</h2>
 		<p class="text-sm leading-relaxed text-slate-400">
-			You're signed in as <span class="text-slate-200">{auth.user?.email ?? 'unknown'}</span>, but
+			You're signed in as
+			<span class="text-slate-200">{auth.user?.email ?? auth.pendingEmail ?? 'unknown'}</span>, but
 			the Simmer readiness engine isn't part of your plan yet.
 			<button
 				class="gate-link cursor-pointer border-none bg-transparent p-0"

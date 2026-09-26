@@ -29,6 +29,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from . import auth
 from .config import get_settings
 
+# The tools_enabled key that grants Matrix. Its signup seeds it (migration 0013).
+MATRIX_TOOL = "market"
+
 log = logging.getLogger("edgelane.market.session")
 
 _bearer = HTTPBearer(auto_error=False)
@@ -82,7 +85,7 @@ def _decode_anon(token: str) -> dict:
     return payload
 
 
-def require_teaser_session(
+async def require_teaser_session(
     request: Request,
     creds: HTTPAuthorizationCredentials = Depends(_bearer),
     x_edgelane_session: str | None = Header(default=None),
@@ -106,15 +109,24 @@ def require_teaser_session(
     if not settings.auth_enabled:
         return {"full": True, "kind": "dev", "id": "dev-local"}
 
-    # Logged-in user → full.
+    # Logged-in user → full, but ONLY if entitled to Matrix ("market").
+    #
+    # A valid Supabase session is not enough: Matrix and Simmer share one
+    # identity pool, so without this any signed-in user — a Simmer-only
+    # customer included — received the full Matrix payload. A signed-in user
+    # without the tool gets a 403 (the UI shows "Matrix isn't enabled for this
+    # account"), deliberately NOT a silent downgrade to the teaser: that would
+    # look like a working product with data missing.
     if creds is not None:
         try:
             user = auth._user_from_payload(auth._decode(creds.credentials))
-            return {"full": True, "kind": "user", "id": user["id"]}
         except HTTPException:
             raise
         except Exception:
             raise HTTPException(401, "Invalid or expired session")
+        from .entitlements import ensure_tool
+        await ensure_tool(user, MATRIX_TOOL)
+        return {"full": True, "kind": "user", "id": user["id"]}
 
     # Anonymous → must present a valid anon session token (teaser only).
     if x_edgelane_session:

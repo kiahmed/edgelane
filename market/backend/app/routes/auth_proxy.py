@@ -28,11 +28,32 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
 from ..config import get_settings
+from .. import supabase_admin
 
 log = logging.getLogger("edgelane.market.authproxy")
 router = APIRouter()
 
 _TIMEOUT = 15.0
+
+# Product entitlements. A user may sign in to a product only if that product's
+# tool key is in profiles.tools_enabled — no cross-product access. The product
+# name IS the tool key here (Simmer→"simmer", Matrix→"market"); the whitelist
+# stops an arbitrary value ever reaching GoTrue's user_metadata or the gate.
+# The GRANT at signup is not done here: Simmer only stamps signup_product on the
+# GoTrue user, and migration 0013's handle_new_user() seeds tools_enabled from
+# it (single shared grant path — do not add a second one in the proxy).
+_PRODUCT_TOOL = {"simmer": "simmer", "market": "market"}
+_PRODUCT_NAME = {"simmer": "Simmer", "market": "Matrix"}
+_DEFAULT_PRODUCT = "simmer"      # the proxy's only caller today is Simmer
+
+
+def _norm_product(v: str | None) -> str:
+    """Absent/blank → the default product; anything not whitelisted is rejected
+    (422) rather than passed through."""
+    v = (v or _DEFAULT_PRODUCT).strip().lower()
+    if v not in _PRODUCT_TOOL:
+        raise ValueError("invalid product")
+    return v
 
 
 def _client_ip(request: Request) -> str | None:
@@ -104,6 +125,7 @@ async def _post(path: str, json_body: dict, params: dict | None = None,
 class Credentials(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=6, max_length=200)
+    product: str = Field(default=_DEFAULT_PRODUCT, max_length=32)
 
     @field_validator("email")
     @classmethod
@@ -115,9 +137,17 @@ class Credentials(BaseModel):
             raise ValueError("invalid email")
         return v
 
+    @field_validator("product")
+    @classmethod
+    def _product_shape(cls, v: str) -> str:
+        return _norm_product(v)
+
 
 class RefreshBody(BaseModel):
     refresh_token: str = Field(min_length=8, max_length=2000)
+    product: str = Field(default=_DEFAULT_PRODUCT, max_length=32)
+
+    _product = field_validator("product")(Credentials._product_shape.__func__)
 
 
 class EmailBody(BaseModel):
@@ -126,9 +156,53 @@ class EmailBody(BaseModel):
     _shape = field_validator("email")(Credentials._email_shape.__func__)
 
 
+async def _revoke(sess: dict) -> None:
+    """Best-effort: invalidate a just-issued session so a user WITHOUT the
+    product's tool never holds a working token. Never raises — a failed revoke
+    must not turn the 403 into a 500 (the client is told no either way, and the
+    token expires on its own). GoTrue's /logout keys off the user's own JWT, so
+    we send it as the bearer alongside the service apikey."""
+    try:
+        base, headers = _gotrue()
+        access = sess.get("access_token")
+        refresh_token = sess.get("refresh_token")
+        auth_headers = {**headers}
+        if access:
+            auth_headers["Authorization"] = f"Bearer {access}"
+        # scope=local: revoke ONLY this just-issued session. GoTrue's default is
+        # global, which would also sign the user out of the products they ARE
+        # entitled to (e.g. a Matrix user refused by Simmer losing Matrix).
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
+            await c.post(f"{base}/logout", headers=auth_headers, params={"scope": "local"},
+                         json={"refresh_token": refresh_token} if refresh_token else {})
+    except Exception:      # noqa: BLE001 — best-effort, all failures swallowed
+        log.warning("auth proxy revoke failed (session left to expire on its own)")
+
+
+async def _enforce_product(sess: dict, product: str) -> None:
+    """Return the session only if the user holds `product`'s tool. Otherwise
+    revoke it and 403 — this is the single rule: no tool for the product, no
+    session (no cross-product access, and a tool-less profile can never log in).
+    Bypassed when auth is disabled (dev/tests), matching the rest of the layer."""
+    if not get_settings().auth_enabled:
+        return
+    tool = _PRODUCT_TOOL.get(product, product)
+    uid = (sess.get("user") or {}).get("id")
+    tools = await supabase_admin.get_user_tools(uid) if uid else []
+    if tool in tools:
+        return
+    await _revoke(sess)
+    name = _PRODUCT_NAME.get(product, product.title())
+    raise HTTPException(403, f"{name} isn't enabled for this account. Contact the operator.")
+
+
 @router.post("/auth/signup")
 async def signup(body: Credentials, request: Request):
-    data = await _post("/signup", {"email": body.email, "password": body.password},
+    # Stamp the product onto the GoTrue user's metadata; migration 0013's
+    # handle_new_user() reads signup_product to seed tools_enabled at insert.
+    data = await _post("/signup",
+                       {"email": body.email, "password": body.password,
+                        "data": {"signup_product": body.product}},
                        client_ip=_client_ip(request))
     sess = _session(data)
     # With email confirmation ON, GoTrue returns a user but no session.
@@ -143,6 +217,7 @@ async def login(body: Credentials, request: Request):
     sess = _session(data)
     if sess is None:
         raise HTTPException(401, "authentication failed")
+    await _enforce_product(sess, body.product)
     return {"session": sess}
 
 
@@ -153,6 +228,9 @@ async def refresh(body: RefreshBody):
     sess = _session(data)
     if sess is None:
         raise HTTPException(401, "refresh failed")
+    # Cheap re-check (one profiles read): a tool revoked mid-session can't be
+    # refreshed back into a working token.
+    await _enforce_product(sess, body.product)
     return {"session": sess}
 
 

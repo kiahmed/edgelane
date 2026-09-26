@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from ..auth import get_current_user
+from ..entitlements import ensure_tool
 from ..webull_client import WebullClient, WebullError, WEBULL_AUTH_HINT
 from .. import supabase_admin
 
@@ -32,6 +33,7 @@ def _tradier_base(env: str) -> str:
 
 @router.post("/broker/test")
 async def test_broker(req: BrokerTestRequest, user: dict = Depends(get_current_user)):
+    await ensure_tool(user, "market")    # Matrix-only surface; no cross-product use
     uid = user.get("id")
     if not uid or user.get("auth") != "supabase":
         raise HTTPException(403, "broker test requires a signed-in user")
