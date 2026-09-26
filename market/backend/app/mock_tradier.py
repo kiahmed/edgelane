@@ -169,6 +169,26 @@ class MockTradierClient:
             "type": "index",
         }
 
+    async def market_calendar(self, month: int, year: int) -> dict:
+        """Synthetic calendar matching Tradier's real shape: every weekday is
+        a normal 09:30-16:00 session, weekends closed. No holiday awareness
+        (mock mode has no real exchange to ask) — good enough for dev/demo."""
+        import calendar as _cal
+        days = []
+        for d in range(1, _cal.monthrange(year, month)[1] + 1):
+            dt = date(year, month, d)
+            if dt.weekday() >= 5:
+                days.append({"date": dt.isoformat(), "status": "closed",
+                            "description": "Market is closed"})
+            else:
+                days.append({
+                    "date": dt.isoformat(), "status": "open", "description": "Market is open",
+                    "premarket": {"start": "07:00", "end": "09:24"},
+                    "open": {"start": "09:30", "end": "16:00"},
+                    "postmarket": {"start": "16:00", "end": "19:55"},
+                })
+        return {"calendar": {"month": month, "year": year, "days": {"day": days}}}
+
     async def option_expirations(self, symbol: str) -> list[str]:
         # Today (or next weekday) for 0DTE, plus a 7DTE for variety.
         today = _next_weekday(date.today())

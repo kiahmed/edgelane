@@ -265,6 +265,22 @@ class Settings(BaseModel):
     # catalyst window.
     simmer_earnings_provider: str = Field(default="off")
 
+    # Torque news-signal ingestion (facades-news-reactor webhook). Off by
+    # default — see docs/torque.md "News-signal ingestion". The endpoint always
+    # accepts the POST regardless of this flag (so the sender doesn't need to
+    # know Torque's mode); when false it logs-and-drops instead of executing.
+    accept_news_reactor_signals: bool = Field(default=False)
+    news_signal_quantity: int = Field(default=1)
+    # Shared HMAC secret authenticating the webhook caller — this endpoint
+    # places real trades, so it fails CLOSED (401) whenever this is unset,
+    # never open-to-anyone. See require_news_signal_auth in routes/torque.py.
+    news_reactor_webhook_secret: str = Field(default="")
+    # Backstop rate cap on signal-driven orders, independent of everything
+    # else (auth, entitlement, idempotency) — a compromised secret or a
+    # runaway sender still can't place unbounded orders.
+    news_signal_max_per_window: int = Field(default=10)
+    news_signal_rate_window_sec: int = Field(default=3600)
+
     # External GEX override (private GEX provider extension webhook)
     use_external_gex: bool = Field(default=True)         # prefer extension data over Tradier-OI walls when fresh
     external_gex_timeout_sec: int = Field(default=30)    # how stale before falling back
@@ -469,6 +485,17 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
     if "SIMMER_EARNINGS_PROVIDER" in raw:
         v = raw["SIMMER_EARNINGS_PROVIDER"].strip().lower()
         out["simmer_earnings_provider"] = v if v in ("off", "yahoo", "nasdaq") else "off"
+
+    if "ACCEPT_NEWS_REACTOR_SIGNALS" in raw:
+        out["accept_news_reactor_signals"] = raw["ACCEPT_NEWS_REACTOR_SIGNALS"].strip().lower() in ("true", "1", "yes", "on")
+    if "NEWS_SIGNAL_QUANTITY" in raw:
+        out["news_signal_quantity"] = int(raw["NEWS_SIGNAL_QUANTITY"])
+    if "NEWS_REACTOR_WEBHOOK_SECRET" in raw:
+        out["news_reactor_webhook_secret"] = raw["NEWS_REACTOR_WEBHOOK_SECRET"]
+    if "NEWS_SIGNAL_MAX_PER_WINDOW" in raw:
+        out["news_signal_max_per_window"] = int(raw["NEWS_SIGNAL_MAX_PER_WINDOW"])
+    if "NEWS_SIGNAL_RATE_WINDOW_SEC" in raw:
+        out["news_signal_rate_window_sec"] = int(raw["NEWS_SIGNAL_RATE_WINDOW_SEC"])
 
     if "USE_EXTERNAL_GEX" in raw:
         out["use_external_gex"] = raw["USE_EXTERNAL_GEX"].strip().lower() in ("true", "1", "yes", "on")

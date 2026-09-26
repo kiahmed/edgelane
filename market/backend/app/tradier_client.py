@@ -215,6 +215,15 @@ class TradierClient:
             q = q[0] if q else {}
         return q
 
+    async def market_calendar(self, month: int, year: int) -> dict:
+        """Raw `GET /v1/markets/calendar` response for one month. Each day
+        carries `status` ("open"/"closed") and, on open days, `premarket`/
+        `open`/`postmarket` sub-objects with `start`/`end` HH:MM (exchange
+        local time) — holidays show as closed with no session times at all,
+        and early closes show a shortened `open.end`. No client-side
+        holiday/early-close calendar needed; Tradier is authoritative."""
+        return await self._get("markets/calendar", {"month": f"{month:02d}", "year": str(year)})
+
     async def option_expirations(self, symbol: str) -> list[str]:
         """List of YYYY-MM-DD expiration dates. Handles:
           * dict.expirations.date as str (single exp) or list

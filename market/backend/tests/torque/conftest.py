@@ -57,12 +57,13 @@ class FakeTradier:
     """Configurable async stand-in for TradierClient used in route tests."""
     def __init__(self, spot=22000.0, exp="2026-06-18", raw=None,
                  place_responses=None, order_status=None, orders=None,
-                 order_status_by_id=None):
+                 order_status_by_id=None, calendar_days=None):
         self._spot = spot
         self._exp = exp
         self._raw = raw if raw is not None else raw_chain(spot, exp=exp)
         self._place = list(place_responses or [])
         self._orders = list(orders or [])
+        self._calendar_days = dict(calendar_days or {})
         self._order_status = order_status or {
             "id": 1, "status": "filled", "avg_fill_price": 1.0,
             "exec_quantity": 1.0, "remaining_quantity": 0.0, "class": "multileg",
@@ -85,6 +86,24 @@ class FakeTradier:
             idx = min(self._status_call_idx.get(key, 0), len(val) - 1)
             return val[idx]
         return val if val is not None else self._order_status
+
+    async def market_calendar(self, month, year):
+        """Tradier-shaped calendar. Defaults to every day open 09:30-16:00
+        (tests that don't care about market hours shouldn't have to think
+        about this); pass `calendar_days` to a FakeTradier to override
+        specific dates (e.g. a holiday or early close) for clock tests."""
+        import calendar as _cal
+        override = getattr(self, "_calendar_days", None) or {}
+        days = []
+        for d in range(1, _cal.monthrange(year, month)[1] + 1):
+            date_str = f"{year:04d}-{month:02d}-{d:02d}"
+            days.append(override.get(date_str) or {
+                "date": date_str, "status": "open", "description": "Market is open",
+                "premarket": {"start": "07:00", "end": "09:24"},
+                "open": {"start": "09:30", "end": "16:00"},
+                "postmarket": {"start": "16:00", "end": "19:55"},
+            })
+        return {"calendar": {"month": month, "year": year, "days": {"day": days}}}
 
     async def stock_quote(self, symbol):
         return {"symbol": symbol.upper(), "last": self._spot, "close": self._spot}
@@ -148,10 +167,32 @@ class FakeTradier:
         self.placed.append({"_modify": order_id, "price": price})
         return {"order": {"id": order_id, "status": "ok", "price": price}}
 
+    async def close(self):
+        """No-op — a per-user client's cleanup, exercised by tests that
+        resolve_broker as per_user=True (a real Supabase-configured user's own
+        connection) rather than the house client every other test uses."""
+        pass
+
+
+class FakeNewsDB:
+    """Minimal Database stand-in for POST /webhook/news_signal's idempotency
+    check — claim_news_signal only. Always claims successfully by default so
+    existing tests that don't care about replay/idempotency don't need to
+    know this exists; pass a shared instance (or pre-seed `_seen`) to a test
+    that specifically exercises duplicate-detection."""
+    def __init__(self):
+        self._seen = set()
+
+    def claim_news_signal(self, source_event_id):
+        if source_event_id in self._seen:
+            return False
+        self._seen.add(source_event_id)
+        return True
+
 
 class FakeRequest:
-    def __init__(self, client):
-        self.app = type("A", (), {"state": type("S", (), {"tradier": client})()})()
+    def __init__(self, client, db=None):
+        self.app = type("A", (), {"state": type("S", (), {"tradier": client, "db": db or FakeNewsDB()})()})()
 
 
 @pytest.fixture(autouse=True)

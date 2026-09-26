@@ -296,7 +296,7 @@ function App(){
   const [result,setResult]=useState(null);
   const [err,setErr]=useState(null);
   const [now,setNow]=useState('');
-  const [mktClock,setMktClock]=useState(null);   // {market_state, open} from Yahoo (holiday-aware)
+  const [mktClock,setMktClock]=useState(null);   // {market_state, open} from Tradier's calendar (holiday-aware)
   // Past Orders is now account-wide: it comes from the /torque/orders `history`
   // list (every Torque-tagged order on the broker account), so it's identical from
   // any tab and shows the broker's own live status. No per-tab tracking here.
@@ -336,9 +336,9 @@ function App(){
   const sdef=cfg&&strategy?cfg.strategies.find(s=>s.key===strategy):null;
   // Options-data polling pauses outside market hours in PRODUCTION only; sandbox/dev
   // always polls so it stays testable off-hours (mirrors backend DEVMODE gating).
-  // Prefer Yahoo's live marketState (holiday/half-day aware); fall back to the local
-  // weekday+time gate only if the clock is unavailable. Recomputes every render — the
-  // 1s clock keeps it fresh.
+  // Prefer the backend's Tradier-calendar clock (holiday/half-day aware); fall back
+  // to the local weekday+time gate only if the clock is unavailable. Recomputes
+  // every render — the 1s clock keeps it fresh.
   const liveGate=cfg&&!cfg.devmode&&cfg.env!=='sandbox';
   const mktOpen=!liveGate?true:(mktClock&&mktClock.open!=null)?mktClock.open:isMarketOpen();
 
@@ -505,8 +505,39 @@ function App(){
   // (so resting GTC orders show, and to capture final state at the close), but the
   // recurring poll runs only during market hours — nothing fills after 4pm ET.
   const [orders,setOrders]=useState(null);
+  // News-signal orders (facades-news-reactor webhook) land here exactly like a
+  // manually-placed order — no separate panel — but nobody's watching the
+  // screen when a webhook fires, so a sound alert on arrival matters. Detected
+  // by tag prefix (torqueNews…) rather than "any unrecognized order", which
+  // would also false-fire for orders placed via `tp` or by hand on the broker.
+  const seenOrderIds=useRef(null);   // null until first fetch primes it — no beep for pre-existing orders
+  const beepNewsOrder=()=>{
+    try{
+      const Ctx=window.AudioContext||window.webkitAudioContext;
+      const ctx=new Ctx();
+      const osc=ctx.createOscillator(),gain=ctx.createGain();
+      osc.type='sine';osc.frequency.value=880;
+      gain.gain.setValueAtTime(0.0001,ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.3,ctx.currentTime+0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001,ctx.currentTime+0.4);
+      osc.connect(gain);gain.connect(ctx.destination);
+      osc.start();osc.stop(ctx.currentTime+0.42);
+    }catch(e){}
+  };
   useEffect(()=>{let live=true;
-    const run=()=>j('/torque/orders').then(o=>{if(live)setOrders(o)}).catch(()=>{});
+    const run=()=>j('/torque/orders').then(o=>{
+      if(!live)return;
+      const all=[...(o.orders||[]),...(o.history||[])];
+      const ids=new Set(all.map(x=>String(x.id)));
+      if(seenOrderIds.current===null){
+        seenOrderIds.current=ids;
+      }else{
+        const isNews=x=>String(x.tag||'').startsWith('torqueNews');
+        if(all.some(x=>isNews(x)&&!seenOrderIds.current.has(String(x.id))))beepNewsOrder();
+        seenOrderIds.current=ids;
+      }
+      setOrders(o);
+    }).catch(()=>{});
     run();
     if(!mktOpen)return()=>{live=false};
     const t=setInterval(run,4000);return()=>{live=false;clearInterval(t)};
@@ -567,7 +598,7 @@ function App(){
       </div>
       <span className={"tag "+(cfg.env==='sandbox'||cfg.devmode?'sandbox':'production')}>
         {cfg.devmode||cfg.env==='sandbox'?'SANDBOX':'PRODUCTION'} · {cfg.mode}</span>
-      {!mktOpen&&<span className="tag closed" title="Polling pauses whenever the market isn't in its regular session — from Yahoo's live marketState, so holidays and early closes are handled automatically (no calendar). Positioning/flow freeze; orders shown as of the pause (cancel/modify still work). Resumes automatically at the next regular session.">MARKET {mktLabel(mktClock)} · PAUSED</span>}
+      {!mktOpen&&<span className="tag closed" title="Polling pauses whenever the market isn't in its regular session — from Tradier's own market calendar, so holidays and early closes are handled automatically. Positioning/flow freeze; orders shown as of the pause (cancel/modify still work). Resumes automatically at the next regular session.">MARKET {mktLabel(mktClock)} · PAUSED</span>}
       <div className="grow"></div>
       <div className="clock">{now}</div>
     </header>
@@ -1002,7 +1033,7 @@ function isMarketOpen(){
   const mins=hh*60+(+g('minute'));
   return mins>=570&&mins<960;   // 09:30 … 16:00 ET
 }
-// short label for the closed banner from Yahoo's marketState (falls back to CLOSED).
+// short label for the closed banner from the backend's market_state (falls back to CLOSED).
 const MKT_STATE_LABEL={REGULAR:'OPEN',PRE:'PRE-MARKET',PREPRE:'PRE-MARKET',POST:'AFTER-HOURS',POSTPOST:'AFTER-HOURS',CLOSED:'CLOSED'};
 const mktLabel=c=>(c&&MKT_STATE_LABEL[c.market_state])||'CLOSED';
 // Positioning is a snapshot of where premium/OI/volume cluster — NOT a price

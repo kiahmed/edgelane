@@ -17,10 +17,14 @@ unfilled entry never leaves a naked close order behind.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import re
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -32,6 +36,7 @@ from ..auth import get_current_user
 from ..config import get_settings
 from ..broker_resolver import resolve_broker
 from ..entitlements import ensure_tool
+from .. import supabase_admin
 from ..order_builder import build_tradier_order_payload
 from .. import torque_config as tcfg
 from .. import torque_engine as teng
@@ -219,25 +224,69 @@ async def _yahoo_spot(ticker: str) -> float | None:
 
 _MKT_CACHE: dict = {"t": 0.0, "state": None, "open": None}
 _MKT_OK_TTL = 30.0     # serve a good read this long
-_MKT_FAIL_TTL = 8.0    # serve a FAILED read briefly too, so a Yahoo outage doesn't
+_MKT_FAIL_TTL = 8.0    # serve a FAILED read briefly too, so an outage doesn't
                        # re-hit every poll — still recovers within seconds
+_NY_TZ = ZoneInfo("America/New_York")
 
-async def _yahoo_market_state() -> str | None:
-    """Yahoo `marketState` for a US reference symbol
-    (PREPRE/PRE/REGULAR/POST/POSTPOST/CLOSED). This reflects the REAL exchange
-    session — including holidays and early closes — so it's an authoritative
-    open/closed signal with no hardcoded calendar. None on any failure."""
-    ref = (tcfg.tickers() or ["SPX"])[0]
-    ysym = tcfg.yahoo_symbol(ref) or "%5EGSPC"   # ^GSPC fallback
+# The whole month's calendar, refetched only when the month rolls over — one
+# Tradier call a day in practice, not one per /torque/clock poll.
+_CALENDAR_CACHE: dict = {"ym": None, "days": {}}
+
+
+async def _tradier_calendar_days(client) -> dict[str, dict]:
+    """This month's Tradier trading calendar, keyed by `YYYY-MM-DD`."""
+    now_ny = datetime.now(_NY_TZ)
+    ym = (now_ny.year, now_ny.month)
+    if _CALENDAR_CACHE["ym"] == ym:
+        return _CALENDAR_CACHE["days"]
     try:
-        async with httpx.AsyncClient(timeout=_YAHOO_TIMEOUT) as cli:
-            r = await cli.get(_YAHOO_URL.format(sym=ysym), headers={"User-Agent": "Mozilla/5.0"})
-            r.raise_for_status()
-            st = r.json()["chart"]["result"][0]["meta"].get("marketState")
-            return str(st) if st else None
+        d = await client.market_calendar(now_ny.month, now_ny.year)
+        raw = ((d.get("calendar") or {}).get("days") or {}).get("day") or []
+        if isinstance(raw, dict):
+            raw = [raw]
+        days = {x["date"]: x for x in raw if x.get("date")}
+        _CALENDAR_CACHE.update(ym=ym, days=days)
+        return days
     except Exception as e:
-        log.warning("yahoo market state failed (%s): %s", ysym, e)
-        return None
+        log.warning("tradier market calendar fetch failed: %s", e)
+        return _CALENDAR_CACHE["days"]   # stale beats nothing; {} if never fetched
+
+
+def _hhmm_today(hhmm: str, now_ny: datetime) -> datetime:
+    h, m = (int(x) for x in hhmm.split(":"))
+    return now_ny.replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+async def _tradier_market_state(client) -> tuple[str | None, bool | None]:
+    """Authoritative open/closed from Tradier's own market calendar — holidays
+    and early closes both handled exactly, no external dependency (Torque
+    already has the credentials/client). Recommended by
+    facades-news-reactor's own integration doc (2026-09-26) after finding
+    Yahoo's `marketState` field had silently disappeared from the v8 chart
+    endpoint; this replaces that Yahoo-based check entirely rather than
+    layering on top of it. Verified against a real closed day (Thanksgiving
+    2026-11-26) and a real early close (2026-11-27, 13:00) via the live API.
+
+    Returns (state, open) mirroring the old Yahoo shape (PRE/REGULAR/POST/
+    CLOSED, open bool) so the frontend's existing label map needs no change.
+    (None, None) only on a total calendar-fetch failure with nothing cached
+    yet."""
+    now_ny = datetime.now(_NY_TZ)
+    date_str = now_ny.strftime("%Y-%m-%d")
+    days = await _tradier_calendar_days(client)
+    day = days.get(date_str)
+    if not day:
+        return None, None
+    if str(day.get("status") or "").lower() == "closed":
+        return "CLOSED", False
+    for label, is_open in (("open", True), ("premarket", False), ("postmarket", False)):
+        window = day.get(label) or {}
+        start, end = window.get("start"), window.get("end")
+        if not (start and end):
+            continue
+        if _hhmm_today(start, now_ny) <= now_ny < _hhmm_today(end, now_ny):
+            return ("REGULAR" if is_open else ("PRE" if label == "premarket" else "POST")), is_open
+    return "CLOSED", False
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -379,19 +428,23 @@ async def torque_cfg():
 
 
 @router.get("/torque/clock", dependencies=_GATE)
-async def torque_clock():
-    """Authoritative market-open flag from Yahoo `marketState` — handles holidays
-    and early closes with no hardcoded calendar. Cached ~30s (one Yahoo hit per
-    window). `open` is None (unknown) on a Yahoo failure, so the client falls back
-    to its own weekday+time gate."""
+async def torque_clock(request: Request):
+    """Authoritative market-open flag from Tradier's own market calendar —
+    handles holidays and early closes exactly, no hardcoded calendar and no
+    external (Yahoo) dependency. Cached ~30s for the open/closed instant
+    check (cheap — a local time comparison, no network call); the underlying
+    calendar itself is cached for the whole month (see _tradier_calendar_days
+    — about one Tradier call a day, not one per poll). `open` is None
+    (unknown) only if the calendar fetch has never once succeeded, so the
+    client falls back to its own weekday+time gate."""
     now = time.time()
-    # serve cache while fresh — a good read for _MKT_OK_TTL, a failed one (state None)
-    # for the shorter _MKT_FAIL_TTL so a sustained Yahoo outage is shielded, not spammed.
-    ttl = _MKT_OK_TTL if _MKT_CACHE["state"] is not None else _MKT_FAIL_TTL
+    # serve cache while fresh — a good read for _MKT_OK_TTL, a failed one (open
+    # still None) for the shorter _MKT_FAIL_TTL so a sustained outage is
+    # shielded, not spammed.
+    ttl = _MKT_OK_TTL if _MKT_CACHE["open"] is not None else _MKT_FAIL_TTL
     if _MKT_CACHE["t"] and now - _MKT_CACHE["t"] < ttl:
         return {"market_state": _MKT_CACHE["state"], "open": _MKT_CACHE["open"]}
-    st = await _yahoo_market_state()
-    is_open = (st == "REGULAR") if st is not None else None
+    st, is_open = await _tradier_market_state(_client(request))
     _MKT_CACHE.update(t=now, state=st, open=is_open)
     return {"market_state": st, "open": is_open}
 
@@ -573,6 +626,12 @@ class PlaceRequest(BaseModel):
     confirm: bool = False
     dry_run: bool = False                 # preview-only: validate entry+close, place nothing
     account_id: str | None = None
+    # Entry tag prefix — default "torque" for every normal UI-placed order.
+    # Internal callers (e.g. the news-signal webhook) override this so their
+    # orders are visibly distinguishable in the orders/history table and can
+    # be detected client-side (for the sound alert) without special-casing
+    # the execution path itself.
+    tag_prefix: str = "torque"
 
 
 def _single_option_payload(*, symbol, leg, otype, price, duration, preview, tag, side_override=None):
@@ -803,7 +862,7 @@ async def torque_place(req: PlaceRequest, request: Request,
         # declared type so the auto-close is built in the right direction.
         sdef = tcfg.STRATEGY_DEFS.get(req.strategy, {})
         entry_type = (sdef.get("type") or req.spread_type or "debit").lower()
-        tag = f"torque{req.strategy}"
+        tag = f"{req.tag_prefix}{req.strategy}"
 
         # qty-scaled order legs
         o_legs = teng.legs_to_order_legs(legs, req.quantity)
@@ -999,6 +1058,216 @@ async def torque_place(req: PlaceRequest, request: Request,
         # Close the per-user client unless the watcher took ownership of it.
         if per_user and not handed_off:
             await client.close()
+
+
+# ── news-signal ingestion (facades-news-reactor) ────────────────────────────
+class NewsSignalPayload(BaseModel):
+    """See ../../docs/torque.md 'News-signal ingestion' and the sibling repo's
+    docs/torque-integration-proposal.md — this mirrors that payload exactly."""
+    source_event_id: str
+    headline: str
+    category: str | None = None
+    symbol: str
+    direction: str                          # "bullish" | "bearish"
+    sentiment: str | None = None
+    confidence: float = Field(ge=0.0, le=1.0)
+    rationale: str | None = None
+    tradier_confirmation: dict | None = None
+    generated_at: str | None = None
+
+
+_NEWS_DIRECTION_STRATEGY = {"bullish": "long_call", "bearish": "long_put"}
+_NEWS_SIGNAL_TS_WINDOW_SEC = 300   # +/-5min — bounds how long a captured request stays replayable
+_NEWS_SIGNAL_RATE: dict = {"window_start": 0.0, "count": 0}
+
+
+async def require_news_signal_auth(request: Request) -> None:
+    """HMAC-signed webhook auth for POST /webhook/news_signal — this endpoint
+    places real trades, so it authenticates the CALLER, not just what the
+    payload is allowed to do (every other check on this route constrains
+    WHAT gets traded; this is the only one that checks WHO is asking).
+    Fails CLOSED (401) whenever NEWS_REACTOR_WEBHOOK_SECRET is unset —
+    "unconfigured" must mean "closed," never "open to anyone who can reach
+    this host."
+
+    Signature: hex HMAC-SHA256 of "{X-Signal-Timestamp}.{raw body}" using the
+    shared secret, in the `X-Signal-Signature` header. The timestamp must be
+    within _NEWS_SIGNAL_TS_WINDOW_SEC of now, so a captured request can't be
+    replayed indefinitely — source_event_id idempotency (claim_news_signal,
+    below) is the second, independent layer against replay, covering both
+    the window itself and the sender's own legitimate retries."""
+    secret = (get_settings().news_reactor_webhook_secret or "").strip()
+    if not secret:
+        raise HTTPException(401, "news-signal webhook not configured")
+    ts_header = request.headers.get("X-Signal-Timestamp", "")
+    sig_header = request.headers.get("X-Signal-Signature", "")
+    try:
+        ts = int(ts_header)
+    except ValueError:
+        raise HTTPException(401, "missing or invalid X-Signal-Timestamp")
+    if abs(time.time() - ts) > _NEWS_SIGNAL_TS_WINDOW_SEC:
+        raise HTTPException(401, "stale timestamp")
+    raw = await request.body()
+    expected = hmac.new(secret.encode(), f"{ts_header}.".encode() + raw, hashlib.sha256).hexdigest()
+    if not sig_header or not hmac.compare_digest(sig_header, expected):
+        raise HTTPException(401, "invalid signature")
+
+
+def _news_signal_rate_ok(settings) -> bool:
+    """Fixed-window backstop cap on signal-driven orders, independent of
+    auth/entitlement/idempotency — a compromised secret or a malfunctioning
+    sender still can't place unbounded orders."""
+    now = time.time()
+    if now - _NEWS_SIGNAL_RATE["window_start"] >= settings.news_signal_rate_window_sec:
+        _NEWS_SIGNAL_RATE.update(window_start=now, count=0)
+    if _NEWS_SIGNAL_RATE["count"] >= settings.news_signal_max_per_window:
+        return False
+    _NEWS_SIGNAL_RATE["count"] += 1
+    return True
+
+
+async def _place_news_signal_for_uid(uid, *, request, symbol, strategy, legs,
+                                     limit_price, stop_pct, quantity) -> dict:
+    """One qualified account's attempt: entitlement + broker checks, then a
+    fresh PlaceRequest through the real place() path. Never raises — every
+    outcome (not entitled, no broker, rejected) comes back as a dict so one
+    account's failure can't stop the fan-out to the rest."""
+    user = {"id": uid, "auth": "supabase"}
+    # Direct function calls bypass the HTTP dependency layer entirely (no
+    # FastAPI Depends() runs for a plain call), so both entitlement checks
+    # normally gated via `_GATE`/`require_torque_access` are done explicitly
+    # here — non-raising, since "not entitled" must be a silent drop for a
+    # webhook, never a 403. A user needs "torque" (can use Torque at all) AND
+    # "news-reactor" (opted into this specific signal source).
+    tools = await supabase_admin.get_user_tools(uid)
+    if "torque" not in tools:
+        return {"uid": uid, "accepted": False, "reason": "not entitled to torque"}
+    if "news-reactor" not in tools:
+        return {"uid": uid, "accepted": False, "reason": "not entitled to news-reactor"}
+
+    place_req = PlaceRequest(
+        symbol=symbol, strategy=strategy, legs=legs, order_type="limit",
+        limit_price=limit_price, quantity=quantity,
+        auto_close=True, stop_loss_pct=stop_pct, confirm=True, tag_prefix="torqueNews",
+    )
+    try:
+        result = await torque_place(place_req, request, user=user)
+    except HTTPException as e:
+        # Most commonly: this account has no active broker connection
+        # (resolve_broker's own 403) — exactly the "not configured, so ignore
+        # it" case this gate is meant to produce, not an error.
+        return {"uid": uid, "accepted": False, "reason": e.detail}
+    return {"uid": uid, "accepted": True, "place_result": result}
+
+
+@router.post("/webhook/news_signal", dependencies=[Depends(require_news_signal_auth)])
+async def news_signal(payload: NewsSignalPayload, request: Request):
+    """Receive a directional news signal ONCE and fan it out, backend-side,
+    to every qualified account — the sender posts a single time and forgets;
+    Torque decides how many accounts act on it, not the reverse. Each
+    qualifying account places it through Torque's own place() path — same
+    guardrails (auto-close, stop-loss, the fully-hardened stop-exit ladder)
+    as a human clicking Send, zero special-casing for "this came from a
+    webhook".
+
+    "Qualified" today means: uid listed in TORQUE_OPERATOR_UIDS (a webhook
+    has no browser session to bind to, so there's no other way yet to know
+    which accounts should react — see docs/torque.md), entitled to both
+    `torque` and `news-reactor`, and has an active broker connection. Every
+    account is checked and acted on independently; one account having no
+    broker connected doesn't block another that does.
+
+    Single-leg only (long_call/long_put) — the payload carries no strike or
+    spread guidance, and single-leg is the only structure that gets the fully
+    broker-native OTOCO bracket for both the profit target and the stop, the
+    safest execution path for something that fires with no one watching it.
+    The chain is fetched and the limit price/stop computed ONCE and shared
+    across every qualified account, so they all act on the identical quote
+    rather than staggered re-fetches drifting apart.
+
+    Authentication (require_news_signal_auth, above) happens before any of
+    this runs and fails CLOSED — everything below authenticates WHAT gets
+    traded, not WHO is asking. ALWAYS returns 200/ok:true past that point
+    regardless of outcome — the proposal is explicit that the sender must not
+    need to know Torque's mode. Every non-execution path (flag off, no ticker
+    match, no operator configured, not entitled, no broker connected, spread
+    too wide, market closed/unknown, duplicate source_event_id, rate-capped)
+    is a log-and-drop, never an error response.
+    """
+    settings = get_settings()
+    if not settings.accept_news_reactor_signals:
+        log.info("news_signal dropped (feature off): %s", payload.source_event_id)
+        return {"ok": True, "accepted": False, "reason": "ACCEPT_NEWS_REACTOR_SIGNALS is off"}
+
+    # Idempotency: a replay of an already-authenticated request (within the
+    # signature's timestamp window) or the sender's own legitimate retry must
+    # never place a second order. Checked before anything else so a replay
+    # never even reaches the rate cap or does any real work.
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return {"ok": True, "accepted": False, "reason": "idempotency store unavailable"}
+    if not db.claim_news_signal(payload.source_event_id):
+        log.info("news_signal duplicate dropped: %s", payload.source_event_id)
+        return {"ok": True, "accepted": False, "reason": "duplicate source_event_id"}
+
+    if not _news_signal_rate_ok(settings):
+        return {"ok": True, "accepted": False, "reason": "signal rate cap exceeded"}
+
+    strategy = _NEWS_DIRECTION_STRATEGY.get((payload.direction or "").lower())
+    if not strategy:
+        return {"ok": True, "accepted": False, "reason": f"unrecognized direction {payload.direction!r}"}
+
+    symbol = payload.symbol.upper()
+    if symbol not in tcfg.tickers():
+        return {"ok": True, "accepted": False, "reason": f"{symbol} is not a configured Torque ticker"}
+
+    # Defensive belt-and-suspenders — facades-news-reactor already enforces
+    # trading_hours on the sending side. Fails CLOSED here: an unattended
+    # trader should never act on an uncertain market-open read, so anything
+    # other than a confirmed `open is True` (including a calendar-fetch
+    # failure) drops the signal rather than trading blind.
+    try:
+        clock = await torque_clock(request)
+    except Exception:
+        clock = {"open": None}
+    if clock.get("open") is not True:
+        return {"ok": True, "accepted": False, "reason": "market is closed or its state is unknown"}
+
+    uids = tcfg.operator_uids()
+    if not uids:
+        return {"ok": True, "accepted": False, "reason": "no TORQUE_OPERATOR_UIDS configured"}
+
+    try:
+        build = await torque_build(BuildRequest(symbol=symbol, strategy=strategy), request)
+    except HTTPException as e:
+        return {"ok": True, "accepted": False, "reason": f"build failed: {e.detail}"}
+    if build.get("missing_legs"):
+        return {"ok": True, "accepted": False, "reason": f"could not resolve contract(s): {build['missing_legs']}"}
+
+    price = build["price"]
+    # Fetched fresh right here, at execution time — this payload deliberately
+    # carries no price, so there is no snapshot to fall back to (by design,
+    # per the proposal). Reject rather than trade against a garbage book.
+    spread_pct = teng.package_spread_pct(price)
+    if spread_pct is not None and spread_pct > tcfg.MAX_AUTO_CLOSE_SPREAD_PCT:
+        return {"ok": True, "accepted": False,
+                "reason": f"package spread too wide to trade blind ({spread_pct:.0f}% of mid)"}
+    limit_price = teng.suggested_limit(price, build["tick"])
+    if not limit_price:
+        return {"ok": True, "accepted": False, "reason": "no live quote available at execution time"}
+
+    stop_pct = tcfg.stop_loss_default(symbol) or tcfg.DEFAULT_STOP_LOSS_PCT
+    results = [
+        await _place_news_signal_for_uid(
+            uid, request=request, symbol=symbol, strategy=strategy, legs=build["legs"],
+            limit_price=limit_price, stop_pct=stop_pct, quantity=settings.news_signal_quantity)
+        for uid in uids
+    ]
+    placed = [r for r in results if r["accepted"]]
+    log.info("news_signal %s %s %s @ %.2f: %d/%d accounts placed",
+             payload.source_event_id, symbol, strategy, limit_price, len(placed), len(results))
+    return {"ok": True, "accepted": len(placed) > 0, "symbol": symbol, "strategy": strategy,
+            "limit_price": limit_price, "stop_loss_pct": stop_pct, "results": results}
 
 
 def _build_close_payload(*, account_id, symbol, strategy, legs, is_single,

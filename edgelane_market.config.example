@@ -160,6 +160,30 @@ BREVO_API_KEY=
 USE_EXTERNAL_GEX=true
 EXTERNAL_GEX_TIMEOUT_SEC=30
 EXTENSION_POLICY_VERSION=1
+
+# ── Torque news-signal ingestion (facades-news-reactor webhook) ──
+# POST /webhook/news_signal always accepts the request; when this is false it
+# logs-and-drops instead of executing. Each account listed in
+# TORQUE_OPERATOR_UIDS (env var, comma-separated) is checked independently and
+# acted on if qualified: "torque" AND "news-reactor" in that account's
+# profiles.tools_enabled, plus its own active broker connection — missing any
+# one of those is a silent drop for THAT account only, never an error, and
+# never blocks another qualified account. See docs/torque.md "News-signal
+# ingestion".
+ACCEPT_NEWS_REACTOR_SIGNALS=false
+NEWS_SIGNAL_QUANTITY=1
+# REQUIRED before ever setting ACCEPT_NEWS_REACTOR_SIGNALS=true — every check
+# above authenticates WHAT gets traded, this is the only one that checks WHO
+# is calling. Empty = the endpoint fails CLOSED (401 to everyone), never open.
+# facades-news-reactor must sign each request: hex HMAC-SHA256 of
+# "{X-Signal-Timestamp}.{raw body}" using this same secret, sent as
+# X-Signal-Signature, with X-Signal-Timestamp within 5 minutes of now.
+NEWS_REACTOR_WEBHOOK_SECRET=
+# Backstop cap on signal-driven orders, independent of auth/entitlement — a
+# compromised secret or a malfunctioning sender still can't place unbounded
+# orders. Fixed window, not sliding.
+NEWS_SIGNAL_MAX_PER_WINDOW=10
+NEWS_SIGNAL_RATE_WINDOW_SEC=3600
 # Tradier-fallback GEX weighting (used only when no fresh external feed):
 #   oi     = gamma × open_interest  (resting positioning; default)
 #   volume = gamma × volume         (today's traded gamma; lands closer to the

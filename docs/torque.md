@@ -359,7 +359,7 @@ Anchoring model (points from spot, snapped to the chain grid):
 |---|---|
 | `GET /torque` | the page |
 | `GET /torque/config` | tickers + strategy registry + env/mode + per-ticker `close_targets`/`richness_floors` |
-| `GET /torque/clock` | `{market_state, open}` from Yahoo `marketState` (holiday/early-close aware; cached ~30s success / ~8s failure so an outage doesn't re-hit each poll) — gates the pause |
+| `GET /torque/clock` | `{market_state, open}` from Tradier's own `markets/calendar` (holiday/early-close aware, no external dependency; the instant check is cached ~30s success / ~8s failure, the underlying month's calendar ~1 call/day) — gates the pause. Replaced a Yahoo `marketState`-based version 2026-09-26 after that field silently disappeared from Yahoo's response |
 | `GET /torque/analyze/{sym}` | spot + positioning snapshot (poll ~5s) |
 | `POST /torque/build` | auto-filled legs for (ticker, strategy, step adjustments); optional `anchor_spot` freezes the strikes (Lock Strikes); also returns `counter` — the opposite structure's legs+price from the same chain/spot, `null` for Iron Condor/Fly (see [Counter Read](torque_operating_manual.html#counter)) |
 | `POST /torque/price` | live net bid/mid/ask for a set of legs (poll ~2.5s) |
@@ -402,6 +402,126 @@ linger).
 **Layout:** the page is a fixed-viewport SPA — centered, never scrolls. The
 orders panel fills the remaining height and scrolls **internally** when it has
 more rows than fit.
+
+## News-signal ingestion (facades-news-reactor)
+
+`POST /webhook/news_signal` receives a directional signal (bullish/bearish, no
+strike/spread guidance) from the sibling repo's news-sentiment pipeline and, if
+every gate passes, places it through Torque's **own** `/torque/place` path —
+same guardrails (auto-close, the stop-exit ladder) as a human clicking Send,
+zero special-casing for "this came from a webhook." Past the authentication
+gate (below), it always returns `200 ok:true` regardless of outcome (the
+sender doesn't need to know Torque's mode); every non-execution path is a
+log-and-drop `accepted:false` with a `reason`, never an error:
+
+- **Authentication (`require_news_signal_auth`) — checked before anything
+  else, and the only gate that verifies WHO is calling** (every other gate
+  here constrains WHAT gets traded). HMAC-SHA256 over `{X-Signal-Timestamp}.
+  {raw body}` with the shared `NEWS_REACTOR_WEBHOOK_SECRET`, sent as
+  `X-Signal-Signature`; the timestamp must be within 5 minutes of now. Fails
+  **closed** (401) when the secret is unset — unconfigured must mean closed,
+  never open-to-anyone reaching `edge.facades.trade`. A real anonymous POST
+  used to reach the handler and place a live order before this existed.
+- **Idempotency (`claim_news_signal`, DuckDB)** — `source_event_id` is
+  claimed atomically before any other work; a replay of an already-signed
+  request (within the timestamp window) or the sender's own retry never
+  places a second order. Claimed IDs are meant to be purged after 24h (see
+  [Multi-user order persistence](#multi-user-order-persistence-specced-not-implemented)
+  for the planned purge hook — not wired to a scheduler yet).
+- **A per-window rate cap** (`NEWS_SIGNAL_MAX_PER_WINDOW`, default 10/hour) —
+  independent backstop; a compromised secret or a malfunctioning sender still
+  can't place unbounded orders.
+- **`ACCEPT_NEWS_REACTOR_SIGNALS`** (default `false`) — the hard kill switch.
+- **Ticker configured**, **market open** — fails **closed**: anything other
+  than a confirmed `open is True` (including a calendar-fetch failure) drops
+  the signal. An unattended trader should never act on an uncertain read, even
+  though the sender already enforces trading hours on its own side.
+- **Which accounts act on this** — facades-news-reactor posts **once and
+  forgets**; fanning out to every qualified account is Torque's own job, not
+  the sender's. A webhook has no browser session to bind to, so "qualified"
+  means every uid listed in `TORQUE_OPERATOR_UIDS` (the same config that seeds
+  operator entitlements at startup) that has **both** `torque` and
+  `news-reactor` in `profiles.tools_enabled` **and** an **active broker
+  connection** (`resolve_broker`'s own per-user check, no house-account
+  fallback). Each account is checked and placed independently — one account
+  with no broker connected doesn't block another that has one, and each gets
+  the order through its **own** broker. The chain/quote is fetched once and
+  shared across every qualified account so they all act on the identical
+  price rather than staggered re-fetches drifting apart. The response's
+  `results` array reports each account's own outcome.
+
+  `TORQUE_OPERATOR_UIDS` is a static allowlist, not "whoever currently has
+  Torque open" — there's no live-session registry, so an entitled+configured
+  account acts on every signal whether or not anyone is looking at the page
+  right now. A per-user "only auto-execute while I'm active" preference is a
+  reasonable later addition but isn't built; today, entitlement + a broker
+  connection is the only opt-in.
+- **Live spread sanity** — the payload deliberately carries no price (by
+  design: Torque fetches its own fresh quote at execution time rather than
+  trading off a stale snapshot), so the freshly-built package spread is
+  checked against `MAX_AUTO_CLOSE_SPREAD_PCT` and rejected if it looks wrong,
+  rather than trading blind.
+
+**Single-leg only for now** (`bullish → long_call`, `bearish → long_put`) —
+the only structure that gets the fully broker-native OTOCO bracket for both
+the profit target and the stop, the safest execution path for something that
+fires with no one watching it. Multi-leg strategy selection is a possible
+later addition once the signal payload itself carries more to base that
+choice on. Quantity is `NEWS_SIGNAL_QUANTITY` (default 1); the stop-loss is
+armed at the ticker's own configured default, same as any other order.
+
+Every resulting order carries the `torqueNews…` tag (vs. the normal
+`torque…`/`torqueClose…`) — visible in the Orders/Past-Orders table like any
+other order (no separate panel), and it's what the page's sound alert keys
+off: a short tone plays the first time a `torqueNews…`-tagged order appears in
+a poll that wasn't there in the previous one, so an unattended fire still gets
+noticed. Detection is tag-based specifically so it doesn't also fire for
+orders placed via `tp` or by hand on the broker's own site, which show up in
+the same account-wide orders list but aren't news-signal-driven.
+
+## Multi-user order persistence (specced, not implemented)
+
+**The problem.** Every watcher (`_watch_and_close` → `_monitor_stop` → the
+stop-exit ladder) is an in-memory `asyncio.create_task`, keyed in the
+process-global `_WATCHERS` dict — true for every Torque order, not just
+news-signal ones. Two characteristics that news-signal's fan-out makes far
+more visible than a single human clicking Send ever did:
+
+- **Concurrency is additive, not deduped.** One signal spawns N concurrent
+  watcher tasks (one per qualified account). A second signal arriving before
+  the first positions close adds another N on top — watcher count tracks
+  (open news-driven positions × qualified accounts), unbounded if signals
+  arrive faster than positions resolve. Each task itself is a cheap coroutine
+  (mostly `sleep()`, not a thread/process), so raw CPU cost stays low; the
+  real cost is N accounts independently polling the *same* underlying chain
+  data every cycle from N different Tradier tokens — redundant traffic/
+  parsing that scales with account count with no dedup today.
+- **No survival across a backend restart.** In-memory state means an
+  in-flight reactive watcher (spreads, or a single-leg stop still requoting)
+  is lost if the process restarts mid-position. A single-leg native OTOCO
+  bracket doesn't have this exposure — it's broker-held, not app-tracked.
+
+**Where it would live.** Not a new database and not Supabase (that's the
+identity/entitlement store — profiles, tools_enabled, broker_configs — wrong
+fit for execution state). The **same single DuckDB file** Matrix and Simmer
+already share (env-suffixed: prod/sandbox/mock), just a new `torque_watchers`
+table. Concurrency is a non-issue: it's one process, one connection, already
+serialized through `db.py`'s own `Lock()` — Matrix's poller and Simmer's
+watcher already write through that same lock concurrently today. A third
+writer is one more caller of an existing lock, not a new locking problem.
+
+**Purge, not a new standalone loop.** `poller.py` already runs a background
+loop, independent of any browser, that recomputes `state.market_open` on its
+own schedule every cycle regardless of whether Torque's UI is ever open. Hook
+the purge there: on the open→closed transition, fire a one-off sweep of
+`torque_watchers` rather than adding a second scheduler or depending on
+`/torque/clock` happening to be polled by an open browser tab (which, unlike
+the poller, only runs when someone has the page open).
+
+**Retention:** keep a row **24h** past its terminal state (filled/canceled/
+rejected/expired) — matches the Orders panel's existing "Past Orders" window
+(today's account-tagged orders), so persisted state doesn't outlive what the
+UI itself already treats as current.
 
 ## Branding & assets
 
