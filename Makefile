@@ -220,16 +220,32 @@ db-push-dry: ## List the migrations that would be applied
 # Fires a genuinely signed POST /webhook/news_signal — real auth, real
 # idempotency/rate-cap/market-hours gates, real fan-out to whoever is
 # currently entitled to news-reactor in Supabase, through THAT account's own
-# broker connection. Defaults to the deployed hostname; point BASE_URL at a
-# local `make run-dev` for a sandbox-account-only test. See
-# tools/send_test_signal.py's own docstring for the full risk note.
-torque-test-signal: ## Fire a signed test news-signal event (BASE_URL=, SYMBOL=NDX, DIRECTION=bullish|bearish)
-	@$(PY) tools/send_test_signal.py --base-url "$(or $(BASE_URL),https://edge.facades.trade)" \
+# broker connection. BASE_URL is REQUIRED (no default): anything but a local
+# dev port can place real orders — edge.facades.trade is production, and
+# 127.0.0.1:8789 is the production container's published port on this host.
+# Those need CONFIRM_PROD=1. Use a local `make run-dev PORT=8790` for testing.
+define _signal_target_guard
+	@test -n "$(BASE_URL)" || { echo "BASE_URL is required, e.g. BASE_URL=http://127.0.0.1:8790 (a local make run-dev PORT=8790)"; exit 1; }
+	@case "$(BASE_URL)" in \
+	  http://127.0.0.1:8789|http://127.0.0.1:8789/*|http://localhost:8789|http://localhost:8789/*) prod=1 ;; \
+	  http://127.0.0.1:*|http://localhost:*) prod=0 ;; \
+	  *) prod=1 ;; \
+	esac; \
+	if [ "$$prod" = 1 ] && [ "$(CONFIRM_PROD)" != "1" ]; then \
+	  echo "refusing: $(BASE_URL) can place REAL orders on every entitled account."; \
+	  echo "re-run with CONFIRM_PROD=1 if that is really intended."; exit 1; \
+	fi
+endef
+
+torque-test-signal: ## Fire a signed test news-signal event (BASE_URL= required, SYMBOL=NDX, DIRECTION=bullish|bearish; prod needs CONFIRM_PROD=1)
+	$(_signal_target_guard)
+	@$(PY) tools/send_test_signal.py --base-url "$(BASE_URL)" \
 		--symbol "$(or $(SYMBOL),NDX)" --direction "$(or $(DIRECTION),bullish)" $(ARGS)
 
-torque-test-cancel: ## Cancel a prior test signal (CANCEL=<source_event_id>, BASE_URL=)
-	@test -n "$(CANCEL)" || { echo "usage: make torque-test-cancel CANCEL=<source_event_id> [BASE_URL=...]"; exit 1; }
-	@$(PY) tools/send_test_signal.py --base-url "$(or $(BASE_URL),https://edge.facades.trade)" \
+torque-test-cancel: ## Cancel a prior test signal (CANCEL=<source_event_id>, BASE_URL= required; prod needs CONFIRM_PROD=1)
+	@test -n "$(CANCEL)" || { echo "usage: make torque-test-cancel CANCEL=<source_event_id> BASE_URL=..."; exit 1; }
+	$(_signal_target_guard)
+	@$(PY) tools/send_test_signal.py --base-url "$(BASE_URL)" \
 		--cancel "$(CANCEL)" $(ARGS)
 
 # Machine migration — DuckDB volume in/out. Dump tars the volume into
