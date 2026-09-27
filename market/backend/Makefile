@@ -31,6 +31,8 @@ CONFIG         = ../../edgelane_market.config
 PY             = python3
 VENV           = .venv
 VENV_PY        = $(VENV)/bin/python
+# Boot with the venv's interpreter when it exists (uvicorn + deps live there).
+RUN_PY         = $(if $(wildcard $(VENV_PY)),$(VENV_PY),$(PY))
 UI_PATH        = ../ui/index.html
 LOG_FILE       = /tmp/edgelane-market.log
 
@@ -109,7 +111,7 @@ _flip_prod: _check_config
 
 run: _check_config clean
 	@echo ">>> booting uvicorn on http://$(HOST):$(PORT)"
-	@EDGELANE_MARKET_CONFIG=$(CONFIG) $(PY) -m uvicorn $(APP) --host $(HOST) --port $(PORT)
+	@EDGELANE_MARKET_CONFIG=$(CONFIG) $(RUN_PY) -m uvicorn $(APP) --host $(HOST) --port $(PORT)
 
 run-dev: _flip_dev run
 
@@ -117,7 +119,7 @@ run-prod: _flip_prod run
 
 run-bg: _check_config clean
 	@echo ">>> booting uvicorn in background (log: $(LOG_FILE))"
-	@EDGELANE_MARKET_CONFIG=$(CONFIG) nohup $(PY) -m uvicorn $(APP) \
+	@EDGELANE_MARKET_CONFIG=$(CONFIG) nohup $(RUN_PY) -m uvicorn $(APP) \
 	  --host $(HOST) --port $(PORT) > $(LOG_FILE) 2>&1 &
 	@sleep 2
 	@echo ">>> server PID: $$(lsof -t -i:$(PORT) 2>/dev/null || ss -lntp 2>/dev/null | grep :$(PORT) | head -1)"

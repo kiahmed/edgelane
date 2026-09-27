@@ -22,7 +22,7 @@ import hmac
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -37,6 +37,7 @@ from ..config import get_settings
 from ..broker_resolver import resolve_broker, resolve_client_for_uid
 from ..entitlements import ensure_tool
 from .. import supabase_admin
+from ..logsetup import TXN, txn
 from ..order_builder import build_tradier_order_payload
 from .. import torque_config as tcfg
 from .. import torque_engine as teng
@@ -178,6 +179,13 @@ _CLOSE_RETRY_DELAY = 2.0
 # entry_order_id -> watcher state dict (also holds the asyncio task ref so it's
 # not garbage-collected mid-flight).
 _WATCHERS: dict[str, dict] = {}
+# entry_order_id -> last recorded status, for news-signal orders placed in the
+# last 24h (from Supabase torque_orders, refreshed every _SIGNAL_ORDERS_TTL).
+# Lets the orders panel flag signal orders — Tradier drops the `tag` on OTOCO
+# brackets, so the torqueNews tag alone can't identify them — and keep each
+# one's status in the database in sync with the broker.
+_SIGNAL_ORDERS: dict = {"t": 0.0, "status": {}}
+_SIGNAL_ORDERS_TTL = 10.0
 
 _WATCHER_ROW_FIELDS = (
     "entry_order_id", "uid", "account_id", "symbol", "strategy", "legs", "is_single",
@@ -725,7 +733,15 @@ async def _poll_fill(client, account_id, order_id, timeout=None, interval=None) 
 
 async def _submit(client, account_id, payload) -> dict:
     resp = await client.place_order(account_id, payload)
-    return resp.get("order") or resp
+    order = resp.get("order") or resp
+    p = payload or {}
+    txn("order submitted", account=account_id, cls=p.get("class"), symbol=p.get("symbol"),
+        option=p.get("option_symbol") or p.get("option_symbol[0]"),
+        side=p.get("side") or p.get("side[0]"), type=p.get("type"),
+        qty=p.get("quantity") or p.get("quantity[0]"), price=p.get("price"), tag=p.get("tag"),
+        order_id=order.get("id"), status=order.get("status"),
+        errors=(order.get("errors") or None))
+    return order
 
 
 async def _place_webull(req: PlaceRequest, client, account_id: str, legs: list[dict]) -> dict:
@@ -1186,9 +1202,25 @@ def _entry_order_id_from_place_result(result: dict) -> str | None:
     return str(oid) if oid else None
 
 
+async def _is_sandbox_account(uid) -> bool:
+    """True only for an active Tradier SANDBOX connection. Anything else —
+    production, Webull, no connection, a lookup failure — is False, so the
+    out-of-hours test mode fails closed onto real-money accounts."""
+    try:
+        cfg = await supabase_admin.get_broker_config(uid)
+    except Exception:
+        return False
+    if not cfg:
+        return False
+    return ((cfg.get("broker") or "tradier").lower() == "tradier"
+            and (cfg.get("tradier_env") or "").lower() == "sandbox")
+
+
 async def _place_news_signal_for_uid(uid, *, request, source_event_id, symbol, strategy,
                                      legs, is_single, entry_type, tick,
-                                     limit_price, stop_pct, quantity) -> dict:
+                                     limit_price, stop_pct, quantity,
+                                     sandbox_only: bool = False, expiration=None,
+                                     attempt: int = 1) -> dict:
     """One qualified account's attempt: entitlement + broker checks, then a
     fresh PlaceRequest through the real place() path. Never raises — every
     outcome (not entitled, no broker, rejected) comes back as a dict so one
@@ -1205,6 +1237,9 @@ async def _place_news_signal_for_uid(uid, *, request, source_event_id, symbol, s
         return {"uid": uid, "accepted": False, "reason": "not entitled to torque"}
     if "news-reactor" not in tools:
         return {"uid": uid, "accepted": False, "reason": "not entitled to news-reactor"}
+    if sandbox_only and not await _is_sandbox_account(uid):
+        return {"uid": uid, "accepted": False,
+                "reason": "market closed — out-of-hours test mode only trades Tradier sandbox accounts"}
 
     place_req = PlaceRequest(
         symbol=symbol, strategy=strategy, legs=legs, order_type="limit",
@@ -1220,20 +1255,106 @@ async def _place_news_signal_for_uid(uid, *, request, source_event_id, symbol, s
         return {"uid": uid, "accepted": False, "reason": e.detail}
 
     entry_order_id = _entry_order_id_from_place_result(result)
-    if entry_order_id and not result.get("rejected"):
-        # Correlation index for a future CANCEL signal to find and act on
-        # this exact order — best-effort: a logging failure here must never
-        # be reported back as "the order wasn't placed," since it was.
+    if not entry_order_id or result.get("rejected"):
+        return {"uid": uid, "accepted": False, "rejected": True,
+                "reason": f"broker rejected: {result.get('reason') or 'no order id returned'}"}
+
+    # Tradier ACCEPTS the submission first and rejects a moment later
+    # (asynchronously) — "submitted" is not "live". Confirm the real status
+    # before calling this placed.
+    status, why = await _confirm_entry_status(uid, entry_order_id)
+    rejected = status == "rejected"
+    # Correlation index for a CANCEL signal to find and act on this exact
+    # order, plus its status — recorded for rejected attempts too, so the
+    # database shows every order a signal produced. Best-effort: a logging
+    # failure must never be reported back as "the order wasn't placed."
+    try:
+        await supabase_admin.insert_torque_order({
+            "source_event_id": str(source_event_id), "uid": uid,
+            "entry_order_id": entry_order_id, "symbol": symbol, "strategy": strategy,
+            "quantity": quantity, "is_single": is_single, "entry_type": entry_type,
+            "legs": legs, "tick": tick, "expiration": expiration, "attempt": attempt,
+            "status": status or "submitted", "status_reason": why,
+            "status_at": datetime.now(timezone.utc).isoformat(),
+        })
+        _SIGNAL_ORDERS["t"] = 0.0   # new signal order — refresh the orders panel's view
+    except Exception as e:
+        log.warning("insert_torque_order failed for %s/%s: %s", source_event_id, uid, e)
+    if rejected:
+        return {"uid": uid, "accepted": False, "rejected": True, "entry_order_id": entry_order_id,
+                "position_conflict": _is_position_conflict(why),
+                "reason": f"broker rejected: {why or 'no reason given'}"}
+    return {"uid": uid, "accepted": True, "entry_order_id": entry_order_id,
+            "expiration": expiration, "attempt": attempt, "place_result": result}
+
+
+# Poll the just-submitted entry a few times: a rejection lands within
+# milliseconds of acceptance; a resting order simply stays pending/open.
+_CONFIRM_TRIES = 3
+_CONFIRM_DELAY = 0.7
+
+
+async def _confirm_entry_status(uid, order_id) -> tuple[str | None, str | None]:
+    """(status, reason_description) of a just-submitted signal order, read
+    back from the account's own broker. (None, None) if it can't be read —
+    treated as live, since the submission itself was accepted."""
+    resolved = await resolve_client_for_uid(uid)
+    if not resolved:
+        return None, None
+    _broker, client, account_id = resolved
+    status, why = None, None
+    try:
+        for i in range(_CONFIRM_TRIES):
+            if i:
+                await asyncio.sleep(_CONFIRM_DELAY)
+            try:
+                o = await client.get_order(account_id, order_id)
+            except Exception:
+                continue
+            status = str(o.get("status") or "").lower() or status
+            why = o.get("reason_description") or why
+            if status in ("rejected", "filled", "canceled", "expired"):
+                break
+        return status, (why.strip() if isinstance(why, str) else why)
+    finally:
         try:
-            await supabase_admin.insert_torque_order({
-                "source_event_id": str(source_event_id), "uid": uid,
-                "entry_order_id": entry_order_id, "symbol": symbol, "strategy": strategy,
-                "quantity": quantity, "is_single": is_single, "entry_type": entry_type,
-                "legs": legs, "tick": tick,
-            })
-        except Exception as e:
-            log.warning("insert_torque_order failed for %s/%s: %s", source_event_id, uid, e)
-    return {"uid": uid, "accepted": True, "place_result": result}
+            await client.close()
+        except Exception:
+            pass
+
+
+def _is_position_conflict(reason: str | None) -> bool:
+    """Tradier's rejection when this contract already has resting exit orders
+    (an earlier signal's bracket on the SAME contract) — the case that gets
+    retried on the next expiry as an independent trade."""
+    r = (reason or "").lower()
+    return "long position" in r or "open orders" in r
+
+
+async def _build_next_expiry(client, symbol: str, strategy: str, after_exp: str, spot: float) -> dict | None:
+    """The same strategy rebuilt on the first tradeable expiry AFTER
+    `after_exp` — the retry for a same-contract rejection. Same shape as the
+    fields news_signal uses from torque_build, or None if nothing usable."""
+    try:
+        exps = await client.option_expirations(symbol)
+    except Exception:
+        return None
+    for cand in teng.expiration_candidates(exps, limit=12):
+        if str(cand) <= str(after_exp):
+            continue
+        try:
+            contracts = teng.normalize_chain(await client.options_chain(symbol, cand), symbol)
+        except Exception:
+            continue
+        if not contracts:
+            continue
+        struct = teng.build_structure(spot, contracts, symbol, strategy, {})
+        if any(not lg.get("symbol") for lg in struct["legs"]):
+            return None
+        price = teng.price_structure(struct["legs"], {c["symbol"]: c for c in contracts if c.get("symbol")})
+        return {"expiration": cand, "legs": struct["legs"], "price": price,
+                "tick": float(struct["rule"].get("tick", 0.05))}
+    return None
 
 
 # ── news-signal CANCEL: unwind a prior signal by source_event_id ───────────
@@ -1272,6 +1393,7 @@ async def _cancel_or_close_entry(client, account_id, order_id, quantity):
     """
     try:
         await client.cancel_order(account_id, order_id)
+        txn("order cancel requested", account=account_id, order_id=order_id, via="cancel-signal")
     except Exception as e:
         log.warning("cancel-signal: cancel failed for %s (may have already filled): %s", order_id, e)
     try:
@@ -1291,7 +1413,7 @@ async def _cancel_or_close_entry(client, account_id, order_id, quantity):
     return "needs_attention", 0.0
 
 
-async def _close_one_signal_order(row: dict) -> dict:
+async def _close_one_signal_order(row: dict, *, sandbox_only: bool = False) -> dict:
     """One (signal, account) correlation row from `torque_orders`: resolve
     that account's own broker client (no HTTP Request in scope — a webhook
     has no browser session, same as watcher restart-recovery), ground-truth
@@ -1305,6 +1427,14 @@ async def _close_one_signal_order(row: dict) -> dict:
         return {"uid": uid, "entry_order_id": entry_order_id, "action": "skipped",
                 "reason": "no usable broker connection to act on this account"}
     _broker, client, account_id = resolved
+    # Checked against the exact client about to act — not a separate lookup.
+    if sandbox_only and "sandbox.tradier.com" not in str(getattr(client, "base_url", "")):
+        try:
+            await client.close()
+        except Exception:
+            pass
+        return {"uid": uid, "entry_order_id": entry_order_id, "action": "skipped",
+                "reason": "market closed — out-of-hours test mode only acts on Tradier sandbox accounts"}
     try:
         outcome, exec_qty = await _cancel_or_close_entry(
             client, account_id, entry_order_id, float(row.get("quantity") or 1))
@@ -1341,20 +1471,56 @@ async def _handle_cancel_signal(payload: "NewsSignalPayload", request: Request) 
     everything that isn't itself the cancel decision."""
     if not payload.cancels_event_id:
         return {"ok": True, "accepted": False, "reason": "cancel signal missing cancels_event_id"}
-    try:
-        clock = await torque_clock(request)
-    except Exception:
-        clock = {"open": None}
-    if clock.get("open") is not True:
+    sandbox_only = await _market_gate_sandbox_only(request)
+    if sandbox_only is None:
         return {"ok": True, "accepted": False, "reason": "market is closed or its state is unknown"}
     rows = await supabase_admin.get_torque_orders_by_event(payload.cancels_event_id)
     if not rows:
         return {"ok": True, "accepted": False,
                 "reason": f"no orders on file for {payload.cancels_event_id} (never placed, or already purged)"}
-    results = [await _close_one_signal_order(row) for row in rows]
-    log.info("news_signal cancel %s -> %s: %d account(s) processed",
+    # A signal can own more than one order row (a rejected first attempt + its
+    # next-expiry retry). An attempt already closed at the broker has nothing
+    # to unwind — leave it (and its recorded status) alone.
+    closed = {"rejected", "canceled", "expired"}
+    live_rows = [row for row in rows if str(row.get("status") or "").lower() not in closed]
+    skipped = [{"uid": row.get("uid"), "entry_order_id": str(row.get("entry_order_id") or ""),
+                "action": "already_closed", "reason": f"order already {row.get('status')}"}
+               for row in rows if row not in live_rows]
+    results = [await _close_one_signal_order(row, sandbox_only=sandbox_only) for row in live_rows]
+    for r in results:
+        try:
+            await supabase_admin.update_torque_order_status(
+                r["entry_order_id"], r["action"],
+                r.get("reason") or f"cancel signal {payload.source_event_id}")
+        except Exception as e:
+            log.warning("torque_orders status update failed for %s: %s", r.get("entry_order_id"), e)
+    TXN.info("news_signal cancel %s -> %s: %d account(s) processed",
              payload.source_event_id, payload.cancels_event_id, len(results))
-    return {"ok": True, "accepted": True, "cancels_event_id": payload.cancels_event_id, "results": results}
+    out = {"ok": True, "accepted": True, "cancels_event_id": payload.cancels_event_id,
+           "results": results + skipped}
+    if sandbox_only:
+        out["test_mode"] = "out-of-hours, sandbox accounts only"
+    return out
+
+
+async def _market_gate_sandbox_only(request: Request) -> bool | None:
+    """The shared market-hours gate for entry and cancel signals.
+      False → market confirmed open: act normally on every account.
+      True  → market closed/unknown BUT the backend runs in DEVMODE / sandbox
+              (the same switch that lifts the Torque UI's own market gate):
+              proceed, restricted to Tradier sandbox accounts — DEVMODE only
+              flips the house client, never a user's own connection, so a
+              production account must still be skipped out of hours.
+      None  → market closed/unknown in production mode: drop the signal.
+    Fails closed — an unreadable clock counts as closed."""
+    try:
+        clock = await torque_clock(request)
+    except Exception:
+        clock = {"open": None}
+    if clock.get("open") is True:
+        return False
+    s = get_settings()
+    return True if (s.devmode or s.tradier_env == "sandbox") else None
 
 
 @router.post("/webhook/news_signal", dependencies=[Depends(require_news_signal_auth)])
@@ -1395,23 +1561,101 @@ async def news_signal(payload: NewsSignalPayload, request: Request):
     """
     settings = get_settings()
     if not settings.accept_news_reactor_signals:
-        log.info("news_signal dropped (feature off): %s", payload.source_event_id)
+        TXN.info("news_signal dropped (feature off): %s", payload.source_event_id)
         return {"ok": True, "accepted": False, "reason": "ACCEPT_NEWS_REACTOR_SIGNALS is off"}
 
     # Idempotency: a replay of an already-authenticated request (within the
     # signature's timestamp window) or the sender's own legitimate retry must
     # never place a second order. Checked before anything else so a replay
-    # never even reaches the rate cap or does any real work. Supabase, not
-    # DuckDB — see supabase_admin.claim_news_signal's docstring.
-    if not await supabase_admin.claim_news_signal(payload.source_event_id):
-        log.info("news_signal duplicate or idempotency check failed: %s", payload.source_event_id)
+    # never even reaches the rate cap or does any real work. The same insert
+    # also persists the full signal (payload + key fields) — this table is the
+    # first place a signal lands. Supabase, not DuckDB — see
+    # supabase_admin.claim_news_signal's docstring.
+    if not await supabase_admin.claim_news_signal(payload.source_event_id, _signal_log_row(payload)):
+        TXN.info("news_signal duplicate or idempotency check failed: %s", payload.source_event_id)
         return {"ok": True, "accepted": False, "reason": "duplicate source_event_id or idempotency check failed"}
+
+    result = await _news_signal_after_claim(payload, request, settings)
+    # Outcome onto the log row — only for signals THIS request claimed (a
+    # duplicate above must never overwrite the original's recorded outcome).
+    try:
+        is_cancel = (payload.state or "").lower() == "cancel"
+        outcome = result.get("outcome") or (
+            "dropped" if not result.get("accepted") else
+            "cancel_processed" if is_cancel else "placed")
+        txn("news_signal outcome", id=payload.source_event_id, state=payload.state or "entry",
+            symbol=payload.symbol, outcome=outcome, reason=result.get("reason"))
+        await supabase_admin.record_news_signal_outcome(
+            payload.source_event_id, outcome, result.get("reason"))
+    except Exception as e:
+        log.warning("news_signal outcome log failed for %s: %s", payload.source_event_id, e)
+    return result
+
+
+def _parse_generated_at(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _signal_log_row(payload: NewsSignalPayload) -> dict:
+    """Everything the signal log stores beyond the key. `generated_at` is
+    only included when it parses — a malformed value must not fail the claim
+    insert (that would silently drop the signal as a "duplicate"); the raw
+    string is still preserved inside `payload`."""
+    gen = _parse_generated_at(payload.generated_at)
+    return {
+        "payload": payload.model_dump(mode="json"),
+        "symbol": (payload.symbol or "").upper() or None,
+        "state": payload.state,
+        "direction": payload.direction,
+        "cancels_event_id": payload.cancels_event_id,
+        "generated_at": gen.isoformat() if gen else None,
+    }
+
+
+def _stale_reason(payload: NewsSignalPayload, max_age_sec: int) -> str | None:
+    """Why an ENTRY signal is too old (or of unknown age) to trade, or None.
+    Measured from `generated_at` — when the signal was produced — not the
+    request signature's timestamp, which only says when it was SENT: a
+    queued, retried or backfilled signal can be freshly signed yet stale."""
+    gen = _parse_generated_at(payload.generated_at)
+    if gen is None:
+        return "missing or unparseable generated_at — refusing to trade a signal of unknown age"
+    age = time.time() - gen.timestamp()
+    if age > max_age_sec:
+        return f"stale signal: generated {age:.0f}s ago (max {max_age_sec}s)"
+    if age < -max_age_sec:
+        return f"generated_at is {-age:.0f}s in the future (clock skew beyond {max_age_sec}s)"
+    return None
+
+
+async def _news_signal_after_claim(payload: NewsSignalPayload, request: Request, settings) -> dict:
+    """Everything past the idempotency claim — split out so the route can
+    record whatever this decides onto the signal's log row."""
+    is_cancel = (payload.state or "").lower() == "cancel"
+
+    # Staleness applies to entries only: a late CANCEL is still worth acting
+    # on (unwinding is risk-reducing), a late ENTRY never is.
+    if not is_cancel:
+        stale = _stale_reason(payload, settings.news_signal_max_age_sec)
+        if stale:
+            TXN.info("news_signal %s dropped: %s", payload.source_event_id, stale)
+            return {"ok": True, "accepted": False, "reason": stale}
+
+    if is_cancel:
+        # Exempt from the rate cap as from staleness: the cap bounds how many
+        # NEW positions a runaway sender can open — an unwind only ever
+        # reduces risk, and dropping one would leave a position it meant to
+        # close still open.
+        return await _handle_cancel_signal(payload, request)
 
     if not _news_signal_rate_ok(settings):
         return {"ok": True, "accepted": False, "reason": "signal rate cap exceeded"}
-
-    if (payload.state or "").lower() == "cancel":
-        return await _handle_cancel_signal(payload, request)
 
     strategy = _NEWS_DIRECTION_STRATEGY.get((payload.direction or "").lower())
     if not strategy:
@@ -1425,12 +1669,11 @@ async def news_signal(payload: NewsSignalPayload, request: Request):
     # trading_hours on the sending side. Fails CLOSED here: an unattended
     # trader should never act on an uncertain market-open read, so anything
     # other than a confirmed `open is True` (including a calendar-fetch
-    # failure) drops the signal rather than trading blind.
-    try:
-        clock = await torque_clock(request)
-    except Exception:
-        clock = {"open": None}
-    if clock.get("open") is not True:
+    # failure) drops the signal rather than trading blind — except in
+    # DEVMODE, where only Tradier sandbox accounts are acted on out of hours
+    # (see _market_gate_sandbox_only).
+    sandbox_only = await _market_gate_sandbox_only(request)
+    if sandbox_only is None:
         return {"ok": True, "accepted": False, "reason": "market is closed or its state is unknown"}
 
     # Live query, not a static allowlist — see the docstring above. Whoever
@@ -1460,19 +1703,74 @@ async def news_signal(payload: NewsSignalPayload, request: Request):
         return {"ok": True, "accepted": False, "reason": "no live quote available at execution time"}
 
     stop_pct = tcfg.stop_loss_default(symbol) or tcfg.DEFAULT_STOP_LOSS_PCT
+    common = dict(request=request, source_event_id=payload.source_event_id, symbol=symbol,
+                  strategy=strategy, is_single=True, entry_type="debit", stop_pct=stop_pct,
+                  quantity=settings.news_signal_quantity, sandbox_only=sandbox_only)
     results = [
         await _place_news_signal_for_uid(
-            uid, request=request, source_event_id=payload.source_event_id,
-            symbol=symbol, strategy=strategy, legs=build["legs"],
-            is_single=True, entry_type="debit", tick=build["tick"],
-            limit_price=limit_price, stop_pct=stop_pct, quantity=settings.news_signal_quantity)
+            uid, legs=build["legs"], tick=build["tick"], limit_price=limit_price,
+            expiration=build.get("expiration"), **common)
         for uid in uids
     ]
+
+    # Same-contract conflict: an earlier signal's bracket already holds exit
+    # orders on this exact contract, so the broker rejects a second bracket on
+    # it. Walk forward one expiry at a time (up to NEWS_SIGNAL_MAX_EXPIRY_RETRIES)
+    # until one takes — each an independent trade with its own bracket; a later
+    # CANCEL for this signal finds it through torque_orders like any other order.
+    conflicted = [i for i, r in enumerate(results) if r.get("position_conflict")]
+    if conflicted:
+        # Each expiry's structure is built once and shared by every account
+        # walking through it.
+        next_after: dict[str, tuple[dict | None, float | None]] = {}
+
+        async def _next(after_exp: str):
+            if after_exp not in next_after:
+                nxt = await _build_next_expiry(_client(request), symbol, strategy,
+                                               after_exp, build.get("spot"))
+                lim = None
+                if nxt:
+                    sp = teng.package_spread_pct(nxt["price"])
+                    if sp is None or sp <= tcfg.MAX_AUTO_CLOSE_SPREAD_PCT:
+                        lim = teng.suggested_limit(nxt["price"], nxt["tick"])
+                next_after[after_exp] = (nxt, lim)
+            return next_after[after_exp]
+
+        max_hops = max(0, int(settings.news_signal_max_expiry_retries))
+        for i in conflicted:
+            cur, first_reason = results[i], results[i].get("reason")
+            last_exp = build.get("expiration") or ""
+            for attempt in range(2, max_hops + 2):
+                nxt, lim = await _next(last_exp)
+                if not lim:
+                    cur["reason"] += " — no usable next expiry to retry on"
+                    break
+                cur = await _place_news_signal_for_uid(
+                    cur["uid"], legs=nxt["legs"], tick=nxt["tick"], limit_price=lim,
+                    expiration=nxt["expiration"], attempt=attempt, **common)
+                cur["retried_after"] = first_reason
+                last_exp = nxt["expiration"]
+                if not cur.get("position_conflict"):
+                    break
+            else:
+                if cur.get("position_conflict"):
+                    cur["reason"] += f" — still conflicting after {max_hops} later expiries"
+            results[i] = cur
+
     placed = [r for r in results if r["accepted"]]
-    log.info("news_signal %s %s %s @ %.2f: %d/%d accounts placed",
+    TXN.info("news_signal %s %s %s @ %.2f: %d/%d accounts placed",
              payload.source_event_id, symbol, strategy, limit_price, len(placed), len(results))
-    return {"ok": True, "accepted": len(placed) > 0, "symbol": symbol, "strategy": strategy,
-            "limit_price": limit_price, "stop_loss_pct": stop_pct, "results": results}
+    out = {"ok": True, "accepted": len(placed) > 0, "symbol": symbol, "strategy": strategy,
+           "limit_price": limit_price, "stop_loss_pct": stop_pct, "results": results}
+    if not placed:
+        # No account got a live order — say why on the signal log, and mark
+        # broker rejections distinctly from a gate dropping it.
+        out["reason"] = "; ".join(sorted({str(r.get("reason")) for r in results if r.get("reason")})) or None
+        if any(r.get("rejected") for r in results):
+            out["outcome"] = "rejected"
+    if sandbox_only:
+        out["test_mode"] = "out-of-hours, sandbox accounts only"
+    return out
 
 
 def _close_tag(tag_prefix: str, entry_order_id, strategy: str = "") -> str:
@@ -1573,6 +1871,7 @@ async def _resolve_stalled_stop(client, account_id, order_id, quantity):
     """
     try:
         await client.cancel_order(account_id, order_id)
+        txn("order cancel requested", account=account_id, order_id=order_id, via="stop-ladder")
     except Exception as e:
         log.warning("stop: cancel failed for %s (may have already filled): %s", order_id, e)
     try:
@@ -1665,6 +1964,8 @@ async def _run_stop_exit_ladder(client, account_id, w, *, symbol, strategy, legs
             try:
                 await client.modify_order(account_id, order_id, price=fresh_px)
                 modify_ok = True
+                txn("order modified", account=account_id, order_id=order_id, price=fresh_px,
+                    via="stop-ladder requote")
             except Exception as e:
                 log.warning("stop: modify failed for %s (may have already filled): %s", order_id, e)
         if modify_ok:
@@ -1914,6 +2215,42 @@ async def _watch_and_close(client, account_id, entry_id, w, *, is_single, legs,
 
 
 _WORKING_STATES = {"open", "pending", "partially_filled", "calculated", "accepted", "queued", "received"}
+# Statuses that record what TORQUE did to a signal order (not a broker state)
+# — the broker poll must not overwrite them with the entry's raw status
+# (e.g. "filled" for a position a cancel signal then closed at market).
+_TORQUE_ACTION_STATUSES = {"closed_at_market", "close_rejected", "needs_attention"}
+
+
+async def _known_signal_orders() -> dict[str, str | None]:
+    """entry_order_id -> recorded status for news-signal orders from the last
+    24h, cached _SIGNAL_ORDERS_TTL. On a read failure keeps serving the last
+    good copy — the orders panel must never break over this."""
+    now = time.time()
+    if now - _SIGNAL_ORDERS["t"] < _SIGNAL_ORDERS_TTL:
+        return _SIGNAL_ORDERS["status"]
+    try:
+        rows = await supabase_admin.get_recent_torque_orders()
+    except Exception:
+        rows = None
+    if rows is not None:
+        _SIGNAL_ORDERS["status"] = {str(r.get("entry_order_id")): r.get("status") for r in rows
+                                    if r.get("entry_order_id")}
+    _SIGNAL_ORDERS["t"] = now
+    return _SIGNAL_ORDERS["status"]
+
+
+async def _record_signal_order_status(order_id: str, status: str, reason: str | None = None) -> None:
+    """Persist a signal order's new status (skipping ones that record a Torque
+    action) and update the local cache so it isn't rewritten every poll."""
+    current = _SIGNAL_ORDERS["status"].get(order_id)
+    if current in _TORQUE_ACTION_STATUSES:
+        return
+    try:
+        await supabase_admin.update_torque_order_status(
+            order_id, status, (reason.strip() if isinstance(reason, str) else reason))
+        _SIGNAL_ORDERS["status"][order_id] = status
+    except Exception as e:
+        log.warning("torque_orders status sync failed for %s: %s", order_id, e)
 
 
 @router.get("/torque/orders", dependencies=_GATE)
@@ -1932,26 +2269,37 @@ async def torque_orders(request: Request, account_id: str | None = None,
             raise HTTPException(502, f"orders fetch failed: {e}")
         orders = []
         history = []
+        signal_status = await _known_signal_orders()
         for o in raw:
             st = str(o.get("status") or "").lower()
             tag = str(o.get("tag") or "")
+            oid = str(o.get("id") or "")
+            is_signal = oid in signal_status
             row = {
-                "id": str(o.get("id") or ""), "symbol": o.get("symbol"),
+                "id": oid, "symbol": o.get("symbol"),
                 "class": o.get("class"), "type": o.get("type"), "side": o.get("side"),
                 "status": st,
                 "quantity": teng._f(o.get("quantity")), "exec_quantity": teng._f(o.get("exec_quantity")),
                 "price": teng._f(o.get("price")), "avg_fill_price": teng._f(o.get("avg_fill_price")),
                 "duration": o.get("duration"), "tag": tag,
                 "create_date": o.get("create_date"),
+                "news_signal": is_signal,
             }
             if st in _WORKING_STATES:
                 orders.append({**row, "working": True})
-            # Past Orders: EVERY Torque-tagged order on this account today, any status
+            # Past Orders: EVERY Torque order on this account today, any status
             # (pending → filled/canceled/rejected/expired). Account-scoped, so it's the
             # same list from every tab, and the status is the broker's own — no per-tab
-            # tracking to drift. Torque tags all its orders "torque…" / "torqueClose…".
-            if tag.lower().startswith("torque"):
+            # tracking to drift. Torque tags its orders "torque…" / "torqueClose…", but
+            # Tradier drops the tag on OTOCO brackets, so news-signal orders are also
+            # recognised by id (torque_orders).
+            if tag.lower().startswith("torque") or is_signal:
                 history.append(row)
+            # The broker is the source of truth: carry any status change on a
+            # signal order (a fill, a cancel done here or directly at the broker,
+            # expiry) into torque_orders.
+            if is_signal and st and signal_status.get(oid) != st:
+                await _record_signal_order_status(oid, st, o.get("reason_description"))
         orders.sort(key=lambda x: x.get("create_date") or "", reverse=True)
         history.sort(key=lambda x: x.get("create_date") or "", reverse=True)
         history = history[:100]
@@ -1988,6 +2336,10 @@ async def torque_cancel(order_id: str, request: Request, account_id: str | None 
             resp = await client.cancel_order(aid, order_id)
         except Exception as e:
             raise HTTPException(502, f"cancel failed: {e}")
+        txn("order cancel requested", account=aid, order_id=order_id, via="torque panel",
+            user=user.get("id"))
+        if str(order_id) in await _known_signal_orders():
+            await _record_signal_order_status(str(order_id), "canceled", "cancelled manually in Torque")
         return {"order_id": order_id, "result": resp}
     finally:
         if per_user:
@@ -2044,6 +2396,8 @@ async def torque_modify(order_id: str, req: ModifyRequest, request: Request,
             resp = await client.modify_order(aid, order_id, price=req.price, duration=req.duration)
         except Exception as e:
             raise HTTPException(502, f"modify failed: {e}")
+        txn("order modified", account=aid, order_id=order_id, price=req.price,
+            duration=req.duration, via="torque panel", user=user.get("id"))
         return {"order_id": order_id, "result": resp}
     finally:
         if per_user:

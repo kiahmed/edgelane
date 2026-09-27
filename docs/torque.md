@@ -429,6 +429,25 @@ log-and-drop `accepted:false` with a `reason`, never an error:
   piggybacked on the poller's own open→closed transition (`app/poller.py` —
   the same browser-independent loop that already recomputes market state
   every cycle), not a separate scheduler.
+  The same insert stores the **full signal** — raw `payload` (jsonb) plus
+  `symbol`/`state`/`direction`/`cancels_event_id`/`generated_at` — and the
+  handler stamps `outcome` (`placed`/`dropped`/`cancel_processed`) + `reason`
+  when it decides, so every signal is traceable (migration 0015).
+- **Staleness (`NEWS_SIGNAL_MAX_AGE_SEC`, default 180)** — an **entry**
+  signal whose `generated_at` is older than this on arrival, missing,
+  unparseable, or that far in the future is dropped, never traded. This is
+  the signal's own age, not the request signature's timestamp (which only
+  says when it was *sent* — a queued/retried signal can be freshly signed yet
+  stale). Cancels are exempt: unwinding late is still risk-reducing.
+- **Out of hours in DEVMODE (sandbox accounts only)** — with `DEVMODE=true`
+  (or `TRADIER_ENV=sandbox`) — the same switch that lifts the Torque UI's own
+  market gate — entry and cancel signals are still processed when the market
+  is closed/unknown, but **only** for accounts whose active connection is a
+  Tradier **sandbox** (`_is_sandbox_account` for entries; the resolved
+  client's sandbox base URL for cancels). DEVMODE only switches the house
+  client, never a user's own connection, so every production account is
+  still skipped exactly as the closed-market gate would. Responses carry
+  `test_mode`. In production mode, closed = dropped, as before.
 - **A per-window rate cap** (`NEWS_SIGNAL_MAX_PER_WINDOW`, default 10/hour) —
   independent backstop; a compromised secret or a malfunctioning sender still
   can't place unbounded orders.
@@ -478,6 +497,36 @@ a poll that wasn't there in the previous one, so an unattended fire still gets
 noticed. Detection is tag-based specifically so it doesn't also fire for
 orders placed via `tp` or by hand on the broker's own site, which show up in
 the same account-wide orders list but aren't news-signal-driven.
+
+### After submission: confirmation, same-contract retry, status
+
+- **Submitted ≠ placed.** Tradier accepts a submission and can reject it a
+  moment later, so each account's entry is read back (`_confirm_entry_status`)
+  before it counts as placed. A rejection is reported per account with
+  Tradier's reason, and the signal's outcome becomes `rejected`.
+- **Same-contract conflict → next expiry.** When an earlier signal's bracket
+  already holds exit orders on the exact contract, Tradier rejects a second
+  bracket (*"Sell order is for more shares than your current long
+  position…"*). That rejection walks forward one tradeable expiry at a time
+  (`_build_next_expiry`, up to `NEWS_SIGNAL_MAX_EXPIRY_RETRIES`, default 1)
+  until one takes — each an independent trade (`attempt` = 2, 3, …); a
+  later CANCEL for the signal finds and unwinds it via `torque_orders` like
+  any other order. Other rejections are not retried.
+- **Every signal order's status lives in `torque_orders`** (`status`,
+  `status_reason`, `status_at`, `expiration`, `attempt` — migration 0016):
+  set at placement (the confirmed status, rejected attempts included), by
+  the cancel-signal handler, by Torque's cancel button, and by the orders
+  panel's broker poll, which catches anything done directly at the broker
+  (fills, manual cancels, expiry). A recorded Torque action
+  (`closed_at_market`, `close_rejected`, `needs_attention`) is never
+  overwritten by the entry's raw broker status.
+- **Recognised by id, not tag.** Tradier drops the `tag` on OTOCO brackets,
+  so `/torque/orders` flags signal orders (`news_signal: true`) from
+  `torque_orders`; the page's sound alert and Past Orders use that flag.
+- **Cancels are exempt from the rate cap** (as from the age limit): the cap
+  bounds new positions; an unwind only reduces risk.
+- **Quantity** is `NEWS_SIGNAL_QUANTITY` (default 1) — raise it once the flow
+  is proven.
 
 ### CANCEL: unwinding a prior signal
 

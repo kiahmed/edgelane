@@ -184,3 +184,51 @@ async def test_purge_stale_torque_records_deletes_from_all_three_tables(monkeypa
     assert tables_hit == {"news_reactor_signals", "torque_orders", "torque_watchers"}
     watcher_call = next(c for c in calls if c["url"].endswith("torque_watchers"))
     assert watcher_call["params"]["done"] == "eq.true"
+
+
+async def test_claim_news_signal_sends_the_full_row_in_one_insert(monkeypatch):
+    calls = []
+    monkeypatch.setattr(supabase_admin.httpx, "AsyncClient",
+                        lambda **kw: _FakeAsyncClient(calls, 201, {}, **kw))
+    assert await supabase_admin.claim_news_signal(
+        "evt-1", {"symbol": "SPY", "payload": {"a": 1}, "source_event_id": "spoofed"}) is True
+    assert len(calls) == 1
+    assert calls[0]["json"]["symbol"] == "SPY" and calls[0]["json"]["payload"] == {"a": 1}
+    assert calls[0]["json"]["source_event_id"] == "evt-1"   # the key always wins over the row
+
+
+async def test_record_news_signal_outcome_patches_by_source_event_id(monkeypatch):
+    seen = {}
+
+    async def _upd(table, filters, values):
+        seen.update(table=table, filters=filters, values=values)
+        return True
+    monkeypatch.setattr(supabase_admin, "update_rows", _upd)
+    assert await supabase_admin.record_news_signal_outcome("evt-1", "dropped", "stale") is True
+    assert seen == {"table": "news_reactor_signals", "filters": {"source_event_id": "eq.evt-1"},
+                    "values": {"outcome": "dropped", "reason": "stale"}}
+
+
+async def test_update_torque_order_status_patches_by_entry_order_id(monkeypatch):
+    seen = {}
+
+    async def _upd(table, filters, values):
+        seen.update(table=table, filters=filters, values=values)
+        return True
+    monkeypatch.setattr(supabase_admin, "update_rows", _upd)
+    assert await supabase_admin.update_torque_order_status("39288449", "canceled", "manual") is True
+    assert seen["table"] == "torque_orders" and seen["filters"] == {"entry_order_id": "eq.39288449"}
+    assert seen["values"]["status"] == "canceled" and seen["values"]["status_reason"] == "manual"
+    assert seen["values"]["status_at"]
+
+
+async def test_get_recent_torque_orders_filters_by_placed_at(monkeypatch):
+    seen = {}
+
+    async def _sel(table, select="*", filters=None, **kw):
+        seen.update(table=table, select=select, filters=filters)
+        return [{"entry_order_id": "1", "status": "pending"}]
+    monkeypatch.setattr(supabase_admin, "select_many", _sel)
+    rows = await supabase_admin.get_recent_torque_orders()
+    assert rows == [{"entry_order_id": "1", "status": "pending"}]
+    assert seen["table"] == "torque_orders" and seen["filters"]["placed_at"].startswith("gte.")

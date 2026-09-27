@@ -24,6 +24,7 @@ from ..order_builder import (
 )
 
 log = logging.getLogger("edgelane.market.orders")
+from ..logsetup import TXN  # noqa: E402
 router = APIRouter()
 
 # --- Order-path deadlines --------------------------------------------------
@@ -343,7 +344,7 @@ async def submit_order(req: OrderRequest, request: Request,
     if not req.confirm:
         raise HTTPException(400, "submit requires confirm=true in the request body")
     t0 = time.monotonic()
-    log.info("order submit: START user=%s symbol=%s strategy=%s label=%s qty=%s",
+    TXN.info("order submit: START user=%s symbol=%s strategy=%s label=%s qty=%s",
              str(user.get("id"))[:8], req.symbol, req.strategy,
              req.candidate_label, req.quantity)
     await ensure_tool(user, "market")
@@ -370,14 +371,14 @@ async def submit_order(req: OrderRequest, request: Request,
         # Webull preview/place response shapes vary; surface what's present.
         result["order_id"] = wb.get("order_id") or wb.get("client_order_id")
         result["order_status"] = wb.get("order_status") or wb.get("status")
-        log.info("live webull order: symbol=%s strategy=%s label=%s qty=%s order_id=%s",
+        TXN.info("live webull order: symbol=%s strategy=%s label=%s qty=%s order_id=%s",
                  req.symbol, req.strategy, req.candidate_label, req.quantity, result.get("order_id"))
         return result
     tradier_resp = result.get("tradier_response") or {}
     order = tradier_resp.get("order") or {}
     result["order_id"] = order.get("id")
     result["order_status"] = order.get("status")
-    log.info(
+    TXN.info(
         "live order: symbol=%s strategy=%s label=%s qty=%s order_id=%s status=%s",
         req.symbol, req.strategy, req.candidate_label, req.quantity,
         result.get("order_id"), result.get("order_status"),

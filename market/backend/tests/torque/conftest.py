@@ -213,3 +213,26 @@ def _no_yahoo(monkeypatch):
     async def _none(sym):
         return None
     monkeypatch.setattr(troute, "_yahoo_spot", _none)
+
+
+@pytest.fixture(autouse=True)
+def _signal_order_tracking(monkeypatch):
+    """The signal-order status layer (torque_orders.status + the orders
+    panel's id-based recognition) talks to Supabase and re-reads the broker —
+    stub both so no test depends on (or hits) a real project/broker. Tests
+    that exercise it re-patch these."""
+    troute._SIGNAL_ORDERS.update(t=0.0, status={})
+
+    async def _recent(hours=24):
+        return []
+
+    async def _update(entry_order_id, status, reason=None):
+        return True
+
+    async def _confirm(uid, order_id):
+        return "pending", None
+    monkeypatch.setattr(troute.supabase_admin, "get_recent_torque_orders", _recent)
+    monkeypatch.setattr(troute.supabase_admin, "update_torque_order_status", _update)
+    monkeypatch.setattr(troute, "_confirm_entry_status", _confirm)
+    yield
+    troute._SIGNAL_ORDERS.update(t=0.0, status={})

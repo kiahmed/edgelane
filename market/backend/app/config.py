@@ -76,6 +76,9 @@ class Settings(BaseModel):
     tradier_account_id: str = Field(default="")             # production account
     tradier_account_id_sandbox: str = Field(default="")     # sandbox/paper account
     devmode: bool = Field(default=False)
+    # Backend-wide log verbosity: quiet (transactions + warnings/errors only),
+    # info, or debug. See app/logsetup.py. Read at startup — restart to change.
+    log_level: str = Field(default="quiet")
 
     # Polling
     symbols: list[str] = Field(default_factory=lambda: ["SPX"])
@@ -280,6 +283,14 @@ class Settings(BaseModel):
     # runaway sender still can't place unbounded orders.
     news_signal_max_per_window: int = Field(default=10)
     news_signal_rate_window_sec: int = Field(default=3600)
+    # An entry signal whose `generated_at` is older than this (or missing /
+    # unparseable) when it arrives is dropped as stale — a queued, retried or
+    # backfilled signal must never trade as if it were current. Cancels are
+    # exempt: unwinding late is still risk-reducing.
+    news_signal_max_age_sec: int = Field(default=180)
+    # Same-contract rejection: how many later expiries to walk (one at a time)
+    # looking for one without a conflicting open bracket before giving up.
+    news_signal_max_expiry_retries: int = Field(default=1)
 
     # External GEX override (private GEX provider extension webhook)
     use_external_gex: bool = Field(default=True)         # prefer extension data over Tradier-OI walls when fresh
@@ -380,6 +391,7 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
     if "TRADIER_ACCOUNT_ID" in raw:          out["tradier_account_id"] = raw["TRADIER_ACCOUNT_ID"].strip()
     if "TRADIER_ACCOUNT_ID_SANDBOX" in raw:  out["tradier_account_id_sandbox"] = raw["TRADIER_ACCOUNT_ID_SANDBOX"].strip()
     if "DEVMODE" in raw:                     out["devmode"] = raw["DEVMODE"].strip().lower() in ("true", "1", "yes", "on")
+    if "LOG_LEVEL" in raw:                   out["log_level"] = raw["LOG_LEVEL"].strip().lower()
 
     if "SYMBOLS" in raw:
         out["symbols"] = [s.strip().upper() for s in raw["SYMBOLS"].split(",") if s.strip()]
@@ -496,6 +508,10 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
         out["news_signal_max_per_window"] = int(raw["NEWS_SIGNAL_MAX_PER_WINDOW"])
     if "NEWS_SIGNAL_RATE_WINDOW_SEC" in raw:
         out["news_signal_rate_window_sec"] = int(raw["NEWS_SIGNAL_RATE_WINDOW_SEC"])
+    if "NEWS_SIGNAL_MAX_AGE_SEC" in raw:
+        out["news_signal_max_age_sec"] = int(raw["NEWS_SIGNAL_MAX_AGE_SEC"])
+    if "NEWS_SIGNAL_MAX_EXPIRY_RETRIES" in raw:
+        out["news_signal_max_expiry_retries"] = int(raw["NEWS_SIGNAL_MAX_EXPIRY_RETRIES"])
 
     if "USE_EXTERNAL_GEX" in raw:
         out["use_external_gex"] = raw["USE_EXTERNAL_GEX"].strip().lower() in ("true", "1", "yes", "on")

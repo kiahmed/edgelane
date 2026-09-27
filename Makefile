@@ -44,7 +44,8 @@ DATA_DUMP    = deploy/edgelane-data.tar.gz
         ui \
         frontend-setup deploy-be deploy-fe deploy-prod deploy-dry \
         deploy-down deploy-be-down deploy-be-restart deploy-prune deploy-builder \
-        db-push db-push-dry deploy-data-dump deploy-data-restore \
+        db-push db-push-dry torque-test-signal torque-test-cancel \
+        deploy-data-dump deploy-data-restore \
         doctor vercel-setup check-tunnel vercel-clean \
         simmer-ui-install simmer-ui-dev simmer-ui-build simmer-ui-check \
         simmer-ui-test deploy-simmer simmer-postiz-integrate simmer-fire-event gcloud-setup
@@ -215,6 +216,21 @@ db-push: ## Apply Supabase migrations (idempotent)
 
 db-push-dry: ## List the migrations that would be applied
 	@$(PY) tools/db_push.py --dry-run
+
+# Fires a genuinely signed POST /webhook/news_signal — real auth, real
+# idempotency/rate-cap/market-hours gates, real fan-out to whoever is
+# currently entitled to news-reactor in Supabase, through THAT account's own
+# broker connection. Defaults to the deployed hostname; point BASE_URL at a
+# local `make run-dev` for a sandbox-account-only test. See
+# tools/send_test_signal.py's own docstring for the full risk note.
+torque-test-signal: ## Fire a signed test news-signal event (BASE_URL=, SYMBOL=NDX, DIRECTION=bullish|bearish)
+	@$(PY) tools/send_test_signal.py --base-url "$(or $(BASE_URL),https://edge.facades.trade)" \
+		--symbol "$(or $(SYMBOL),NDX)" --direction "$(or $(DIRECTION),bullish)" $(ARGS)
+
+torque-test-cancel: ## Cancel a prior test signal (CANCEL=<source_event_id>, BASE_URL=)
+	@test -n "$(CANCEL)" || { echo "usage: make torque-test-cancel CANCEL=<source_event_id> [BASE_URL=...]"; exit 1; }
+	@$(PY) tools/send_test_signal.py --base-url "$(or $(BASE_URL),https://edge.facades.trade)" \
+		--cancel "$(CANCEL)" $(ARGS)
 
 # Machine migration — DuckDB volume in/out. Dump tars the volume into
 # $(DATA_DUMP) (gitignored); copy that file to the new host and run restore

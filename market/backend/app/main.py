@@ -40,10 +40,9 @@ _tradier_account_id: str = ""
 _tradier_client = None
 
 log = logging.getLogger("edgelane.market")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+# Verbosity from LOG_LEVEL (default quiet: transactions + warnings/errors only).
+from .logsetup import configure_logging, txn  # noqa: E402
+_LOG_LEVEL = configure_logging(get_settings().log_level)
 
 
 def _settings_view(settings, should_poll_when_closed: bool, tradier_mode: str):
@@ -67,6 +66,7 @@ def _settings_view(settings, should_poll_when_closed: bool, tradier_mode: str):
 async def lifespan(app: FastAPI):
     settings = get_settings()
     log.info("EdgeLane MARKET starting up")
+    txn("backend starting", log_level=_LOG_LEVEL, devmode=settings.devmode)
     log.info("  symbols=%s  poll=%ss  env=%s",
              settings.symbols, settings.poll_interval_sec, settings.tradier_env)
     log.info("  db=%s", settings.db_path_expanded)

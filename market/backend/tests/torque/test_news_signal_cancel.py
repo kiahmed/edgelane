@@ -9,6 +9,8 @@ _handle_cancel_signal / _cancel_or_close_entry in app/routes/torque.py.
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from app.routes import torque as troute
@@ -17,11 +19,15 @@ from app.routes.torque import NewsSignalPayload, news_signal
 from .conftest import FakeTradier, FakeRequest
 
 
+def _now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 def _payload(**kw):
     base = dict(
         source_event_id="evt-1", headline="Fed signals pause", category="economic",
         symbol="NDX", direction="bullish", sentiment="bullish", confidence=0.8,
-        rationale="test", tradier_confirmation=None, generated_at="2026-09-26T14:32:10Z",
+        rationale="test", tradier_confirmation=None, generated_at=_now_iso(),
     )
     base.update(kw)
     return NewsSignalPayload(**base)
@@ -37,7 +43,9 @@ def _cancel_payload(**kw):
 @pytest.fixture
 def enabled(monkeypatch):
     s = troute.get_settings().model_copy(update={
-        "accept_news_reactor_signals": True, "news_signal_quantity": 2,
+        "accept_news_reactor_signals": True,
+        # hermetic: never inherit DEVMODE/sandbox from the local config file
+        "devmode": False, "tradier_env": "production", "news_signal_quantity": 2,
     })
     monkeypatch.setattr(troute, "get_settings", lambda: s)
     return s
@@ -88,7 +96,7 @@ def _idempotency_and_correlation(monkeypatch):
     seen = set()
     inserted = []
 
-    async def _claim(source_event_id):
+    async def _claim(source_event_id, row=None):
         if source_event_id in seen:
             return False
         seen.add(source_event_id)
@@ -105,6 +113,12 @@ def _idempotency_and_correlation(monkeypatch):
         return True
 
     monkeypatch.setattr(troute.supabase_admin, "claim_news_signal", _claim)
+    outcomes = {}
+
+    async def _outcome(source_event_id, outcome, reason):
+        outcomes[source_event_id] = (outcome, reason)
+        return True
+    monkeypatch.setattr(troute.supabase_admin, "record_news_signal_outcome", _outcome)
     monkeypatch.setattr(troute.supabase_admin, "insert_torque_order", _insert_order)
     monkeypatch.setattr(troute.supabase_admin, "get_torque_orders_by_event", _by_event)
     monkeypatch.setattr(troute.supabase_admin, "upsert_torque_watcher", _upsert_watcher)

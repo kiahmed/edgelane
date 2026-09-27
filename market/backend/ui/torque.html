@@ -508,7 +508,8 @@ function App(){
   // News-signal orders (facades-news-reactor webhook) land here exactly like a
   // manually-placed order — no separate panel — but nobody's watching the
   // screen when a webhook fires, so a sound alert on arrival matters. Detected
-  // by tag prefix (torqueNews…) rather than "any unrecognized order", which
+  // as a signal order (backend news_signal flag, or the torqueNews… tag) rather
+  // than "any unrecognized order", which
   // would also false-fire for orders placed via `tp` or by hand on the broker.
   const seenOrderIds=useRef(null);   // null until first fetch primes it — no beep for pre-existing orders
   const beepNewsOrder=()=>{
@@ -532,7 +533,9 @@ function App(){
       if(seenOrderIds.current===null){
         seenOrderIds.current=ids;
       }else{
-        const isNews=x=>String(x.tag||'').startsWith('torqueNews');
+        // Tradier drops the tag on OTOCO brackets, so the backend also flags
+        // signal orders by id (news_signal) — the tag alone can't be relied on.
+        const isNews=x=>x.news_signal||String(x.tag||'').startsWith('torqueNews');
         if(all.some(x=>isNews(x)&&!seenOrderIds.current.has(String(x.id))))beepNewsOrder();
         seenOrderIds.current=ids;
       }
@@ -970,7 +973,7 @@ function PastList({past}){
       <td className="muted">{fmtTime(o.create_date)}</td>
       <td className="muted">{o.id||'—'}</td>
       <td>{o.symbol}</td>
-      <td>{tagLabel(o.tag)}</td>
+      <td>{o.news_signal?'news signal':tagLabel(o.tag)}</td>
       <td>{o.price!=null?'$'+fmt(o.price):(o.type||'').toUpperCase()}</td>
       <td>{(o.exec_quantity||0)}/{(o.quantity||0)}{o.avg_fill_price!=null?' @$'+fmt(o.avg_fill_price):''}</td>
       <td><span className={"ostat "+o.status}>{o.status}</span></td>

@@ -14,6 +14,11 @@ TRADIER_ACCOUNT_ID=            # production account (e.g. VA12345678)
 TRADIER_ACCOUNT_ID_SANDBOX=    # sandbox/paper account
 
 # Dev mode toggles many off-hours conveniences. When DEVMODE=true:
+# Log verbosity for the whole backend (Matrix, Simmer, Torque, pollers):
+#   quiet = transactions (orders, cancels, modifies, signals) + warnings/errors only
+#   info  = everything, incl. every HTTP request and Tradier call
+#   debug = maximum. Read at startup — restart after changing.
+LOG_LEVEL=quiet
 #   - polling runs anytime (not just market hours)
 #   - sandbox token is preferred over production
 #   - extra debug logging
@@ -184,6 +189,12 @@ NEWS_REACTOR_WEBHOOK_SECRET=
 # orders. Fixed window, not sliding.
 NEWS_SIGNAL_MAX_PER_WINDOW=10
 NEWS_SIGNAL_RATE_WINDOW_SEC=3600
+# Max age (seconds) of an ENTRY signal's generated_at when it arrives — older,
+# missing, or unparseable is dropped as stale, never traded. Cancels exempt.
+NEWS_SIGNAL_MAX_AGE_SEC=180
+# Same-contract rejection: walk this many later expiries (one at a time) looking
+# for one without a conflicting open bracket before giving up.
+NEWS_SIGNAL_MAX_EXPIRY_RETRIES=1
 # Tradier-fallback GEX weighting (used only when no fresh external feed):
 #   oi     = gamma × open_interest  (resting positioning; default)
 #   volume = gamma × volume         (today's traded gamma; lands closer to the

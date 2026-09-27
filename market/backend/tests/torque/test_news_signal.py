@@ -5,6 +5,8 @@ docs/torque-integration-proposal.md.
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from app.routes import torque as troute
@@ -14,6 +16,10 @@ from app import torque_config as tcfg
 from .conftest import FakeTradier, FakeRequest
 
 
+def _now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 def _payload(**kw):
     base = dict(
         # NDX matches FakeTradier's default synthetic chain (root NDXP, spot
@@ -21,7 +27,7 @@ def _payload(**kw):
         source_event_id="evt-1", headline="Fed signals pause", category="economic",
         symbol="NDX", direction="bullish", sentiment="bullish", confidence=0.8,
         rationale="test", tradier_confirmation={"symbol": "SPY", "samples": 3, "agreed": True, "lean": "call"},
-        generated_at="2026-09-26T14:32:10Z",
+        generated_at=_now_iso(),
     )
     base.update(kw)
     return NewsSignalPayload(**base)
@@ -34,6 +40,8 @@ def enabled(monkeypatch):
     itself to return a modified copy rather than mutating the singleton."""
     s = troute.get_settings().model_copy(update={
         "accept_news_reactor_signals": True,
+        # hermetic: never inherit DEVMODE/sandbox from the local config file
+        "devmode": False, "tradier_env": "production",
         "news_signal_quantity": 2,
     })
     monkeypatch.setattr(troute, "get_settings", lambda: s)
@@ -82,7 +90,7 @@ def _idempotency_store(monkeypatch):
     seen = set()
     inserted = []
 
-    async def _claim(source_event_id):
+    async def _claim(source_event_id, row=None):
         if source_event_id in seen:
             return False
         seen.add(source_event_id)
@@ -93,6 +101,12 @@ def _idempotency_store(monkeypatch):
         return True
 
     monkeypatch.setattr(troute.supabase_admin, "claim_news_signal", _claim)
+    outcomes = {}
+
+    async def _outcome(source_event_id, outcome, reason):
+        outcomes[source_event_id] = (outcome, reason)
+        return True
+    monkeypatch.setattr(troute.supabase_admin, "record_news_signal_outcome", _outcome)
     monkeypatch.setattr(troute.supabase_admin, "insert_torque_order", _insert_order)
 
     # _checkpoint_watcher fires a fire-and-forget asyncio.create_task for any
@@ -310,7 +324,7 @@ async def test_claim_failure_drops_rather_than_risk_a_double_place(enabled, monk
     """claim_news_signal returning False for ANY reason (real duplicate,
     Supabase misconfigured, a transient error) must block placement the same
     way — refuse to guess, never place without confirmed replay protection."""
-    async def _always_false(source_event_id):
+    async def _always_false(source_event_id, row=None):
         return False
     monkeypatch.setattr(troute.supabase_admin, "claim_news_signal", _always_false)
     client = FakeTradier()
@@ -361,3 +375,230 @@ async def test_rate_cap_blocks_after_the_configured_limit(enabled, monkeypatch):
         results.append(r["accepted"])
 
     assert results == [True, True, False]   # third call in the same window is capped
+
+
+# ── staleness (generated_at) + full-payload signal log ──────────────────────
+def _iso_ago(seconds):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds))
+
+
+def _capture_outcomes(monkeypatch):
+    seen = {}
+
+    async def _outcome(source_event_id, outcome, reason):
+        seen[source_event_id] = (outcome, reason)
+        return True
+    monkeypatch.setattr(troute.supabase_admin, "record_news_signal_outcome", _outcome)
+    return seen
+
+
+async def test_entry_older_than_max_age_is_dropped_and_never_placed(enabled, monkeypatch):
+    outcomes = _capture_outcomes(monkeypatch)
+    client = FakeTradier()
+    r = await news_signal(_payload(generated_at=_iso_ago(enabled.news_signal_max_age_sec + 30)),
+                          FakeRequest(client))
+    assert r["accepted"] is False and "stale signal" in r["reason"]
+    assert client.placed == []
+    assert outcomes["evt-1"][0] == "dropped" and "stale" in outcomes["evt-1"][1]
+
+
+async def test_entry_just_inside_max_age_is_not_treated_as_stale(enabled, monkeypatch):
+    async def _tools(uid):
+        return ["torque", "news-reactor"]
+    monkeypatch.setattr(troute.supabase_admin, "get_user_tools", _tools)
+    client = FakeTradier(place_responses=[{"order": {"id": 1, "status": "ok"}}])
+
+    async def _fake_resolve(request, user):
+        return "tradier", client, "TEST123", True
+    monkeypatch.setattr(troute, "resolve_broker", _fake_resolve)
+    outcomes = _capture_outcomes(monkeypatch)
+    r = await news_signal(_payload(generated_at=_iso_ago(enabled.news_signal_max_age_sec - 30)),
+                          FakeRequest(client))
+    assert r["accepted"] is True
+    assert outcomes["evt-1"] == ("placed", None)
+
+
+async def test_entry_with_missing_generated_at_is_dropped(enabled):
+    client = FakeTradier()
+    r = await news_signal(_payload(generated_at=None), FakeRequest(client))
+    assert r["accepted"] is False and "unknown age" in r["reason"]
+    assert client.placed == []
+
+
+async def test_entry_with_unparseable_generated_at_is_dropped(enabled):
+    r = await news_signal(_payload(generated_at="yesterday-ish"), FakeRequest(FakeTradier()))
+    assert r["accepted"] is False and "unknown age" in r["reason"]
+
+
+async def test_entry_generated_far_in_the_future_is_dropped(enabled):
+    r = await news_signal(_payload(generated_at=_iso_ago(-3600)), FakeRequest(FakeTradier()))
+    assert r["accepted"] is False and "in the future" in r["reason"]
+
+
+async def test_stale_cancel_is_still_processed_not_dropped(enabled, monkeypatch):
+    """Unwinding late is still risk-reducing — the age limit is entry-only."""
+    async def _by_event(eid):
+        return []
+    monkeypatch.setattr(troute.supabase_admin, "get_torque_orders_by_event", _by_event)
+    r = await news_signal(NewsSignalPayload(
+        source_event_id="evt-1-cancel", headline="x", symbol="NDX", state="cancel",
+        cancels_event_id="evt-1", generated_at=_iso_ago(3600)), FakeRequest(FakeTradier()))
+    assert "stale" not in (r.get("reason") or "")
+    assert "no orders on file" in r["reason"]   # reached the cancel handler itself
+
+
+async def test_claim_carries_the_full_payload_in_the_same_insert(enabled, monkeypatch):
+    rows = {}
+
+    async def _claim(source_event_id, row=None):
+        rows[source_event_id] = row
+        return True
+    monkeypatch.setattr(troute.supabase_admin, "claim_news_signal", _claim)
+    gen = _iso_ago(10)
+    await news_signal(_payload(direction="bearish", generated_at=gen), FakeRequest(FakeTradier()))
+    row = rows["evt-1"]
+    assert row["symbol"] == "NDX" and row["direction"] == "bearish"
+    assert row["payload"]["headline"] == "Fed signals pause"
+    assert row["payload"]["generated_at"] == gen
+    assert row["generated_at"] is not None
+
+
+async def test_unparseable_generated_at_is_kept_in_payload_but_not_the_typed_column(enabled, monkeypatch):
+    """A bad timestamp must never break the claim insert (that would drop the
+    signal as a false "duplicate") — the raw value survives in payload."""
+    rows = {}
+
+    async def _claim(source_event_id, row=None):
+        rows[source_event_id] = row
+        return True
+    monkeypatch.setattr(troute.supabase_admin, "claim_news_signal", _claim)
+    await news_signal(_payload(generated_at="garbage"), FakeRequest(FakeTradier()))
+    assert rows["evt-1"]["generated_at"] is None
+    assert rows["evt-1"]["payload"]["generated_at"] == "garbage"
+
+
+async def test_duplicate_never_overwrites_the_original_outcome(enabled, monkeypatch):
+    outcomes = _capture_outcomes(monkeypatch)
+
+    async def _dup(source_event_id, row=None):
+        return False
+    monkeypatch.setattr(troute.supabase_admin, "claim_news_signal", _dup)
+    r = await news_signal(_payload(), FakeRequest(FakeTradier()))
+    assert "duplicate" in r["reason"]
+    assert outcomes == {}
+
+
+async def test_news_reactor_real_payload_shapes_parse(enabled):
+    """The exact shapes facades-news-reactor sends (no confidence; state=
+    confirmed / cancel)."""
+    NewsSignalPayload(**{"source_event_id": "nr-9779493-97df2d09",
+                         "headline": "Senior Iranian Official: ...", "symbol": "SPY",
+                         "state": "confirmed", "direction": "bearish",
+                         "sentiment": "very_bearish", "generated_at": "2026-09-25T16:34:38.000Z"})
+    NewsSignalPayload(**{"source_event_id": "nr-9779493-b1d1b4ff-cancel",
+                         "headline": "Senior Iranian Official: ...", "symbol": "SPY",
+                         "state": "cancel", "cancels_event_id": "nr-9779493-b1d1b4ff",
+                         "generated_at": "2026-09-25T16:36:13.000Z"})
+    assert troute._parse_generated_at("2026-09-25T16:34:38.000Z") is not None
+
+
+# ── out-of-hours in DEVMODE: sandbox accounts only ─────────────────────────
+@pytest.fixture
+def sandbox_override(enabled, monkeypatch):
+    s = enabled.model_copy(update={"devmode": True})
+    monkeypatch.setattr(troute, "get_settings", lambda: s)
+
+    async def _closed(request):
+        return {"market_state": "CLOSED", "open": False}
+    monkeypatch.setattr(troute, "torque_clock", _closed)
+    return s
+
+
+def _two_accounts(monkeypatch, envs):
+    """envs: {uid: tradier_env}; each uid gets its own FakeTradier."""
+    _mock_qualified_uids(monkeypatch, list(envs))
+
+    async def _tools(uid):
+        return ["torque", "news-reactor"]
+    monkeypatch.setattr(troute.supabase_admin, "get_user_tools", _tools)
+
+    async def _cfg(uid, config_id=None):
+        return {"broker": "tradier", "tradier_env": envs[uid], "tradier_token": "t"}
+    monkeypatch.setattr(troute.supabase_admin, "get_broker_config", _cfg)
+    clients = {uid: FakeTradier(place_responses=[{"order": {"id": 1, "status": "ok"}}]) for uid in envs}
+
+    async def _resolve(request, user):
+        return "tradier", clients[user["id"]], "ACC", True
+    monkeypatch.setattr(troute, "resolve_broker", _resolve)
+    return clients
+
+
+async def test_production_mode_market_closed_still_drops_everything(enabled, monkeypatch):
+    s = enabled.model_copy(update={"devmode": False, "tradier_env": "production"})
+    monkeypatch.setattr(troute, "get_settings", lambda: s)
+    async def _closed(request):
+        return {"market_state": "CLOSED", "open": False}
+    monkeypatch.setattr(troute, "torque_clock", _closed)
+    clients = _two_accounts(monkeypatch, {"sbx": "sandbox", "prod": "production"})
+    r = await news_signal(_payload(), FakeRequest(FakeTradier()))
+    assert r["accepted"] is False and "market is closed" in r["reason"]
+    assert all(c.placed == [] for c in clients.values())
+
+
+async def test_override_on_market_closed_trades_sandbox_only(sandbox_override, monkeypatch):
+    clients = _two_accounts(monkeypatch, {"sbx": "sandbox", "prod": "production"})
+    r = await news_signal(_payload(), FakeRequest(FakeTradier()))
+    assert r["accepted"] is True and r["test_mode"]
+    by = {x["uid"]: x for x in r["results"]}
+    assert by["sbx"]["accepted"] is True and len(clients["sbx"].placed) == 1
+    assert by["prod"]["accepted"] is False and "sandbox" in by["prod"]["reason"]
+    assert clients["prod"].placed == []          # real money never touched out of hours
+
+
+async def test_override_on_but_market_open_behaves_normally(sandbox_override, monkeypatch):
+    async def _open(request):
+        return {"market_state": "REGULAR", "open": True}
+    monkeypatch.setattr(troute, "torque_clock", _open)
+    clients = _two_accounts(monkeypatch, {"sbx": "sandbox", "prod": "production"})
+    r = await news_signal(_payload(), FakeRequest(FakeTradier()))
+    assert "test_mode" not in r
+    assert len(clients["prod"].placed) == 1 and len(clients["sbx"].placed) == 1
+
+
+async def test_is_sandbox_account_fails_closed(monkeypatch):
+    async def _cfg(uid, config_id=None):
+        return {"webull": {"broker": "webull", "webull_env": "sandbox"},
+                "prod": {"broker": "tradier", "tradier_env": "production"},
+                "none": None}.get(uid) if uid != "boom" else (_ for _ in ()).throw(RuntimeError("x"))
+    monkeypatch.setattr(troute.supabase_admin, "get_broker_config", _cfg)
+    for uid in ("webull", "prod", "none", "boom"):
+        assert await troute._is_sandbox_account(uid) is False
+
+
+async def test_cancel_override_on_market_closed_unwinds_sandbox_only(sandbox_override, monkeypatch):
+    sbx = FakeTradier(order_status={"status": "open", "exec_quantity": 0.0})
+    sbx.base_url = "https://sandbox.tradier.com"
+    prod = FakeTradier(order_status={"status": "open", "exec_quantity": 0.0})
+    prod.base_url = "https://api.tradier.com"
+    rows = [
+        {"uid": "sbx", "entry_order_id": "1", "symbol": "NDX", "strategy": "long_call", "quantity": 1,
+         "is_single": True, "entry_type": "debit", "legs": [{"symbol": "X1", "action": "buy_to_open", "quantity": 1}]},
+        {"uid": "prod", "entry_order_id": "2", "symbol": "NDX", "strategy": "long_call", "quantity": 1,
+         "is_single": True, "entry_type": "debit", "legs": [{"symbol": "X1", "action": "buy_to_open", "quantity": 1}]},
+    ]
+
+    async def _by_event(eid):
+        return rows
+    monkeypatch.setattr(troute.supabase_admin, "get_torque_orders_by_event", _by_event)
+
+    async def _resolve_uid(uid):
+        return "tradier", {"sbx": sbx, "prod": prod}[uid], "ACC"
+    monkeypatch.setattr(troute, "resolve_client_for_uid", _resolve_uid)
+    r = await news_signal(NewsSignalPayload(
+        source_event_id="evt-1-cancel", headline="x", symbol="NDX", state="cancel",
+        cancels_event_id="evt-1"), FakeRequest(FakeTradier()))
+    by = {x["uid"]: x for x in r["results"]}
+    assert by["sbx"]["action"] == "canceled"
+    assert by["prod"]["action"] == "skipped" and "sandbox" in by["prod"]["reason"]
+    assert prod._order_status_by_id == {}         # never cancelled
+    troute._SUPERSEDED.clear()

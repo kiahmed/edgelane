@@ -321,12 +321,15 @@ async def upsert_row(table: str, row: dict, on_conflict: str) -> bool:
 
 # ── Torque news-signal persistence (see docs/torque.md) ─────────────────────
 
-async def claim_news_signal(source_event_id: str) -> bool:
+async def claim_news_signal(source_event_id: str, row: Optional[dict] = None) -> bool:
     """Atomically claim a source_event_id for POST /webhook/news_signal —
     True the first time (safe to place the order), False if already claimed
-    (a replay, or the sender's own retry). Deliberately NOT built on
-    insert_row: a duplicate-key conflict here is the expected, normal
-    idempotency case, not an error worth logging loudly."""
+    (a replay, or the sender's own retry). `row` carries the rest of the
+    signal log (full payload + key fields) so it lands in the SAME insert as
+    the claim — the table is the first place a signal is persisted, and a
+    second write could be lost. Deliberately NOT built on insert_row: a
+    duplicate-key conflict here is the expected, normal idempotency case, not
+    an error worth logging loudly."""
     settings = get_settings()
     if not (settings.supabase_url and settings.supabase_service_key):
         log.warning("[supabase] URL/service key not configured; cannot claim news signal")
@@ -336,7 +339,7 @@ async def claim_news_signal(source_event_id: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.post(f"{base}/news_reactor_signals", headers=headers,
-                             json={"source_event_id": str(source_event_id)})
+                             json={**(row or {}), "source_event_id": str(source_event_id)})
             if r.status_code in (200, 201):
                 return True
             if r.status_code == 409:
@@ -346,6 +349,14 @@ async def claim_news_signal(source_event_id: str) -> bool:
     except Exception as exc:
         log.error("[supabase] claim_news_signal error: %s", exc)
         return False
+
+
+async def record_news_signal_outcome(source_event_id: str, outcome: str, reason: Optional[str]) -> bool:
+    """Stamp what Torque decided (placed / dropped / cancel_processed, and
+    why) onto a claimed signal's log row."""
+    return await update_rows("news_reactor_signals",
+                             {"source_event_id": f"eq.{source_event_id}"},
+                             {"outcome": outcome, "reason": reason})
 
 
 async def insert_torque_order(row: dict) -> bool:
@@ -362,6 +373,26 @@ async def get_torque_orders_by_event(source_event_id: str) -> list[dict]:
     original signal."""
     rows = await select_many("torque_orders", filters={"source_event_id": f"eq.{source_event_id}"})
     return rows or []
+
+
+async def update_torque_order_status(entry_order_id: str, status: str,
+                                     reason: Optional[str] = None) -> bool:
+    """Record a signal order's latest state (broker status or the Torque
+    action taken on it). A no-op for an order id that isn't a signal order."""
+    from datetime import datetime, timezone
+    return await update_rows("torque_orders", {"entry_order_id": f"eq.{entry_order_id}"},
+                             {"status": status, "status_reason": reason,
+                              "status_at": datetime.now(timezone.utc).isoformat()})
+
+
+async def get_recent_torque_orders(hours: int = 24) -> Optional[list[dict]]:
+    """Signal orders placed in the last `hours` — lets the orders panel
+    recognise them (Tradier drops the `tag` on OTOCO brackets, so the tag
+    alone can't) and keep their status in sync. None = unknown (read failed)."""
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    return await select_many("torque_orders", select="entry_order_id,status",
+                             filters={"placed_at": f"gte.{cutoff}"})
 
 
 async def upsert_torque_watcher(row: dict) -> bool:
