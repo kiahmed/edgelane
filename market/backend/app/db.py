@@ -394,17 +394,12 @@ CREATE TABLE IF NOT EXISTS simmer_published_events (
     fired_at    TIMESTAMP,
     takeaways   VARCHAR           -- JSON: {symbol, expiry, state, score, structure, decision}
 );
-
--- Idempotency for POST /webhook/news_signal — a replayed or retried
--- source_event_id must never place a second order. The PRIMARY KEY does the
--- actual work (claim_news_signal below inserts and treats a constraint
--- violation as "already seen"); this table holds nothing else and is purged
--- of anything older than a day, same pattern as simmer_published_events.
-CREATE TABLE IF NOT EXISTS news_signal_seen (
-    source_event_id  VARCHAR PRIMARY KEY,
-    seen_at          TIMESTAMP NOT NULL
-);
 """
+# Torque news-signal idempotency / order correlation / watcher persistence
+# live in Supabase (news_reactor_signals / torque_orders / torque_watchers —
+# see supabase/migrations/0014_torque_signal_persistence.sql), not here.
+# DuckDB is single-process by design and cannot safely be shared across
+# multiple backend containers, which this state needs to survive.
 
 _STRIKE_PROFILE_COLS = (
     "symbol", "enabled", "long_delta_lo", "long_delta_hi", "long_offset_pts",
@@ -1170,34 +1165,12 @@ class Database:
                 [str(event_id)])
             return cur.fetchone() is not None
 
-    def claim_news_signal(self, source_event_id: str) -> bool:
-        """Atomically claim a source_event_id for POST /webhook/news_signal —
-        True the first time (safe to place the order), False if already
-        claimed (a replay, or the legitimate sender's own retry). Check +
-        insert happen under one lock acquisition so two near-simultaneous
-        replays can't both pass the check before either inserts."""
-        conn = self.connect()
-        with self._lock:
-            cur = conn.execute(
-                "SELECT 1 FROM news_signal_seen WHERE source_event_id = ? LIMIT 1",
-                [str(source_event_id)])
-            if cur.fetchone() is not None:
-                return False
-            conn.execute(
-                "INSERT INTO news_signal_seen (source_event_id, seen_at) VALUES (?, now())",
-                [str(source_event_id)])
-            return True
-
-    def purge_old_news_signals(self, older_than_hours: int = 24) -> None:
-        """Drop claimed source_event_ids past the retention window. Not
-        wired to a scheduler yet — see docs/torque.md 'Multi-user order
-        persistence' for the planned poller-transition purge hook this
-        should eventually share rather than getting its own timer."""
-        conn = self.connect()
-        with self._lock:
-            conn.execute(
-                "DELETE FROM news_signal_seen WHERE seen_at < now() - INTERVAL (?) HOUR",
-                [older_than_hours])
+    # Torque news-signal idempotency / order correlation / watcher
+    # persistence moved to Supabase (see app/supabase_admin.py:
+    # claim_news_signal / insert_torque_order / upsert_torque_watcher /
+    # get_active_torque_watchers / purge_stale_torque_records) — DuckDB is
+    # single-process and cannot safely be shared across multiple backend
+    # containers, which this state needs to survive.
 
     _SIMMER_OUTCOME_COLS = (
         "readiness_id", "symbol", "expiration", "evaluated_at", "spot_at_expiry",

@@ -125,6 +125,18 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             log.warning("  operator seed failed for uid=%s: %s", _uid, e)
 
+    # Resume any Torque watcher that was still in-flight when this process
+    # last stopped (see docs/torque.md "Multi-user order persistence"). Named
+    # late-bound reference to routes.torque — that module is imported further
+    # down this file, but by the time this coroutine actually runs (well
+    # after module load completes) the name is already resolvable.
+    try:
+        _resumed = await torque.resume_active_torque_watchers()
+        if _resumed:
+            log.info("  resumed %d in-flight Torque watcher(s) from Supabase", _resumed)
+    except Exception as e:
+        log.warning("  torque watcher resume failed: %s", e)
+
     poll_task = asyncio.create_task(
         poll_loop(client, db, runtime_settings),
         name="edgelane.poll_loop",

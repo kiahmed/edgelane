@@ -105,6 +105,36 @@ async def get_user_tools(user_id: str) -> list[str]:
     return list(tools) if isinstance(tools, list) else []
 
 
+async def get_users_with_tool(tool: str) -> list[str]:
+    """Every profile id currently entitled to `tool` (tools_enabled contains
+    it), read live from Supabase — the database is the source of truth for
+    "who can use this," not a separately-maintained allowlist. Used by the
+    news-signal webhook's fan-out: granting or revoking a user's
+    news-reactor entitlement takes effect on the very next signal, no
+    backend restart needed, and no TORQUE_OPERATOR_UIDS entry to remember to
+    add. Returns [] if Supabase isn't configured or the query fails — the
+    caller drops the signal rather than guessing who's entitled."""
+    settings = get_settings()
+    if not (settings.supabase_url and settings.supabase_service_key):
+        log.debug("[supabase] URL/service key not configured; skipping tools-by-tool query")
+        return []
+    base, headers = _rest(settings)
+    # PostgREST "contains" filter on a text[] column: tools_enabled=cs.{tool}
+    params = {"tools_enabled": f"cs.{{{tool}}}", "select": "id"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(f"{base}/profiles", headers=headers, params=params)
+            if r.status_code != 200:
+                log.error("[supabase] profiles-by-tool query failed (%s): %s",
+                          r.status_code, r.text[:200])
+                return []
+            rows = r.json()
+            return [str(row["id"]) for row in rows if row.get("id")]
+    except Exception as exc:
+        log.error("[supabase] profiles-by-tool query error (tool=%s): %s", tool, exc)
+        return []
+
+
 async def grant_user_tools(user_id: str, tools: list[str]) -> bool:
     """Idempotently union `tools` into a user's profiles.tools_enabled, written
     via the service_role key (bypasses RLS). Used to seed the server operator(s)
@@ -287,6 +317,77 @@ async def upsert_row(table: str, row: dict, on_conflict: str) -> bool:
     except Exception as exc:
         log.error("[supabase] upsert %s error: %s", table, exc)
         return False
+
+
+# ── Torque news-signal persistence (see docs/torque.md) ─────────────────────
+
+async def claim_news_signal(source_event_id: str) -> bool:
+    """Atomically claim a source_event_id for POST /webhook/news_signal —
+    True the first time (safe to place the order), False if already claimed
+    (a replay, or the sender's own retry). Deliberately NOT built on
+    insert_row: a duplicate-key conflict here is the expected, normal
+    idempotency case, not an error worth logging loudly."""
+    settings = get_settings()
+    if not (settings.supabase_url and settings.supabase_service_key):
+        log.warning("[supabase] URL/service key not configured; cannot claim news signal")
+        return False
+    base, headers = _rest(settings)
+    headers = {**headers, "Content-Type": "application/json", "Prefer": "return=minimal"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(f"{base}/news_reactor_signals", headers=headers,
+                             json={"source_event_id": str(source_event_id)})
+            if r.status_code in (200, 201):
+                return True
+            if r.status_code == 409:
+                return False   # already claimed — expected, not an error
+            log.error("[supabase] claim_news_signal failed (%s): %s", r.status_code, r.text[:200])
+            return False
+    except Exception as exc:
+        log.error("[supabase] claim_news_signal error: %s", exc)
+        return False
+
+
+async def insert_torque_order(row: dict) -> bool:
+    """Record which order, on which account, resulted from which news-signal
+    event — one row per (signal, qualified account). Correlation index for a
+    future CANCEL signal to find and act on exactly the right order(s)."""
+    return await insert_row("torque_orders", row)
+
+
+async def get_torque_orders_by_event(source_event_id: str) -> list[dict]:
+    """Every (account, order) pair a prior news-signal fanned out to — the
+    correlation a CANCEL signal (state="cancel") needs to find and act on
+    exactly the right order(s) across every account that received the
+    original signal."""
+    rows = await select_many("torque_orders", filters={"source_event_id": f"eq.{source_event_id}"})
+    return rows or []
+
+
+async def upsert_torque_watcher(row: dict) -> bool:
+    """Checkpoint a watcher's current state (see docs/torque.md 'Multi-user
+    order persistence'). Called at state TRANSITIONS, not every price tick —
+    the in-memory watcher stays authoritative for a running process; this is
+    the recovery path for when that process didn't stay running."""
+    return await upsert_row("torque_watchers", row, on_conflict="entry_order_id")
+
+
+async def get_active_torque_watchers() -> list[dict]:
+    """Every not-yet-done watcher, read once at backend startup to resume
+    monitoring positions a restart would otherwise have silently dropped."""
+    rows = await select_many("torque_watchers", filters={"done": "eq.false"})
+    return rows or []
+
+
+async def purge_stale_torque_records(older_than_hours: int = 24) -> None:
+    """Delete claimed news signals, their order-correlation rows, and
+    completed watcher rows past the retention window. Hooked into
+    poller.py's own open->closed transition — not a standalone scheduler."""
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=older_than_hours)).isoformat()
+    await delete_rows("news_reactor_signals", {"received_at": f"lt.{cutoff}"})
+    await delete_rows("torque_orders", {"placed_at": f"lt.{cutoff}"})
+    await delete_rows("torque_watchers", {"done": "eq.true", "updated_at": f"lt.{cutoff}"})
 
 
 async def get_broker_config(user_id: str, config_id: Optional[str] = None) -> Optional[dict]:

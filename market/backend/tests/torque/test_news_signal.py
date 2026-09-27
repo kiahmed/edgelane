@@ -11,7 +11,7 @@ from app.routes import torque as troute
 from app.routes.torque import NewsSignalPayload, news_signal
 from app import torque_config as tcfg
 
-from .conftest import FakeTradier, FakeRequest, FakeNewsDB
+from .conftest import FakeTradier, FakeRequest
 
 
 def _payload(**kw):
@@ -40,9 +40,20 @@ def enabled(monkeypatch):
     return s
 
 
+def _mock_qualified_uids(monkeypatch, uids):
+    """Which accounts get fanned out to is now a live Supabase query
+    (get_users_with_tool), not a static allowlist — see news_signal's own
+    docstring. Per-account entitlement (get_user_tools, checked separately
+    inside _place_news_signal_for_uid) still needs its own mock in tests that
+    exercise it."""
+    async def _q(tool):
+        return list(uids)
+    monkeypatch.setattr(troute.supabase_admin, "get_users_with_tool", _q)
+
+
 @pytest.fixture(autouse=True)
-def _operator(monkeypatch):
-    monkeypatch.setattr(tcfg, "operator_uids", lambda: ["op-uid-1"])
+def _qualified_uids(monkeypatch):
+    _mock_qualified_uids(monkeypatch, ["op-uid-1"])
 
 
 @pytest.fixture(autouse=True)
@@ -62,7 +73,48 @@ def _fast_clock(monkeypatch):
     monkeypatch.setattr(troute, "torque_clock", _open)
 
 
-async def test_disabled_by_default_drops_without_placing():
+@pytest.fixture(autouse=True)
+def _idempotency_store(monkeypatch):
+    """Real claim_news_signal/insert_torque_order hit Supabase over the
+    network — replace with an in-memory stand-in so tests never depend on
+    (or accidentally hit) a real project. `seen` is exposed on the fixture
+    object so a test can pre-seed it or inspect it directly."""
+    seen = set()
+    inserted = []
+
+    async def _claim(source_event_id):
+        if source_event_id in seen:
+            return False
+        seen.add(source_event_id)
+        return True
+
+    async def _insert_order(row):
+        inserted.append(row)
+        return True
+
+    monkeypatch.setattr(troute.supabase_admin, "claim_news_signal", _claim)
+    monkeypatch.setattr(troute.supabase_admin, "insert_torque_order", _insert_order)
+
+    # _checkpoint_watcher fires a fire-and-forget asyncio.create_task for any
+    # per_user watcher — without this, that task would make a REAL network
+    # call to whatever Supabase project the local config happens to point at,
+    # unpredictably depending on event-loop timing. Mock it closed here too.
+    checkpoints = []
+
+    async def _upsert_watcher(row):
+        checkpoints.append(row)
+        return True
+    monkeypatch.setattr(troute.supabase_admin, "upsert_torque_watcher", _upsert_watcher)
+
+    ns = type("NS", (), {"seen": seen, "inserted": inserted, "checkpoints": checkpoints})()
+    return ns
+
+
+async def test_disabled_by_default_drops_without_placing(monkeypatch):
+    # Explicit, not ambient — don't rely on whatever the real local config
+    # file happens to have the flag set to.
+    s = troute.get_settings().model_copy(update={"accept_news_reactor_signals": False})
+    monkeypatch.setattr(troute, "get_settings", lambda: s)
     client = FakeTradier()
     r = await news_signal(_payload(), FakeRequest(client))
     assert r == {"ok": True, "accepted": False, "reason": "ACCEPT_NEWS_REACTOR_SIGNALS is off"}
@@ -93,11 +145,11 @@ async def test_market_closed_defensive_check_drops(enabled, monkeypatch):
     assert client.placed == []
 
 
-async def test_no_operator_configured_is_dropped(enabled, monkeypatch):
-    monkeypatch.setattr(tcfg, "operator_uids", lambda: [])
+async def test_no_qualified_accounts_is_dropped(enabled, monkeypatch):
+    _mock_qualified_uids(monkeypatch, [])
     client = FakeTradier()
     r = await news_signal(_payload(), FakeRequest(client))
-    assert r["accepted"] is False and "operator" in r["reason"].lower()
+    assert r["accepted"] is False and "news-reactor" in r["reason"]
     assert client.placed == []
 
 
@@ -148,7 +200,7 @@ async def test_two_qualified_accounts_both_get_the_order_from_one_post(enabled, 
     """The sender posts once; Torque fans out to every qualified account —
     not the other way around. One account with no broker must not block a
     second account that has one."""
-    monkeypatch.setattr(tcfg, "operator_uids", lambda: ["op-uid-1", "op-uid-2"])
+    _mock_qualified_uids(monkeypatch, ["op-uid-1", "op-uid-2"])
 
     async def _tools(uid):
         return ["torque", "news-reactor"]
@@ -231,8 +283,9 @@ async def test_bearish_signal_places_a_long_put(enabled, monkeypatch):
 async def test_replay_of_the_same_source_event_id_does_not_place_twice(enabled, monkeypatch):
     """The legitimate sender's own retry, or a captured-and-replayed request
     within the signature's timestamp window, must never place a second order.
-    Same FakeRequest (hence same FakeNewsDB) used for both calls, mirroring a
-    real replay hitting the same backend process/DB."""
+    claim_news_signal is Supabase-backed in production; the autouse
+    _idempotency_store fixture stands in for it here with the same
+    claim-once semantics."""
     async def _tools(uid):
         return ["torque", "news-reactor"]
     monkeypatch.setattr(troute.supabase_admin, "get_user_tools", _tools)
@@ -246,21 +299,23 @@ async def test_replay_of_the_same_source_event_id_does_not_place_twice(enabled, 
     req = FakeRequest(client)
     payload = _payload(source_event_id="evt-replay-1")
     r1 = await news_signal(payload, req)
-    r2 = await news_signal(payload, req)   # identical event, same request/db
+    r2 = await news_signal(payload, req)   # identical event, same request
 
     assert r1["accepted"] is True
-    assert r2["accepted"] is False and r2["reason"] == "duplicate source_event_id"
+    assert r2["accepted"] is False and "duplicate" in r2["reason"]
     assert len(client.placed) == 1   # only the first call ever placed anything
 
 
-async def test_idempotency_store_unavailable_drops_rather_than_risk_a_double_place(enabled):
-    """If app.state.db isn't wired for some reason, refuse to guess — drop
-    rather than place without any replay protection at all."""
+async def test_claim_failure_drops_rather_than_risk_a_double_place(enabled, monkeypatch):
+    """claim_news_signal returning False for ANY reason (real duplicate,
+    Supabase misconfigured, a transient error) must block placement the same
+    way — refuse to guess, never place without confirmed replay protection."""
+    async def _always_false(source_event_id):
+        return False
+    monkeypatch.setattr(troute.supabase_admin, "claim_news_signal", _always_false)
     client = FakeTradier()
-    req = FakeRequest(client)
-    req.app.state.db = None
-    r = await news_signal(_payload(), req)
-    assert r["accepted"] is False and "idempotency" in r["reason"]
+    r = await news_signal(_payload(), FakeRequest(client))
+    assert r["accepted"] is False and "duplicate" in r["reason"]
     assert client.placed == []
 
 

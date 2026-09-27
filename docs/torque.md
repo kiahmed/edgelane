@@ -422,12 +422,13 @@ log-and-drop `accepted:false` with a `reason`, never an error:
   **closed** (401) when the secret is unset — unconfigured must mean closed,
   never open-to-anyone reaching `edge.facades.trade`. A real anonymous POST
   used to reach the handler and place a live order before this existed.
-- **Idempotency (`claim_news_signal`, DuckDB)** — `source_event_id` is
-  claimed atomically before any other work; a replay of an already-signed
-  request (within the timestamp window) or the sender's own retry never
-  places a second order. Claimed IDs are meant to be purged after 24h (see
-  [Multi-user order persistence](#multi-user-order-persistence-specced-not-implemented)
-  for the planned purge hook — not wired to a scheduler yet).
+- **Idempotency (`claim_news_signal`, Supabase — `news_reactor_signals`)** —
+  `source_event_id` is claimed atomically before any other work; a replay of
+  an already-signed request (within the timestamp window) or the sender's own
+  retry never places a second order. Claimed IDs are purged after 24h,
+  piggybacked on the poller's own open→closed transition (`app/poller.py` —
+  the same browser-independent loop that already recomputes market state
+  every cycle), not a separate scheduler.
 - **A per-window rate cap** (`NEWS_SIGNAL_MAX_PER_WINDOW`, default 10/hour) —
   independent backstop; a compromised secret or a malfunctioning sender still
   can't place unbounded orders.
@@ -438,24 +439,23 @@ log-and-drop `accepted:false` with a `reason`, never an error:
   though the sender already enforces trading hours on its own side.
 - **Which accounts act on this** — facades-news-reactor posts **once and
   forgets**; fanning out to every qualified account is Torque's own job, not
-  the sender's. A webhook has no browser session to bind to, so "qualified"
-  means every uid listed in `TORQUE_OPERATOR_UIDS` (the same config that seeds
-  operator entitlements at startup) that has **both** `torque` and
-  `news-reactor` in `profiles.tools_enabled` **and** an **active broker
+  the sender's. "Qualified" is a **live Supabase query**
+  (`supabase_admin.get_users_with_tool("news-reactor")`) — every profile
+  whose `tools_enabled` currently contains `news-reactor`, checked again for
+  **both** `torque` and `news-reactor` per account, plus an **active broker
   connection** (`resolve_broker`'s own per-user check, no house-account
-  fallback). Each account is checked and placed independently — one account
-  with no broker connected doesn't block another that has one, and each gets
-  the order through its **own** broker. The chain/quote is fetched once and
-  shared across every qualified account so they all act on the identical
-  price rather than staggered re-fetches drifting apart. The response's
-  `results` array reports each account's own outcome.
-
-  `TORQUE_OPERATOR_UIDS` is a static allowlist, not "whoever currently has
-  Torque open" — there's no live-session registry, so an entitled+configured
-  account acts on every signal whether or not anyone is looking at the page
-  right now. A per-user "only auto-execute while I'm active" preference is a
-  reasonable later addition but isn't built; today, entitlement + a broker
-  connection is the only opt-in.
+  fallback). Granting or revoking a user's `news-reactor` entitlement takes
+  effect on the very next signal — no restart, no separate allowlist to keep
+  in sync with the database. (There is no live-session registry either way —
+  an entitled+configured account acts on every signal whether or not anyone
+  is looking at the page right now; a per-user "only auto-execute while I'm
+  active" preference is a reasonable later addition but isn't built.) Each
+  account is checked and placed independently — one account with no broker
+  connected doesn't block another that has one, and each gets the order
+  through its **own** broker. The chain/quote is fetched once and shared
+  across every qualified account so they all act on the identical price
+  rather than staggered re-fetches drifting apart. The response's `results`
+  array reports each account's own outcome.
 - **Live spread sanity** — the payload deliberately carries no price (by
   design: Torque fetches its own fresh quote at execution time rather than
   trading off a stale snapshot), so the freshly-built package spread is
@@ -479,49 +479,99 @@ noticed. Detection is tag-based specifically so it doesn't also fire for
 orders placed via `tp` or by hand on the broker's own site, which show up in
 the same account-wide orders list but aren't news-signal-driven.
 
-## Multi-user order persistence (specced, not implemented)
+### CANCEL: unwinding a prior signal
 
-**The problem.** Every watcher (`_watch_and_close` → `_monitor_stop` → the
-stop-exit ladder) is an in-memory `asyncio.create_task`, keyed in the
-process-global `_WATCHERS` dict — true for every Torque order, not just
-news-signal ones. Two characteristics that news-signal's fan-out makes far
-more visible than a single human clicking Send ever did:
+The same endpoint also accepts a **cancel** for a signal it already acted on —
+`state: "cancel"` plus `cancels_event_id: "<the original source_event_id>"`,
+in place of a fresh `direction`/`confidence` (both are optional in this
+shape; the payload carries neither strike, spread, nor quantity of its own).
+It looks up every `torque_orders` row the original signal produced — one per
+qualified account it fanned out to — and, **for each account independently**:
 
-- **Concurrency is additive, not deduped.** One signal spawns N concurrent
-  watcher tasks (one per qualified account). A second signal arriving before
-  the first positions close adds another N on top — watcher count tracks
-  (open news-driven positions × qualified accounts), unbounded if signals
-  arrive faster than positions resolve. Each task itself is a cheap coroutine
-  (mostly `sleep()`, not a thread/process), so raw CPU cost stays low; the
-  real cost is N accounts independently polling the *same* underlying chain
-  data every cycle from N different Tradier tokens — redundant traffic/
-  parsing that scales with account count with no dedup today.
-- **No survival across a backend restart.** In-memory state means an
-  in-flight reactive watcher (spreads, or a single-leg stop still requoting)
-  is lost if the process restarts mid-position. A single-leg native OTOCO
-  bracket doesn't have this exposure — it's broker-held, not app-tracked.
+- Cancels that account's entry order, then trusts only a *fresh* `get_order`
+  read of its real post-cancel status (`_cancel_or_close_entry` — the same
+  "cancel best-effort, then re-confirm before acting" discipline the
+  stop-exit ladder's `_resolve_stalled_stop` uses, because a cancel call
+  commonly fails/no-ops precisely because the order just filled).
+- **Never executed** → the cancel alone is the whole story (`action:
+  "canceled"`).
+- **Fully or partially executed** → a genuine market order closes **exactly
+  the executed quantity** — regardless of current profitability or the
+  stop-loss threshold, per spec (`action: "closed_at_market"`, tagged
+  `torqueCancelMkt…` so it's distinguishable from a routine close in the
+  Orders/Past-Orders table).
+- If a TP/SL watcher (`_WATCHERS`) is still actively polling that exact entry
+  when the cancel lands, it's marked **superseded** so it stops acting on a
+  position the cancel just closed out-of-band — checked cooperatively at the
+  top of every poll iteration in `_monitor_stop` and the stop-exit ladder
+  (there's no way to forcibly interrupt a running task mid-`sleep`); its
+  terminal state becomes `canceled_by_signal`.
+- An account with no broker connection left, or one whose final order state
+  can't be confirmed even after the cancel attempt, never blocks the unwind
+  of the rest (`action: "skipped"` / `"needs_attention"` respectively) — same
+  "one account's failure can't stop the others" posture as the entry
+  fan-out. Same fail-closed market-hours gate as an entry signal.
 
-**Where it would live.** Not a new database and not Supabase (that's the
-identity/entitlement store — profiles, tools_enabled, broker_configs — wrong
-fit for execution state). The **same single DuckDB file** Matrix and Simmer
-already share (env-suffixed: prod/sandbox/mock), just a new `torque_watchers`
-table. Concurrency is a non-issue: it's one process, one connection, already
-serialized through `db.py`'s own `Lock()` — Matrix's poller and Simmer's
-watcher already write through that same lock concurrently today. A third
-writer is one more caller of an existing lock, not a new locking problem.
+## Multi-user order persistence
 
-**Purge, not a new standalone loop.** `poller.py` already runs a background
-loop, independent of any browser, that recomputes `state.market_open` on its
-own schedule every cycle regardless of whether Torque's UI is ever open. Hook
-the purge there: on the open→closed transition, fire a one-off sweep of
-`torque_watchers` rather than adding a second scheduler or depending on
-`/torque/clock` happening to be polled by an open browser tab (which, unlike
-the poller, only runs when someone has the page open).
+Every watcher (`_watch_and_close` → `_monitor_stop` → the stop-exit ladder)
+is still driven live by the in-memory `_WATCHERS` dict for a *running*
+process — that never changed, and never should (persistence must not add
+latency to the actual trading logic). What's built on top is a
+**checkpoint-and-resume** layer for when the process *isn't* running:
 
-**Retention:** keep a row **24h** past its terminal state (filled/canceled/
-rejected/expired) — matches the Orders panel's existing "Past Orders" window
-(today's account-tagged orders), so persisted state doesn't outlive what the
-UI itself already treats as current.
+- **Checkpointing** (`_checkpoint_watcher`, `app/routes/torque.py`) — a
+  fire-and-forget write to Supabase's `torque_watchers` table (see
+  `supabase/migrations/0014_torque_signal_persistence.sql`) at every
+  meaningful state transition (entry filled, close placed, each stop
+  requote, market fallback, terminal states) — never on a price tick, and
+  never awaited by the caller: a slow or unreachable Supabase must never
+  delay or break a live order. Skipped entirely for a non-per-user
+  (dev/admin/house) watcher — those aren't tied to a real Supabase uid.
+- **Recovery** (`resume_active_torque_watchers`, called once at backend
+  startup in `main.py`) — queries every not-yet-`done` row and resumes each
+  independently; one account with a broker connection revoked since its last
+  checkpoint is marked `stop_needs_attention` and skipped, never allowed to
+  block the rest. Resumption is deliberately conservative, because
+  `_checkpoint_watcher` is fire-and-forget and never retried — a real close
+  or stop-exit can land at the broker while the write recording it fails or
+  simply never lands, leaving the row stuck one step behind indefinitely (not
+  just a millisecond race). A watcher whose row carries a specific resting
+  order id (`stop_placed`/`stop_requoted`) **never blindly restarts breach
+  detection** — it resolves that order's ground truth first
+  (`_resolve_stalled_stop`, the same function the ladder itself uses for
+  every in-process stall) and only then decides: already filled → done;
+  confirmed dead → exactly one fresh bounded re-cross; state unconfirmable →
+  `stop_needs_attention`, refuse to guess. A row with **no** order id to
+  ground-truth against (`watching_fill`, or `close_placed`/
+  `stop_blocked_wide_market` before a stop has ever been recorded) doesn't
+  get to assume the stale state is accurate either — it first **reconciles
+  with the broker's own order list** (`_find_resting_order`) and adopts any
+  already-resting order it finds instead of placing a new one; only when
+  nothing turns up does it fall back to placing fresh (`_watch_and_close` /
+  `_monitor_stop`), exactly like a genuinely new watcher. The match is scoped
+  to **this specific entry**, not just the option symbol or tag prefix: every
+  close/stop tag has the entry's own order id stamped into it
+  (`_close_tag` — `torqueClose<entry_order_id><strategy>`, trimming or
+  dropping the strategy suffix first if the ~30-char tag budget is tight) and
+  `_find_resting_order` recomputes and matches that exact tag. Without this,
+  an old **filled** close/stop from an *earlier, unrelated* trade in the same
+  contract — routine with 0DTE strikes reused across signals in one session —
+  could be mistaken for "this position already closed/stopped out" and
+  silently leave the current one with no exit at all.
+- **Why Supabase, not the backend's own DuckDB** — these are low-frequency,
+  low-volume rows (checkpoints at transitions, not ticks), where a network
+  round-trip is a non-issue, and DuckDB is single-process by design: it
+  cannot safely be shared across multiple backend containers, which this
+  state needs to survive as much as a single-process restart.
+- **Purge** — piggybacked on `poller.py`'s own open→closed transition (the
+  same background loop that already recomputes market state every cycle,
+  independent of any browser being open), not a second standalone scheduler.
+  `supabase_admin.purge_stale_torque_records()` drops claimed news signals,
+  their order-correlation rows (`torque_orders` — see News-signal ingestion,
+  above), and `done=true` watcher rows older than **24h** — matching the
+  Orders panel's own "Past Orders" window, so persisted state never outlives
+  what the UI itself already treats as current.
 
 ## Branding & assets
 

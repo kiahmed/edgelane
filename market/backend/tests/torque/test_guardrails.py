@@ -1,6 +1,8 @@
 """DJX guardrails: stop-loss math, wide-market refusal, and the modify bypass."""
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi import HTTPException
 
@@ -679,3 +681,59 @@ async def test_place_caps_credit_target_and_arms_a_positive_close():
     assert closes, "no close order was placed"
     price = float(closes[-1].get("price"))
     assert price > 0, f"credit close placed at non-positive price {price}"
+
+
+# ── watcher checkpointing (Supabase torque_watchers) ────────────────────────
+def test_checkpoint_watcher_skips_non_per_user_watchers(monkeypatch):
+    """dev/admin/house watchers aren't tied to a real Supabase uid — the
+    table's FK would reject them, and this is a per-user persistence project.
+    Must not even attempt the call."""
+    calls = []
+    async def _upsert(row):
+        calls.append(row)
+        return True
+    monkeypatch.setattr(tq.supabase_admin, "upsert_torque_watcher", _upsert)
+
+    tq._checkpoint_watcher({"entry_order_id": "1", "per_user": False, "uid": "dev-local"})
+    tq._checkpoint_watcher({"entry_order_id": "2", "per_user": True, "uid": None})
+    assert calls == []
+
+
+async def test_checkpoint_watcher_persists_a_real_per_user_watcher(monkeypatch):
+    calls = []
+    async def _upsert(row):
+        calls.append(row)
+        return True
+    monkeypatch.setattr(tq.supabase_admin, "upsert_torque_watcher", _upsert)
+
+    w = {
+        "entry_order_id": "o1", "per_user": True, "uid": "u1", "account_id": "T",
+        "symbol": "NDX", "strategy": "long_call", "legs": [{"a": 1}], "is_single": True,
+        "entry_type": "debit", "quantity": 1, "tick": 0.05, "auto_close": True,
+        "close_target_pct": 30.0, "stop_loss_pct": 30.0, "floor_pct": 1.0,
+        "state": "stop_placed", "entry_status": "filled", "entry_fill": 1.0,
+        "close_order_id": None, "close_target_price": 1.3, "stop_order_id": "s1",
+        "stop_exit_price": 0.7, "stop_market_fallback": False, "stop_note": None,
+        "done": False, "task": "not-json-serializable-should-never-be-sent",
+    }
+    tq._checkpoint_watcher(w)
+    await asyncio.sleep(0)   # let the fire-and-forget task actually run
+
+    assert len(calls) == 1
+    row = calls[0]
+    assert row["entry_order_id"] == "o1" and row["uid"] == "u1"
+    assert row["state"] == "stop_placed" and row["stop_order_id"] == "s1"
+    assert "task" not in row   # only the whitelisted reconstruction fields go out
+
+
+async def test_checkpoint_watcher_failure_is_swallowed_not_raised(monkeypatch):
+    """A down/slow Supabase must never break the actual trading logic — the
+    checkpoint is fire-and-forget and best-effort only."""
+    async def _boom(row):
+        raise RuntimeError("network down")
+    monkeypatch.setattr(tq.supabase_admin, "upsert_torque_watcher", _boom)
+
+    w = {"entry_order_id": "o1", "per_user": True, "uid": "u1", "symbol": "NDX",
+        "strategy": "long_call", "state": "stop_placed", "done": False}
+    tq._checkpoint_watcher(w)   # must not raise synchronously
+    await asyncio.sleep(0)      # let the task run and swallow its own exception

@@ -60,29 +60,9 @@ async def resolve_broker(request: Request, user: dict) -> tuple[str, Any, str | 
     cfg = None
     if uid and auth_kind == "supabase":
         cfg = await supabase_admin.get_broker_config(uid)
-    if cfg:
-        broker = (cfg.get("broker") or "tradier").lower()
-        if broker == "webull" and cfg.get("webull_app_key") and cfg.get("webull_app_secret"):
-            client = WebullClient(
-                app_key=cfg["webull_app_key"], app_secret=cfg["webull_app_secret"],
-                region=cfg.get("webull_region") or "us", env=cfg.get("webull_env") or "production",
-            )
-            account = _clean_account_id(cfg.get("webull_account_id"))
-            return "webull", client, account, True
-        if cfg.get("tradier_token"):
-            env = (cfg.get("tradier_env") or "production").lower()
-            base = "https://sandbox.tradier.com" if env == "sandbox" else "https://api.tradier.com"
-            # Tighter socket timeout than the data-polling default: every call on
-            # the execution path is a small JSON round-trip, and a user is
-            # watching the Preview button while it runs. Keeping it well under
-            # the route's stage budgets means a slow broker surfaces as a named
-            # timeout rather than a spinner that outlives the browser's patience.
-            client = TradierClient(base_url=base, token=cfg["tradier_token"],
-                                   timeout=EXECUTION_HTTP_TIMEOUT_SEC)
-            account = _clean_account_id(cfg.get("tradier_account_id"))
-            return "tradier", client, account, True
-        # cfg row exists but carries no usable credentials → treat as "no
-        # connection" and fall through to the rejection below.
+    resolved = _client_from_broker_cfg(cfg)
+    if resolved:
+        return resolved
 
     # No usable per-user broker connection resolved.
     if auth_kind == "supabase":
@@ -95,3 +75,49 @@ async def resolve_broker(request: Request, user: dict) -> tuple[str, Any, str | 
     # Server-owner bypass only (admin token / dev mode): the house client backs
     # owner-only tooling.
     return "tradier", house_client(request), None, False
+
+
+def _client_from_broker_cfg(cfg: Optional[dict]) -> Optional[tuple[str, Any, Optional[str], bool]]:
+    """Build a (broker, client, account, is_per_user=True) tuple from a
+    decrypted broker_configs row, or None if it carries no usable
+    credentials. Factored out of resolve_broker so watcher restart-recovery
+    (no HTTP Request to fall back to a house client with) can reuse the exact
+    same per-user construction logic."""
+    if not cfg:
+        return None
+    broker = (cfg.get("broker") or "tradier").lower()
+    if broker == "webull" and cfg.get("webull_app_key") and cfg.get("webull_app_secret"):
+        client = WebullClient(
+            app_key=cfg["webull_app_key"], app_secret=cfg["webull_app_secret"],
+            region=cfg.get("webull_region") or "us", env=cfg.get("webull_env") or "production",
+        )
+        account = _clean_account_id(cfg.get("webull_account_id"))
+        return "webull", client, account, True
+    if cfg.get("tradier_token"):
+        env = (cfg.get("tradier_env") or "production").lower()
+        base = "https://sandbox.tradier.com" if env == "sandbox" else "https://api.tradier.com"
+        # Tighter socket timeout than the data-polling default: every call on
+        # the execution path is a small JSON round-trip, and a user is
+        # watching the Preview button while it runs. Keeping it well under
+        # the route's stage budgets means a slow broker surfaces as a named
+        # timeout rather than a spinner that outlives the browser's patience.
+        client = TradierClient(base_url=base, token=cfg["tradier_token"],
+                               timeout=EXECUTION_HTTP_TIMEOUT_SEC)
+        account = _clean_account_id(cfg.get("tradier_account_id"))
+        return "tradier", client, account, True
+    return None   # cfg row exists but carries no usable credentials
+
+
+async def resolve_client_for_uid(uid: str) -> Optional[tuple[str, Any, Optional[str]]]:
+    """Per-user broker client for a uid with no HTTP Request in scope at
+    all — used by watcher restart-recovery at backend startup, which has no
+    browser session to resolve against and must never fall back to the house
+    client (that's read-only for a regular user's own positions). Returns
+    None if this account has no usable broker connection; the caller must
+    treat that as "cannot resume this watcher," not silently skip the check."""
+    cfg = await supabase_admin.get_broker_config(uid)
+    resolved = _client_from_broker_cfg(cfg)
+    if not resolved:
+        return None
+    broker, client, account, _is_per_user = resolved
+    return broker, client, account

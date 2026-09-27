@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 from .. import auth
 from ..auth import get_current_user
 from ..config import get_settings
-from ..broker_resolver import resolve_broker
+from ..broker_resolver import resolve_broker, resolve_client_for_uid
 from ..entitlements import ensure_tool
 from .. import supabase_admin
 from ..order_builder import build_tradier_order_payload
@@ -178,6 +178,36 @@ _CLOSE_RETRY_DELAY = 2.0
 # entry_order_id -> watcher state dict (also holds the asyncio task ref so it's
 # not garbage-collected mid-flight).
 _WATCHERS: dict[str, dict] = {}
+
+_WATCHER_ROW_FIELDS = (
+    "entry_order_id", "uid", "account_id", "symbol", "strategy", "legs", "is_single",
+    "entry_type", "quantity", "tick", "auto_close", "close_target_pct", "stop_loss_pct",
+    "floor_pct", "state", "entry_status", "entry_fill", "close_order_id",
+    "close_target_price", "stop_order_id", "stop_exit_price", "stop_market_fallback",
+    "stop_note", "done",
+)
+
+
+def _checkpoint_watcher(w: dict) -> None:
+    """Fire-and-forget persistence of a watcher's current state (Supabase
+    torque_watchers — see docs/torque.md "Multi-user order persistence").
+    Never awaited by the caller: a slow or unreachable Supabase must never
+    delay or break the actual trading logic, which stays driven entirely by
+    the in-memory `w` dict. Skipped for a non-per-user (dev/admin/house)
+    watcher — those aren't tied to a real Supabase uid, and the table's FK
+    would reject them anyway; the multi-user persistence project is about
+    entitled per-user accounts specifically."""
+    if not w.get("per_user") or not w.get("uid"):
+        return
+    row = {k: w.get(k) for k in _WATCHER_ROW_FIELDS}
+    row["done"] = bool(row.get("done", False))
+
+    async def _go():
+        try:
+            await supabase_admin.upsert_torque_watcher(row)
+        except Exception as e:
+            log.warning("watcher checkpoint failed for %s: %s", w.get("entry_order_id"), e)
+    asyncio.create_task(_go())
 
 # Stop-loss poll cadence (slower than the fill poll — this runs for hours).
 _STOP_INTERVAL = 10.0
@@ -1040,8 +1070,17 @@ async def torque_place(req: PlaceRequest, request: Request,
             # that placed it; /torque/orders returns only the caller's own (never
             # sent to the client). dev/admin/supabase all carry a stable "id".
             "uid": user.get("id"),
+            # Everything below is otherwise-static context needed to fully
+            # reconstruct this watcher after a restart (see
+            # _checkpoint_watcher / docs/torque.md "Multi-user order
+            # persistence") — not used by the live in-memory watcher itself.
+            "per_user": per_user, "account_id": account_id, "legs": legs,
+            "is_single": is_single, "entry_type": entry_type, "quantity": req.quantity,
+            "tick": tick, "auto_close": req.auto_close, "close_target_pct": req.close_target_pct,
+            "floor_pct": close_floor,
         }
         _WATCHERS[str(order_id)] = w
+        _checkpoint_watcher(w)
         w["task"] = asyncio.create_task(_watch_and_close(
             client, account_id, str(order_id), w,
             is_single=is_single, legs=legs, symbol=req.symbol, strategy=req.strategy,
@@ -1063,17 +1102,25 @@ async def torque_place(req: PlaceRequest, request: Request,
 # ── news-signal ingestion (facades-news-reactor) ────────────────────────────
 class NewsSignalPayload(BaseModel):
     """See ../../docs/torque.md 'News-signal ingestion' and the sibling repo's
-    docs/torque-integration-proposal.md — this mirrors that payload exactly."""
+    docs/torque-integration-proposal.md — this mirrors that payload exactly.
+
+    `state`/`cancels_event_id` are the CANCEL extension: a normal directional
+    trigger omits `state` entirely (or sends "confirmed"); `state="cancel"`
+    instead names a prior signal (`cancels_event_id`, its `source_event_id`)
+    to unwind. `direction`/`confidence` are only required for the former —
+    Optional here so a cancel payload doesn't need to fabricate either."""
     source_event_id: str
     headline: str
     category: str | None = None
     symbol: str
-    direction: str                          # "bullish" | "bearish"
+    direction: str | None = None            # "bullish" | "bearish" — required unless state="cancel"
     sentiment: str | None = None
-    confidence: float = Field(ge=0.0, le=1.0)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     rationale: str | None = None
     tradier_confirmation: dict | None = None
     generated_at: str | None = None
+    state: str | None = None                # None/"confirmed" = entry trigger; "cancel" = unwind a prior signal
+    cancels_event_id: str | None = None     # required when state="cancel"
 
 
 _NEWS_DIRECTION_STRATEGY = {"bullish": "long_call", "bearish": "long_put"}
@@ -1126,7 +1173,21 @@ def _news_signal_rate_ok(settings) -> bool:
     return True
 
 
-async def _place_news_signal_for_uid(uid, *, request, symbol, strategy, legs,
+def _entry_order_id_from_place_result(result: dict) -> str | None:
+    """torque_place's return shape varies by path: the reactive-watcher path
+    ("confirm_then_close"/"watching_fill") sets a top-level order_id, while
+    the native OTO/OTOCO bracket paths nest the raw Tradier response under
+    "entry" instead."""
+    oid = result.get("order_id")
+    if oid:
+        return str(oid)
+    entry = result.get("entry") or {}
+    oid = entry.get("id")
+    return str(oid) if oid else None
+
+
+async def _place_news_signal_for_uid(uid, *, request, source_event_id, symbol, strategy,
+                                     legs, is_single, entry_type, tick,
                                      limit_price, stop_pct, quantity) -> dict:
     """One qualified account's attempt: entitlement + broker checks, then a
     fresh PlaceRequest through the real place() path. Never raises — every
@@ -1157,7 +1218,143 @@ async def _place_news_signal_for_uid(uid, *, request, symbol, strategy, legs,
         # (resolve_broker's own 403) — exactly the "not configured, so ignore
         # it" case this gate is meant to produce, not an error.
         return {"uid": uid, "accepted": False, "reason": e.detail}
+
+    entry_order_id = _entry_order_id_from_place_result(result)
+    if entry_order_id and not result.get("rejected"):
+        # Correlation index for a future CANCEL signal to find and act on
+        # this exact order — best-effort: a logging failure here must never
+        # be reported back as "the order wasn't placed," since it was.
+        try:
+            await supabase_admin.insert_torque_order({
+                "source_event_id": str(source_event_id), "uid": uid,
+                "entry_order_id": entry_order_id, "symbol": symbol, "strategy": strategy,
+                "quantity": quantity, "is_single": is_single, "entry_type": entry_type,
+                "legs": legs, "tick": tick,
+            })
+        except Exception as e:
+            log.warning("insert_torque_order failed for %s/%s: %s", source_event_id, uid, e)
     return {"uid": uid, "accepted": True, "place_result": result}
+
+
+# ── news-signal CANCEL: unwind a prior signal by source_event_id ───────────
+_SUPERSEDED: set[str] = set()   # entry_order_ids closed out-of-band by a cancel signal
+
+
+def _is_superseded(w: dict) -> bool:
+    return str(w.get("entry_order_id") or "") in _SUPERSEDED
+
+
+def _supersede_watcher(entry_order_id: str, reason: str) -> None:
+    """Mark an entry order's underlying position as closed out-of-band (by a
+    cancel-signal), so any in-memory watcher still polling ITS OWN tracked
+    order (a TP close, a resting stop) stops acting on a position that no
+    longer exists. There is no way to forcibly interrupt a running asyncio
+    task mid-`sleep` — this is a cooperative flag, checked at the top of every
+    poll iteration in `_monitor_stop`/`_run_stop_exit_ladder`."""
+    key = str(entry_order_id)
+    _SUPERSEDED.add(key)
+    w = _WATCHERS.get(key)
+    if w is not None:
+        w["superseded_reason"] = reason
+
+
+async def _cancel_or_close_entry(client, account_id, order_id, quantity):
+    """Ground truth for an ENTRY order when a cancel-signal arrives — same
+    "cancel best-effort, then a fresh get_order read decides" discipline as
+    `_resolve_stalled_stop`, but answering a different question: not "how much
+    is still unfilled and needs a fresh stop," but "how much already executed
+    and needs a market close" (a cancel already kills whatever never filled).
+
+    Returns one of:
+      ("canceled", 0)              — never executed; the cancel alone was enough
+      ("close_market", exec_qty)   — fully or partially executed; must market-close this much
+      ("needs_attention", 0)       — final state unconfirmed; do NOT act further
+    """
+    try:
+        await client.cancel_order(account_id, order_id)
+    except Exception as e:
+        log.warning("cancel-signal: cancel failed for %s (may have already filled): %s", order_id, e)
+    try:
+        o = await client.get_order(account_id, order_id)
+    except Exception as e:
+        log.warning("cancel-signal: could not confirm order %s's state: %s", order_id, e)
+        return "needs_attention", 0.0
+    st = str(o.get("status") or "").lower()
+    exec_qty = teng._f(o.get("exec_quantity")) or 0.0
+    if st in ("rejected", "expired"):
+        return "canceled", 0.0
+    if st == "canceled":
+        return ("canceled", 0.0) if exec_qty <= 0 else ("close_market", exec_qty)
+    if st in ("filled", "partially_filled"):
+        return ("close_market", exec_qty) if exec_qty > 0 else ("needs_attention", 0.0)
+    # Still open/pending even after a cancel attempt — not safe to act on.
+    return "needs_attention", 0.0
+
+
+async def _close_one_signal_order(row: dict) -> dict:
+    """One (signal, account) correlation row from `torque_orders`: resolve
+    that account's own broker client (no HTTP Request in scope — a webhook
+    has no browser session, same as watcher restart-recovery), ground-truth
+    the entry order, and either market-close whatever actually executed or
+    let the plain cancel stand. Never raises — one account's failure can't
+    stop the unwind of the rest."""
+    uid = row.get("uid")
+    entry_order_id = str(row.get("entry_order_id") or "")
+    resolved = await resolve_client_for_uid(uid)
+    if not resolved:
+        return {"uid": uid, "entry_order_id": entry_order_id, "action": "skipped",
+                "reason": "no usable broker connection to act on this account"}
+    _broker, client, account_id = resolved
+    try:
+        outcome, exec_qty = await _cancel_or_close_entry(
+            client, account_id, entry_order_id, float(row.get("quantity") or 1))
+        result = {"uid": uid, "entry_order_id": entry_order_id, "action": outcome}
+        if outcome == "close_market":
+            payload = _build_close_payload(
+                account_id=account_id, symbol=row["symbol"], strategy=row["strategy"],
+                legs=row["legs"], is_single=bool(row["is_single"]), entry_type=row["entry_type"],
+                close_px=None, quantity=int(round(exec_qty)), entry_order_id=entry_order_id,
+                market=True, tag_prefix="torqueCancelMkt")
+            close_res = await _submit(client, account_id, payload)
+            crej, cwhy = _is_rejected(close_res)
+            result["action"] = "close_rejected" if crej else "closed_at_market"
+            result["exec_quantity"] = exec_qty
+            if crej:
+                result["reason"] = cwhy
+        elif outcome == "needs_attention":
+            result["reason"] = "entry order's final state could not be confirmed after cancel — needs manual review"
+        _supersede_watcher(entry_order_id, f"cancel-signal: {result['action']}")
+        return result
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+
+async def _handle_cancel_signal(payload: "NewsSignalPayload", request: Request) -> dict:
+    """Unwind every order a prior signal (`payload.cancels_event_id`) placed,
+    across every account it fanned out to: close at market whatever actually
+    executed (only the executed quantity), or simply let the cancel stand for
+    whatever never filled — per spec, regardless of current profitability or
+    stop-loss threshold. Same fail-closed posture as an entry signal on
+    everything that isn't itself the cancel decision."""
+    if not payload.cancels_event_id:
+        return {"ok": True, "accepted": False, "reason": "cancel signal missing cancels_event_id"}
+    try:
+        clock = await torque_clock(request)
+    except Exception:
+        clock = {"open": None}
+    if clock.get("open") is not True:
+        return {"ok": True, "accepted": False, "reason": "market is closed or its state is unknown"}
+    rows = await supabase_admin.get_torque_orders_by_event(payload.cancels_event_id)
+    if not rows:
+        return {"ok": True, "accepted": False,
+                "reason": f"no orders on file for {payload.cancels_event_id} (never placed, or already purged)"}
+    results = [await _close_one_signal_order(row) for row in rows]
+    log.info("news_signal cancel %s -> %s: %d account(s) processed",
+             payload.source_event_id, payload.cancels_event_id, len(results))
+    return {"ok": True, "accepted": True, "cancels_event_id": payload.cancels_event_id, "results": results}
 
 
 @router.post("/webhook/news_signal", dependencies=[Depends(require_news_signal_auth)])
@@ -1170,10 +1367,12 @@ async def news_signal(payload: NewsSignalPayload, request: Request):
     as a human clicking Send, zero special-casing for "this came from a
     webhook".
 
-    "Qualified" today means: uid listed in TORQUE_OPERATOR_UIDS (a webhook
-    has no browser session to bind to, so there's no other way yet to know
-    which accounts should react — see docs/torque.md), entitled to both
-    `torque` and `news-reactor`, and has an active broker connection. Every
+    "Qualified" means: entitled to `news-reactor` in Supabase right now
+    (queried live — get_users_with_tool — not a separately-maintained
+    allowlist; granting/revoking takes effect on the very next signal, no
+    restart), also entitled to `torque`, and has an active broker connection.
+    A webhook has no browser session to bind to, so this DB query is the only
+    way to know which accounts should react — see docs/torque.md. Every
     account is checked and acted on independently; one account having no
     broker connected doesn't block another that does.
 
@@ -1202,16 +1401,17 @@ async def news_signal(payload: NewsSignalPayload, request: Request):
     # Idempotency: a replay of an already-authenticated request (within the
     # signature's timestamp window) or the sender's own legitimate retry must
     # never place a second order. Checked before anything else so a replay
-    # never even reaches the rate cap or does any real work.
-    db = getattr(request.app.state, "db", None)
-    if db is None:
-        return {"ok": True, "accepted": False, "reason": "idempotency store unavailable"}
-    if not db.claim_news_signal(payload.source_event_id):
-        log.info("news_signal duplicate dropped: %s", payload.source_event_id)
-        return {"ok": True, "accepted": False, "reason": "duplicate source_event_id"}
+    # never even reaches the rate cap or does any real work. Supabase, not
+    # DuckDB — see supabase_admin.claim_news_signal's docstring.
+    if not await supabase_admin.claim_news_signal(payload.source_event_id):
+        log.info("news_signal duplicate or idempotency check failed: %s", payload.source_event_id)
+        return {"ok": True, "accepted": False, "reason": "duplicate source_event_id or idempotency check failed"}
 
     if not _news_signal_rate_ok(settings):
         return {"ok": True, "accepted": False, "reason": "signal rate cap exceeded"}
+
+    if (payload.state or "").lower() == "cancel":
+        return await _handle_cancel_signal(payload, request)
 
     strategy = _NEWS_DIRECTION_STRATEGY.get((payload.direction or "").lower())
     if not strategy:
@@ -1233,9 +1433,12 @@ async def news_signal(payload: NewsSignalPayload, request: Request):
     if clock.get("open") is not True:
         return {"ok": True, "accepted": False, "reason": "market is closed or its state is unknown"}
 
-    uids = tcfg.operator_uids()
+    # Live query, not a static allowlist — see the docstring above. Whoever
+    # currently has news-reactor entitled gets this signal; no separate
+    # config to keep in sync with the database.
+    uids = await supabase_admin.get_users_with_tool("news-reactor")
     if not uids:
-        return {"ok": True, "accepted": False, "reason": "no TORQUE_OPERATOR_UIDS configured"}
+        return {"ok": True, "accepted": False, "reason": "no accounts entitled to news-reactor"}
 
     try:
         build = await torque_build(BuildRequest(symbol=symbol, strategy=strategy), request)
@@ -1259,7 +1462,9 @@ async def news_signal(payload: NewsSignalPayload, request: Request):
     stop_pct = tcfg.stop_loss_default(symbol) or tcfg.DEFAULT_STOP_LOSS_PCT
     results = [
         await _place_news_signal_for_uid(
-            uid, request=request, symbol=symbol, strategy=strategy, legs=build["legs"],
+            uid, request=request, source_event_id=payload.source_event_id,
+            symbol=symbol, strategy=strategy, legs=build["legs"],
+            is_single=True, entry_type="debit", tick=build["tick"],
             limit_price=limit_price, stop_pct=stop_pct, quantity=settings.news_signal_quantity)
         for uid in uids
     ]
@@ -1270,19 +1475,39 @@ async def news_signal(payload: NewsSignalPayload, request: Request):
             "limit_price": limit_price, "stop_loss_pct": stop_pct, "results": results}
 
 
+def _close_tag(tag_prefix: str, entry_order_id, strategy: str = "") -> str:
+    """Deterministic tag correlating a close/stop order to ONE specific
+    entry — computed identically at submission time and again by
+    `_find_resting_order` on resume, so an order that merely shares the same
+    option symbol (a later signal trading the identical OCC contract, very
+    plausible for 0DTE strikes reused across a session) is never mistaken for
+    protecting THIS position. `entry_order_id` is what the match actually
+    keys on and is placed first so it's never truncated away; `strategy` is a
+    purely cosmetic suffix for the Orders panel, trimmed (or dropped) first
+    if the combined tag would exceed the ~30-char alphanumeric tag budget."""
+    prefix = re.sub(r"[^a-zA-Z0-9]", "", tag_prefix or "")
+    eid = re.sub(r"[^a-zA-Z0-9]", "", str(entry_order_id or ""))
+    budget = max(30 - len(prefix) - len(eid), 0)
+    strat = re.sub(r"[^a-zA-Z0-9]", "", strategy or "")[:budget]
+    return f"{prefix}{eid}{strat}"[:30]
+
+
 def _build_close_payload(*, account_id, symbol, strategy, legs, is_single,
-                         entry_type, close_px, quantity, duration="gtc",
-                         tag_prefix="torqueClose", market=False):
+                         entry_type, close_px, quantity, entry_order_id,
+                         duration="gtc", tag_prefix="torqueClose", market=False):
     """Closing order payload (single option or multileg), limit or market.
 
     `tag_prefix` distinguishes the passive profit-target close (torqueClose…)
     from a stop exit (torqueStop…) so the orders panel and the modify guard can
     tell them apart. A stop uses duration=day and a marketable price.
+    `entry_order_id` is stamped into the tag (`_close_tag`) so a resumed
+    watcher's broker-reconciliation can recognize an order as belonging to
+    THIS position specifically, not just any order in the same contract.
 
     `market=True` gives up price control entirely (no `close_px` needed) — the
     escalation path once a stop-limit has sat unfilled too long: a limit can
     only ever guarantee price, never a fill, on a fast enough move."""
-    tag = f"{tag_prefix}{strategy}"
+    tag = _close_tag(tag_prefix, entry_order_id, strategy)
     if is_single:
         cs = "sell_to_close" if legs[0]["action"].startswith("buy") else "buy_to_close"
         return _single_option_payload(
@@ -1309,7 +1534,7 @@ async def _package_price(client, symbol: str, legs: list[dict]) -> dict | None:
 
 
 async def _submit_stop_exit(client, account_id, *, symbol, strategy, legs, is_single,
-                            entry_type, quantity, close_px=None, market=False,
+                            entry_type, quantity, entry_order_id, close_px=None, market=False,
                             tag_prefix="torqueStop"):
     """Build + submit a stop-exit close (resting limit, or escalated market).
     Returns (order_id, rejected, reason). `tag_prefix` defaults to the normal
@@ -1319,7 +1544,8 @@ async def _submit_stop_exit(client, account_id, *, symbol, strategy, legs, is_si
     payload = _build_close_payload(
         account_id=account_id, symbol=symbol, strategy=strategy, legs=legs,
         is_single=is_single, entry_type=entry_type, close_px=close_px,
-        quantity=quantity, duration="day", tag_prefix=tag_prefix, market=market)
+        quantity=quantity, entry_order_id=entry_order_id, duration="day",
+        tag_prefix=tag_prefix, market=market)
     res = await _submit(client, account_id, payload)
     rej, why = _is_rejected(res)
     return str(res.get("id") or ""), rej, why
@@ -1390,23 +1616,36 @@ async def _run_stop_exit_ladder(client, account_id, w, *, symbol, strategy, legs
     the next order goes out. Never a blind resubmit for the original
     quantity, which can over-close a partially-filled position into a naked
     one on the excess."""
+    if _is_superseded(w):
+        # A cancel-signal already closed this entry out-of-band between the
+        # breach firing and the ladder actually starting — nothing left here
+        # for a stop to protect.
+        w["state"] = "canceled_by_signal"
+        _checkpoint_watcher(w)
+        return
     order_id, rej, why = await _submit_stop_exit(
         client, account_id, symbol=symbol, strategy=strategy, legs=legs,
         is_single=is_single, entry_type=entry_type, quantity=quantity,
-        close_px=first_price)
+        entry_order_id=w.get("entry_order_id"), close_px=first_price)
     w["stop_exit_price"] = first_price
     w["stop_order_id"] = order_id
     w["stop_market_fallback"] = False
     if rej:
         w["state"] = "stop_rejected"
         w["stop_note"] = why
+        _checkpoint_watcher(w)
         return
     w["state"] = "stop_placed"
+    _checkpoint_watcher(w)
     remaining = quantity
 
     for _requote in range(tcfg.STOP_MAX_REQUOTES):
         for _tick in range(tcfg.STOP_ESCALATE_AFTER_TICKS):
             await asyncio.sleep(_STOP_INTERVAL)
+            if _is_superseded(w):
+                w["state"] = "canceled_by_signal"
+                _checkpoint_watcher(w)
+                return
             try:
                 o = await client.get_order(account_id, order_id)
             except Exception:
@@ -1414,6 +1653,7 @@ async def _run_stop_exit_ladder(client, account_id, w, *, symbol, strategy, legs
             st = str(o.get("status") or "").lower()
             if st == "filled":
                 w["state"] = "stop_filled"
+                _checkpoint_watcher(w)
                 return
             if st in ("rejected", "canceled", "expired"):
                 break   # dead order — resolve immediately rather than waiting out the tick budget
@@ -1430,6 +1670,7 @@ async def _run_stop_exit_ladder(client, account_id, w, *, symbol, strategy, legs
         if modify_ok:
             w["stop_exit_price"] = fresh_px
             w["state"] = "stop_requoted"
+            _checkpoint_watcher(w)
             continue   # same order_id, same tracked order — just a fresh price
 
         # Modify didn't happen (no live quote, or the modify call itself
@@ -1437,12 +1678,14 @@ async def _run_stop_exit_ladder(client, account_id, w, *, symbol, strategy, legs
         outcome, remaining = await _resolve_stalled_stop(client, account_id, order_id, remaining)
         if outcome == "filled":
             w["state"] = "stop_filled"
+            _checkpoint_watcher(w)
             return
         if outcome == "needs_attention":
             w["state"] = "stop_needs_attention"
             w["stop_note"] = (f"order {order_id} left an unconfirmed final state while requoting — "
                               f"refusing to resubmit and risk closing more than is actually open; "
                               f"needs manual review")
+            _checkpoint_watcher(w)
             return
         # Confirmed dead (not filled) — the old order is gone, so this one
         # requote has to be a fresh submission rather than a modify.
@@ -1453,14 +1696,16 @@ async def _run_stop_exit_ladder(client, account_id, w, *, symbol, strategy, legs
         order_id, rej, why = await _submit_stop_exit(
             client, account_id, symbol=symbol, strategy=strategy, legs=legs,
             is_single=is_single, entry_type=entry_type, quantity=remaining,
-            close_px=fresh_px)
+            entry_order_id=w.get("entry_order_id"), close_px=fresh_px)
         w["stop_exit_price"] = fresh_px
         w["stop_order_id"] = order_id
         w["state"] = "stop_requoted"
         if rej:
             w["state"] = "stop_rejected"
             w["stop_note"] = why
+            _checkpoint_watcher(w)
             return
+        _checkpoint_watcher(w)
 
     # Exhausted every bounded re-cross attempt. Freeze: stop trying to chase
     # a moving book with a bounded price and guarantee the exit instead. The
@@ -1471,22 +1716,25 @@ async def _run_stop_exit_ladder(client, account_id, w, *, symbol, strategy, legs
     outcome, remaining = await _resolve_stalled_stop(client, account_id, order_id, remaining)
     if outcome == "filled":
         w["state"] = "stop_filled"
+        _checkpoint_watcher(w)
         return
     if outcome == "needs_attention":
         w["state"] = "stop_needs_attention"
         w["stop_note"] = (f"order {order_id} left an unconfirmed final state before the market "
                           f"fallback — refusing to submit and risk an over-close; needs manual review")
+        _checkpoint_watcher(w)
         return
     market_id, rej, why = await _submit_stop_exit(
         client, account_id, symbol=symbol, strategy=strategy, legs=legs,
-        is_single=is_single, entry_type=entry_type, quantity=remaining, market=True,
-        tag_prefix="torqueStopMkt")
+        is_single=is_single, entry_type=entry_type, quantity=remaining,
+        entry_order_id=w.get("entry_order_id"), market=True, tag_prefix="torqueStopMkt")
     w["stop_order_id"] = market_id
     w["stop_market_fallback"] = True
     w["state"] = "stop_rejected" if rej else "stop_market_placed"
     w["stop_note"] = (why if rej else
                       f"no bounded fill after {tcfg.STOP_MAX_REQUOTES} re-quotes — exited at "
                       f"market to guarantee the stop; verify the fill price")
+    _checkpoint_watcher(w)
 
 
 async def _monitor_stop(client, account_id, w, *, legs, symbol, strategy, is_single,
@@ -1506,11 +1754,19 @@ async def _monitor_stop(client, account_id, w, *, legs, symbol, strategy, is_sin
     blocked_ticks = 0
     while time.time() < deadline:
         await asyncio.sleep(_STOP_INTERVAL)
+        if _is_superseded(w):
+            # A cancel-signal already closed this position out-of-band —
+            # stop watching it for a stop-loss that no longer applies to
+            # anything open.
+            w["state"] = "canceled_by_signal"
+            _checkpoint_watcher(w)
+            return
         if close_order_id:                       # target already hit → nothing to protect
             try:
                 o = await client.get_order(account_id, close_order_id)
                 if str(o.get("status") or "").lower() == "filled":
                     w["state"] = "closed_at_target"
+                    _checkpoint_watcher(w)
                     return
             except Exception:
                 pass
@@ -1553,12 +1809,14 @@ async def _monitor_stop(client, account_id, w, *, legs, symbol, strategy, is_sin
                 # protect, and a stop-exit here would open a naked position
                 # from nothing.
                 w["state"] = "closed_at_target"
+                _checkpoint_watcher(w)
                 return
             if outcome == "needs_attention":
                 w["state"] = "stop_needs_attention"
                 w["stop_note"] = (f"could not confirm the profit-target close {close_order_id}'s "
                                   f"final state before handing off to the stop — refusing to guess "
                                   f"how much is actually still open; needs manual review")
+                _checkpoint_watcher(w)
                 return
 
         await _run_stop_exit_ladder(
@@ -1595,6 +1853,7 @@ async def _watch_and_close(client, account_id, entry_id, w, *, is_single, legs,
         # (e.g. $0.05) instead of the real ~70%-of-credit buyback.
         entry_fill = abs(teng._f(filled.get("avg_fill_price")) or 0.0)
         w["entry_fill"] = entry_fill
+        _checkpoint_watcher(w)
         close_order_id = None
 
         if auto_close:
@@ -1604,7 +1863,7 @@ async def _watch_and_close(client, account_id, entry_id, w, *, is_single, legs,
             payload = _build_close_payload(
                 account_id=account_id, symbol=symbol, strategy=strategy, legs=legs,
                 is_single=is_single, entry_type=entry_type, close_px=close_px,
-                quantity=quantity)
+                quantity=quantity, entry_order_id=entry_id)
             placed = False
             for attempt in range(_CLOSE_RETRIES):
                 close = await _submit(client, account_id, payload)
@@ -1629,6 +1888,7 @@ async def _watch_and_close(client, account_id, entry_id, w, *, is_single, legs,
                     continue
                 break
             w["state"] = "close_placed" if placed else "close_rejected"
+            _checkpoint_watcher(w)
             if not placed and not stop_pct:
                 return
 
@@ -1645,6 +1905,7 @@ async def _watch_and_close(client, account_id, entry_id, w, *, is_single, legs,
         w["close_reason"] = str(e)
     finally:
         w["done"] = True
+        _checkpoint_watcher(w)
         if close_client:
             try:
                 await client.close()
@@ -1802,3 +2063,225 @@ async def torque_order(order_id: str, request: Request, account_id: str | None =
     finally:
         if per_user:
             await client.close()
+
+
+# ── watcher restart recovery (Supabase torque_watchers) ─────────────────────
+def _order_matches_leg(order: dict, legs: list[dict]) -> bool:
+    """True if a raw Tradier order touches the same option symbol(s) as this
+    watcher's position — used to recognize an existing resting close/stop for
+    THIS specific entry among everything else on the account. Checks both the
+    single-leg shape (top-level `option_symbol`) and the multileg shape (a
+    `leg`/`legs` array of per-leg dicts), since we don't control which one a
+    resumed row's original order actually used."""
+    wanted = {str(l.get("symbol") or "").upper() for l in legs if l.get("symbol")}
+    if not wanted:
+        return False
+    found = set()
+    top = order.get("option_symbol") or order.get("symbol")
+    if top:
+        found.add(str(top).upper())
+    sub = order.get("leg") or order.get("legs")
+    if isinstance(sub, dict):
+        sub = [sub]
+    if isinstance(sub, list):
+        for lg in sub:
+            s = (lg or {}).get("option_symbol") or (lg or {}).get("symbol")
+            if s:
+                found.add(str(s).upper())
+    return bool(wanted & found)
+
+
+async def _find_resting_order(client, account_id, *, legs, tag_prefix,
+                              entry_order_id, strategy) -> dict | None:
+    """Reconcile with the broker's OWN order list before a resumed watcher
+    places a close or stop-exit from a persisted state that can't be trusted
+    to reflect reality: `_checkpoint_watcher` is fire-and-forget and never
+    retried, so a real side effect (the close/stop actually submitted) can
+    land at the broker while the Supabase row is left one step behind —
+    forever, if that write failed rather than merely raced. Blindly trusting
+    the stale row's state here is exactly the over-close bug this function
+    exists to prevent — same principle as `_resolve_stalled_stop`, just
+    applied when there's no specific order id on the row to ground-truth
+    against yet.
+
+    Matches on the EXACT tag this entry's own close/stop would have been
+    submitted with (`_close_tag`) — not merely the shared prefix or option
+    symbol. An old order for a DIFFERENT position that happens to trade the
+    identical OCC contract (very plausible: 0DTE signals routinely reuse the
+    same strike across a session) must never be mistaken for protecting THIS
+    one — in EITHER direction: adopting a stale FILLED order as "already
+    closed"/"already stopped out" would silently leave the current position
+    with no exit at all, which is worse than the duplicate-order bug this
+    function was originally built to prevent. The leg/option-symbol check is
+    kept as a second, independent signal on top of the tag match, not a
+    substitute for it. Returns the matching order (preferring one still
+    working over an already-filled one) or None if nothing for this entry
+    exists."""
+    expected_tag = _close_tag(tag_prefix, entry_order_id, strategy)
+    try:
+        orders = await client.get_orders(account_id)
+    except Exception as e:
+        log.warning("resume: could not list orders to reconcile (%s): %s", tag_prefix, e)
+        return None
+    candidates = [
+        o for o in (orders or [])
+        if str(o.get("tag") or "") == expected_tag
+        and _order_matches_leg(o, legs)
+        and str(o.get("status") or "").lower() in (_WORKING_STATES | {"filled"})
+    ]
+    if not candidates:
+        return None
+    for o in candidates:
+        if str(o.get("status") or "").lower() in _WORKING_STATES:
+            return o
+    return candidates[-1]
+
+
+async def _resume_from_resting_stop(client, account_id, w: dict, stop_order_id) -> None:
+    """Shared resume path once a stop-exit order is known (or, via broker
+    reconciliation, discovered) to be or have been resting for this watcher —
+    ground truth is resolved before it's ever touched again, exactly like an
+    in-process stall (`_resolve_stalled_stop`)."""
+    w["stop_order_id"] = str(stop_order_id)
+    outcome, remaining = await _resolve_stalled_stop(
+        client, account_id, stop_order_id, w.get("quantity") or 1)
+    if outcome == "filled":
+        w["state"] = "stop_filled"
+    elif outcome == "needs_attention":
+        w["state"] = "stop_needs_attention"
+        w["stop_note"] = "restart recovery could not confirm the resting stop order's state"
+    else:
+        px = await _package_price(client, w["symbol"], w["legs"])
+        fresh_px = teng.stop_exit_price(px, w["entry_type"], w["tick"]) if px else None
+        if fresh_px is None:
+            w["state"] = "stop_needs_attention"
+            w["stop_note"] = "restart recovery had no live quote to re-cross against"
+        else:
+            await _run_stop_exit_ladder(
+                client, account_id, w, symbol=w["symbol"], strategy=w["strategy"],
+                legs=w["legs"], is_single=w["is_single"], entry_type=w["entry_type"],
+                quantity=remaining, tick=w["tick"], first_price=fresh_px)
+    _checkpoint_watcher(w)
+
+
+async def _resume_watcher_from_row(client, account_id, w: dict) -> None:
+    """Resume monitoring a watcher reconstructed from a persisted Supabase
+    row. Never blindly restarts breach-detection OR places a fresh close from
+    a state that doesn't itself carry a specific order id to ground-truth
+    against — that can submit a second order on top of one that's already
+    resting if a fire-and-forget checkpoint write failed or lagged behind the
+    real side effect (see `_find_resting_order`). Always resolves ground
+    truth — either from a known order id, or by reconciling with the
+    broker's own order list first — exactly like a normal in-process stall."""
+    state = w.get("state")
+    stop_order_id = w.get("stop_order_id")
+    close_order_id = w.get("close_order_id")
+
+    if stop_order_id and state in ("stop_placed", "stop_requoted"):
+        await _resume_from_resting_stop(client, account_id, w, stop_order_id)
+        return
+
+    if state == "watching_fill":
+        # The persisted row says nothing beyond the entry was ever placed —
+        # but that's only trustworthy if every checkpoint write along the way
+        # actually landed. Reconcile with the broker before believing it: a
+        # resting torqueStop-tagged order means the process got all the way
+        # to arming a stop before its checkpoints stopped landing; a resting
+        # torqueClose-tagged one means at least the profit-target close went
+        # out. Only when neither exists is _watch_and_close-from-scratch safe.
+        existing_stop = await _find_resting_order(
+            client, account_id, legs=w["legs"], tag_prefix="torqueStop",
+            entry_order_id=w["entry_order_id"], strategy=w["strategy"])
+        if existing_stop:
+            w["entry_status"] = "filled"
+            await _resume_from_resting_stop(client, account_id, w, existing_stop.get("id"))
+            return
+
+        existing_close = await _find_resting_order(
+            client, account_id, legs=w["legs"], tag_prefix="torqueClose",
+            entry_order_id=w["entry_order_id"], strategy=w["strategy"])
+        if existing_close:
+            w["entry_status"] = "filled"
+            w["close_order_id"] = str(existing_close.get("id") or "")
+            w["state"] = "close_placed"
+            _checkpoint_watcher(w)
+            if w.get("stop_loss_pct"):
+                await _monitor_stop(
+                    client, account_id, w, legs=w["legs"], symbol=w["symbol"], strategy=w["strategy"],
+                    is_single=w["is_single"], entry_type=w["entry_type"],
+                    entry_fill=w.get("entry_fill") or 0.0, stop_pct=float(w["stop_loss_pct"]),
+                    tick=w["tick"], quantity=w["quantity"], close_order_id=w["close_order_id"])
+            else:
+                w["done"] = True
+                _checkpoint_watcher(w)
+            return
+
+        # Genuinely nothing beyond the entry on the broker's own book — safe
+        # to resume exactly like a fresh watcher.
+        await _watch_and_close(
+            client, account_id, w["entry_order_id"], w, is_single=w["is_single"],
+            legs=w["legs"], symbol=w["symbol"], strategy=w["strategy"],
+            entry_type=w["entry_type"], pct=w.get("close_target_pct"), tick=w["tick"],
+            quantity=w["quantity"], floor_pct=w.get("floor_pct", 1.0),
+            stop_pct=w.get("stop_loss_pct"), auto_close=w.get("auto_close", True))
+        return
+
+    if w.get("stop_loss_pct") and state in ("close_placed", "stop_blocked_wide_market"):
+        # Same reconciliation: a stop may already be resting even though the
+        # persisted row never advanced past close_placed — the identical
+        # lost-checkpoint gap _monitor_stop's own breach-to-ladder handoff can
+        # fall into (see _run_stop_exit_ladder's own checkpoint-on-placement).
+        existing_stop = await _find_resting_order(
+            client, account_id, legs=w["legs"], tag_prefix="torqueStop",
+            entry_order_id=w["entry_order_id"], strategy=w["strategy"])
+        if existing_stop:
+            await _resume_from_resting_stop(client, account_id, w, existing_stop.get("id"))
+            return
+        # A profit-target close may be resting (close_order_id, re-verified by
+        # _monitor_stop itself before acting on it) and a stop is armed —
+        # resume live protection the normal way.
+        await _monitor_stop(
+            client, account_id, w, legs=w["legs"], symbol=w["symbol"], strategy=w["strategy"],
+            is_single=w["is_single"], entry_type=w["entry_type"],
+            entry_fill=w.get("entry_fill") or 0.0, stop_pct=float(w["stop_loss_pct"]),
+            tick=w["tick"], quantity=w["quantity"], close_order_id=close_order_id)
+        return
+
+    # Terminal, or nothing left for Torque to do (a resting profit-target
+    # close with no stop armed just sits on the broker's own book from here).
+    w["done"] = True
+    _checkpoint_watcher(w)
+
+
+async def resume_active_torque_watchers() -> int:
+    """Called once at backend startup (see main.py). Every not-yet-done
+    watcher gets its own resumed background task; one account with no
+    resolvable broker connection (revoked since the watcher was checkpointed,
+    say) is logged and skipped, never allowed to block the rest. Returns how
+    many were actually resumed, for the startup log line."""
+    rows = await supabase_admin.get_active_torque_watchers()
+    resumed = 0
+    for row in rows:
+        entry_order_id = row.get("entry_order_id")
+        uid = row.get("uid")
+        try:
+            resolved = await resolve_client_for_uid(uid) if uid else None
+        except Exception as e:
+            resolved = None
+            log.warning("watcher resume: broker resolve failed for uid=%s: %s", uid, e)
+        if not resolved:
+            log.warning("watcher resume: no usable broker for %s (uid=%s) — marking needs_attention",
+                       entry_order_id, uid)
+            # Every row in torque_watchers is per-user by construction (see
+            # _checkpoint_watcher) — the flag itself is never persisted, so
+            # it has to be re-asserted here for the checkpoint write to fire.
+            w = {**row, "per_user": True, "state": "stop_needs_attention",
+                "stop_note": "no usable broker connection at restart recovery time", "done": True}
+            _checkpoint_watcher(w)
+            continue
+        _broker, client, account_id = resolved
+        w = {**row, "per_user": True, "task": None}
+        _WATCHERS[str(entry_order_id)] = w
+        w["task"] = asyncio.create_task(_resume_watcher_from_row(client, account_id or row.get("account_id"), w))
+        resumed += 1
+    return resumed

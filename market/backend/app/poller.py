@@ -25,6 +25,8 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from . import supabase_admin
+
 log = logging.getLogger("edgelane.market.poller")
 
 
@@ -416,6 +418,7 @@ async def poll_loop(tradier_client, db, settings) -> None:
              mode_label, symbols, interval,
              tz_name, "poll-anytime" if poll_when_closed else "skip-off-hours")
 
+    prev_open: bool | None = None   # tracks the open->closed edge, for the Torque signal/watcher purge below
     try:
         while True:
             try:
@@ -423,6 +426,19 @@ async def poll_loop(tradier_client, db, settings) -> None:
                 open_, reason = _is_market_open(tz_name)
                 state.market_open = open_
                 state.market_reason = reason
+
+                # Piggyback Torque's news-signal/order/watcher purge (Supabase
+                # — see app/supabase_admin.py) on this loop's own open->closed
+                # edge, rather than a second standalone scheduler — this loop
+                # already runs independent of any browser being open, and
+                # already recomputes market state every cycle. See
+                # docs/torque.md "Multi-user order persistence".
+                if prev_open is True and open_ is False:
+                    try:
+                        await supabase_admin.purge_stale_torque_records()
+                    except Exception as e:
+                        log.warning("torque signal/watcher purge failed: %s", e)
+                prev_open = open_
 
                 if not open_:
                     if poll_when_closed:
