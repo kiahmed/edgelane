@@ -479,6 +479,7 @@ async def _poll_all(symbols: list[str], tradier_client, db, settings, persist: b
         try:
             out = await poll_symbol(sym, tradier_client, db, settings, persist=persist)
             now = _utc_iso()
+            out["ts"] = now  # capture time, for anything rendering "as of" (matrix_snap.py)
             state.latest_by_symbol[sym] = out
             state.last_poll_at[sym] = now
             state.last_error.pop(sym, None)

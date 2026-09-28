@@ -14,8 +14,10 @@ Views (§5): engine_pick | strategy_grid | bias_chip | walls_chip | win_eval_gri
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from html import escape
 from typing import Any
+from zoneinfo import ZoneInfo
 
 _BG = "#07090d"
 _CARD = "#1e293b"
@@ -55,6 +57,26 @@ def _money(v: Any, dp: int = 2) -> str:
         return "—"
 
 
+def _fmt_as_of(ts: Any) -> str:
+    """Poller capture time (`out["ts"]`, poller.py::_poll_all) -> 'Sep 28,
+    9:31 AM ET' — America/New_York, same session timezone the rest of the
+    engine uses (matrix_signals.py::_SESSION_TZ). Every card shows `exp
+    <expiration>` but none showed WHEN it was captured — a walls/market-read
+    card in particular is stale the moment the session moves, so this is
+    the difference between "today's read" and "a specific, checkable moment"."""
+    if not ts:
+        return ""
+    try:
+        s = str(ts).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(ZoneInfo("America/New_York"))
+        return dt.strftime("%b %-d, %-I:%M %p ET")
+    except (TypeError, ValueError):
+        return ""
+
+
 def _doc(title: str, view: str, inner: str, width: int = 600) -> str:
     return f"""<!doctype html>
 <html><head><meta charset="utf-8">
@@ -74,9 +96,11 @@ def _doc(title: str, view: str, inner: str, width: int = 600) -> str:
 
 
 def _header(symbol: str, expiration: str, right_top: str = "", right_sub: str = "",
-            accent: str = _DIM, eyebrow: str = "") -> str:
+            accent: str = _DIM, eyebrow: str = "", as_of: str = "") -> str:
     eb = (f'<div style="color:{accent};font-size:12px;font-weight:700;'
           f'letter-spacing:.08em;margin-top:3px;">{_esc(eyebrow)}</div>') if eyebrow else ""
+    as_of_html = (f'<div style="color:{_MUTE};font-size:11px;margin-top:2px;">'
+                  f'as of {_esc(as_of)}</div>') if as_of else ""
     right = ""
     if right_top:
         right = (f'<div style="text-align:right;">'
@@ -87,7 +111,7 @@ def _header(symbol: str, expiration: str, right_top: str = "", right_sub: str = 
    <div>
      <div style="color:{_FG};font-size:26px;font-weight:800;">{_esc(symbol)}
        <span style="color:#cbd5e1;font-size:15px;font-weight:600;">&nbsp;exp {_esc(expiration)}</span>
-     </div>{eb}
+     </div>{eb}{as_of_html}
    </div>
    {right}
   </div>"""
@@ -187,7 +211,7 @@ def _render_engine_pick(snap: dict) -> str:
                 f'No engine pick right now — nothing cleared the bar. '
                 f'The engine is refusing, not reaching.</div>')
         return _doc(f"{sym} — Matrix engine pick", "engine_pick",
-                    _header(sym, exp, eyebrow="NO PICK") +
+                    _header(sym, exp, eyebrow="NO PICK", as_of=_fmt_as_of(snap.get("ts"))) +
                     f'  <div style="padding:18px 22px;">{body}{_footer()}</div>')
 
     verdict = pick.get("composite_verdict") or {}
@@ -207,7 +231,7 @@ def _render_engine_pick(snap: dict) -> str:
            f'{_esc(name)} · {_esc(pick.get("label"))} · '
            f'<span style="color:{accent};">{_esc(vlabel)}</span></div>')
     inner = (_header(sym, exp, right_top=_num(score, 1), right_sub="/ 100",
-                     accent=accent, eyebrow="ENGINE PICK") +
+                     accent=accent, eyebrow="ENGINE PICK", as_of=_fmt_as_of(snap.get("ts"))) +
              f'  <div style="padding:18px 22px;">{sub}'
              f'<table style="border-collapse:collapse;width:100%;">{rows}</table>'
              f'{_footer(_esc(str(pick.get("health") or "")))}</div>')
@@ -242,7 +266,7 @@ def _render_strategy_grid(snap: dict) -> str:
             f'margin-top:5px;text-transform:uppercase;">{_esc(health)}</div></div>')
     grid = ('<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">'
             + "".join(cells) + "</div>")
-    inner = (_header(sym, exp, eyebrow="STRATEGY GRID") +
+    inner = (_header(sym, exp, eyebrow="STRATEGY GRID", as_of=_fmt_as_of(snap.get("ts"))) +
              f'  <div style="padding:18px 22px;">{grid}{_footer(f"{len(cells)} structures")}</div>')
     return _doc(f"{sym} — Matrix strategy grid", "strategy_grid", inner, width=640)
 
@@ -286,7 +310,8 @@ def _render_bias_chip(snap: dict, trust: dict | None) -> str:
            f'{_esc(name)} · {_esc(pick.get("label") or "")} · '
            f'<span style="color:{accent};">{_esc(pills)}</span></div>')
     inner = (_header(sym, exp, right_top=_num(pick.get("composite_score"), 1),
-                     right_sub="composite", accent=accent, eyebrow="ENGINE PICK") +
+                     right_sub="composite", accent=accent, eyebrow="ENGINE PICK",
+                     as_of=_fmt_as_of(snap.get("ts"))) +
              f'  <div style="padding:18px 22px;">{sub}'
              f'<table style="border-collapse:collapse;width:100%;">{rows}</table>'
              f'{_footer()}</div>')
@@ -321,7 +346,7 @@ def _render_walls_chip(snap: dict) -> str:
         _kv("Net GEX", _gex(bias.get("net_gex"))),
     ])
     inner = (_header(sym, exp, right_top=headline, right_sub=sub,
-                     accent=accent, eyebrow="MARKET READ") +
+                     accent=accent, eyebrow="MARKET READ", as_of=_fmt_as_of(snap.get("ts"))) +
              f'  <div style="padding:18px 22px;">'
              f'<table style="border-collapse:collapse;width:100%;">{rows}</table>'
              f'{_footer("dealer positioning")}</div>')
@@ -351,7 +376,7 @@ def _render_win_eval_grid(snap: dict, trust: dict | None, stats: dict | None) ->
     ])
     note = _record_line(trust, stats)
     inner = (_header(sym, exp, right_top=wr_s, right_sub="win rate",
-                     accent=accent, eyebrow="SELF-EVALUATION") +
+                     accent=accent, eyebrow="SELF-EVALUATION", as_of=_fmt_as_of(snap.get("ts"))) +
              f'  <div style="padding:18px 22px;">'
              f'<table style="border-collapse:collapse;width:100%;">{rows}</table>'
              f'<div style="margin-top:12px;color:{_DIM};font-size:13px;">{_esc(note)}</div>'
