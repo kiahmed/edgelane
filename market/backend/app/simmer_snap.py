@@ -11,11 +11,32 @@ Pure formatting; no I/O. `render_snap_card(env, ready, watch)` returns a full
 HTML document with a `[data-snap="card"]` wrapper the crop targets."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .simmer_email import _esc, _money, _pct, _strike, _strikes_line, _structure_name, _num
 
 _BG = "#07090d"
+
+
+def _fmt_as_of(ts: Any) -> str:
+    """`env["computed_at"]` (simmer_watcher.py's `_utc_iso()`) -> 'Sep 28,
+    9:31 AM ET'. Same helper as matrix_snap.py's (fork, not shared — see
+    docs/matrix_events_update.md's §GCP plan rationale for why these two
+    stay independent files): the card showed `exp <date>` but never WHEN the
+    readiness snapshot was actually computed."""
+    if not ts:
+        return ""
+    try:
+        s = str(ts).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(ZoneInfo("America/New_York"))
+        return dt.strftime("%b %-d, %-I:%M %p ET")
+    except (TypeError, ValueError):
+        return ""
 
 
 def _decision_style(decision: str, score: float | None,
@@ -61,8 +82,14 @@ def render_snap_card(env: dict, ready: float = 70.0, watch: float = 50.0) -> str
                 f'No sellable spread — <span style="color:#cbd5e1;">{_esc(why)}</span>.'
                 f' The engine is refusing, not selling.</div>')
 
-    reg_line = (f'<span style="color:#64748b;">regime: {regime_state.replace("_", " ")}</span>'
-                if regime_state else "")
+    as_of = _fmt_as_of(env.get("computed_at"))
+    reg_bits = []
+    if regime_state:
+        reg_bits.append(f"regime: {regime_state.replace('_', ' ')}")
+    if as_of:
+        reg_bits.append(f"as of {_esc(as_of)}")
+    reg_line = (f'<span style="color:#64748b;">{" · ".join(reg_bits)}</span>'
+                if reg_bits else "")
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8">
