@@ -195,6 +195,12 @@ class Settings(BaseModel):
     # send_email just returns False.
     simmer_alert_from_email: str = Field(
         default="Facades Simmer <noreply@facades.trade>")
+    # Matrix's own sender (its daily summary email) — same authenticated domain,
+    # Matrix-branded so it's never mistaken for another product's mail.
+    matrix_from_email: str = Field(default="Facades Matrix <noreply@facades.trade>")
+    # When the Matrix daily summary goes out, ET (after the close, once the last
+    # picks have been graded).
+    matrix_daily_summary_at: str = Field(default="16:15")
     # Base URL of the Simmer UI, for the "open in Simmer" link in alert emails.
     # The public hostname, not the raw Vercel URL it fronts.
     simmer_app_url: str = Field(default="https://simmer.facades.trade")
@@ -457,6 +463,8 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
         out["smtp_use_ssl"] = raw["SMTP_USE_SSL"].strip().lower() in ("true", "1", "yes", "on")
     if "BREVO_API_KEY" in raw:               out["brevo_api_key"] = raw["BREVO_API_KEY"].strip()
     if "SIMMER_ALERT_FROM_EMAIL" in raw:     out["simmer_alert_from_email"] = raw["SIMMER_ALERT_FROM_EMAIL"].strip()
+    if "MATRIX_FROM_EMAIL" in raw:           out["matrix_from_email"] = raw["MATRIX_FROM_EMAIL"].strip()
+    if "MATRIX_DAILY_SUMMARY_AT" in raw:     out["matrix_daily_summary_at"] = raw["MATRIX_DAILY_SUMMARY_AT"].strip()
     if "SIMMER_APP_URL" in raw:              out["simmer_app_url"] = raw["SIMMER_APP_URL"].strip().rstrip("/")
 
     if "FORCE_POLL_WHEN_CLOSED" in raw:

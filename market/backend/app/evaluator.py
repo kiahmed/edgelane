@@ -470,6 +470,14 @@ async def evaluator_loop(db, poller_state, settings) -> None:
                         log.info("daily archive: wrote %d day/symbol summaries", written)
                     state.last_archive_date = today_et
 
+                # Matrix daily summary email — after the close (default 4:15 PM
+                # ET), once per session, only to Matrix users who opted in.
+                # Before the market-closed guard below on purpose: it runs when
+                # the market is SHUT. tick() is a clock check that hands the
+                # work to a background task, so it never slows this sweep.
+                from . import matrix_daily_summary
+                matrix_daily_summary.tick(db, settings)
+
                 # Self-eval is paused while the market is closed: prices are
                 # frozen, so any "outcome" would be manufactured noise. The
                 # poller leaves evaluation_active False during display-only

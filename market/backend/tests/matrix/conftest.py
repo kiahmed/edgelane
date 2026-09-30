@@ -17,8 +17,12 @@ from __future__ import annotations
 
 import pytest
 
-from app import config, matrix_events, supabase_admin
+from app import config, emailer, matrix_events, matrix_signals, supabase_admin
 from app.config import Settings
+
+# The real session-open window, captured before the autouse fixture below
+# replaces it — so its own test can exercise it without undoing the guards.
+REAL_WITHIN_OPEN_WINDOW = matrix_signals._within_open_window
 
 
 @pytest.fixture(autouse=True)
@@ -34,4 +38,13 @@ def _no_real_services(monkeypatch):
     monkeypatch.setattr(supabase_admin, "insert_row_ignore_duplicates", _no_supabase)
     monkeypatch.setattr(supabase_admin, "insert_row", _no_supabase)
     monkeypatch.setattr(matrix_events, "_get_publisher", _no_pubsub)
+
+    async def _no_email(*a, **k):
+        raise AssertionError("test reached the REAL email send — stub it")
+
+    monkeypatch.setattr(emailer, "send_email", _no_email)
+
+    # session_open only fires in the first hour of the session; tests run at any
+    # wall-clock time, so they start "inside" it. Its own tests override this.
+    monkeypatch.setattr(matrix_signals, "_within_open_window", lambda settings: True)
     yield

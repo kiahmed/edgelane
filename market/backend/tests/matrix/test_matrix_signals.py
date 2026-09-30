@@ -755,3 +755,45 @@ async def test_a_pick_dropped_within_a_minute_is_never_announced(
     other["engine_pick"] = dict(other["engine_pick"], legs=[{"strike": 7755.0}])
     await ms.on_snapshot(other, None); await ms.drain()      # engine moved on
     assert "pick_selected" not in _states(sent)
+
+
+
+# ── session_open needs the walls it shows (2026-09-30: NDX posted no levels) ──
+
+async def test_session_open_waits_for_call_and_put_walls(sent):
+    """NDX's first poll had VEX/TEX but no call/put walls yet. The open must
+    wait for them — not fire an empty frame, and not be marked done."""
+    early = _snap(bias={"bias_label": "neutral", "directional_score": 0,
+                        "vex_wall_strike": 30600.0, "tex_wall_strike": 30600.0})
+    await ms.on_snapshot(early, None); await ms.drain()
+    assert "session_open" not in _states(sent)
+    assert ms.state.session_open_date.get("SPX") is None, "not done — keep checking"
+
+    await ms.on_snapshot(_snap(), None); await ms.drain()      # walls resolved
+    ev = next(c for c in sent if c["state"] == "session_open")
+    assert ev["attrs"]["call_wall_strike"] and ev["attrs"]["put_wall_strike"]
+
+
+async def test_session_open_never_posts_after_the_first_hour(sent, monkeypatch):
+    monkeypatch.setattr(ms, "_within_open_window", lambda settings: False)
+    await ms.on_snapshot(_snap(), None); await ms.drain()
+    assert "session_open" not in _states(sent)
+
+
+def test_the_open_window_is_the_first_hour(monkeypatch):
+    from datetime import datetime as real_dt
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+
+    class _Clock(real_dt):
+        at = None
+        @classmethod
+        def now(cls, tz=None):
+            return cls.at.astimezone(tz) if tz else cls.at
+
+    from .conftest import REAL_WITHIN_OPEN_WINDOW       # guards stay in place
+    monkeypatch.setattr(ms, "datetime", _Clock)
+    for hhmm, expect in (("09:29", False), ("09:31", True), ("10:29", True), ("10:31", False)):
+        h, m = map(int, hhmm.split(":"))
+        _Clock.at = real_dt(2026, 9, 30, h, m, tzinfo=et)
+        assert REAL_WITHIN_OPEN_WINDOW(None) is expect, hhmm

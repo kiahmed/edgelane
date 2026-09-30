@@ -105,6 +105,17 @@ CREATE TABLE IF NOT EXISTS outcomes (
 -- Raw bias_decisions/outcomes are kept forever; this is the modeling-friendly,
 -- deduped daily record. `complete` = session was fully/mostly covered with no big
 -- polling gaps (partial days are kept but flagged so modeling can filter them out).
+-- One row per ET session the Matrix daily summary email was handled for —
+-- sent, or skipped (no graded picks that day). Persisted so a restart after
+-- 4:15 PM can't send it twice. (app/matrix_daily_summary.py)
+CREATE TABLE IF NOT EXISTS matrix_daily_email_log (
+    session_date  DATE       PRIMARY KEY,
+    status        VARCHAR    NOT NULL,     -- sent | skipped
+    recipients    INTEGER    NOT NULL,
+    detail        VARCHAR,
+    handled_at    TIMESTAMP  NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS outcome_daily_summary (
     session_date  DATE       NOT NULL,
     symbol        VARCHAR    NOT NULL,
@@ -820,6 +831,75 @@ class Database:
                 params,
             )
             return cur.fetchall()
+
+    def fetch_session_picks(self, symbol: str, start, end, min_dwell: int = 1) -> list[dict]:
+        """Every pick the engine made for ``symbol`` in [start, end) with its
+        FINAL graded result — one row per pick, the same unit the win rate uses
+        (a run of polls holding the same legs, graded by its last grade; runs
+        shorter than ``min_dwell`` polls are flickers and dropped). Oldest
+        first. For the Matrix daily summary."""
+        with self._lock:
+            rows = self.connect().execute(
+                """
+                WITH marked AS (
+                    SELECT bd.id, bd.ts, bd.pick_legs, bd.pick_strategy,
+                           CASE WHEN bd.pick_legs IS DISTINCT FROM
+                                     LAG(bd.pick_legs) OVER (ORDER BY bd.ts)
+                                THEN 1 ELSE 0 END AS chg
+                    FROM bias_decisions bd
+                    WHERE bd.symbol = ? AND bd.ts >= ? AND bd.ts < ?
+                ),
+                runs AS (
+                    SELECT marked.*, SUM(chg) OVER (ORDER BY ts ROWS UNBOUNDED PRECEDING) AS run
+                    FROM marked
+                ),
+                agg AS (
+                    SELECT run, ANY_VALUE(pick_strategy) AS strategy, COUNT(*) AS polls,
+                           MIN(ts) AS first_ts, MAX(ts) AS last_ts
+                    FROM runs WHERE pick_legs IS NOT NULL GROUP BY run
+                ),
+                res AS (
+                    SELECT r.run, ARG_MAX(o.result, r.ts) AS result
+                    FROM runs r JOIN outcomes o ON o.decision_id = r.id
+                    WHERE r.pick_legs IS NOT NULL AND o.favorable_delta IS NOT NULL
+                    GROUP BY r.run
+                )
+                SELECT a.strategy, x.result, a.polls, a.first_ts, a.last_ts
+                FROM agg a JOIN res x USING (run)
+                WHERE a.polls >= ?
+                ORDER BY a.first_ts
+                """,
+                [symbol, start, end, int(min_dwell)],
+            ).fetchall()
+        return [{"strategy": r[0] or "unknown", "result": r[1], "polls": r[2],
+                 "first_ts": r[3], "last_ts": r[4]} for r in rows]
+
+    def fetch_session_coverage(self, symbol: str, start, end) -> dict:
+        """How well the engine watched ``symbol`` in [start, end): first/last
+        poll and the longest gap between polls, in minutes."""
+        with self._lock:
+            ts = [r[0] for r in self.connect().execute(
+                "SELECT ts FROM bias_decisions WHERE symbol = ? AND ts >= ? AND ts < ? ORDER BY ts",
+                [symbol, start, end]).fetchall()]
+        if not ts:
+            return {"polls": 0, "first_ts": None, "last_ts": None, "max_gap_min": None}
+        gap = max(((b - a).total_seconds() / 60.0 for a, b in zip(ts, ts[1:])), default=0.0)
+        return {"polls": len(ts), "first_ts": ts[0], "last_ts": ts[-1], "max_gap_min": round(gap, 1)}
+
+    def matrix_daily_email_handled(self, session_date) -> bool:
+        with self._lock:
+            return self.connect().execute(
+                "SELECT 1 FROM matrix_daily_email_log WHERE session_date = ? LIMIT 1",
+                [session_date]).fetchone() is not None
+
+    def log_matrix_daily_email(self, session_date, status: str, recipients: int,
+                               detail: str = "") -> None:
+        with self._lock:
+            self.connect().execute(
+                "INSERT OR REPLACE INTO matrix_daily_email_log "
+                "(session_date, status, recipients, detail, handled_at) VALUES (?, ?, ?, ?, ?)",
+                [session_date, status, int(recipients), detail[:500],
+                 datetime.now(timezone.utc).replace(tzinfo=None)])
 
     def fetch_graded_for_archive(self, before) -> list[tuple]:
         """(symbol, ts, result) for every graded outcome with bd.ts < `before`

@@ -308,15 +308,13 @@
         <div class="settings-section">
           <h3>Notifications</h3>
           <div class="toggle-row">
-            <span>Order fill confirmations</span>
-            <input type="checkbox" data-notif="email_fills" />
+            <span title="Two sounds for the symbol you're viewing: a falling tone when the engine's pick stops winning and it pauses, a rising tone when a pick starts winning.">Sound alerts
+              <button id="soundPreviewBtn" type="button" class="ml-1 text-[10px] text-slate-400 hover:text-slate-200 underline">preview</button>
+            </span>
+            <input type="checkbox" data-notif="sound_alerts" />
           </div>
           <div class="toggle-row">
-            <span>Regime-shift alerts</span>
-            <input type="checkbox" data-notif="email_regime_shift" />
-          </div>
-          <div class="toggle-row">
-            <span>Daily summary email</span>
+            <span title="After the close (4:15 PM ET): how often the engine was right vs wrong, by strategy, and how many times it paused.">Daily summary email <span class="text-slate-500 text-[10px]">4:15 PM ET</span></span>
             <input type="checkbox" data-notif="email_daily_summary" />
           </div>
           <div id="notifSaveState" class="text-[10px] text-slate-600 mt-1"></div>
@@ -368,7 +366,7 @@
   <!-- Regime-shift banner — hidden by default, surfaced when evaluator flags N consec losses -->
   <section id="regimeBanner" class="hidden card border-rose-500/40 bg-rose-900/30 p-3 text-rose-100 text-sm flex items-center justify-between">
     <div>
-      <span class="font-bold uppercase tracking-wider text-rose-200">Regime shift detected</span>
+      <span class="font-bold uppercase tracking-wider text-rose-200">Engine paused</span>
       <span id="regimeMsg" class="ml-2">—</span>
     </div>
     <span id="regimeTs" class="text-xs text-rose-300/80"></span>
@@ -1627,7 +1625,7 @@
       // Regime banner
       if (acc.regime_alert) {
         banner.classList.remove('hidden');
-        $('regimeMsg').textContent = `${acc.regime_consec_losses} consecutive losses — engine confidence rebuilding…`;
+        $('regimeMsg').textContent = `its pick stopped winning (${acc.regime_consec_losses} losses in a row) — waiting for a confirming win`;
         $('regimeTs').textContent = acc.regime_triggered_at
           ? `since ${etTime(acc.regime_triggered_at)}`
           : '';
@@ -1706,10 +1704,70 @@
     }).join('');
   }
 
+  // ── Sound alerts ─────────────────────────────────────────────────────────
+  // Two signals, deliberately only two, for the symbol being viewed:
+  //   PAUSED  — the engine's pick stopped winning and the engine paused itself
+  //             (regime alert: a losing streak). Falling tone.
+  //   WINNING — a pick just started winning: the pause lifted, or the first
+  //             graded win after a loss. Rising tone.
+  // Tones are synthesised (Web Audio) — no files to load. Browsers only allow
+  // audio after a user gesture, so the context is unlocked on the first click.
+  const Sound = {
+    ctx: null,
+    unlock() {
+      try {
+        if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        if (this.ctx.state === 'suspended') this.ctx.resume();
+      } catch (_) { this.ctx = null; }
+    },
+    _seq(freqs) {
+      this.unlock();
+      const ctx = this.ctx; if (!ctx) return;
+      let t = ctx.currentTime + 0.02;
+      freqs.forEach(f => {
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.type = 'sine'; o.frequency.value = f;
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.18, t + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+        o.connect(g).connect(ctx.destination);
+        o.start(t); o.stop(t + 0.24);
+        t += 0.18;
+      });
+    },
+    paused()  { this._seq([659, 523, 392]); },    // falling: E5 → C5 → G4
+    winning() { this._seq([523, 659, 784]); },    // rising:  C5 → E5 → G5
+  };
+  ['pointerdown', 'keydown'].forEach(ev =>
+    document.addEventListener(ev, () => Sound.unlock(), { once: true, capture: true }));
+
+  function _soundOn() {
+    const el = document.querySelector('[data-notif="sound_alerts"]');
+    return el ? el.checked : true;
+  }
+
+  // Last-seen engine state per symbol. The first read of a symbol is only a
+  // baseline — switching symbols or reloading must never chime by itself.
+  const _alertSeen = {};
+  function _checkAlertTransitions(sym, acc) {
+    const now = { paused: !!acc.regime_alert, wins: Number(acc.regime_consec_wins || 0) };
+    const prev = _alertSeen[sym];
+    _alertSeen[sym] = now;
+    if (!prev || !isFull() || !_soundOn()) return;
+    if (!prev.paused && now.paused) {
+      Sound.paused();
+      toast(`${sym}: engine paused — its pick stopped winning`);
+    } else if ((prev.paused && !now.paused) || (!now.paused && prev.wins === 0 && now.wins >= 1)) {
+      Sound.winning();
+      toast(`${sym}: a pick just started winning`);
+    }
+  }
+
   async function pollAccuracy() {
     try {
-      const acc = await getJSON(`/accuracy/${encodeURIComponent(state.symbol)}`);
-      if (acc && !acc.__404) renderAccuracy(acc);
+      const sym = state.symbol;
+      const acc = await getJSON(`/accuracy/${encodeURIComponent(sym)}`);
+      if (acc && !acc.__404) { renderAccuracy(acc); _checkAlertTransitions(sym, acc); }
     } catch (_) {
       // soft-fail — accuracy is non-critical; just leave the pill in its last state
     }
@@ -2298,13 +2356,22 @@
   }
 
   // ── Notification settings (per-user, persisted to Supabase user_settings) ─
-  const NOTIF_KEYS = ['email_fills', 'email_regime_shift', 'email_daily_summary'];
-  const NOTIF_DEFAULTS = { email_fills: true, email_regime_shift: true, email_daily_summary: false };
+  // `sound_alerts` replaced `email_regime_shift`, which was saved but never read
+  // by anything — no email, no sound — so the toggle promised something that
+  // didn't exist.
+  // `email_fills` was removed (saved but never read by anything). The daily
+  // summary is real: the backend emails it after the close to Matrix users who
+  // switch it on (app/matrix_daily_summary.py).
+  const NOTIF_KEYS = ['sound_alerts', 'email_daily_summary'];
+  const NOTIF_DEFAULTS = { sound_alerts: true, email_daily_summary: false };
   async function loadNotifications() {
     if (!supa || !AUTH.user) return;
     const { data } = await supa.from('user_settings').select('notifications').eq('user_id', AUTH.user.id).maybeSingle();
     const n = (data && data.notifications) || NOTIF_DEFAULTS;
-    NOTIF_KEYS.forEach(k => { const el = document.querySelector(`[data-notif="${k}"]`); if (el) el.checked = !!n[k]; });
+    NOTIF_KEYS.forEach(k => {
+      const el = document.querySelector(`[data-notif="${k}"]`);
+      if (el) el.checked = (k in n) ? !!n[k] : !!NOTIF_DEFAULTS[k];
+    });
   }
   async function _saveNotifications() {
     if (!supa || !AUTH.user) return;
@@ -2315,6 +2382,11 @@
     setTimeout(() => { $('notifSaveState').textContent = ''; }, 1500);
   }
   document.querySelectorAll('[data-notif]').forEach(el => el.addEventListener('change', _saveNotifications));
+  $('soundPreviewBtn').addEventListener('click', (e) => {
+    e.preventDefault(); e.stopPropagation();
+    Sound.paused();
+    setTimeout(() => Sound.winning(), 900);
+  });
 
   // ── Profile panel toggle ───────────────────────────────────────────────
   function toggleSettings(force) {

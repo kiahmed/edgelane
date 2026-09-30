@@ -354,10 +354,29 @@ def _changed_cards(a: str, b: str) -> int:
 
 
 def _walls_worth_showing(bias: dict) -> bool:
-    """A session_open chip needs at least one real wall to talk about; §2 says
-    skip silently rather than post an empty frame."""
-    return any(bias.get(k) is not None for k in
-               ("call_wall_strike", "put_wall_strike", "vex_wall_strike", "tex_wall_strike"))
+    """A session_open chip needs the walls it actually SHOWS: the call wall and
+    the put wall. (It used to accept any of call/put/VEX/TEX — on 2026-09-30
+    NDX's first poll had VEX/TEX but no call/put yet, so the open fired, froze
+    empty walls into the ledger, and posted "today's session open" with no
+    levels at all.) §2: skip silently rather than post an empty frame."""
+    return (bias.get("call_wall_strike") is not None
+            and bias.get("put_wall_strike") is not None)
+
+
+# Walls can take a poll or two to resolve at the bell. session_open keeps
+# checking until they do — but only for this long after the open, so a late
+# resolve never produces a "session open" post in the middle of the afternoon.
+_SESSION_OPEN_WINDOW_MIN = 60.0
+
+
+def _within_open_window(settings: Any) -> bool:
+    now = datetime.now(_SESSION_TZ)
+    try:
+        hh, mm = str(getattr(settings, "market_open", "09:30") or "09:30").split(":")
+        opened = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+    except (TypeError, ValueError):
+        opened = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    return 0 <= (now - opened).total_seconds() / 60.0 <= _SESSION_OPEN_WINDOW_MIN
 
 
 def _track_day_extremes(sym: str, pick: dict, today: str) -> None:
@@ -534,9 +553,12 @@ async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
                             "announced_at": datetime.now(timezone.utc),
                         })
 
-        # 2. session_open — first persisted poll of a new ET day that has walls
-        #    worth a chip.
-        if state.session_open_date.get(sym) != today and _walls_worth_showing(bias):
+        # 2. session_open — the first persisted poll of a new ET day whose call
+        #    and put walls have resolved, within the first hour of the session.
+        #    Not marked done until it fires, so an empty first poll just waits
+        #    for the next one.
+        if (state.session_open_date.get(sym) != today and _walls_worth_showing(bias)
+                and _within_open_window(settings)):
             state.session_open_date[sym] = today
             # The market read: walls + the bias engine's direction. This is the
             # one event that is ABOUT direction, so it's the one that carries it.
