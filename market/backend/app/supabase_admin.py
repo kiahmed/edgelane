@@ -184,6 +184,71 @@ async def insert_row(table: str, row: dict) -> bool:
         return False
 
 
+async def insert_row_ignore_duplicates(table: str, row: dict, on_conflict: str) -> bool:
+    """Insert one row, treating a conflict on ``on_conflict`` as success (the row
+    is already there). For idempotent writers — e.g. a re-fired Matrix event whose
+    ledger row already exists. service_role; best-effort, never raises."""
+    settings = get_settings()
+    if not (settings.supabase_url and settings.supabase_service_key):
+        log.warning("[supabase] URL/service key not configured; cannot insert into %s", table)
+        return False
+    base, headers = _rest(settings)
+    headers = {**headers, "Content-Type": "application/json",
+               "Prefer": "resolution=ignore-duplicates,return=minimal"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(f"{base}/{table}", headers=headers, json=row,
+                             params={"on_conflict": on_conflict})
+            if r.status_code >= 300:
+                log.error("[supabase] insert %s failed (%s): %s", table, r.status_code, r.text[:200])
+                return False
+            return True
+    except Exception as exc:
+        log.error("[supabase] insert %s error: %s", table, exc)
+        return False
+
+
+async def insert_row_report_created(table: str, row: dict, on_conflict: str) -> bool | None:
+    """Insert one row, ignoring a conflict on ``on_conflict``, and REPORT whether
+    a NEW row was created. Simmer's exactly-once publish depends on this: publish
+    only when the ledger insert actually created the row (a re-seen transition
+    must not re-publish).
+
+    Returns:
+      * ``True``  — a new row was inserted (PostgREST returned it),
+      * ``False`` — the id already existed (empty representation),
+      * ``None``  — unconfigured or a write error (caller must NOT publish; a
+        later sweep re-fires and may create the row then).
+
+    Differs from ``insert_row_ignore_duplicates`` only in asking for
+    ``return=representation`` so the ``[row]`` vs ``[]`` distinction is visible.
+    service_role; best-effort, never raises."""
+    settings = get_settings()
+    if not (settings.supabase_url and settings.supabase_service_key):
+        log.warning("[supabase] URL/service key not configured; cannot insert into %s", table)
+        return None
+    base, headers = _rest(settings)
+    headers = {**headers, "Content-Type": "application/json",
+               "Prefer": "resolution=ignore-duplicates,return=representation"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(f"{base}/{table}", headers=headers, json=row,
+                             params={"on_conflict": on_conflict})
+            if r.status_code >= 300:
+                log.error("[supabase] insert %s failed (%s): %s", table, r.status_code, r.text[:200])
+                return None
+            try:
+                body = r.json()
+            except ValueError:
+                body = None
+            # PostgREST returns the inserted row(s) on a create, [] on a
+            # duplicate that was ignored.
+            return bool(body)
+    except Exception as exc:
+        log.error("[supabase] insert %s error: %s", table, exc)
+        return None
+
+
 async def upload_object(bucket: str, path: str, content: bytes, content_type: str) -> bool:
     """Upload bytes to a Supabase Storage bucket via the service_role key."""
     settings = get_settings()

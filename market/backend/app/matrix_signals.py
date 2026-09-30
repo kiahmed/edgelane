@@ -24,13 +24,14 @@ and asks only "is this different from what we last published?".
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from . import matrix_events
+from . import matrix_events, matrix_ledger
 
 log = logging.getLogger("edgelane.matrix.signals")
 
@@ -52,6 +53,15 @@ _DIGEST_MIN_CHANGED = 3           # of the 8 strategy cards
 # The 2026-09-22 incident (10% / 15% "notable" posts) and the 2026-09-23 one (a
 # bias_aligned card at 45%) are both what happens without it.
 _SHOW_MIN_WIN_PCT = 55.0
+
+# A pick is only a CALL once it has held long enough that someone could have
+# traded it. The grading dwell (pick_min_dwell_polls, ~48s) exists to drop
+# flickers from the win rate; it is far too short for a public announcement —
+# on 2026-09-29 a pick was announced, dropped within a minute, and its result
+# went out as "Bear Call lost … Held 0 min". Matrix trades 1–20 minute holds, so
+# a pick must stand this long before it is announced, and a result is only
+# reported for a pick that did.
+_ANNOUNCE_MIN_HOLD_MIN = 5.0
 
 # pick_result: how long to keep waiting for a posted pick's outcome before
 # giving up (a run that never closes, or closes after the session and is never
@@ -103,6 +113,7 @@ class MatrixSignalState:
         self.day_date: dict[str, str] = {}
         self.day_best: dict[str, dict] = {}
         self.day_worst: dict[str, dict] = {}
+        self.day_best_pick: dict[str, dict] = {}     # the full best pick, for its card
 
     def reset(self) -> None:
         for d in (self.last_pick_key, self.cur_pick_key, self.cur_pick_polls,
@@ -111,7 +122,7 @@ class MatrixSignalState:
                   self.last_trust_state, self.last_win_tier,
                   self.last_regime_alert, self.session_open_date, self.last_digest_at,
                   self.last_digest_grid, self.last_recap_date, self.day_date,
-                  self.day_best, self.day_worst):
+                  self.day_best, self.day_worst, self.day_best_pick):
             d.clear()
 
 
@@ -131,14 +142,39 @@ _INFLIGHT: set[asyncio.Task] = set()
 
 
 def _fire(symbol: str, state_name: str, expiry: Any = None,
-          attrs: dict[str, str] | None = None, disc: str | None = None) -> str:
-    """Queue one publish and return immediately. Returns the state name, so
+          attrs: dict[str, str] | None = None, disc: str | None = None,
+          snap: dict | None = None, card_pick: dict | None = None) -> str:
+    """Queue one event and return immediately. Returns the state name, so
     callers report what was HANDED OFF — not what was confirmed sent.
 
     `disc` distinguishes repeat occurrences of a state within one day (see
-    matrix_events.event_id). Omit it for states that happen once a day."""
+    matrix_events.event_id). Omit it for states that happen once a day.
+
+    `snap` is the snapshot the event describes. It is FROZEN here, synchronously,
+    before anything else can poll — then, in the background, the ledger row
+    (data + card HTML, matrix_ledger) is written and only once it exists is the
+    Pub/Sub message published. `card_pick` is for events about a PAST pick
+    (pick_result, daily_recap): its card shows that pick, not today's."""
+    frozen = matrix_ledger.freeze_snapshot(snap) if snap is not None else None
+    frozen_pick = copy.deepcopy(card_pick) if card_pick else None
+    event_at = datetime.now(timezone.utc)
+    attrs = dict(attrs or {})
+
     async def _run() -> None:
         try:
+            if frozen is not None and matrix_events.is_enabled():
+                eid = matrix_events.event_id(symbol, state_name, None, disc)
+                row = await asyncio.to_thread(
+                    matrix_ledger.build_row, event_id=eid, symbol=symbol,
+                    state=state_name, expiry=expiry, attrs=attrs, snap=frozen,
+                    card_pick=frozen_pick, event_at=event_at)
+                if not await matrix_ledger.record(row):
+                    # No row, no message: a poster woken for an event it can't
+                    # read would only log an error.
+                    log.error("[matrix-signals] %s %s not published — ledger write failed",
+                              symbol, state_name)
+                    return
+                attrs.update({"ledger": "1", "event_at": event_at.isoformat()})
             await matrix_events.publish_transition(
                 symbol, state_name, expiry, discriminator=disc, extra_attributes=attrs)
         except Exception:                      # publish_transition swallows its own,
@@ -248,6 +284,10 @@ def _pick_block_reason(sym: str, pick: dict) -> str | None:
         return f"bias={trust or 'unknown'}"
     if state.pick_blocked.get(sym) and not _recovery_earned(sym):
         return "awaiting-confirming-win"
+    since = state.cur_pick_since.get(sym)
+    held = ((datetime.now(timezone.utc) - since).total_seconds() / 60.0) if since else 0.0
+    if held < _ANNOUNCE_MIN_HOLD_MIN:
+        return f"held {held:.1f}m < {_ANNOUNCE_MIN_HOLD_MIN:.0f}m"
     # The chip's takeaway is the engine's record — a pick announced beside a
     # losing record undercuts itself.
     wr, graded = state.last_win_rate.get(sym), state.last_graded.get(sym)
@@ -326,6 +366,7 @@ def _track_day_extremes(sym: str, pick: dict, today: str) -> None:
         state.day_date[sym] = today
         state.day_best.pop(sym, None)
         state.day_worst.pop(sym, None)
+        state.day_best_pick.pop(sym, None)
     score = pick.get("composite_score")
     try:
         score = float(score)
@@ -335,6 +376,7 @@ def _track_day_extremes(sym: str, pick: dict, today: str) -> None:
     best, worst = state.day_best.get(sym), state.day_worst.get(sym)
     if best is None or score > float(best.get("composite_score") or -1e9):
         state.day_best[sym] = row
+        state.day_best_pick[sym] = copy.deepcopy(pick)
     if worst is None or score < float(worst.get("composite_score") or 1e9):
         state.day_worst[sym] = row
 
@@ -352,7 +394,7 @@ def _as_utc(ts: Any) -> datetime | None:
     return ts.astimezone(timezone.utc)        # naive ⇒ interpreted as local
 
 
-def _resolve_pick_results(sym: str, db: Any) -> list[str]:
+def _resolve_pick_results(sym: str, db: Any, snap: dict | None = None) -> list[str]:
     """Report the outcome of each announced pick whose run has ended.
 
     This is the loop the rest of the feed can't close on its own: a
@@ -401,13 +443,19 @@ def _resolve_pick_results(sym: str, db: Any) -> list[str]:
             log.info("[matrix-signals] %s pick_result dropped (run ended ungraded)", sym)
             continue
 
+        first_ts = _as_utc(run.get("first_ts"))
+        held = ((last_ts - first_ts).total_seconds() / 60.0) if (first_ts and last_ts) else 0.0
+        if held < _ANNOUNCE_MIN_HOLD_MIN:
+            log.info("[matrix-signals] %s pick_result not posted (held %.1fm — not a trade)",
+                     sym, held)
+            continue
+
         result = str(final.get("result") or "")
         if result not in ("win", "loss"):
             log.info("[matrix-signals] %s pick_result not posted (%s — no takeaway)",
                      sym, result or "ungraded")
             continue
 
-        first_ts = _as_utc(run.get("first_ts"))
         held_min = ""
         if first_ts is not None and last_ts is not None:
             held_min = f"{(last_ts - first_ts).total_seconds() / 60.0:.0f}"
@@ -421,7 +469,8 @@ def _resolve_pick_results(sym: str, db: Any) -> list[str]:
             "announced_at": p["announced_at"].isoformat(),
         })
         published.append(_fire(sym, "pick_result", p.get("expiry"), attrs,
-                               disc=matrix_events.discriminator(p["key"])))
+                               disc=matrix_events.discriminator(p["key"]),
+                               snap=snap, card_pick=p.get("pick")))
     state.pending_results[sym] = keep
     return published
 
@@ -456,7 +505,9 @@ async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
                 if (state.cur_pick_polls[sym] >= _dwell(settings)
                         and state.last_pick_key.get(sym) != key):
                     reason = _pick_block_reason(sym, pick)
-                    if reason:
+                    if reason and reason.startswith("held "):
+                        pass                 # not yet a call — re-checked next poll
+                    elif reason:
                         # Suppressed. The RUN bookkeeping above still advanced,
                         # but `last_pick_key` deliberately does NOT — it means
                         # "last announced", so leaving it alone lets this very
@@ -471,10 +522,13 @@ async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
                         summary = _pick_summary(pick, sym)
                         published.append(_fire(
                             sym, "pick_selected", expiry, summary,
-                            disc=matrix_events.discriminator(key)))
+                            disc=matrix_events.discriminator(key), snap=snap))
                         # Close the loop later: report how THIS pick ended.
+                        # The full pick is kept so the result's card shows THIS
+                        # pick, not whatever the engine is showing by then.
                         state.pending_results.setdefault(sym, []).append({
                             "key": key, "expiry": expiry, "summary": summary,
+                            "pick": copy.deepcopy(pick),
                             "since": state.cur_pick_since.get(sym)
                                      or datetime.now(timezone.utc),
                             "announced_at": datetime.now(timezone.utc),
@@ -498,7 +552,7 @@ async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
                 pass
             if snap.get("expected_move") is not None:
                 attrs["expected_move"] = str(snap.get("expected_move"))
-            published.append(_fire(sym, "session_open", expiry, attrs))
+            published.append(_fire(sym, "session_open", expiry, attrs, snap=snap))
 
         # 3. grid_digest — enough of the grid moved, and it has been long enough.
         sig = _grid_signature(snap.get("strategies") or {})
@@ -515,7 +569,7 @@ async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
             if due and _changed_cards(state.last_digest_grid.get(sym, ""), sig) >= _DIGEST_MIN_CHANGED:
                 state.last_digest_at[sym] = datetime.now(timezone.utc).isoformat()
                 state.last_digest_grid[sym] = sig
-                published.append(_fire(sym, "grid_digest", expiry))
+                published.append(_fire(sym, "grid_digest", expiry, snap=snap))
     except Exception:
         log.exception("[matrix-signals] on_snapshot failed (ignored)")
     return published
@@ -586,7 +640,8 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
                                  sym, ev, prev_state, cur_state, why)
                         ev = None
                 if was != now and ev:
-                    published.append(_fire(sym, ev, expiry, disc=matrix_events.discriminator(
+                    published.append(_fire(sym, ev, expiry, snap=snap,
+                                           disc=matrix_events.discriminator(
                         f"{prev_state}>{cur_state}"), attrs={
                         "trust_state": cur_state,
                         "previous_state": prev_state,
@@ -618,7 +673,7 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
                          sym, pct, graded, _SHOW_MIN_WIN_PCT)
             if recovered or crossed_green:
                 reason = "recovery" if recovered else "win_streak"
-                published.append(_fire(sym, "win_rate_notable", expiry,
+                published.append(_fire(sym, "win_rate_notable", expiry, snap=snap,
                                        disc=matrix_events.discriminator(reason), attrs={
                     "reason": reason,
                     "win_rate": f"{pct:.0f}",
@@ -631,7 +686,7 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
             state.last_win_tier[sym] = tier
 
             # 8. pick_result — how each posted pick actually ended.
-            published.extend(_resolve_pick_results(sym, db))
+            published.extend(_resolve_pick_results(sym, db, snap))
 
             # 7. daily_recap — once per ET day, headlined by the day's BEST pick.
             #    Fires on the first sweep of a NEW day, recapping the day just
@@ -657,7 +712,8 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
                     attrs = {"session_date": recap_for, "headline": "best"}
                     attrs.update({f"best_{k}": v for k, v in best.items()})
                     attrs.update({f"worst_{k}": v for k, v in worst.items()})
-                    published.append(_fire(sym, "daily_recap", expiry, attrs))
+                    published.append(_fire(sym, "daily_recap", expiry, attrs, snap=snap,
+                                           card_pick=state.day_best_pick.get(sym)))
     except Exception:
         log.exception("[matrix-signals] on_evaluation failed (ignored)")
     return published

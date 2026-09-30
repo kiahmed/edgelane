@@ -39,13 +39,16 @@ def test_off_hours_catalyst_flag():
 def captured(monkeypatch):
     calls: list[dict] = []
 
-    async def _fake_publish(symbol, state, expiry=None, *, db=None,
-                            extra_attributes=None, takeaways=None, **kw):
+    def _fake_fire(symbol, state, expiry=None, *, env=None, db=None,
+                   extra_attributes=None, takeaways=None, force=False, **kw):
         calls.append({"symbol": symbol, "state": state,
                       "extra": extra_attributes or {}})
-        return True
+        return state
 
-    monkeypatch.setattr(sw.simmer_events, "publish_transition", _fake_publish)
+    # The off-hours path now hands off to the ledger (freeze → row →
+    # publish-if-new). Capture the hand-off; the ledger's behaviour is tested in
+    # test_simmer_ledger.
+    monkeypatch.setattr(sw.simmer_ledger, "fire", _fake_fire)
     return calls
 
 

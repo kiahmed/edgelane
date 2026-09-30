@@ -74,6 +74,15 @@ def _iso_expiry(value: Any) -> str:
         return str(value)
 
 
+def is_enabled() -> bool:
+    """Events on, with somewhere to send them. Callers use it to skip work (e.g.
+    writing a ledger row) that only matters if a message will actually go out."""
+    s = get_settings()
+    return bool(getattr(s, "matrix_events_enabled", False)
+                and (getattr(s, "matrix_events_topic", "") or "")
+                and (getattr(s, "gcp_project", "") or ""))
+
+
 def _get_publisher() -> Any:
     global _publisher
     if _publisher is None:

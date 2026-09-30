@@ -23,6 +23,13 @@ def _clean_state():
     ms.state.reset()
 
 
+@pytest.fixture(autouse=True)
+def _no_hold(monkeypatch):
+    """Most tests exercise firing MECHANICS, so the 5-minute announce hold is
+    off by default; the hold's own tests turn it back on."""
+    monkeypatch.setattr(ms, "_ANNOUNCE_MIN_HOLD_MIN", 0.0)
+
+
 @pytest.fixture
 def sent(monkeypatch):
     """Capture publishes instead of hitting Pub/Sub."""
@@ -205,7 +212,9 @@ async def test_the_poll_does_not_wait_for_the_topic(monkeypatch):
     t0 = time.monotonic()
     await ms.on_snapshot(_snap(), None)
     elapsed = time.monotonic() - t0
-    assert elapsed < 0.1, f"on_snapshot waited {elapsed:.2f}s on the publish"
+    # The publisher sleeps 0.5s; anything well under that proves the poll did
+    # not wait. (0.3s, not 0.1s: the full suite runs loaded and 0.1s flaked.)
+    assert elapsed < 0.3, f"on_snapshot waited {elapsed:.2f}s on the publish"
     await ms.drain()
 
 
@@ -713,3 +722,36 @@ async def test_session_open_carries_the_market_read(sent):
     assert attrs["bias_direction"] == "bearish" and attrs["bias_strength"] == "80"
     assert attrs["confidence"] == "high"
     assert "composite_score" not in attrs            # no engine data on the market read
+
+
+
+# ── a pick must HOLD before it's a call (2026-09-29: "lost … Held 0 min") ──
+
+async def test_a_pick_is_not_announced_before_it_has_held_5_minutes(
+        sent, evaluator_state, monkeypatch):
+    monkeypatch.setattr(ms, "_ANNOUNCE_MIN_HOLD_MIN", 5.0)
+    _good()
+    for _ in range(4):                               # several polls, seconds apart
+        await ms.on_snapshot(_snap(), None); await ms.drain()
+    assert "pick_selected" not in _states(sent)
+    assert ms.state.pick_blocked.get("SPX") is not True, "not-yet is not a failure"
+
+
+async def test_a_pick_that_held_5_minutes_is_announced(sent, evaluator_state, monkeypatch):
+    monkeypatch.setattr(ms, "_ANNOUNCE_MIN_HOLD_MIN", 5.0)
+    _good()
+    await ms.on_snapshot(_snap(), None); await ms.drain()
+    ms.state.cur_pick_since["SPX"] -= timedelta(minutes=6)    # it has now stood 6 min
+    await ms.on_snapshot(_snap(), None); await ms.drain()
+    assert "pick_selected" in _states(sent)
+
+
+async def test_a_pick_dropped_within_a_minute_is_never_announced(
+        sent, evaluator_state, monkeypatch):
+    monkeypatch.setattr(ms, "_ANNOUNCE_MIN_HOLD_MIN", 5.0)
+    _good()
+    await ms.on_snapshot(_snap(), None); await ms.drain()
+    other = _snap()
+    other["engine_pick"] = dict(other["engine_pick"], legs=[{"strike": 7755.0}])
+    await ms.on_snapshot(other, None); await ms.drain()      # engine moved on
+    assert "pick_selected" not in _states(sent)

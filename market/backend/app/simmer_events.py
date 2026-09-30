@@ -63,6 +63,15 @@ def event_id(symbol: str, state: str, expiry: Any = None,
     return f"SMR-{sym}-{d}-{exp}-{state}"
 
 
+def is_enabled() -> bool:
+    """Events on, with somewhere to send them. Callers use it to skip work (e.g.
+    writing a ledger row) that only matters if a message will actually go out."""
+    s = get_settings()
+    return bool(getattr(s, "simmer_events_enabled", False)
+                and (getattr(s, "facades_events_topic", "") or "")
+                and (getattr(s, "gcp_project", "") or ""))
+
+
 def _get_publisher() -> Any:
     """The PublisherClient, created lazily. Isolated so tests can stub it and so
     an import/credential failure surfaces as a swallowed exception, not a crash

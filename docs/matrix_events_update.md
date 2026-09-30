@@ -376,3 +376,86 @@ gives the reader a number or a word they can't trace to what the post is about.
   `low_conf`); they carry `engine_state` instead. **Postiz: if a template reads
   `trust_state` on `pick_selected` / `pick_result`, switch it to `engine_state`.**
   The `bias_*` events keep `trust_state` — they are about that relationship.
+
+## A pick must hold 5 minutes before it's a call (2026-09-29)
+
+**Incident:** a `pick_result` went out as "Bear Call lost. $0.88 to $1.45. Held
+0 min." The pick had been announced after only the grading dwell (3 polls,
+~48s), the engine dropped it within about a minute, and that run was then
+graded and posted as if it were a trade. Nobody trades a sub-minute pick; it
+was noise dressed as a result.
+
+**Fix:** `matrix_signals._ANNOUNCE_MIN_HOLD_MIN = 5.0`.
+
+* `pick_selected` announces only once the pick has **held 5 minutes** (measured
+  from when its run began). Before that it is "not yet a call" — re-checked
+  each poll, and *not* counted as a quality failure, so it doesn't trip the
+  earned-recovery gate.
+* `pick_result` is never reported for a run shorter than 5 minutes (defensive:
+  it already only follows announced picks).
+
+The grading dwell (`pick_min_dwell_polls`) is unchanged — it drops flickers
+from the win rate; announcement is a higher bar on top of it. Every announced
+pick is still a graded pick, never the reverse.
+
+## The ledger — engine records, poster reads (2026-09-29)
+
+**Before:** the Pub/Sub message carried attributes only, so the GCP poster
+called BACK into EdgeLane over the tunnel twice per post — `GET /matrix/state`
+for the numbers and wording, and the snap service loaded `GET /matrix/snap` for
+the image. Both rendered from the snapshot at *fetch* time, so a post could show
+a later state than the event it described.
+
+**Now:** the engine writes one row per postable event to Supabase
+`public.matrix_event_ledger` (migrations 0017 + 0018), holding everything the
+post needs **frozen at the moment the engine detected it**:
+
+| column | what |
+|---|---|
+| `event_id` | same deterministic id as the Pub/Sub message (unique) |
+| `event_at` | when the engine detected it |
+| `attributes` | the event attributes |
+| `data` | the `pick` / `grid` / `bias` / `win_eval` / `walls` blocks (+ `card_pick` for a past pick) |
+| `snap_view`, `snap_html` | the card, as standalone HTML |
+| `status` | `pending` → `claimed` |
+
+Flow:
+
+1. `matrix_signals._fire()` deep-copies the snapshot **synchronously** (before
+   any later poll can change it), then in the background builds the row
+   (`matrix_ledger.build_row`), writes it, and **only if the write succeeded**
+   publishes the message with `ledger=1`, `event_at`. No row, no message.
+2. The poster (soljet-postiz `bin/matrix_poster.py`) claims the row, composes
+   from its `data`, and sends `snap_html` to `matrix-snap`, which renders it with
+   `set_content` (all network blocked — the card is self-contained). Nothing
+   calls back into EdgeLane.
+3. After a successful post the poster deletes the row (`matrix_ledger_done`).
+   Every run also prunes rows from before today, ET (`matrix_ledger_prune`) —
+   the ledger is a rolling queue, not an archive.
+
+`pick_result` and `daily_recap` are about a PAST pick, so their card is rendered
+from that pick (kept at announcement), never from whatever the engine shows now.
+The poster writes an event in the **past tense** when it is inherently past
+(`pick_result`, `daily_recap`) or more than 10 minutes old when composed, and
+drops live advice ("wait for a confirming win…") from past events.
+
+**Access — least privilege.** The poster does NOT hold the Supabase service key
+(that key can decrypt users' broker tokens). It holds a ledger-only token
+(Secret Manager `matrix-ledger-token`; only its sha256 is stored, in
+`matrix_ledger_secret`) and calls four `SECURITY DEFINER` functions that touch
+nothing but this table: `peek` (dry-run, doesn't consume), `claim` (atomic;
+a claim older than 15 min is re-claimable), `done`, `prune`. RLS is on with no
+policies, so the browser and signed-in users can't read the table at all.
+
+**Wins only.** The poster skips losing `pick_result`s without claiming them, so
+their rows stay available for the planned loss-post feature (1/week, ≤20% loss,
+"the engine warned" framing — design pending).
+
+**Verified 2026-09-29:** real row written from the live SPX snapshot → read back
+from Supabase → claim / re-claim (refused) / done; local poster dry-run and the
+DEPLOYED poster (no-traffic dry-run revision) both composed from the ledger and
+produced the PNG from the stored HTML, with zero `/matrix/state` or
+`/matrix/snap` requests reaching EdgeLane.
+
+The `/matrix/state` and `/matrix/snap` endpoints still exist (legacy messages
+without `ledger=1`, and for debugging); nothing in the normal path uses them.

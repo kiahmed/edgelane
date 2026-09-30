@@ -132,22 +132,25 @@ def test_transition_downward_and_veto_are_silent():
     assert sw.state.event_bands["D"] == "cold"
 
 
-# ── process_alerts wiring: both transitions published ───────────────────────
-async def test_process_alerts_publishes_both_transitions(monkeypatch):
-    published: list[tuple] = []
+# ── process_alerts wiring: both transitions handed to the ledger ─────────────
+async def test_process_alerts_hands_both_transitions_to_the_ledger(monkeypatch):
+    """process_alerts now hands each transition to simmer_ledger.fire (freeze →
+    row → publish-if-new happens there, off the sweep). Assert the hand-off; the
+    ledger's own new-row/exactly-once behaviour is covered in test_simmer_ledger."""
+    handed: list[tuple] = []
 
-    async def _rec(symbol, state, expiry=None, **k):
-        published.append((str(symbol).upper(), state, expiry))
-        return True
+    def _fire(symbol, state, expiry=None, **k):
+        handed.append((str(symbol).upper(), state, expiry))
+        return state
 
     async def _no_fanout(env, regime):     # isolate the event path from Supabase
         return 0
 
-    monkeypatch.setattr(sw.simmer_events, "publish_transition", _rec)
+    monkeypatch.setattr(sw.simmer_ledger, "fire", _fire)
     monkeypatch.setattr(sw, "fanout_alert", _no_fanout)
 
     env = readiness_env(symbol="NVDA", score=85)     # cold → ready in one sweep
     await sw.process_alerts({"NVDA|" + env["expiration"]: env}, {"state": "contango"})
 
-    assert ("NVDA", "watch_entered", env["expiration"]) in published
-    assert ("NVDA", "ready", env["expiration"]) in published
+    assert ("NVDA", "watch_entered", env["expiration"]) in handed
+    assert ("NVDA", "ready", env["expiration"]) in handed

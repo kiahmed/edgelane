@@ -65,6 +65,7 @@ from . import simmer_config
 from . import simmer_email
 from . import simmer_engine
 from . import simmer_events
+from . import simmer_ledger
 from . import supabase_admin
 from .config import get_settings
 from .dealer_exposures import compute_dealer_exposures
@@ -1421,8 +1422,11 @@ async def process_alerts(results: dict[str, dict], regime: dict | None,
             # (best-effort, dark until provisioned; same market-hours gating as
             # alerts since process_alerts only runs when open).
             for st in event_transitions(key, env, watch_threshold, threshold):
-                await simmer_events.publish_transition(
-                    env.get("symbol"), st, env.get("expiration"), db=db,
+                # Freeze the envelope into the ledger, then publish only if the
+                # row was new (exactly-once); hand-off is non-blocking so the
+                # sweep never waits on Supabase/Pub-Sub.
+                simmer_ledger.fire(
+                    env.get("symbol"), st, env.get("expiration"), env=env, db=db,
                     takeaways={
                         "symbol": str(env.get("symbol") or "").upper(),
                         "expiry": env.get("expiration"),
@@ -1485,8 +1489,8 @@ async def process_off_hours_catalyst_events(results: dict[str, dict],
                 st = "watch_entered"
             else:
                 continue
-            await simmer_events.publish_transition(
-                env.get("symbol"), st, env.get("expiration"), db=db,
+            simmer_ledger.fire(
+                env.get("symbol"), st, env.get("expiration"), env=env, db=db,
                 extra_attributes={"off_hours_catalyst": "true"},
                 takeaways={
                     "symbol": str(env.get("symbol") or "").upper(),

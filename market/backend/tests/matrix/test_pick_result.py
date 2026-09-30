@@ -28,6 +28,13 @@ def _clean():
     ms.state.reset()
 
 
+@pytest.fixture(autouse=True)
+def _no_hold(monkeypatch):
+    """Most tests exercise firing MECHANICS, so the 5-minute announce hold is
+    off by default; the hold's own tests turn it back on."""
+    monkeypatch.setattr(ms, "_ANNOUNCE_MIN_HOLD_MIN", 0.0)
+
+
 @pytest.fixture
 def sent(monkeypatch):
     calls: list[dict] = []
@@ -197,3 +204,26 @@ async def test_the_result_threads_under_its_announcement(sent, monkeypatch):
     result = next(c for c in sent if c["state"] == "pick_result")
     assert result["disc"] == announced["disc"], "same pick hash → poster can thread it"
     assert result["attrs"]["held_minutes"] == "4"
+
+
+
+async def test_a_result_for_a_pick_that_did_not_hold_is_not_posted(db, sent, monkeypatch):
+    """The 2026-09-29 post: 'Bear Call lost … Held 0 min'. Not a trade."""
+    monkeypatch.setattr(ms, "_ANNOUNCE_MIN_HOLD_MIN", 5.0)
+    _poll(db, T0, LEGS_A, "loss")
+    _poll(db, T0 + timedelta(seconds=32), LEGS_A, "loss")
+    _poll(db, T0 + timedelta(seconds=48), LEGS_B)
+    _pend()
+    _run(db); await ms.drain()
+    assert sent == []
+
+
+async def test_a_result_for_a_pick_that_held_is_posted(db, sent, monkeypatch):
+    monkeypatch.setattr(ms, "_ANNOUNCE_MIN_HOLD_MIN", 5.0)
+    _poll(db, T0, LEGS_A, "loss")
+    _poll(db, T0 + timedelta(minutes=7), LEGS_A, "win")
+    _poll(db, T0 + timedelta(minutes=7, seconds=16), LEGS_B)
+    _pend()
+    _run(db); await ms.drain()
+    ev = next(c for c in sent if c["state"] == "pick_result")
+    assert ev["attrs"]["held_minutes"] == "7" and ev["attrs"]["result"] == "win"

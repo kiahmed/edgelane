@@ -278,6 +278,29 @@ def _pin_default_settings():
 
 
 @pytest.fixture(autouse=True)
+def _no_real_services(monkeypatch):
+    """Ledger/events work must NEVER touch real Supabase or Pub/Sub from the
+    suite. During the Matrix build the tests wrote fixture rows into the LIVE
+    ledger before anyone noticed (docs/simmer_events_update.md §9). Stub the
+    lowest real layers to FAIL the test if reached; everything above them
+    (simmer_ledger.fire/record, publish_transition) still runs for real and tests
+    that need them stub at their own layer."""
+    from app import simmer_events, supabase_admin
+
+    async def _no_supabase(*a, **k):
+        raise AssertionError("test reached a REAL Supabase write — stub it")
+
+    def _no_pubsub():
+        raise AssertionError("test reached the REAL Pub/Sub client — stub it")
+
+    monkeypatch.setattr(supabase_admin, "insert_row_report_created", _no_supabase)
+    monkeypatch.setattr(supabase_admin, "insert_row_ignore_duplicates", _no_supabase)
+    monkeypatch.setattr(supabase_admin, "insert_row", _no_supabase)
+    monkeypatch.setattr(simmer_events, "_get_publisher", _no_pubsub)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _pin_default_engine_config():
     """Same guard as above, for the ENGINE knobs: `simmer_config` deep-merges an
     optional `simmer_tickers.json` discovered by walking parent dirs, so the
