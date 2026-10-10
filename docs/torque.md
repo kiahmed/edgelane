@@ -110,8 +110,9 @@ from the backend origin and browsers isolate storage per-origin.
 ### Spot price (Yahoo live, parity fallback)
 
 Spot source order (`_get_chain` in `routes/torque.py`):
-1. **Yahoo** live `regularMarketPrice` — primary (`YAHOO_SYMBOLS` map: NDX→^NDX,
-   SPX→^GSPC, RUT→^RUT, SPY, QQQ). 2s timeout; any failure is soft.
+1. **Yahoo** live `regularMarketPrice` — primary (each ticker's `yahoo_symbol` in
+   `torque_tickers_setup`: NDX→^NDX, SPX→^GSPC, RUT→^RUT, SPY, QQQ, …). 2s
+   timeout; any failure is soft.
 2. **Tradier put-call parity** at the ATM strike (`spot ≈ call_mid − put_mid +
    strike`, `torque_engine.implied_spot`) — fallback if Yahoo is down. Computed
    from real-time option bid/ask, so it's accurate even though Tradier's own
@@ -168,9 +169,9 @@ The profit target and stop-loss are both a **% return on the entry's debit/credi
   **1.30 × entry credit**.
 
 Both default to 30% (`DEFAULT_CLOSE_TARGET_PCT` / `DEFAULT_STOP_LOSS_PCT`),
-overridable per ticker (`torque_tickers.json`) and per order (UI toggle,
+overridable per ticker (`torque_tickers_setup`) and per order (UI toggle,
 `close_target_pct` / `stop_loss_pct`). DJX keeps a wider 50% stop
-(`STOP_LOSS["DJX"]`) — its own package spread is wide enough that a 30% stop
+(`stop_loss_default` on DJX's row) — its own package spread is wide enough that a 30% stop
 would fire on noise; `stop_loss_defaults_map()` feeds this to the UI so
 switching to DJX doesn't silently flatten it to 30%. `stop_loss_pct=0`
 explicitly disables the stop (the field is now always sent, so `0` — not
@@ -299,50 +300,66 @@ real buying-power limit.
 
 ## Per-ticker strike config
 
-Offsets are **backend-owned and API-served** — never hardcoded in the page. Edit
-defaults in `market/backend/app/torque_config.py`, or drop a `torque_tickers.json`
-at **`market/backend/torque/torque_tickers.json`** (a dedicated folder for Torque
-config, kept alongside — not inside — the `app/` code; a template with every
-current key is at `torque_tickers.json.example` in that same folder) to override
-without touching code. `$TORQUE_TICKERS_CONFIG` still works too if you'd rather
-point at a file elsewhere; a bare `torque_tickers.json` at the repo root is also
-still picked up as a back-compat fallback. Shape:
+Every per-ticker setting is **backend-owned, database-held and API-served** —
+never hardcoded in the page or in code. It lives in the Supabase table
+**`public.torque_tickers_setup`** (migration `0021`), one row per ticker, so every
+backend container reads the same data:
 
-```json
-{
-  "tickers": ["NDX","SPX","RUT","SPY","QQQ"],
-  "default_strategy": "bull_call",
-  "overrides": {
-    "NDX": {
-      "tick": 0.05,
-      "vertical":  {"anchor": 20, "width": 100},
-      "condor":    {"short_offset": 100, "width": 100},
-      "iron_fly":  {"width": 100},
-      "butterfly": {"body_offset": 0, "wing": 100}
-    }
-  }
-}
-```
+| Column | Meaning |
+|---|---|
+| `ticker`, `enabled`, `sort_order` | Which tickers trade and in what list order (first enabled = page default). A disabled ticker leaves the list and is ignored by news signals, but its settings still apply to anything already open on it. |
+| `tick`, `tick_above_3` | Price step. `tick_above_3` is the step once a price is ≥ $3 — penny-pilot names $0.01 below / $0.05 at or above; SPX/NDX/RUT $0.05 below / $0.10 at or above. null = `tick` at every price. It is a **single-option** rule: a multi-leg spread is a complex order priced in the base `tick` at any net price. For single legs every limit, profit target and stop rounds to the step valid **at its own price**, so a bracket that straddles $3 stays legal on both sides. |
+| `offsets` (jsonb) | Strike offsets per strategy shape (`single` / `vertical` / `condor` / `iron_fly` / `butterfly`), merged over the built-in base offsets. |
+| `yahoo_symbol` | Primary live spot quote (null = Tradier put-call parity). |
+| `allowed_roots` | Option roots allowed (null = any; DJX trades `DJXW` only). |
+| `commission_per_contract`, `extra_fee_per_contract` | Per contract per leg, one way (null = global default). |
+| `stop_loss_default`, `close_target_default`, `close_target_min`, `close_target_spread_scaled`, `close_target_required` | Exit defaults / floors (null = global default). |
+| `market_orders_allowed` | False forces limits (DJX). |
+| `richness_floor` | Counter Read noise floor in $ (null = global default 0.03) — see [Counter Read](torque_operating_manual.html#counter). |
+| `daily_min_range`, `daily_max_range` | Reserved for later use; not read by Torque yet. |
 
-Per-ticker defaults (0DTE, scaled to each instrument's price + strike grid;
-debit-vertical `anchor`/`width` shown — condor/fly widths match):
+**How it's read.** Each container loads the table into memory before it serves
+(`torque_config.refresh_ticker_setup`, from `main.py`), then re-reads it every
+`TORQUE_TICKERS_REFRESH_SEC` (default 60) — **an edit in the table reaches every
+container within that window, no restart or redeploy**. It **fails closed**:
+until the table has been read once, Torque has no tickers (the page lists none,
+news signals drop as "not a configured Torque ticker"; `GET /torque/config`
+reports `tickers_loaded: false`). A failed refresh keeps the last good copy.
+**New entries are refused** — `/torque/build`, `/torque/price` and
+`/torque/place` return 503 while the setup hasn't loaded and 400 for a ticker
+with no enabled row — because every per-ticker safety rule (DJX's forced limit
+orders, mandatory auto-close and 45% floor, 50% stop, penny step) comes from
+the table and must never fall back to permissive defaults. Exits, cancels and
+modifies on existing positions keep working; a Torque profit-target close keeps
+the step and floor rule it was placed with.
+There is no `torque_tickers.json` and no hardcoded per-ticker data any more;
+code keeps only strategy shapes and global defaults.
 
-| Ticker | grid | anchor | width |
-|---|---|---|---|
-| NDX | 5–10 | 20 | 100 |
-| SPX | 5 | 5 | 25 |
-| RUT | 5 | 5 | 20 |
-| SPY | 1 | 1 | 5 |
-| QQQ | 1 | 1 | 5 |
+**Setup.** `make db-setup` (Backend — setup) applies every migration including
+the seed, idempotently; the seed uses `on conflict do nothing`, so re-running it
+never overwrites a row someone has since edited.
 
-These are starting points — tune per taste in `torque_config.py` or `torque_tickers.json`.
+Seeded tickers (0DTE-scaled starting points; debit-vertical `anchor`/`width`
+shown — condor/fly widths match):
 
-**Counter Read's noise floor** lives in the same override file, under a
-`richness_floor` key (per-ticker, in $) — see
-[Counter Read](torque_operating_manual.html#counter) for what it does and why one
-flat number doesn't work across tickers with different premium scales. Defaults:
-NDX/SPX/RUT `0.05`, SPY/QQQ/DJX `0.02`, everything else `0.03`. Served to the
-frontend as `richness_floors` in `GET /torque/config`.
+| Ticker | step | anchor | width | notes |
+|---|---|---|---|---|
+| NDX | 0.05 / 0.10 ≥ $3 (single legs) | 20 | 100 | |
+| SPX | 0.05 / 0.10 ≥ $3 (single legs) | 5 | 25 | |
+| RUT | 0.05 / 0.10 ≥ $3 (single legs) | 5 | 20 | |
+| SPY | 0.01 | 1 | 5 | penny at every price |
+| QQQ | 0.01 | 1 | 5 | penny at every price |
+| DJX | 0.01 | 1 | 10 | DJXW only; 50% stop, mandatory auto-close (60%/min 45%, spread-scaled), no market orders |
+| IWM | 0.01 | 1 | 5 | penny at every price |
+| XLF | 0.01 / 0.05 ≥ $3 | 0.5 | 1 | penny pilot |
+| XLE | 0.01 / 0.05 ≥ $3 | 1 | 2 | penny pilot |
+| SMH | 0.01 / 0.05 ≥ $3 | 2 | 5 | penny pilot |
+
+IWM, XLF, XLE and SMH were added for Reflex `engine_v2`; their spread offsets
+are starting points (news signals only trade the ATM single leg). Torque always
+trades the **next listed expiry** from the chain, whether that's same-day (0DTE)
+or a week out for weekly-only names, and the same-contract retry moves to the
+following listed expiry.
 
 Anchoring model (points from spot, snapped to the chain grid):
 - `single` — long option `offset` points OTM (0 = ATM).
@@ -640,7 +657,9 @@ Logo and favicon live in `market/backend/ui/assets/` (`torque-logo.svg`,
 - `market/backend/ui/assets/` — logo + favicon (SVG).
 - `market/backend/app/routes/torque.py` — endpoints + place/confirm/close flow.
 - `market/backend/app/torque_engine.py` — strike auto-fill, pricing, lean, close math (pure).
-- `market/backend/app/torque_config.py` — per-ticker offsets + strategy registry.
+- `market/backend/app/torque_config.py` — strategy registry, global defaults, and the in-memory
+  copy of `torque_tickers_setup` (per-ticker settings, refreshed from Supabase).
+- `supabase/migrations/0021_torque_tickers_setup.sql` — the per-ticker table + seed.
 - Reuses `order_builder.py` (multileg payloads) and the async `TradierClient`
   (`quotes`, `place_order`, `get_order` added for Torque).
 
@@ -649,7 +668,7 @@ Logo and favicon live in `market/backend/ui/assets/` (`torque-logo.svg`,
 DJX is Cboe's 1/100th-DJIA index option (spot ~525 when the Dow is ~52,500).
 Torque trades **only the `DJXW` root** — the daily/weekly, PM-settled listing
 (dailies launched 2026-05-18). The AM-settled monthly `DJX` root is excluded via
-`torque_config.TICKER_ROOTS`, and any expiration that lists *only* that root
+`allowed_roots` on DJX's `torque_tickers_setup` row, and any expiration that lists *only* that root
 (the 3rd-Friday monthlies) is **skipped** — `_get_chain` walks forward through
 `teng.expiration_candidates()` until an expiration yields DJXW contracts.
 
@@ -668,7 +687,7 @@ Consequences, all encoded in config rather than in the page:
   of its own mid and cannot be closed profitably; width 10 brings it to ~16%.
 * **Auto-close floor.** The global +30% target is *below* DJX's round-trip cost,
   so a 30% close order prices inside the package bid/ask and can never fill.
-  `CLOSE_TARGETS["DJX"]` sets `default 60% / min 45%` and marks the ticker
+  DJX's `torque_tickers_setup` row sets `close_target_default 60 / close_target_min 45` and marks the ticker
   `spread_scaled`, which additionally raises the floor to the **live** package
   spread at place time. `/torque/place` clamps **up** to that floor and reports
   `close_target_pct` + `close_target_clamped` + `package_spread_pct`.
@@ -707,7 +726,7 @@ This shapes every guardrail:
 
 * **Auto-close is a passive resting GTC limit** — it never crosses, so it never
   pays the exit half-spread. That is why it remains viable on a wide book.
-* **Auto-close is MANDATORY on DJX** (`CLOSE_TARGETS["DJX"]["required"]`). The
+* **Auto-close is MANDATORY on DJX** (`close_target_required` on DJX's row). The
   target % is editable (floored); the toggle is locked on. `/torque/place`
   rejects `auto_close=false` rather than silently coercing it — a coerced `true`
   would place a second real order the caller never asked for.
@@ -719,8 +738,8 @@ This shapes every guardrail:
   therefore triggers off the **mid**, never the bid (a wide package is underwater
   by half its spread the instant it fills — a bid-based stop fires immediately),
   and refuses to cross a book wider than `STOP_MAX_EXIT_SPREAD_PCT` (60%).
-  Config: `STOP_LOSS["DJX"] = {"default": 50.0}`.
-* **Market orders are disabled for DJX** (`NO_MARKET_ORDER_TICKERS`), enforced in
+  Config: DJX's row in `torque_tickers_setup` (`stop_loss_default = 50`).
+* **Market orders are disabled for DJX** (`market_orders_allowed = false` on DJX's row), enforced in
   `/torque/place` and greyed out in the page. A market order is "cross at any
   price", and DJX's ask has been measured at 4× its own mid.
 * **`/torque/price` surfaces the real cost** — `marketable_price` (what crossing
@@ -738,7 +757,7 @@ Commission is charged **per contract, per leg, on the open and again on the
 close**. Because fee and premium both scale with quantity, the per-unit cost is
 quantity-independent: `round_trip_fee = 2 × legs × fee ÷ multiplier`.
 
-Rates in `COMMISSION_PER_CONTRACT` were read off Tradier's own order-preview
+Rates (`commission_per_contract` in `torque_tickers_setup`) were read off Tradier's own order-preview
 `commission` field against a live production account (sandbox agrees):
 
 | | 1 contract | 10 contracts | 2-leg vertical |
@@ -748,7 +767,7 @@ Rates in `COMMISSION_PER_CONTRACT` were read off Tradier's own order-preview
 
 Preview reports `fees = 0` — regulatory pass-throughs (ORF, TAF) are assessed at
 settlement, not at order time. We do **not** invent them; `extra_fee_per_contract`
-defaults to `0.0` and is configurable in `torque_tickers.json`.
+defaults to `0.0` and is configurable per ticker (`extra_fee_per_contract` in `torque_tickers_setup`).
 
 **Credit targets are bounded below 100%.** A credit buy-to-close is priced at
 `entry×(1−pct)`, which goes **non-positive at pct ≥ ~100%** (sooner with fees) —

@@ -195,6 +195,9 @@ NEWS_SIGNAL_MAX_AGE_SEC=180
 # Same-contract rejection: walk this many later expiries (one at a time) looking
 # for one without a conflicting open bracket before giving up.
 NEWS_SIGNAL_MAX_EXPIRY_RETRIES=1
+# How often each backend container re-reads Torque's ticker setup
+# (Supabase public.torque_tickers_setup). Edits there apply within this window.
+TORQUE_TICKERS_REFRESH_SEC=60
 # Tradier-fallback GEX weighting (used only when no fresh external feed):
 #   oi     = gamma × open_interest  (resting positioning; default)
 #   volume = gamma × volume         (today's traded gamma; lands closer to the

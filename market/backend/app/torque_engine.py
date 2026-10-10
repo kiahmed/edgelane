@@ -18,7 +18,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from .order_builder import Leg
-from .torque_config import ticker_rule, STRATEGY_DEFS, allowed_roots
+from .torque_config import ticker_rule, STRATEGY_DEFS, allowed_roots, TickSize
 
 
 # ── chain helpers ──────────────────────────────────────────────────────────
@@ -33,7 +33,7 @@ def normalize_chain(raw: list[dict], ticker: str | None = None) -> list[dict]:
     live root wins generically (NDX→NDXP, SPX→SPXW) without hardcoding roots.
     Tie-break: higher volume, then open interest, then first seen.
 
-    When `ticker` has an explicit root allowlist (torque_config.TICKER_ROOTS —
+    When `ticker` has an explicit root allowlist (allowed_roots in torque_tickers_setup —
     today only DJX→DJXW), rows from any other root are dropped up front rather
     than being left to the generic dedup. Returns [] if the expiration lists no
     allowed root at all, which is the caller's signal to try the next one."""
@@ -369,10 +369,18 @@ def _leg_brief(lg: dict) -> dict:
             "action": lg.get("action"), "quantity": lg.get("quantity"), "symbol": lg.get("symbol")}
 
 
+def _tick_at(price: float, tick: float) -> float:
+    """The increment valid at `price`: a TickSize steps up above its break
+    (penny-pilot names: $0.01 below $3, $0.05 at/above); a plain float is the
+    same step at every price."""
+    return tick.at(price) if isinstance(tick, TickSize) else tick
+
+
 def round_to_tick(price: float, tick: float) -> float:
     if not tick:
         return round(price, 2)
-    return round(round(price / tick) * tick, 4)
+    step = _tick_at(price, tick)
+    return round(round(price / step) * step, 4)
 
 
 def suggested_limit(price: dict, tick: float) -> float:
@@ -465,7 +473,7 @@ def stop_limit_leg_prices(entry_price: float, order_type: str, stop_pct: float,
       credit → buy back; limit is ABOVE the trigger (still further up).
     """
     trigger = stop_loss_price(entry_price, order_type, stop_pct, tick)
-    buf = float(tick) * int(buffer_ticks)
+    buf = float(_tick_at(trigger, tick)) * int(buffer_ticks)
     if order_type == "credit":
         return trigger, _ceil_tick(trigger + buf, tick)
     return trigger, _floor_tick(trigger - buf, tick)
@@ -474,13 +482,15 @@ def stop_limit_leg_prices(entry_price: float, order_type: str, stop_pct: float,
 def _ceil_tick(price: float, tick: float) -> float:
     if not tick:
         return round(price, 2)
-    return round(math.ceil(round(price / tick, 9)) * tick, 4)
+    step = _tick_at(price, tick)
+    return round(math.ceil(round(price / step, 9)) * step, 4)
 
 
 def _floor_tick(price: float, tick: float) -> float:
     if not tick:
         return round(price, 2)
-    return round(math.floor(round(price / tick, 9)) * tick, 4)
+    step = _tick_at(price, tick)
+    return round(math.floor(round(price / step, 9)) * step, 4)
 
 
 def round_trip_fee_price(ticker_fee: float, legs: int, multiplier: int = 100) -> float:
@@ -523,7 +533,7 @@ def close_target_price(entry_price: float, order_type: str, pct: float, tick: fl
     # limit, which would silently unarm the auto-close. Floor it at one tick: the
     # cheapest real buy-back, i.e. "keep essentially all the credit". Callers that
     # want the target reported honestly should also cap pct (see max_credit_pct).
-    return max(price, tick if tick else 0.01)
+    return max(price, float(tick) if tick else 0.01)
 
 
 def max_credit_pct(entry_credit: float, tick: float, *, legs: int = 1,
@@ -533,7 +543,7 @@ def max_credit_pct(entry_credit: float, tick: float, *, legs: int = 1,
     by letting it expire, not by a resting limit. Returns a value in [1, 99]."""
     one_way = int(legs) * float(fee_per_contract) / float(multiplier)
     credit = float(entry_credit) - one_way
-    floor_px = tick if tick else 0.01
+    floor_px = float(tick) if tick else 0.01
     if credit <= floor_px:                      # credit already ≤ the min buy-back
         return 1.0
     f = 1.0 - (floor_px + one_way) / credit     # price(f) == floor_px

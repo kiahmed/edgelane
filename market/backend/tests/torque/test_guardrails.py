@@ -487,14 +487,14 @@ async def test_single_leg_stop_plus_autoclose_uses_native_otoco():
     req = _single_leg_req(stop_loss_pct=30)
     r = await torque_place(req, FakeRequest(client), user=DEV)
     assert r["mode"] == "otoco_bracket"
-    assert r["close_target_price"] == 91.05          # unchanged math vs the plain-OTO case
+    assert r["close_target_price"] == 91.10          # 70 × 1.30 + fees, ceil to NDX single-leg $0.10 step (≥$3)
     assert r["stop_loss_price"] == 49.0               # 70 * 0.70, floored to tick
     assert r["stop_loss_pct"] == 30.0
     p = client.placed[0]
     assert p["class"] == "otoco"
     assert len(client.placed) == 1                    # still one atomic order, not two
     assert p["side[0]"] == "buy_to_open" and p["type[0]"] == "limit"
-    assert p["side[1]"] == "sell_to_close" and p["type[1]"] == "limit" and p["price[1]"] == "91.05"
+    assert p["side[1]"] == "sell_to_close" and p["type[1]"] == "limit" and p["price[1]"] == "91.10"
     assert p["side[2]"] == "sell_to_close" and p["type[2]"] == "stop_limit"
     assert p["stop[2]"] == "49.00"
     assert float(p["price[2]"]) < 49.0                # limit sits further below the trigger (marketable once tripped)

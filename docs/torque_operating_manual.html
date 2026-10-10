@@ -115,8 +115,12 @@
 
 <div class="btn-ref">
   <div class="name">Ticker dropdown</div>
-  <div class="desc">Switches the underlying. First entry (NDX) is selected on load. Switching
-  tickers resets Lock Strikes, the session-flow history, and Counter Read's spot-trend buffer —
+  <div class="desc">Switches the underlying. The list (NDX, SPX, RUT, SPY, QQQ, DJX, IWM, XLF,
+  XLE, SMH as shipped) and its order come from the backend's ticker setup — the first entry is
+  selected on load, and a ticker added or disabled there shows up or disappears within about a
+  minute, no reload of the backend needed. If the list is empty, the backend can't reach its
+  ticker setup yet — until it does, Torque refuses to build, price or place new orders (existing
+  orders can still be cancelled or edited). Switching tickers resets Lock Strikes, the session-flow history, and Counter Read's spot-trend buffer —
   none of that carries over between tickers, since it's all tied to that ticker's own price scale.</div>
 </div>
 <div class="btn-ref">
@@ -151,7 +155,13 @@
 <div class="btn-ref">
   <div class="name">Limit Price</div>
   <div class="desc">Pre-fills to the current mid; type any price to override. Feeds the
-  <strong>Send Limit</strong> button.</div>
+  <strong>Send Limit</strong> button. The arrows step by the ticker's own <strong>price
+  step</strong>, and a typed price snaps to it when you leave the field (and again on the
+  server): $0.01 for SPY, QQQ, IWM and DJX; for XLF, XLE and SMH $0.01 below $3 but $0.05 at or
+  above (so 4.12 on SMH becomes 4.10, while 2.37 stays 2.37); for NDX, SPX and RUT $0.05 below $3
+  and $0.10 at or above. The above-$3 steps apply to single options only — a spread's net price
+  keeps the base step ($0.01, or $0.05 on NDX/SPX/RUT). A price the broker would reject as
+  off-increment is never sent.</div>
 </div>
 <div class="btn-ref">
   <div class="name">Qty</div>
@@ -606,7 +616,7 @@ lean yet to check, or time to have held one.</p>
   sides fall under the ticker's own noise floor, the band shows nothing confident —
   no name, no %, no fill, no mid — just this caution line, until real premium
   returns to at least one side. The floor is set <strong>per ticker</strong>
-  (<code>richness_floor</code> in the config override file — see
+  (<code>richness_floor</code> in the backend's ticker setup — see
   <a href="torque.md#per-ticker-strike-config">Per-ticker strike config</a>) because
   one flat number is wrong in both directions: NDX/SPX/RUT trade in bigger dollar
   increments (default floor $0.05) than SPY/QQQ, where a $0.50 mid is still a real,
@@ -717,7 +727,8 @@ format, symbols, and buying power without placing anything.</p>
 newest-first. Each row's limit price is <strong>click-to-edit</strong> (Enter or ✓ submits a
 modify), and has a <strong>cancel</strong> button. An auto-close watcher strip shows an armed close
 still waiting on its entry to fill; once the close is actually placed it becomes a normal working
-order in the table. Polls every ~4s.</p>
+order in the table. Polls every ~4s. A price you edit snaps to the ticker's price step, the same
+as the Limit Price field.</p>
 
 <h3>Past Orders</h3>
 <p><strong>Account-wide</strong>, newest-first: every Torque-tagged order today at any status
@@ -725,6 +736,28 @@ order in the table. Polls every ~4s.</p>
 broker's own live status. <em>An order rejected at submission never becomes a broker order, so it
 won't appear here</em> — the red "✗ ENTRY REJECTED" panel right after you send is your record of
 that.</p>
+
+<h3>News-signal orders <em>(automatic)</em></h3>
+<p>When the Reflex news engine confirms a call, Torque can place the order on its own — no click
+needed — on every account opted into news signals. These are always a single at-the-money
+long call (bullish) or long put (bearish) on the nearest listed expiry, with the profit target
+and stop-loss attached — as one broker-held bracket whenever the two exit prices are at least
+$0.10 apart, otherwise watched by Torque (see <a href="#autoclose">Auto-close</a>). They show up in <strong>Working</strong>
+like any other order, play a <strong>short tone</strong> when they first appear (so an unattended
+fire still gets noticed), and are labelled <strong>news signal</strong> in Past Orders.</p>
+<ul>
+  <li><strong>Unwound automatically.</strong> If later news invalidates the call, a cancel arrives
+  and Torque closes it out on its own: a still-unfilled entry is simply cancelled; a filled one is
+  closed at market for exactly the filled quantity, whatever its P/L.</li>
+  <li><strong>Same contract already in use.</strong> If an earlier signal's bracket already sits on
+  the exact same contract, the broker refuses a second one; Torque then tries the next listed
+  expiry once, and otherwise skips the signal.</li>
+  <li><strong>What gets skipped.</strong> Signals older than about 3 minutes, signals while the
+  market is closed, tickers that aren't configured, or a package spread too wide to trade blind —
+  nothing is placed for those.</li>
+  <li><strong>You can still act on them by hand.</strong> Cancel or edit them like any order;
+  Torque records what you did.</li>
+</ul>
 
 <p>The order-status confirmation under the builder ("✓ ENTRY SENT · entry id N") auto-dismisses
 after 10s — the order itself lives on in Working/Past Orders below.</p>
@@ -747,6 +780,8 @@ after 10s — the order itself lives on in Working/Past Orders below.</p>
   <tr><td>Counter Read</td><td>relative richness between your current structure and its natural opposite</td></tr>
   <tr><td>Lock Strikes</td><td>freeze strike selection while premiums keep updating live</td></tr>
   <tr><td>Dry Run</td><td>validate an order with the broker without placing it</td></tr>
+  <tr><td>Price step</td><td>the smallest price change a ticker's options allow; typed prices snap to it</td></tr>
+  <tr><td>News signal</td><td>an order Torque placed on its own from a confirmed Reflex news call</td></tr>
 </table>
 
 <div class="footer">

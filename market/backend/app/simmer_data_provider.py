@@ -227,7 +227,7 @@ _YAHOO_HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
-# Index symbols the sweep quotes that torque_config.YAHOO_SYMBOLS doesn't map
+# Index symbols the sweep quotes that Torque's ticker setup (yahoo_symbol) doesn't map
 # (torque never trades them; the regime computation quotes them every sweep).
 _YAHOO_EXTRA_SYMBOLS = {"VIX": "^VIX", "VIX3M": "^VIX3M"}
 

@@ -132,9 +132,10 @@ A separate page (`/torque`) served from this same backend — the place-order
 dialog as its own fast, auto-filling advanced order menu (ticker + one of 10
 strategies, no bias logic). Auto-close is hybrid: single-leg limit entries use a
 native Tradier OTO bracket, spreads/market entries place→confirm-fill→close (so a
-rejected/unfilled entry never leaves a naked close). Strike offsets are
-backend-configured (`torque_config.py` / `torque_tickers.json`), never hardcoded
-in the page. Run via `make run-dev` (sandbox) and open `:8789/torque`. Full doc:
+rejected/unfilled entry never leaves a naked close). Per-ticker settings (tickers,
+price steps, strike offsets, fees, exit defaults) live in the Supabase table
+`torque_tickers_setup` (seeded by `make db-setup`, refreshed into every
+container), never hardcoded in code or the page. Run via `make run-dev` (sandbox) and open `:8789/torque`. Full doc:
 `docs/torque.md`.
 
 ### Data Providers

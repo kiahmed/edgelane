@@ -248,6 +248,12 @@ if(TOK)sessionStorage.setItem('tq_tok',TOK);
 const j=(u,o={})=>fetch(API+u,{...o,headers:{...(o.headers||{}),...(TOK?{'X-Admin-Token':TOK}:{})}}).then(async r=>{const t=await r.text();let d;try{d=JSON.parse(t)}catch{d={detail:t}}if(!r.ok)throw new Error(d.detail||r.statusText);return d});
 const fmt=(n,d=2)=>n==null||isNaN(n)?'—':Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const fmt0=n=>n==null?'—':Number(n).toLocaleString('en-US');
+// Legal price step at a price, per ticker ({tick, tick_above_3} from the backend's
+// torque_tickers_setup): penny-pilot names step $0.01 below $3 and $0.05 at/above.
+const stepAt=(t,p)=>{if(!t)return 0.01;const a=t.tick_above_3;return (a&&Math.abs(Number(p))>=3)?a:(t.tick||0.01);};
+// Snap a typed price to that step (nearest); leaves blanks/garbage for the user to fix.
+const snapPx=(t,p)=>{const n=Number(p);if(!t||p===''||!isFinite(n)||n<=0)return p;
+  const s=stepAt(t,n);return String(Number((Math.round(n/s)*s).toFixed(4)));};
 const fmtTime=s=>{if(!s)return '—';const d=new Date(s);return isNaN(d)?'—':d.toLocaleTimeString();};
 // Torque tags every order "torque<strategy>" (entry) or "torqueClose<strategy>";
 // turn that back into a readable label for the Past Orders list.
@@ -550,15 +556,18 @@ function App(){
   const cancelOrder=(id)=>{setPlacing(true);
     j('/torque/cancel/'+id,{method:'POST'}).catch(e=>setErr('cancel: '+e.message))
       .finally(()=>{setPlacing(false);refreshOrders();});};
-  const modifyOrder=(id,price)=>{setPlacing(true);
-    j('/torque/modify/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({price:Number(price)})})
+  const modifyOrder=(id,price,symbol,order_class)=>{setPlacing(true);
+    j('/torque/modify/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({price:Number(price),symbol,order_class})})
       .catch(e=>setErr('modify: '+e.message)).finally(()=>{setPlacing(false);refreshOrders();});};
 
+  // This ticker's price step — from the live build when present, else config.
+  const tkInfo=(build&&build.tick)?{tick:build.tick,tick_above_3:build.tick_above_3}
+    :((cfg&&cfg.ticks&&ticker&&cfg.ticks[ticker])||null);
   const place=(order_type,dry=false)=>{
     setPlacing(true);setResult(null);setErr(null);
     const legs=build.legs.map(l=>({symbol:l.symbol,action:l.action,quantity:l.quantity,side:l.side,strike:l.strike,role:l.role}));
     const body={symbol:ticker,strategy,legs,order_type,
-      limit_price:order_type==='limit'?Number(limit):null,duration,quantity:Number(qty),
+      limit_price:order_type==='limit'?Number(snapPx(tkInfo,limit)):null,duration,quantity:Number(qty),
       // DJX-class tickers: auto-close is mandatory, so always request it.
       auto_close:(price&&price.auto_close_required)?true:(autoClose&&!(price&&price.untradeable)),
       close_target_pct:Number(targetPct),
@@ -684,8 +693,10 @@ function App(){
           <div style={{flex:'0 0 auto'}}>
             <div className="sendrow">
               <label className="fld">Limit Price
-                <input type="number" step="0.05" value={limit}
-                  onChange={e=>{setLimit(e.target.value);setUserLimit(true)}} style={{width:110}}/>
+                <input type="number" step={stepAt(tkInfo,limit)} value={limit}
+                  onChange={e=>{setLimit(e.target.value);setUserLimit(true)}}
+                  onBlur={()=>{const v=snapPx(tkInfo,limit);if(v!==limit)setLimit(v)}}
+                  title="snaps to this ticker's price step" style={{width:110}}/>
               </label>
               <label className="fld">Qty
                 <input type="number" min="1" max="50" value={qty} onChange={e=>setQty(e.target.value)} style={{width:70}}/>
@@ -892,26 +903,32 @@ function App(){
       </div>
     </div>
 
-    <OrdersPanel data={orders} onCancel={cancelOrder} onModify={modifyOrder} busy={placing}/>
+    <OrdersPanel data={orders} onCancel={cancelOrder} onModify={modifyOrder} busy={placing}
+      ticks={cfg&&cfg.ticks}/>
     <SiteFooter cfg={cfg}/>
   </div>;
 }
 
-function PriceEdit({o,onModify,busy}){
+function PriceEdit({o,onModify,busy,ticks}){
+  const t0=(ticks&&o.symbol&&ticks[String(o.symbol).toUpperCase()])||null;
+  // the above-$3 step is a single-option rule; a spread (multileg) uses the base step
+  const tk=(t0&&o.class==='multileg')?{tick:t0.tick,tick_above_3:null}:t0;
+  const submit=()=>{onModify(o.id,snapPx(tk,v),o.symbol,o.class);setEdit(false)};
   const [v,setV]=useState('');
   const [edit,setEdit]=useState(false);
   useEffect(()=>{if(!edit)setV(o.price!=null?String(o.price):'')},[o.price,edit]);
   if(o.price==null)return <span className="muted">{o.avg_fill_price!=null?'@$'+fmt(o.avg_fill_price):'mkt'}</span>;
   if(!edit)return <span className="pxedit" onClick={()=>setEdit(true)} title="click to modify">${fmt(o.price)} ✎</span>;
   return <span className="pxrow">
-    <input type="number" step="0.05" value={v} autoFocus onChange={e=>setV(e.target.value)}
-      onKeyDown={e=>{if(e.key==='Enter'){onModify(o.id,v);setEdit(false)}if(e.key==='Escape')setEdit(false)}}/>
-    <button className="btn xsave" disabled={busy} onClick={()=>{onModify(o.id,v);setEdit(false)}}>✓</button>
+    <input type="number" step={stepAt(tk,v)} value={v} autoFocus onChange={e=>setV(e.target.value)}
+      onBlur={()=>{const n=snapPx(tk,v);if(n!==v)setV(n)}}
+      onKeyDown={e=>{if(e.key==='Enter')submit();if(e.key==='Escape')setEdit(false)}}/>
+    <button className="btn xsave" disabled={busy} onClick={submit}>✓</button>
     <button className="btn xx" onClick={()=>setEdit(false)}>✕</button>
   </span>;
 }
 
-function OrdersPanel({data,onCancel,onModify,busy}){
+function OrdersPanel({data,onCancel,onModify,busy,ticks}){
   const [tab,setTab]=useState('working');
   const orders=(data&&data.orders)||[];      // live/working only
   const watchers=(data&&data.watchers)||[];
@@ -954,7 +971,7 @@ function OrdersPanel({data,onCancel,onModify,busy}){
         <td>{o.class}</td>
         <td><span className={"side "+(/credit|sell/i.test((o.type||'')+(o.side||''))?'put':'call')}>{(o.type||o.side||'').toUpperCase()}</span></td>
         <td>{o.exec_quantity||0}/{o.quantity||0}</td>
-        <td><PriceEdit o={o} onModify={onModify} busy={busy}/></td>
+        <td><PriceEdit o={o} onModify={onModify} busy={busy} ticks={ticks}/></td>
         <td><span className={"ostat "+o.status}>{o.status}</span></td>
         <td className="muted" style={{fontSize:10}}>{o.tag}</td>
         <td><button className="btn xcancel" disabled={busy} onClick={()=>onCancel(o.id)}>cancel</button></td>

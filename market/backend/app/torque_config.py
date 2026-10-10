@@ -1,9 +1,18 @@
 """Torque ticker + strategy configuration.
 
-Everything the frontend needs to know about *which* strikes to auto-fill lives
-here, server-side — the page never hardcodes offsets. A JSON file at the repo
-root (`torque_tickers.json`, or $TORQUE_TICKERS_CONFIG) is deep-merged over
-these defaults so the offsets can be tuned without touching code.
+Strategy shapes, global defaults and safety constants live here in code. Every
+PER-TICKER setting — which tickers trade, price step, strike offsets, spot
+symbol, option-root allowlist, fees, exit defaults, market-order policy, Counter
+Read floor — lives in the Supabase table `public.torque_tickers_setup`
+(migration 0021), so every backend container reads the same data. It is held
+in memory (`_SETUP`), loaded before the app serves (`refresh_ticker_setup`,
+called from main.py) and refreshed every TORQUE_TICKERS_REFRESH_SEC, so an
+edit in the table reaches every container without a redeploy. The accessors
+below are synchronous reads of that snapshot.
+
+Fails closed: until the table has been read once, no ticker is configured —
+the page lists nothing and news signals are dropped as "not a configured
+Torque ticker". A failed refresh keeps the last good copy.
 
 Anchoring model (all distances are in index/underlying POINTS, snapped to the
 live chain grid by the engine):
@@ -20,10 +29,13 @@ live chain grid by the engine):
 """
 from __future__ import annotations
 
-import json
+import asyncio
+import logging
 import os
-from pathlib import Path
+import time
 from typing import Any
+
+log = logging.getLogger("edgelane.market.torque_config")
 
 # ── Strategy registry ──────────────────────────────────────────────────────
 # Order here is the display order in the strategy selector. Default = bull_call.
@@ -62,8 +74,10 @@ COUNTER_STRATEGY: dict[str, str] = {
 
 DEFAULT_STRATEGY = "bull_call"
 
-# ── Per-ticker offsets ─────────────────────────────────────────────────────
-# `tick` is the option price increment used for rounding limit prices.
+# ── Base strike offsets (strategy-shape defaults) ──────────────────────────
+# Structural defaults for every ticker; a ticker's `offsets` in
+# torque_tickers_setup are merged over these. `tick` is the fallback price step
+# for a ticker with no row at all.
 _BASE_OFFSETS: dict[str, Any] = {
     "tick": 0.05,
     "single":    {"offset": 0},
@@ -73,92 +87,141 @@ _BASE_OFFSETS: dict[str, Any] = {
     "butterfly": {"body_offset": 0, "wing": 50},
 }
 
-# First entry = the default ticker (NDX), pre-selected on load.
-TICKERS: list[str] = ["NDX", "SPX", "RUT", "SPY", "QQQ", "DJX"]
 
-# Yahoo Finance chart symbols for the live spot quote (indices need the ^ form;
-# ETFs are the bare ticker). Used as the primary spot source, with Tradier
-# put-call parity as fallback. A ticker absent here just uses the fallback.
-# ^DJX already quotes at the 1/100 DJIA scale (~525) that the option strike grid
-# uses, so it needs no rescaling — do NOT substitute ^DJI (~52,550).
-YAHOO_SYMBOLS: dict[str, str] = {
-    "NDX": "^NDX", "SPX": "^GSPC", "RUT": "^RUT", "SPY": "SPY", "QQQ": "QQQ",
-    "DJX": "^DJX",
+class TickSize(float):
+    """A price increment that can step up above a price break — the US
+    penny-pilot rule: $0.01 below $3, $0.05 at or above. Behaves as its base
+    (minimum) step wherever it's used as a plain number; the engine's
+    rounding helpers ask `at(price)` for the step that's valid at the price
+    being rounded, so every limit, target and stop lands on a legal increment
+    on either side of $3."""
+    above: float | None
+    brk: float
+
+    def __new__(cls, base: float, above: float | None = None, brk: float = 3.0):
+        obj = super().__new__(cls, base)
+        obj.above = float(above) if above else None
+        obj.brk = float(brk)
+        return obj
+
+    def at(self, price: float) -> float:
+        if self.above and abs(float(price)) >= self.brk:
+            return self.above
+        return float(self)
+
+
+# ── Per-ticker setup: Supabase public.torque_tickers_setup ─────────────────
+# ticker -> row, in list order (dict keeps insertion order). Holds every row,
+# enabled or not: a disabled ticker drops out of tickers() but its settings
+# still apply to anything already open on it.
+_SETUP: dict[str, dict[str, Any]] = {}
+_SETUP_STATE: dict[str, Any] = {"loaded": False, "loaded_at": 0.0}
+
+_ROW_DEFAULTS: dict[str, Any] = {
+    "enabled": True, "offsets": {}, "close_target_spread_scaled": False,
+    "close_target_required": False, "market_orders_allowed": True,
 }
 
-# ── Root allowlist ─────────────────────────────────────────────────────────
-# Tradier serves option chains only by BASE symbol, returning every root listed
-# for that expiration mixed together. For most indices the generic dedup in
-# torque_engine._keep_primary_root picks the live root. DJX needs an explicit
-# allowlist: the AM-settled monthly `DJX` root and the daily/weekly `DJXW` root
-# never coexist except on the monthly expiration itself, and we trade DJXW only.
-# An expiration whose chain has no allowed root is skipped (see choose_expiration).
-TICKER_ROOTS: dict[str, list[str]] = {
-    "DJX": ["DJXW"],
-}
+
+def apply_ticker_setup(rows: list[dict[str, Any]]) -> None:
+    """Replace the in-memory snapshot with `rows` (the table's contents)."""
+    norm = []
+    for r in rows or []:
+        t = str(r.get("ticker") or "").strip().upper()
+        if not t:
+            continue
+        row = {**_ROW_DEFAULTS, **{k: v for k, v in r.items() if v is not None}, "ticker": t}
+        if not isinstance(row.get("offsets"), dict):
+            row["offsets"] = {}
+        norm.append(row)
+    norm.sort(key=lambda r: (int(r.get("sort_order") or 0), r["ticker"]))
+    _SETUP.clear()
+    _SETUP.update({r["ticker"]: r for r in norm})
+    _SETUP_STATE.update(loaded=True, loaded_at=time.time())
+
+
+async def refresh_ticker_setup() -> bool:
+    """Reload the snapshot from Supabase. False (snapshot untouched) when the
+    read failed — a transient outage must never wipe a good copy."""
+    from . import supabase_admin
+    try:
+        rows = await supabase_admin.get_torque_ticker_setup()
+    except Exception as e:
+        log.warning("torque ticker setup read failed: %s", e)
+        rows = None
+    if rows is None:
+        if not _SETUP_STATE["loaded"]:
+            log.warning("torque ticker setup not loaded yet — no Torque tickers until it is")
+        return False
+    apply_ticker_setup(rows)
+    return True
+
+
+async def ticker_setup_loop(interval_sec: float) -> None:
+    """Background refresh so every container converges on the table's
+    contents within `interval_sec`. Retries every 10s while the setup has
+    never loaded (Torque has no tickers until it does)."""
+    interval = max(5.0, float(interval_sec))
+    while True:
+        await asyncio.sleep(interval if _SETUP_STATE["loaded"] else min(10.0, interval))
+        before = (tickers(), {t: dict(r) for t, r in _SETUP.items()})
+        if await refresh_ticker_setup() and (tickers(), {t: dict(r) for t, r in _SETUP.items()}) != before:
+            from .logsetup import txn
+            txn("torque ticker setup changed", tickers=",".join(tickers()))
+
+
+def ticker_setup_loaded() -> bool:
+    return bool(_SETUP_STATE["loaded"])
+
+
+def _row(ticker: str) -> dict[str, Any]:
+    return _SETUP.get((ticker or "").upper(), {})
+
+
+def tick_size(ticker: str) -> TickSize:
+    """The ticker's price step (price-aware for penny-pilot names)."""
+    r = _row(ticker)
+    base = r.get("tick")
+    return TickSize(float(base) if base is not None else float(_BASE_OFFSETS["tick"]),
+                    r.get("tick_above_3"))
+
+
+def structure_tick(ticker: str, *, single: bool) -> float:
+    """The step for an order on `ticker`. The above-$3 step (`tick_above_3`)
+    is a SINGLE-option rule — a multi-leg spread trades as a complex order
+    priced in the base step at any net price — so spreads get the plain base
+    step and single legs the price-aware TickSize."""
+    t = tick_size(ticker)
+    return t if single else float(t)
+
+
+def ticks_map() -> dict[str, dict[str, float | None]]:
+    """Per-ticker {tick, tick_above_3} for the frontend's price inputs."""
+    return {t: {"tick": float(tick_size(t)), "tick_above_3": tick_size(t).above} for t in tickers()}
 
 
 def allowed_roots(ticker: str) -> list[str]:
-    """Roots we're willing to trade for `ticker`. Empty list = no restriction."""
-    f = _load_overrides_file().get("roots", {}).get((ticker or "").upper())
-    if isinstance(f, list):
-        return [str(r).upper() for r in f]
-    return list(TICKER_ROOTS.get((ticker or "").upper(), []))
+    """Roots we're willing to trade for `ticker`. Empty list = no restriction.
+    Tradier serves chains by BASE symbol with every root mixed in; the generic
+    dedup in torque_engine._keep_primary_root handles most names, but DJX must
+    trade only DJXW (its AM-settled monthly DJX root never coexists except on
+    the monthly expiration itself)."""
+    return [str(x).upper() for x in (_row(ticker).get("allowed_roots") or [])]
 
 
 def yahoo_symbol(ticker: str) -> str | None:
-    return YAHOO_SYMBOLS.get((ticker or "").upper())
+    """Yahoo chart symbol for the live spot quote (indices need the ^ form;
+    ^DJX already quotes at the 1/100 DJIA scale the strike grid uses). None =
+    fall back to Tradier put-call parity."""
+    return _row(ticker).get("yahoo_symbol") or None
 
-_TICKER_OVERRIDES: dict[str, dict[str, Any]] = {
-    "NDX": {
-        "tick": 0.05,
-        "vertical":  {"anchor": 20, "width": 100},   # long 20pts off spot, short 100 beyond
-        "condor":    {"short_offset": 100, "width": 100},
-        "iron_fly":  {"width": 100},
-        "butterfly": {"body_offset": 0, "wing": 100},
-    },
-    "SPX": {   # ~7490, 5pt grid
-        "tick": 0.05,
-        "vertical":  {"anchor": 5, "width": 25},
-        "condor":    {"short_offset": 25, "width": 25},
-        "iron_fly":  {"width": 25},
-        "butterfly": {"body_offset": 0, "wing": 25},
-    },
-    "RUT": {   # ~2960, 5pt grid
-        "tick": 0.05,
-        "vertical":  {"anchor": 5, "width": 20},
-        "condor":    {"short_offset": 20, "width": 20},
-        "iron_fly":  {"width": 20},
-        "butterfly": {"body_offset": 0, "wing": 20},
-    },
-    "SPY": {   # ~746, 1pt grid
-        "tick": 0.01,
-        "vertical":  {"anchor": 1, "width": 5},
-        "condor":    {"short_offset": 5, "width": 5},
-        "iron_fly":  {"width": 5},
-        "butterfly": {"body_offset": 0, "wing": 5},
-    },
-    "QQQ": {   # ~738, 1pt grid
-        "tick": 0.01,
-        "vertical":  {"anchor": 1, "width": 5},
-        "condor":    {"short_offset": 5, "width": 5},
-        "iron_fly":  {"width": 5},
-        "butterfly": {"body_offset": 0, "wing": 5},
-    },
-    # DJX (DJXW root) ~525, 1pt grid, PENNY-quoted (bids like 2.68/1.41 are not
-    # 0.05 multiples, so tick=0.01). Widths are deliberately wider than the
-    # 1pt grid would suggest: DJX is 1/100 of the Dow, so its option premiums
-    # are ~1/12 of SPX's while market makers still quote a ~$0.30 wide market.
-    # A 2-3pt vertical therefore has a package spread of 47-60% of its own mid
-    # and cannot be closed profitably; at width 10 that falls to ~16-20%.
-    "DJX": {
-        "tick": 0.01,
-        "vertical":  {"anchor": 1, "width": 10},
-        "condor":    {"short_offset": 10, "width": 10},
-        "iron_fly":  {"width": 10},
-        "butterfly": {"body_offset": 0, "wing": 10},
-    },
-}
+
+def daily_range(ticker: str) -> tuple[float | None, float | None]:
+    """(daily_min_range, daily_max_range) — reserved for later use."""
+    r = _row(ticker)
+    lo, hi = r.get("daily_min_range"), r.get("daily_max_range")
+    return (float(lo) if lo is not None else None, float(hi) if hi is not None else None)
+
 
 DEFAULT_CLOSE_TARGET_PCT = 30.0   # +30% profit target for the auto-close order
 
@@ -170,19 +233,18 @@ DEFAULT_CLOSE_TARGET_PCT = 30.0   # +30% profit target for the auto-close order
 # huge headroom. On DJX it is 16-43% of mid (measured live), so 30% is BELOW
 # the round-trip cost for tighter widths. Hence a per-ticker floor that the API
 # clamps UP to — a user cannot select a target that is structurally unfillable.
-#   "default" = pre-filled in the UI, "min" = hard floor enforced server-side.
-#   "spread_scaled": also raise the floor to the LIVE package spread at place
+# Per ticker in torque_tickers_setup (null = the global default):
+#   close_target_default = pre-filled in the UI, close_target_min = hard floor
+#   enforced server-side.
+#   close_target_spread_scaled: also raise the floor to the LIVE package spread at place
 #   time. Opt-in per ticker: on tight names the static floor already clears the
 #   spread by 10x, and scaling there would silently move long-standing SPX/NDX
 #   close targets. DJX needs it because its spread% swings 16% → 800% intraday
 #   as premium decays.
-#   "required": auto-close cannot be turned OFF for this ticker. The user may
+#   close_target_required: auto-close cannot be turned OFF for this ticker. The user may
 #   raise the profit target but never disarm the exit. Consequence: when the
 #   package is wider than MAX_AUTO_CLOSE_SPREAD_PCT the close cannot be armed,
 #   so the ENTRY is refused too — a mandatory exit means no exit, no trade.
-CLOSE_TARGETS: dict[str, dict[str, float]] = {
-    "DJX": {"default": 60.0, "min": 45.0, "spread_scaled": True, "required": True},
-}
 
 # A package whose own bid/ask is this wide relative to its mid cannot support ANY
 # profit target — the close limit would sit inside the spread forever. Observed on
@@ -217,9 +279,6 @@ MAX_AUTO_CLOSE_SPREAD_PCT = 100.0
 #     keeps polling for a sane book instead.
 DEFAULT_STOP_LOSS_PCT = 30.0   # global default — same % as DEFAULT_CLOSE_TARGET_PCT,
                                 # symmetric protection alongside the profit target
-STOP_LOSS: dict[str, dict[str, float]] = {
-    "DJX": {"default": 50.0},   # wider book needs a wider stop or it fires on noise
-}
 STOP_MAX_EXIT_SPREAD_PCT = 60.0
 
 # A stop-LIMIT (the trigger converts to a limit order, never a market order)
@@ -273,13 +332,11 @@ STOP_LIMIT_BUFFER_TICKS = 3
 # costs a cent; on DJX the ask can be 10.00 against a 5.22 mid, so a market
 # entry silently pays ~2x fair value. There is no legitimate reason to send a
 # market order into that book — force a limit and let the user see the price.
-NO_MARKET_ORDER_TICKERS: set[str] = {"DJX"}
-
-
 def market_orders_allowed(ticker: str) -> bool:
-    f = _load_overrides_file().get("no_market_order_tickers")
-    banned = {str(t).upper() for t in f} if isinstance(f, list) else NO_MARKET_ORDER_TICKERS
-    return (ticker or "").upper() not in banned
+    """A market order crosses to whatever the book shows — on DJX that silently
+    pays ~2x fair value, so such tickers force a limit (market_orders_allowed
+    = false in torque_tickers_setup)."""
+    return bool(_row(ticker).get("market_orders_allowed", True))
 
 
 # ── Execution fees ─────────────────────────────────────────────────────────
@@ -290,36 +347,26 @@ def market_orders_allowed(ticker: str) -> bool:
 #     DJX  2-leg vertical  -> 1.06      (= 2 legs x 0.53)
 #     SPX  buy 1 contract  -> 0.95
 # Index options carry a proprietary exchange fee, hence DJX/SPX > the plain
-# equity-option rate. A ticker not listed here uses DEFAULT_COMMISSION.
+# equity-option rate. Per ticker in torque_tickers_setup
+# (commission_per_contract); null uses DEFAULT_COMMISSION.
 #
 # `extra_fee_per_contract` covers regulatory pass-throughs (ORF, TAF) which
 # Tradier's preview reports as fees=0 because they are assessed at settlement,
-# not at order time. It defaults to 0.0 — we do NOT invent a number. Set it in
-# torque_tickers.json if you want the target to absorb them too.
+# not at order time. It defaults to 0.0 — we do NOT invent a number. Set
+# extra_fee_per_contract in torque_tickers_setup if you want the target to
+# absorb them too.
 DEFAULT_COMMISSION = 0.35
-COMMISSION_PER_CONTRACT: dict[str, float] = {
-    "DJX": 0.53,
-    "SPX": 0.95,
-    "NDX": 0.95,
-    "RUT": 0.95,
-}
 DEFAULT_EXTRA_FEE = 0.0
 
 
 def commission_per_contract(ticker: str) -> float:
-    f = _load_overrides_file().get("commissions", {})
-    tk = (ticker or "").upper()
-    if isinstance(f, dict) and tk in f:
-        return float(f[tk])
-    return float(COMMISSION_PER_CONTRACT.get(tk, DEFAULT_COMMISSION))
+    c = _row(ticker).get("commission_per_contract")
+    return float(c) if c is not None else DEFAULT_COMMISSION
 
 
 def extra_fee_per_contract(ticker: str) -> float:
-    f = _load_overrides_file().get("extra_fees", {})
-    tk = (ticker or "").upper()
-    if isinstance(f, dict) and tk in f:
-        return float(f[tk])
-    return DEFAULT_EXTRA_FEE
+    f = _row(ticker).get("extra_fee_per_contract")
+    return float(f) if f is not None else DEFAULT_EXTRA_FEE
 
 
 def fee_per_contract(ticker: str) -> float:
@@ -337,39 +384,31 @@ def stop_loss_default(ticker: str) -> float | None:
     this feature — silently start getting a stop armed, which is exactly the
     kind of surprise a live-order-placement default must not spring on a caller
     that never asked for it."""
-    f = _load_overrides_file().get("stop_loss", {}).get((ticker or "").upper(), {})
-    sl = {**STOP_LOSS.get((ticker or "").upper(), {}), **(f if isinstance(f, dict) else {})}
-    d = sl.get("default")
+    d = _row(ticker).get("stop_loss_default")
     return float(d) if d is not None else None
 
 
 def close_target_default(ticker: str) -> float:
-    f = _load_overrides_file().get("close_targets", {}).get((ticker or "").upper(), {})
-    ct = {**CLOSE_TARGETS.get((ticker or "").upper(), {}), **(f if isinstance(f, dict) else {})}
-    return float(ct.get("default", DEFAULT_CLOSE_TARGET_PCT))
+    d = _row(ticker).get("close_target_default")
+    return float(d) if d is not None else DEFAULT_CLOSE_TARGET_PCT
 
 
 def close_target_min(ticker: str) -> float:
     """Hard floor for the auto-close profit target. Default 1.0 (= the API's
     existing lower bound) for tickers whose spreads are tight enough not to
     need one."""
-    f = _load_overrides_file().get("close_targets", {}).get((ticker or "").upper(), {})
-    ct = {**CLOSE_TARGETS.get((ticker or "").upper(), {}), **(f if isinstance(f, dict) else {})}
-    return float(ct.get("min", 1.0))
+    m = _row(ticker).get("close_target_min")
+    return float(m) if m is not None else 1.0
 
 
 def close_target_spread_scaled(ticker: str) -> bool:
     """True when the floor must also clear the live package bid/ask (DJX)."""
-    f = _load_overrides_file().get("close_targets", {}).get((ticker or "").upper(), {})
-    ct = {**CLOSE_TARGETS.get((ticker or "").upper(), {}), **(f if isinstance(f, dict) else {})}
-    return bool(ct.get("spread_scaled", False))
+    return bool(_row(ticker).get("close_target_spread_scaled", False))
 
 
 def close_target_required(ticker: str) -> bool:
     """True when auto-close may not be disarmed for this ticker (DJX)."""
-    f = _load_overrides_file().get("close_targets", {}).get((ticker or "").upper(), {})
-    ct = {**CLOSE_TARGETS.get((ticker or "").upper(), {}), **(f if isinstance(f, dict) else {})}
-    return bool(ct.get("required", False))
+    return bool(_row(ticker).get("close_target_required", False))
 
 
 def close_targets_map() -> dict[str, dict[str, float]]:
@@ -403,21 +442,14 @@ def stop_loss_defaults_map() -> dict[str, float]:
 # One flat number is wrong in both directions across tickers: NDX/SPX/RUT trade
 # in bigger dollar increments (a $0.05 mid there really can be near-worthless),
 # while SPY/QQQ run smaller nominal premiums (a $0.50 mid there is still a real,
-# meaningful price) — so the floor is sized per ticker, same pattern as
-# COMMISSION_PER_CONTRACT / CLOSE_TARGETS above.
+# meaningful price) — so the floor is sized per ticker (richness_floor in
+# torque_tickers_setup; null uses DEFAULT_RICHNESS_FLOOR).
 DEFAULT_RICHNESS_FLOOR = 0.03
-RICHNESS_FLOOR: dict[str, float] = {
-    "NDX": 0.05, "SPX": 0.05, "RUT": 0.05,
-    "SPY": 0.02, "QQQ": 0.02, "DJX": 0.02,
-}
 
 
 def richness_floor(ticker: str) -> float:
-    f = _load_overrides_file().get("richness_floor", {})
-    tk = (ticker or "").upper()
-    if isinstance(f, dict) and tk in f:
-        return float(f[tk])
-    return float(RICHNESS_FLOOR.get(tk, DEFAULT_RICHNESS_FLOOR))
+    f = _row(ticker).get("richness_floor")
+    return float(f) if f is not None else DEFAULT_RICHNESS_FLOOR
 
 
 def richness_floors_map() -> dict[str, float]:
@@ -435,33 +467,10 @@ def _deep_merge(base: dict, over: dict) -> dict:
     return out
 
 
-def _load_overrides_file() -> dict[str, Any]:
-    """Optional JSON override file. Shape:
-       {"tickers":[...], "default_strategy":"...", "overrides":{"NDX":{...}}}"""
-    path = os.environ.get("TORQUE_TICKERS_CONFIG")
-    candidates = [Path(path)] if path else []
-    # Canonical location: market/backend/torque/torque_tickers.json — a dedicated
-    # folder for Torque config, alongside (not inside) the app/ package so it's
-    # obviously config, not code. this file lives at market/backend/app/torque_config.py,
-    # so parents[1] is market/backend.
-    here = Path(__file__).resolve()
-    candidates.append(here.parents[1] / "torque" / "torque_tickers.json")
-    # Back-compat fallback: also walk up looking for a bare torque_tickers.json at
-    # any ancestor (e.g. repo root), in case one was ever placed there directly.
-    for parent in here.parents:
-        candidates.append(parent / "torque_tickers.json")
-    for p in candidates:
-        try:
-            if p and p.is_file():
-                return json.loads(p.read_text())
-        except Exception:
-            continue
-    return {}
-
-
 def ticker_rule(ticker: str, strategy: str) -> dict[str, Any]:
-    """Resolved offset rule for (ticker, strategy): base ⊕ ticker-override ⊕
-    file-override, narrowed to the strategy's kind. Returns e.g.
+    """Resolved offset rule for (ticker, strategy): base offsets ⊕ the ticker's
+    `offsets` from torque_tickers_setup, narrowed to the strategy's kind.
+    `tick` is the ticker's TickSize. Returns e.g.
     {"kind":"vertical","tick":0.05,"anchor":20,"width":100,"type":"debit","side":"call","dir":"bull"}.
     """
     sdef = STRATEGY_DEFS.get(strategy)
@@ -470,14 +479,11 @@ def ticker_rule(ticker: str, strategy: str) -> dict[str, Any]:
     kind = sdef["kind"]
     tk = ticker.upper()
 
-    merged = _deep_merge({}, _BASE_OFFSETS)
-    merged = _deep_merge(merged, _TICKER_OVERRIDES.get(tk, {}))
-    file_over = _load_overrides_file().get("overrides", {}).get(tk, {})
-    merged = _deep_merge(merged, file_over)
+    merged = _deep_merge(_deep_merge({}, _BASE_OFFSETS), _row(tk).get("offsets") or {})
 
     rule = dict(merged.get(kind) or {})
     rule["kind"] = kind
-    rule["tick"] = float(merged.get("tick", 0.05))
+    rule["tick"] = structure_tick(tk, single=(kind == "single"))
     rule["type"] = sdef["type"]
     rule["side"] = sdef["side"]
     if "dir" in sdef:
@@ -486,27 +492,30 @@ def ticker_rule(ticker: str, strategy: str) -> dict[str, Any]:
 
 
 def tickers() -> list[str]:
-    f = _load_overrides_file().get("tickers")
-    return list(f) if isinstance(f, list) and f else list(TICKERS)
+    """Enabled tickers, in list order (first = the page's default)."""
+    return [t for t, r in _SETUP.items() if r.get("enabled", True)]
+
+
+def known_tickers() -> list[str]:
+    """Every configured ticker, enabled or not (e.g. to recognise the
+    underlying of an existing position)."""
+    return list(_SETUP)
 
 
 def default_strategy() -> str:
-    return _load_overrides_file().get("default_strategy") or DEFAULT_STRATEGY
+    return DEFAULT_STRATEGY
 
 
 def operator_uids() -> list[str]:
     """Auth uid(s) (Supabase `profiles.id`) of the server operator(s) to auto-grant
     the full toolset on startup. Sourced from config — never hardcoded: the
-    `TORQUE_OPERATOR_UIDS` env var (comma-separated) and/or an `operator_uids`
-    array in torque_tickers.json. Empty by default (no seeding). Used by the
+    `TORQUE_OPERATOR_UIDS` env var (comma-separated). Empty by default (no
+    seeding). Used by the
     backend to seed `profiles.tools_enabled` via service_role (see
     supabase_admin.grant_user_tools); the admin token bypasses the gate anyway."""
     out: list[str] = []
     env = os.environ.get("TORQUE_OPERATOR_UIDS", "")
     out.extend(u.strip() for u in env.split(",") if u.strip())
-    f = _load_overrides_file().get("operator_uids")
-    if isinstance(f, list):
-        out.extend(str(u).strip() for u in f if str(u).strip())
     seen: set[str] = set()
     uniq: list[str] = []
     for u in out:

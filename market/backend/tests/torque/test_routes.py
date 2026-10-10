@@ -308,7 +308,7 @@ async def test_single_leg_limit_autoclose_uses_oto():
                        account_id="T", confirm=True)
     r = await torque_place(req, FakeRequest(client), user=DEV)
     assert r["mode"] == "oto_bracket"
-    assert r["close_target_price"] == 91.05    # 70 × 1.30, + round-trip commission
+    assert r["close_target_price"] == 91.10    # 70 × 1.30 + fees, ceil to NDX single-leg $0.10 step (≥$3)
     p = client.placed[0]
     assert p["class"] == "oto"
     assert p["side[0]"] == "buy_to_open" and p["side[1]"] == "sell_to_close"

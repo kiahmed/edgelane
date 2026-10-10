@@ -56,6 +56,7 @@ for the risk.
 - [Frontend](#frontend)
 - [Deployment](#deployment)
 - [Configuration](#configuration)
+- [Database-held ticker and engine setup (planned)](#database-held-ticker-and-engine-setup-planned)
 - [Testing](#testing)
 - [Gap analysis and open risks](#gap-analysis-and-open-risks)
 - [Phased build plan](#phased-build-plan)
@@ -2252,6 +2253,11 @@ named Cloudflare tunnel (`edge.facades.trade`) that Matrix and Torque use.
 
 ## Configuration
 
+> **Current state, due to change.** This describes how Simmer is configured
+> today. Torque has since moved all of its per-ticker data into the database;
+> the plan to do the same for Simmer is in
+> [Database-held ticker and engine setup (planned)](#database-held-ticker-and-engine-setup-planned).
+
 Follows the **Torque config precedent**: a Python module of defaults, optionally
 deep-merged with a JSON override file — not a second KEY=VALUE file.
 
@@ -2274,6 +2280,137 @@ belong in `edgelane_market.config` alongside the existing keys, surfaced through
 `config.py`'s `Settings` model with the usual `_coerce` line per key. **Do not
 put API keys in `simmer/simmer_tickers.json`** — that file is tracked in git and
 not covered by the gitignore patterns.
+
+---
+
+## Database-held ticker and engine setup (planned)
+
+**Status: planned, not built.** The target is for Simmer to work the way Torque
+now does (see `docs/torque.md` → *Per-ticker strike config*): every setting that
+is data rather than algorithm lives in Supabase, every backend container reads
+the same rows, an edit applies without a redeploy, and nothing per-ticker is
+hardcoded in code or read from a JSON file.
+
+### Why
+
+- **Multiple containers.** A JSON file mounted into one container can't be the
+  source of truth once the backend runs as several. The database is shared.
+- **Edits without a redeploy.** Today a tuning change means editing
+  `simmer/simmer_tickers.json` and running `make deploy-be-restart`.
+- **One place.** Per-ticker data is split today between hardcoded dicts in
+  `simmer_config.py`, the JSON file, and Torque's spot-symbol map (which
+  `simmer_data_provider` borrows).
+
+### What lives where today
+
+| Setting | Today | After |
+|---|---|---|
+| Default universe (`TICKERS`: AAPL … TSLA) | code | `simmer_tickers_setup.default_watchlist` |
+| Data-only symbols (`INDEX_DATA_SYMBOLS`: SPY, QQQ, VIX) | code | `simmer_tickers_setup.index_data` |
+| Blocked from trading (`BLOCKED_TICKERS`: SPX, NDX, RUT, DJX, VIX) | code | `simmer_tickers_setup.blocked` |
+| Per-ticker rule (`_BASE_RULE` ⊕ `_TICKER_OVERRIDES`: eligible, tick, min OI, wall floor, structures, is_index, squeeze veto; NVDA/TSLA min OI 1000) | code | one row per ticker in `simmer_tickers_setup` |
+| Commission (`COMMISSION_PER_CONTRACT`) | code (empty → 0.35) | `simmer_tickers_setup.commission_per_contract` |
+| Spot-quote symbol (Torque's map + `_YAHOO_EXTRA_SYMBOLS` for VIX/VIX3M) | code | `simmer_tickers_setup.yahoo_symbol` |
+| Engine sections (weights, gates, targets, decision bands, earnings, management, vol, DTE tiers, catalyst, cadence, TTLs, velocity, news, sentiment, squeeze, regime, user clamps, social) | code defaults ⊕ `simmer_tickers.json` (today: `gates` with `dte_min: 0`, and `social`) | code defaults ⊕ `simmer_engine_settings` |
+| Engine version (`ENGINE_VERSION`) | code ⊕ JSON | `simmer_engine_settings` (`engine` section) |
+| Locked vs toggleable gates (`LOCKED_GATES`, `TOGGLEABLE_GATES`) | code | **stays in code** — a safety contract, not tuning |
+| Per-user watchlist (`simmer_watchlist`) and user settings (`simmer_settings`) | Supabase | unchanged |
+
+### Table 1 — `public.simmer_tickers_setup`
+
+One row per symbol Simmer knows about. Columns:
+
+| Column | Meaning |
+|---|---|
+| `ticker` text PK (uppercase) | the symbol |
+| `enabled` bool | false = treated as unknown (settings kept for history) |
+| `sort_order` int | display / default order |
+| `default_watchlist` bool | in the default universe (today's `TICKERS`; also the dev fallback when the watchlist can't be read) |
+| `index_data` bool | quoted every sweep for the regime gate, never traded (SPY, QQQ, VIX) |
+| `blocked` bool | can't be traded or added to a watchlist (SPX, NDX, RUT, DJX, VIX) |
+| `eligible` bool | false = chain too thin to sell; skipped without running the liquidity gate |
+| `tick`, `tick_above_3` | price step; `tick_above_3` applies at prices ≥ $3 (penny pilot), null = `tick` everywhere — same rule as Torque |
+| `min_open_interest` int | liquidity floor (null = the `gates` default) |
+| `wall_strength_floor` text | `low` / `medium` / `high` |
+| `structures` text[] | allowed structures (`bull_put`, `bear_call`, `iron_condor`) |
+| `is_index` bool | uses the index sentiment half-life |
+| `squeeze_veto` bool | call-side squeeze guard on/off |
+| `sector` text | for the sector-dislocation check (`ticker_rule(sym)["sector"]`, unset today → "unknown") |
+| `commission_per_contract`, `extra_fee_per_contract` numeric | per contract per leg, one way (null = 0.35 / 0) |
+| `yahoo_symbol` text | spot-quote symbol (`^VIX`, `^VIX3M`, …; null = the bare ticker) |
+| `daily_min_range`, `daily_max_range` numeric | reserved for later, as on Torque's table |
+| `notes`, `created_at`, `updated_at` | |
+
+Seeded from today's code values exactly: the 13 default names, SPY/QQQ/VIX as
+`index_data`, SPX/NDX/RUT/DJX/VIX as `blocked`, SPY/QQQ `is_index` and not
+`eligible`, NVDA/TSLA `min_open_interest` 1000, VIX/VIX3M Yahoo symbols.
+
+### Table 2 — `public.simmer_engine_settings`
+
+One row per section: `section` text PK (`weights`, `gates`, `targets`,
+`decision`, `earnings`, `management`, `vol`, `dte_tiers`, `catalyst`, `cadence`,
+`ttl`, `velocity`, `news`, `sentiment`, `squeeze`, `regime`, `user_clamps`,
+`social`, `engine`), `settings` jsonb, `notes`, `updated_at`.
+
+Each section is **deep-merged over the code defaults**, exactly as the JSON file
+is today, so the code keeps the engine's built-in defaults (they are part of the
+algorithm) and the table holds only what is tuned. Seeded with what
+`simmer_tickers.json` overrides now: `gates` (including `dte_min: 0`) and
+`social`. The `engine` section holds `engine_version`.
+
+### How it's read — same pattern as Torque
+
+- `simmer_config` keeps an **in-memory copy** of both tables, loaded in
+  `main.py` before `simmer_loop` starts, and refreshed every
+  `SIMMER_SETUP_REFRESH_SEC` (default 60). The existing synchronous accessors
+  (`tickers()`, `ticker_rule()`, `index_data_symbols()`, `blocked_tickers()`,
+  `commission_per_contract()`, `weights()`, `gates()`, … `resolved()`) read that
+  copy, so `simmer_engine` stays a pure function of (inputs, cfg) and no caller
+  changes.
+- **A failed refresh keeps the last good copy.**
+- **Fails closed until first loaded:** the watcher skips its sweep (nothing is
+  scored or alerted) rather than falling back to the code defaults — those
+  differ from production today (`dte_min` 7 in code vs 0 in use), so a silent
+  fallback would change verdicts. `GET /simmer/config` reports whether the
+  setup has loaded.
+- The Simmer-only spot symbols move out of `simmer_data_provider` into
+  `simmer_tickers_setup.yahoo_symbol`; it stops borrowing Torque's map.
+
+### Calibration stays honest
+
+An engine-settings edit changes verdicts, so it must stay visible to the
+calibration loop ([The hard requirement: calibration is config-independent](#the-hard-requirement-calibration-is-config-independent)):
+
+- every alert payload and `simmer_outcomes` row records a **settings
+  fingerprint** (a hash of the resolved engine settings) alongside
+  `engine_version`;
+- a change to `weights`, `gates`, `targets` or `decision` must come with an
+  `engine_version` bump in the `engine` row; the backend logs a warning if the
+  fingerprint changes while the version doesn't.
+
+### Removed once built
+
+- `simmer/simmer_tickers.json`, its mount and `SIMMER_TICKERS_CONFIG` in
+  `deploy/docker-compose.yml`;
+- `_load_overrides_file` and the hardcoded per-ticker dicts in `simmer_config.py`
+  (`TICKERS`, `INDEX_DATA_SYMBOLS`, `BLOCKED_TICKERS`, `_TICKER_OVERRIDES`,
+  `COMMISSION_PER_CONTRACT`) and `_YAHOO_EXTRA_SYMBOLS`.
+
+### Setup, tests, rollout
+
+- **Migration:** the next free number under `supabase/migrations/`, creating both
+  tables (RLS on, no policies — service role only, like `torque_tickers_setup`)
+  and seeding them from a JSON block between `$seed$` markers with
+  `on conflict do nothing`, so re-running never overwrites an edited row.
+  Applied by **`make db-setup`**.
+- **Tests:** like Torque's `tests/conftest.py`, load the seed straight from the
+  migration file so tests and database can't drift. Cover: tables are the only
+  source; failed refresh keeps the last copy; never-loaded = sweep skipped;
+  section deep-merge over code defaults; locked gates can't be loosened from the
+  table; the fingerprint and version-bump warning; seeded values equal today's
+  resolved config (`resolved()` before == after, per ticker).
+- **Rollout:** run `make db-setup` before deploying the code; remove the JSON
+  file and its mount in the same deploy.
 
 ---
 

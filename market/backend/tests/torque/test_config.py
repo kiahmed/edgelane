@@ -1,12 +1,14 @@
-"""Torque config: ticker rules, strategy registry, file overrides."""
+"""Torque config: ticker rules and strategy registry, with every per-ticker
+setting read from the database snapshot (public.torque_tickers_setup)."""
 from __future__ import annotations
 
-import json
-from pathlib import Path
+import asyncio
 
 import pytest
 
 from app import torque_config as tc
+
+from ..conftest import torque_seed_rows
 
 
 def test_all_strategies_present():
@@ -80,24 +82,23 @@ def test_unknown_strategy_raises():
         tc.ticker_rule("NDX", "nope")
 
 
-def test_file_override_merges(tmp_path, monkeypatch):
-    cfg = {
-        "tickers": ["ABC", "NDX"],
-        "default_strategy": "long_put",
-        "overrides": {"NDX": {"tick": 0.10, "vertical": {"anchor": 5}}},
-    }
-    p = tmp_path / "torque_tickers.json"
-    p.write_text(json.dumps(cfg))
-    monkeypatch.setenv("TORQUE_TICKERS_CONFIG", str(p))
-    assert tc.tickers()[0] == "ABC"
-    assert tc.default_strategy() == "long_put"
+def _with_row(ticker, **fields):
+    rows = [dict(r) for r in torque_seed_rows()]
+    for r in rows:
+        if r["ticker"] == ticker:
+            r.update(fields)
+    tc.apply_ticker_setup(rows)
+
+
+def test_table_row_is_the_source_of_a_tickers_settings():
+    """An edit in torque_tickers_setup — not code, not a file — is what moves a
+    ticker's settings; untouched keys keep their seeded/base values."""
+    _with_row("NDX", tick=0.10, offsets={"vertical": {"anchor": 5, "width": 100}})
     r = tc.ticker_rule("NDX", "bull_call")
-    assert r["tick"] == 0.10        # overridden
-    assert r["anchor"] == 5         # overridden
-    assert r["width"] == 100        # untouched base/ticker value preserved
+    assert r["tick"] == 0.10 and r["anchor"] == 5 and r["width"] == 100
+    assert tc.ticker_rule("NDX", "iron_condor")["short_offset"] == 50   # base, NDX row no longer sets it
 
 
-# ── Counter Read noise floor ───────────────────────────────────────────────
 def test_richness_floor_defaults_are_sized_per_ticker():
     # Index tickers (bigger dollar increments) get a looser floor than the
     # lower-nominal-premium ETFs — one flat number would misfire on both ends.
@@ -132,37 +133,22 @@ def test_stop_loss_defaults_map_djx_keeps_its_own_wider_default():
     assert m["SPY"] == tc.DEFAULT_STOP_LOSS_PCT
 
 
-def test_richness_floor_file_override(tmp_path, monkeypatch):
-    cfg = {"richness_floor": {"NDX": 0.09}}
-    p = tmp_path / "torque_tickers.json"
-    p.write_text(json.dumps(cfg))
-    monkeypatch.setenv("TORQUE_TICKERS_CONFIG", str(p))
-    assert tc.richness_floor("NDX") == 0.09      # overridden
-    assert tc.richness_floor("SPY") == 0.02      # untouched ticker keeps its default
+def test_richness_floor_from_the_table():
+    _with_row("NDX", richness_floor=0.09)
+    assert tc.richness_floor("NDX") == 0.09      # changed in the table
+    assert tc.richness_floor("SPY") == 0.02      # untouched ticker keeps its value
 
 
-def test_overrides_file_found_in_dedicated_torque_folder(monkeypatch):
-    # Canonical location: market/backend/torque/torque_tickers.json — a real
-    # file there (not just the env-var override) must be picked up with no
-    # TORQUE_TICKERS_CONFIG set at all.
-    monkeypatch.delenv("TORQUE_TICKERS_CONFIG", raising=False)
-    here = Path(tc.__file__).resolve()
-    target_dir = here.parents[1] / "torque"
-    target = target_dir / "torque_tickers.json"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    pre_existing = target.exists()
-    original = target.read_text() if pre_existing else None
-    try:
-        target.write_text(json.dumps({"richness_floor": {"SPY": 0.011}}))
-        assert tc.richness_floor("SPY") == 0.011
-    finally:
-        if pre_existing:
-            target.write_text(original)
-        else:
-            target.unlink(missing_ok=True)
+def test_no_json_file_or_hardcoded_ticker_data_is_read_anymore():
+    """Per-ticker data comes only from the table snapshot: with it empty,
+    nothing is configured (fail closed), even for the old built-in names."""
+    tc.apply_ticker_setup([])
+    assert tc.tickers() == [] and tc.known_tickers() == []
+    assert tc.yahoo_symbol("NDX") is None and tc.allowed_roots("DJX") == []
+    assert tc.ticker_rule("NDX", "bull_call")["width"] == 50          # base shape only
+    assert not hasattr(tc, "_load_overrides_file") and not hasattr(tc, "TICKERS")
 
 
-# ── DJX (DJXW root) ────────────────────────────────────────────────────────
 def test_djx_is_a_tradeable_ticker_with_yahoo_spot():
     assert "DJX" in tc.tickers()
     # ^DJX already quotes at the 1/100 DJIA scale the strike grid uses.
@@ -214,3 +200,146 @@ def test_only_djx_opts_into_spread_scaled_floor():
 
 def test_untradeable_package_ceiling_is_configured():
     assert tc.MAX_AUTO_CLOSE_SPREAD_PCT == 100.0
+
+
+# ── torque_tickers_setup: loading, refresh, fail-closed ─────────────────────
+def test_seed_tickers_in_list_order_with_the_four_reflex_symbols():
+    assert tc.tickers() == ["NDX", "SPX", "RUT", "SPY", "QQQ", "DJX", "IWM", "XLF", "XLE", "SMH"]
+    for t in ("IWM", "XLF", "XLE", "SMH"):
+        assert tc.yahoo_symbol(t) == t
+        assert tc.ticker_rule(t, "long_call")["offset"] == 0          # ATM single leg for signals
+
+
+def test_disabled_ticker_leaves_the_list_but_keeps_its_settings():
+    _with_row("SMH", enabled=False)
+    assert "SMH" not in tc.tickers()
+    assert "SMH" in tc.known_tickers()                                # open positions still resolve
+    assert tc.ticker_rule("SMH", "long_call")["tick"].at(5.0) == 0.05
+
+
+def test_sort_order_drives_the_list_and_the_default_ticker():
+    _with_row("SPY", sort_order=1)
+    assert tc.tickers()[0] == "SPY"
+
+
+def test_not_loaded_means_no_tickers():
+    tc._SETUP.clear()
+    tc._SETUP_STATE.update(loaded=False, loaded_at=0.0)
+    assert tc.tickers() == [] and tc.ticker_setup_loaded() is False
+
+
+def test_daily_range_columns_are_empty_until_filled():
+    assert tc.daily_range("SPY") == (None, None)
+    _with_row("SPY", daily_min_range=2.5, daily_max_range=9.0)
+    assert tc.daily_range("SPY") == (2.5, 9.0)
+
+
+async def test_refresh_applies_the_table_and_a_failed_read_keeps_the_last_good_copy(monkeypatch):
+    rows = [{"ticker": "spy", "sort_order": 1, "tick": 0.01, "yahoo_symbol": "SPY"}]
+
+    async def _ok():
+        return rows
+    from app import supabase_admin
+    monkeypatch.setattr(supabase_admin, "get_torque_ticker_setup", _ok)
+    assert await tc.refresh_ticker_setup() is True
+    assert tc.tickers() == ["SPY"] and tc.ticker_setup_loaded()
+
+    async def _down():
+        return None
+    monkeypatch.setattr(supabase_admin, "get_torque_ticker_setup", _down)
+    assert await tc.refresh_ticker_setup() is False
+    assert tc.tickers() == ["SPY"]                                    # last good copy kept
+
+    async def _boom():
+        raise RuntimeError("network")
+    monkeypatch.setattr(supabase_admin, "get_torque_ticker_setup", _boom)
+    assert await tc.refresh_ticker_setup() is False
+    assert tc.tickers() == ["SPY"]
+
+
+async def test_refresh_loop_picks_up_table_edits(monkeypatch):
+    from app import supabase_admin
+    versions = iter([[{"ticker": "SPY", "tick": 0.01}],
+                     [{"ticker": "SPY", "tick": 0.01}, {"ticker": "IWM", "tick": 0.01}]])
+    calls = []
+
+    async def _rows():
+        calls.append(1)
+        return next(versions)
+    monkeypatch.setattr(supabase_admin, "get_torque_ticker_setup", _rows)
+    real_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        if len(calls) >= 2:
+            raise asyncio.CancelledError
+        await real_sleep(0)
+    monkeypatch.setattr(tc.asyncio, "sleep", _fast_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await tc.ticker_setup_loop(60)
+    assert tc.tickers() == ["IWM", "SPY"]                              # equal sort_order → by ticker
+
+
+async def test_supabase_read_orders_by_sort_order(monkeypatch):
+    from app import supabase_admin
+    seen = {}
+
+    async def _sel(table, select="*", filters=None, order=None, **kw):
+        seen.update(table=table, order=order)
+        return []
+    monkeypatch.setattr(supabase_admin, "select_many", _sel)
+    assert await supabase_admin.get_torque_ticker_setup() == []
+    assert seen == {"table": "torque_tickers_setup", "order": "sort_order.asc,ticker.asc"}
+
+
+# ── price steps (tick) per ticker ────────────────────────────────────────────
+def test_penny_everywhere_tickers_step_a_cent_at_any_price():
+    for t in ("SPY", "QQQ", "IWM", "DJX"):
+        tick = tc.ticker_rule(t, "long_call")["tick"]
+        assert tick == 0.01 and tick.at(2.0) == 0.01 and tick.at(12.0) == 0.01
+
+
+def test_penny_pilot_tickers_step_up_at_three_dollars():
+    for t in ("XLF", "XLE", "SMH"):
+        tick = tc.ticker_rule(t, "long_call")["tick"]
+        assert tick.at(2.99) == 0.01 and tick.at(3.0) == 0.05 and tick.at(7.5) == 0.05
+
+
+def test_index_tickers_keep_their_nickel_step():
+    for t in ("NDX", "SPX", "RUT"):
+        assert tc.ticker_rule(t, "bull_call")["tick"] == 0.05
+
+
+def test_unconfigured_ticker_falls_back_to_the_base_step():
+    assert tc.tick_size("ZZZZ") == 0.05
+
+
+# ── engine rounding honours the price-aware step ────────────────────────────
+from app import torque_engine as teng   # noqa: E402
+
+
+def _valid(price, tick):
+    step = tick.at(price) if isinstance(tick, tc.TickSize) else tick
+    return abs(round(price / step) * step - price) < 1e-9
+
+
+@pytest.mark.parametrize("price", [0.07, 1.234, 2.37, 2.996, 3.0, 3.02, 3.37, 5.12, 11.98])
+def test_every_rounding_helper_lands_on_a_legal_increment(price):
+    tick = tc.tick_size("XLF")
+    for f in (teng.round_to_tick, teng._ceil_tick, teng._floor_tick):
+        out = f(price, tick)
+        assert _valid(out, tick), (f.__name__, price, out)
+
+
+def test_bracket_prices_crossing_three_dollars_are_all_legal():
+    """XLF bought at 2.80: the +30% target lands above $3 (nickel step) while
+    the stop stays below it (penny step) — each must be legal on its own side."""
+    tick = tc.tick_size("XLF")
+    target = teng.close_target_price(2.80, "debit", 30.0, tick)
+    trigger, limit = teng.stop_limit_leg_prices(2.80, "debit", 30.0, tick, 3)
+    assert target >= 3.0 and _valid(target, tick)
+    assert trigger < 3.0 and _valid(trigger, tick) and _valid(limit, tick) and limit < trigger
+
+
+def test_plain_float_ticks_behave_exactly_as_before():
+    assert teng.round_to_tick(3.37, 0.05) == 3.35 and teng.round_to_tick(3.37, 0.01) == 3.37
+    assert teng._ceil_tick(3.01, 0.05) == 3.05 and teng._floor_tick(3.09, 0.05) == 3.05

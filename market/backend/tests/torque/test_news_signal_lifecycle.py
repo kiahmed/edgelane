@@ -297,3 +297,53 @@ async def test_walk_stops_at_the_configured_cap(enabled, monkeypatch, _world):
     r = await news_signal(_payload(), FakeRequest(client))
     assert r["accepted"] is False and "after 1 later expiries" in r["results"][0]["reason"]
     assert len(_world.inserted) == 2                       # never tried the third expiry
+
+
+# ── Reflex engine_v2 symbols + next listed expiry ───────────────────────────
+def _penny_pilot_chain(spot, exp, root, premium):
+    return raw_chain(spot, step=1, span=10, exp=exp, root=root, price_fn=lambda k, s: premium)
+
+
+class WeeklyTradier(FakeTradier):
+    """A weekly-only name: expiries a week apart, no daily 0DTE."""
+    def __init__(self, exps, root, premium, spot, **kw):
+        super().__init__(spot=spot, exp=exps[0], raw=_penny_pilot_chain(spot, exps[0], root, premium), **kw)
+        self._exps, self._root, self._premium = list(exps), root, premium
+
+    async def option_expirations(self, symbol):
+        return list(self._exps)
+
+    async def options_chain(self, symbol, expiration, greeks=True):
+        return _penny_pilot_chain(self._spot, expiration, self._root, self._premium)
+
+
+def _legal(v):
+    v = float(v)
+    step = 0.05 if v >= 3.0 else 0.01
+    return abs(round(v / step) * step - v) < 1e-9
+
+
+@pytest.mark.parametrize("premium", [2.37, 4.12])
+async def test_xle_signal_trades_the_next_listed_expiry_with_legal_bracket_prices(
+        enabled, monkeypatch, _world, premium):
+    """XLE is now a configured ticker (it used to be dropped); with only weekly
+    expiries the entry uses the very next LISTED one, and every price in the
+    native bracket is a legal increment on its own side of $3."""
+    client = WeeklyTradier(["2030-01-04", "2030-01-11"], root="XLE", premium=premium, spot=90.0,
+                           place_responses=[{"order": {"id": 1, "status": "ok"}}])
+    _broker(monkeypatch, client, {"1": ("pending", None)})
+    r = await news_signal(_payload(symbol="XLE"), FakeRequest(client))
+    assert r["accepted"] is True and r["symbol"] == "XLE"
+    assert _world.inserted[0]["expiration"] == "2030-01-04"           # next listed, not "today"
+    entry = client.placed[0]
+    prices = [v for k, v in entry.items() if k.startswith(("price[", "stop["))]
+    assert prices and all(_legal(v) for v in prices), prices
+
+
+async def test_weekly_name_conflict_retries_on_the_following_listed_expiry(enabled, monkeypatch, _world):
+    client = WeeklyTradier(["2030-01-04", "2030-01-11"], root="SMH", premium=4.12, spot=280.0,
+                           place_responses=[{"order": {"id": n, "status": "ok"}} for n in (1, 2)])
+    _broker(monkeypatch, client, {"1": ("rejected", CONFLICT), "2": ("pending", None)})
+    r = await news_signal(_payload(symbol="SMH"), FakeRequest(client))
+    assert r["accepted"] is True
+    assert [row["expiration"] for row in _world.inserted] == ["2030-01-04", "2030-01-11"]

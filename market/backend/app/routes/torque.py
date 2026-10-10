@@ -442,6 +442,9 @@ async def torque_cfg():
     settings = get_settings()
     return {
         "tickers": tcfg.tickers(),
+        # False until public.torque_tickers_setup has been read once — an empty
+        # ticker list with this false means the database is unreachable.
+        "tickers_loaded": tcfg.ticker_setup_loaded(),
         "default_strategy": tcfg.default_strategy(),
         "strategies": tcfg.strategy_list(),
         "close_target_pct": tcfg.DEFAULT_CLOSE_TARGET_PCT,
@@ -458,6 +461,9 @@ async def torque_cfg():
         # mids being under it means the reading is 0DTE-close penny noise, not a
         # real richness signal, so the UI suppresses it (see Counter Read docs).
         "richness_floors": tcfg.richness_floors_map(),
+        # Per-ticker price step: {tick, tick_above_3} — tick_above_3 (when set)
+        # applies at prices >= $3 (penny pilot). Drives the page's price inputs.
+        "ticks": tcfg.ticks_map(),
         "env": settings.tradier_env,
         "mode": settings.tradier_mode,
         "devmode": bool(getattr(settings, "devmode", False)),
@@ -498,6 +504,26 @@ async def torque_analyze(symbol: str, request: Request):
     return result
 
 
+def _require_tradeable_ticker(symbol: str | None) -> str:
+    """Gate for anything that starts a NEW entry (build / price / place).
+
+    Every per-ticker safety rule — DJX's forced limit orders, mandatory
+    auto-close and 45% floor, its 50% stop default and penny step — now comes
+    from torque_tickers_setup. Without the setup loaded (or for a ticker with
+    no enabled row) those rules would silently fall back to permissive
+    defaults, so new entries are refused instead: 503 while the setup hasn't
+    loaded, 400 for a ticker that isn't configured. Exits, cancels and modifies
+    on existing positions don't go through here and keep working."""
+    if not tcfg.ticker_setup_loaded():
+        raise HTTPException(503, ("Torque's ticker setup hasn't loaded yet (database unreachable) — "
+                                  "new orders are refused until it does, so no ticker trades "
+                                  "without its own safety rules."))
+    sym = (symbol or "").upper()
+    if sym not in tcfg.tickers():
+        raise HTTPException(400, f"{sym or 'that symbol'} is not a configured Torque ticker")
+    return sym
+
+
 # ── build (auto-fill legs) ─────────────────────────────────────────────────
 class BuildRequest(BaseModel):
     symbol: str
@@ -508,6 +534,7 @@ class BuildRequest(BaseModel):
 
 @router.post("/torque/build", dependencies=_GATE)
 async def torque_build(req: BuildRequest, request: Request):
+    _require_tradeable_ticker(req.symbol)
     if req.strategy not in tcfg.STRATEGY_DEFS:
         raise HTTPException(400, f"unknown strategy {req.strategy!r}")
     client = _client(request)
@@ -519,7 +546,7 @@ async def torque_build(req: BuildRequest, request: Request):
     struct = teng.build_structure(anchor, contracts, req.symbol, req.strategy, req.adjustments)
     px_map = {c["symbol"]: c for c in contracts if c.get("symbol")}
     price = teng.price_structure(struct["legs"], px_map)
-    tick = float(struct["rule"].get("tick", 0.05))
+    tick = struct["rule"]["tick"]          # TickSize — keep it, never float() it
     # attach steppable grid neighbors per leg
     for lg in struct["legs"]:
         lg["grid"] = _grid_neighbors(contracts, lg["side"], lg["strike"])
@@ -546,6 +573,7 @@ async def torque_build(req: BuildRequest, request: Request):
         "symbol": req.symbol.upper(), "expiration": exp, "spot": spot,
         "strategy": req.strategy, "name": struct["name"], "type": struct["type"],
         "legs": struct["legs"], "price": price, "tick": tick,
+        "tick_above_3": getattr(tick, "above", None),
         "suggested_limit": teng.suggested_limit(price, tick),
         "missing_legs": missing,
         "counter": counter,
@@ -572,6 +600,7 @@ async def torque_price(req: PriceRequest, request: Request):
     sym = (req.symbol or _underlying_from_legs(req.legs))
     if not sym:
         raise HTTPException(400, "cannot determine underlying for pricing")
+    sym = _require_tradeable_ticker(sym)
     _, _, contracts = await _get_chain(client, sym)
     px = {c["symbol"]: c for c in contracts if c.get("symbol")}
     out = teng.price_structure(req.legs, px)
@@ -610,14 +639,15 @@ async def torque_price(req: PriceRequest, request: Request):
     # `tick` is a per-ticker property of the merged rule, identical across
     # strategies, so any strategy resolves it. Fall back if the name is unknown.
     try:
-        tick = float(tcfg.ticker_rule(sym, req.strategy or "long_call")["tick"])
+        tick = tcfg.ticker_rule(sym, req.strategy or "long_call")["tick"]
     except KeyError:
-        tick = float(tcfg.ticker_rule(sym, "long_call")["tick"])
+        tick = tcfg.ticker_rule(sym, "long_call")["tick"]
     fee = tcfg.fee_per_contract(sym)
     nlegs = len(req.legs)
     out["fee_per_contract"] = fee
     out["round_trip_fee"] = round(teng.round_trip_fee_price(fee, nlegs), 4)
     out["tick"] = tick
+    out["tick_above_3"] = getattr(tick, "above", None)
     if out.get("complete") and out.get("abs_mid"):
         kw = {"legs": nlegs, "fee_per_contract": fee}
         t = out["type"]
@@ -638,7 +668,7 @@ def _underlying_from_legs(legs: list[dict]) -> str | None:
         if m:
             root = m.group(1)
             # strip the weekly/PM suffix variants back to the base underlying
-            for base in tcfg.TICKERS:
+            for base in tcfg.known_tickers():
                 if root == base or root.startswith(base):
                     return base
             return root
@@ -810,6 +840,7 @@ async def torque_place(req: PlaceRequest, request: Request,
                        user: dict = Depends(get_current_user)):
     if not req.confirm and not req.dry_run:
         raise HTTPException(400, "place requires confirm=true (or dry_run=true to preview only)")
+    _require_tradeable_ticker(req.symbol)
     legs = req.legs
     if not legs or any(not l.get("symbol") for l in legs):
         raise HTTPException(400, "every leg needs a resolved symbol (call /torque/build first)")
@@ -823,6 +854,14 @@ async def torque_place(req: PlaceRequest, request: Request,
         raise HTTPException(400, (
             f"market orders are disabled for {req.symbol.upper()} — its book is too wide "
             f"(the ask can be ~2x the mid). Use a limit order so you see the fill price."))
+    if otype == "limit" and req.limit_price is not None:
+        # Snap a typed price to the ticker's legal increment AT that price
+        # (penny pilot: $0.01 below $3, $0.05 at/above) — the broker rejects an
+        # off-increment limit anyway. An already-legal price is unchanged.
+        snapped = teng.round_to_tick(float(req.limit_price),
+                                     tcfg.structure_tick(req.symbol, single=len(legs) == 1))
+        if snapped > 0:
+            req.limit_price = snapped
 
     # Auto-close target floor. A target below the package's OWN bid/ask width
     # prices the close order inside the spread, so it can never fill and the
@@ -878,7 +917,7 @@ async def torque_place(req: PlaceRequest, request: Request,
     _sdef = tcfg.STRATEGY_DEFS.get(req.strategy, {})
     _entry_type = (_sdef.get("type") or req.spread_type or "debit").lower()
     if req.auto_close and _entry_type == "credit" and req.limit_price:
-        _tick = float(tcfg.ticker_rule(req.symbol, req.strategy).get("tick", 0.05))
+        _tick = tcfg.ticker_rule(req.symbol, req.strategy)["tick"]
         ceil = teng.max_credit_pct(abs(float(req.limit_price)), _tick, **_fee_kw(req.symbol, legs))
         if req.close_target_pct > ceil:
             req.close_target_pct = ceil
@@ -902,7 +941,7 @@ async def torque_place(req: PlaceRequest, request: Request,
                 await client.close()
 
     try:
-        tick = float(tcfg.ticker_rule(req.symbol, req.strategy).get("tick", 0.05))
+        tick = tcfg.ticker_rule(req.symbol, req.strategy)["tick"]
         # Authoritative: a bull_call is a debit and a long fly is a debit
         # regardless of what a wide live bid/ask momentarily nets to — use the
         # declared type so the auto-close is built in the right direction.
@@ -1353,7 +1392,7 @@ async def _build_next_expiry(client, symbol: str, strategy: str, after_exp: str,
             return None
         price = teng.price_structure(struct["legs"], {c["symbol"]: c for c in contracts if c.get("symbol")})
         return {"expiration": cand, "legs": struct["legs"], "price": price,
-                "tick": float(struct["rule"].get("tick", 0.05))}
+                "tick": struct["rule"]["tick"]}
     return None
 
 
@@ -2180,6 +2219,9 @@ async def _watch_and_close(client, account_id, entry_id, w, *, is_single, legs,
                             "symbol": symbol.upper(), "entry_type": entry_type,
                             "entry_fill": float(entry_fill), "tick": tick,
                             "floor_pct": float(floor_pct), **_fee_kw(symbol, legs),
+                            # captured now, so an edit stays floor-checked even
+                            # if the ticker setup is later unavailable
+                            "spread_scaled": tcfg.close_target_spread_scaled(symbol),
                         }
                     break
                 w["close_reason"] = cwhy
@@ -2350,6 +2392,8 @@ class ModifyRequest(BaseModel):
     price: float
     duration: str | None = None
     account_id: str | None = None
+    symbol: str | None = None     # underlying — lets the new price snap to its legal step
+    order_class: str | None = None  # Tradier order class; "multileg" = a spread (base step)
 
 
 def _enforce_close_floor_on_modify(order_id: str, new_price: float) -> None:
@@ -2363,7 +2407,10 @@ def _enforce_close_floor_on_modify(order_id: str, new_price: float) -> None:
     through — we have no entry fill to measure against.
     """
     g = _CLOSE_GUARD.get(order_id)
-    if not g or not tcfg.close_target_spread_scaled(g["symbol"]):
+    if not g:
+        return
+    scaled = g["spread_scaled"] if "spread_scaled" in g else tcfg.close_target_spread_scaled(g["symbol"])
+    if not scaled:
         return
     floor_px = teng.close_target_price(g["entry_fill"], g["entry_type"],
                                        g["floor_pct"], g["tick"],
@@ -2390,15 +2437,29 @@ async def torque_modify(order_id: str, req: ModifyRequest, request: Request,
     the close down to 5% and get an order that can never fill."""
     broker, client, aid, per_user = await _resolve_torque_broker(request, user, req.account_id)
     await _require_tradier(broker, client, per_user, "modifying an order")
-    _enforce_close_floor_on_modify(str(order_id), float(req.price))
+    # Same snap as /torque/place: the ticker's legal increment at this price.
+    # Underlying from the page, else from Torque's own record of its closes.
+    price = float(req.price)
+    guard = _CLOSE_GUARD.get(str(order_id)) or {}
+    sym = (req.symbol or guard.get("symbol") or "").upper()
+    # Only snap with a step we actually know: the ticker's setup row, else the
+    # tick this close was placed with. Never a default — without the setup that
+    # would round a penny-quoted DJX 2.68 to 2.70.
+    step = (tcfg.structure_tick(sym, single=(req.order_class or "").lower() != "multileg")
+            if sym in tcfg.known_tickers() else guard.get("tick"))
+    if step:
+        snapped = teng.round_to_tick(price, step)
+        if snapped > 0:
+            price = snapped
+    _enforce_close_floor_on_modify(str(order_id), price)
     try:
         try:
-            resp = await client.modify_order(aid, order_id, price=req.price, duration=req.duration)
+            resp = await client.modify_order(aid, order_id, price=price, duration=req.duration)
         except Exception as e:
             raise HTTPException(502, f"modify failed: {e}")
-        txn("order modified", account=aid, order_id=order_id, price=req.price,
+        txn("order modified", account=aid, order_id=order_id, price=price,
             duration=req.duration, via="torque panel", user=user.get("id"))
-        return {"order_id": order_id, "result": resp}
+        return {"order_id": order_id, "price": price, "result": resp}
     finally:
         if per_user:
             await client.close()
@@ -2635,6 +2696,12 @@ async def resume_active_torque_watchers() -> int:
             continue
         _broker, client, account_id = resolved
         w = {**row, "per_user": True, "task": None}
+        # The persisted tick is a plain number; re-resolve the ticker's price-
+        # aware step so a resumed exit still rounds to a valid increment on
+        # either side of $3 (penny-pilot names).
+        sym = str(row.get("symbol") or "").upper()
+        if sym in tcfg.known_tickers():
+            w["tick"] = tcfg.structure_tick(sym, single=bool(row.get("is_single")))
         _WATCHERS[str(entry_order_id)] = w
         w["task"] = asyncio.create_task(_resume_watcher_from_row(client, account_id or row.get("account_id"), w))
         resumed += 1

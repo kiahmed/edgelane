@@ -297,6 +297,9 @@ class Settings(BaseModel):
     # Same-contract rejection: how many later expiries to walk (one at a time)
     # looking for one without a conflicting open bracket before giving up.
     news_signal_max_expiry_retries: int = Field(default=1)
+    # How often each backend container re-reads public.torque_tickers_setup (s).
+    # An edit in the table reaches every container within this window.
+    torque_tickers_refresh_sec: int = Field(default=60)
 
     # External GEX override (private GEX provider extension webhook)
     use_external_gex: bool = Field(default=True)         # prefer extension data over Tradier-OI walls when fresh
@@ -520,6 +523,8 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
         out["news_signal_max_age_sec"] = int(raw["NEWS_SIGNAL_MAX_AGE_SEC"])
     if "NEWS_SIGNAL_MAX_EXPIRY_RETRIES" in raw:
         out["news_signal_max_expiry_retries"] = int(raw["NEWS_SIGNAL_MAX_EXPIRY_RETRIES"])
+    if "TORQUE_TICKERS_REFRESH_SEC" in raw:
+        out["torque_tickers_refresh_sec"] = int(raw["TORQUE_TICKERS_REFRESH_SEC"])
 
     if "USE_EXTERNAL_GEX" in raw:
         out["use_external_gex"] = raw["USE_EXTERNAL_GEX"].strip().lower() in ("true", "1", "yes", "on")

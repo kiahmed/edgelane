@@ -37,7 +37,7 @@ DATA_VOLUME  = edgelane_edgelane-data
 DATA_DUMP    = deploy/edgelane-data.tar.gz
 
 .PHONY: help \
-        setup run run-dev run-prod run-bg stop logs clean \
+        setup db-setup run run-dev run-prod run-bg stop logs clean \
         diag status snapshot accuracy \
         test test-e2e test-all \
         webhook-debug webhook-post ext-version ext-policy \
@@ -72,6 +72,13 @@ setup: ## Idempotent: venv + pip (only if missing) + gcloud/GCP readiness check
 
 gcloud-setup: ## Just the gcloud/GCP readiness check (install + auth account + project + roles)
 	@bash ops/gcloud_bootstrap.sh
+
+# All database setup and updates in one step: applies every
+# supabase/migrations/*.sql in order (schemas, plus seeds such as Torque's
+# torque_tickers_setup). Idempotent — safe to re-run any time; seeds never
+# overwrite rows already edited in the table. ARGS=--dry-run lists only.
+db-setup: ## All DB setup + updates: apply every Supabase migration, incl. seeds (idempotent; ARGS=--dry-run)
+	@$(PY) tools/db_push.py $(ARGS)
 
 clean: ## Clear __pycache__ under the backend
 	@$(MAKE) -C $(BACKEND) clean

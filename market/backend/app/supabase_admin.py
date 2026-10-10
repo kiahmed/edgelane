@@ -460,6 +460,13 @@ async def get_recent_torque_orders(hours: int = 24) -> Optional[list[dict]]:
                              filters={"placed_at": f"gte.{cutoff}"})
 
 
+async def get_torque_ticker_setup() -> Optional[list[dict]]:
+    """Every row of public.torque_tickers_setup (Torque's per-ticker setup), in
+    list order. None = unknown (Supabase not configured or the read failed) —
+    the caller must keep its last good copy, never treat it as "no tickers"."""
+    return await select_many("torque_tickers_setup", order="sort_order.asc,ticker.asc")
+
+
 async def upsert_torque_watcher(row: dict) -> bool:
     """Checkpoint a watcher's current state (see docs/torque.md 'Multi-user
     order persistence'). Called at state TRANSITIONS, not every price tick —

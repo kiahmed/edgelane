@@ -125,6 +125,19 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             log.warning("  operator seed failed for uid=%s: %s", _uid, e)
 
+    # Torque's per-ticker setup (public.torque_tickers_setup) — loaded before
+    # anything quotes or trades (Simmer's spot-quote symbols come from it too),
+    # then refreshed in the background so every container picks up table edits
+    # without a restart. Fails closed: no setup, no Torque tickers.
+    if await tcfg.refresh_ticker_setup():
+        txn("torque ticker setup loaded", tickers=",".join(tcfg.tickers()))
+    else:
+        log.warning("  torque ticker setup unavailable — Torque has no tickers until it loads")
+    ticker_setup_task = asyncio.create_task(
+        tcfg.ticker_setup_loop(settings.torque_tickers_refresh_sec),
+        name="edgelane.torque_ticker_setup",
+    )
+
     # Resume any Torque watcher that was still in-flight when this process
     # last stopped (see docs/torque.md "Multi-user order persistence"). Named
     # late-bound reference to routes.torque — that module is imported further
@@ -167,9 +180,9 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         log.info("EdgeLane MARKET shutting down")
-        for t in (poll_task, eval_task, simmer_task):
+        for t in (poll_task, eval_task, simmer_task, ticker_setup_task):
             t.cancel()
-        for t in (poll_task, eval_task, simmer_task):
+        for t in (poll_task, eval_task, simmer_task, ticker_setup_task):
             try:
                 await t
             except (asyncio.CancelledError, Exception):
