@@ -20,6 +20,7 @@ from __future__ import annotations
 import html as _html
 import logging
 import re
+import textwrap
 import uuid
 from pathlib import PurePosixPath
 
@@ -43,7 +44,7 @@ _ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg",
 # one-line code change (see supabase/migrations/0012_contact_ticket_product.sql).
 # An unrecognised or absent value becomes "unknown" instead of raising: a support
 # ticket must never be lost over a metadata field the user didn't fill in.
-_PRODUCTS = {"matrix": "Matrix", "simmer": "Simmer", "torque": "Torque"}
+_PRODUCTS = {"matrix": "Matrix", "simmer": "Simmer", "torque": "Torque", "reflex": "REFLEX"}
 _UNKNOWN_PRODUCT = "unknown"
 
 
@@ -57,6 +58,22 @@ def _normalise_product(raw: str | None) -> tuple[str, str]:
     if key and key != _UNKNOWN_PRODUCT:
         log.warning("[contact] unrecognised product %r — filing as %s", key, _UNKNOWN_PRODUCT)
     return _UNKNOWN_PRODUCT, "unidentified product"
+
+
+# A leading greeting, optionally with a short address ("Hi team,", "Good morning -").
+_GREETING = re.compile(r"^(hi|hello|hey|dear|good (morning|afternoon|evening))\b(?:[^,.!?:\-\n]{0,25}[,.!:\-]+)?\s*", re.I)
+
+
+def _auto_subject(message: str, name: str, product_key: str) -> str:
+    """Subject summarised from the message itself - no LLM: the first sentence,
+    minus a leading greeting, shortened at a word boundary, then the product tag,
+    e.g. "Alerts didn't arrive after the 8:30 release [REFLEX]"."""
+    text = _GREETING.sub("", " ".join((message or "").split()))
+    first = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0].strip(" .") if text else ""
+    if not re.search(r"\w", first):
+        first = ""
+    summary = textwrap.shorten(first, width=70, placeholder="…") if first else f"Message from {name}"
+    return f"{summary[:1].upper()}{summary[1:]} [{product_key.upper()}]"
 
 
 def _safe_name(name: str) -> str:
@@ -163,7 +180,10 @@ async def submit_contact(
         settings.support_email,
         # Prefix kept verbatim so any existing support-inbox filter on
         # "[EdgeLane contact" keeps matching; the product is appended, not swapped in.
-        subject=f"[EdgeLane contact · {product_label}] {name}",
+        # Reflex: subject summarised from the message + [REFLEX] tag. Others keep
+        # the "[EdgeLane contact" prefix their inbox filters match.
+        subject=(_auto_subject(message, name, product_key) if product_key == "reflex"
+                 else f"[EdgeLane contact · {product_label}] {name}"),
         html=_ticket_email_html(name, email, message, att_name, user_id, product_label),
         reply_to=email,
         attachment=att_for_email,
