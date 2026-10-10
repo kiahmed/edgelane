@@ -233,28 +233,27 @@ class AuthStore {
 		}, ENTITLEMENT_RETRY_MS);
 	}
 
-	async signIn(email: string, password: string): Promise<string | null> {
+	async signIn(email: string, password: string, turnstileToken?: string): Promise<string | null> {
 		try {
-			const res = await postJSON<{ session: AuthSession }>('/auth/login', {
-				email,
-				password,
-				product: PRODUCT
-			});
+			const body: Record<string, string> = { email, password, product: PRODUCT };
+			if (turnstileToken) body.turnstile_token = turnstileToken;
+			const res = await postJSON<{ session: AuthSession }>('/auth/login', body);
 			this.setSession(res.session);
 			this.productDenied = false;
 			this.toolsEnabled = null;
 			void this.loadEntitlements();
 			return null;
 		} catch (e) {
-			// 403 = backend refused: the account lacks the 'simmer' tool and NO
-			// session was issued. Show ProductGate (via productDenied), not an
-			// inline auth error.
-			if (e instanceof ApiError && e.status === 403) {
+			const msg = errorMessage(e);
+			// 403 is overloaded: an ENTITLEMENT refusal (account lacks the 'simmer'
+			// tool → ProductGate, no session) vs a Turnstile "human verification
+			// failed" (an inline error — the user just needs to re-solve it). Only
+			// the entitlement message flips to ProductGate.
+			if (e instanceof ApiError && e.status === 403 && /enabled for this account/i.test(msg)) {
 				this.pendingEmail = email;
 				this.productDenied = true;
 				return null;
 			}
-			const msg = errorMessage(e);
 			// Surface unconfirmed-email as a resend opportunity, like Matrix.
 			if (/confirm/i.test(msg)) this.pendingEmail = email;
 			return msg;
@@ -264,13 +263,16 @@ class AuthStore {
 	/** Returns { error } or { needsConfirmation } */
 	async signUp(
 		email: string,
-		password: string
+		password: string,
+		turnstileToken?: string
 	): Promise<{ error?: string; needsConfirmation?: boolean }> {
 		try {
+			const body: Record<string, string> = { email, password, product: PRODUCT };
+			if (turnstileToken) body.turnstile_token = turnstileToken;
 			const res = await postJSON<{
 				session?: AuthSession | null;
 				confirmation_required?: boolean;
-			}>('/auth/signup', { email, password, product: PRODUCT });
+			}>('/auth/signup', body);
 			if (res.confirmation_required || !res.session) {
 				this.pendingEmail = email;
 				return { needsConfirmation: true };

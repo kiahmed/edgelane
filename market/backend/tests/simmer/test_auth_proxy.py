@@ -74,6 +74,59 @@ def test_refresh_rotates(gotrue, monkeypatch):
     assert calls[0][2] == {"grant_type": "refresh_token"}
 
 
+# ── Turnstile human-check (signup/login) ────────────────────────────────────
+@pytest.fixture
+def turnstile_on(monkeypatch):
+    """Configure a Turnstile secret so the gate turns on, and stub the Cloudflare
+    verify so no network is hit. `verdict['ok']` flips pass/fail."""
+    from app import config
+    s = config.Settings()
+    object.__setattr__(s, "turnstile_secret", "tsk")
+    monkeypatch.setattr(config, "_cached", s)
+    verdict = {"ok": True}
+
+    async def _verify(token, ip=None):
+        verdict["seen"] = token
+        return verdict["ok"]
+
+    monkeypatch.setattr(auth_proxy.session_auth, "verify_turnstile", _verify)
+    return verdict
+
+
+def test_login_400_when_turnstile_token_missing(gotrue, monkeypatch, turnstile_on):
+    calls, install = gotrue
+    monkeypatch.setattr(auth_proxy, "_post", install(200, _SESSION))
+    r = _client(None).post("/auth/login", json={"email": "a@b.co", "password": "secret1"})
+    assert r.status_code == 400
+    assert calls == []                      # never reached GoTrue
+
+
+def test_login_403_when_turnstile_fails(gotrue, monkeypatch, turnstile_on):
+    calls, install = gotrue
+    turnstile_on["ok"] = False
+    monkeypatch.setattr(auth_proxy, "_post", install(200, _SESSION))
+    r = _client(None).post("/auth/login",
+                           json={"email": "a@b.co", "password": "secret1", "turnstile_token": "x"})
+    assert r.status_code == 403
+    assert calls == []
+
+
+def test_login_ok_when_turnstile_passes(gotrue, monkeypatch, turnstile_on):
+    calls, install = gotrue
+    monkeypatch.setattr(auth_proxy, "_post", install(200, _SESSION))
+    r = _client(None).post("/auth/login",
+                           json={"email": "a@b.co", "password": "secret1", "turnstile_token": "good"})
+    assert r.status_code == 200 and r.json()["session"]["access_token"] == "jwt.x.y"
+    assert turnstile_on["seen"] == "good"
+
+
+def test_signup_requires_turnstile_too(gotrue, monkeypatch, turnstile_on):
+    calls, install = gotrue
+    monkeypatch.setattr(auth_proxy, "_post", install(200, {"id": "u-1"}))
+    r = _client(None).post("/auth/signup", json={"email": "a@b.co", "password": "secret1"})
+    assert r.status_code == 400
+
+
 def test_logout_always_200_even_unconfigured():
     r = _client(None).post("/auth/logout", json={"refresh_token": "x" * 12})
     assert r.status_code == 200 and r.json() == {"ok": True}

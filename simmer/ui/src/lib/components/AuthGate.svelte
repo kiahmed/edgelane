@@ -2,11 +2,16 @@
 	// Sign-in/sign-up gate — visual port of Matrix's gate-mask/gate-card
 	// (signin/signup tabs, resend confirmation, dev-bypass notice). Email/
 	// password against the backend's /auth/* proxy endpoints — the browser
-	// never talks to Supabase. Turnstile and the SSO ticket flow are
-	// deliberately absent in Simmer v1 (auth required or dev-bypass).
+	// never talks to Supabase. When a Turnstile site key is baked into the
+	// deploy (__EDGELANE_TURNSTILE_SITE_KEY__), a Cloudflare human-check widget
+	// gates both signup and sign-in; with no key (dev-bypass) it's absent.
+	import { onMount } from 'svelte';
 	import { asset } from '$app/paths';
 	import GateFooter from './GateFooter.svelte';
 	import { auth } from '$lib/stores/auth.svelte';
+	import { readGlobals } from '$lib/config';
+
+	const siteKey = readGlobals().turnstileSiteKey;
 
 	let email = $state('');
 	let password = $state('');
@@ -14,6 +19,50 @@
 	let error = $state('');
 	let notice = $state('');
 	let showResend = $state(false);
+
+	// Turnstile widget state. The token is single-use — reset the widget after
+	// every attempt so the next submit carries a fresh one.
+	let turnstileToken = $state('');
+	let widgetEl = $state<HTMLDivElement>();
+	let widgetId: string | undefined;
+
+	onMount(() => {
+		if (!siteKey) return;
+		const w = window as unknown as { turnstile?: any };
+		const render = () => {
+			if (!w.turnstile || !widgetEl || widgetId !== undefined) return;
+			widgetId = w.turnstile.render(widgetEl, {
+				sitekey: siteKey,
+				callback: (t: string) => (turnstileToken = t),
+				'expired-callback': () => (turnstileToken = ''),
+				'error-callback': () => (turnstileToken = '')
+			});
+		};
+		if (w.turnstile) return render();
+		const SCRIPT_ID = 'cf-turnstile-script';
+		if (!document.getElementById(SCRIPT_ID)) {
+			const s = document.createElement('script');
+			s.id = SCRIPT_ID;
+			s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+			s.async = true;
+			s.defer = true;
+			s.onload = render;
+			document.head.appendChild(s);
+		} else {
+			const poll = setInterval(() => {
+				if (w.turnstile) {
+					clearInterval(poll);
+					render();
+				}
+			}, 100);
+		}
+	});
+
+	function resetTurnstile() {
+		turnstileToken = '';
+		const w = window as unknown as { turnstile?: any };
+		if (w.turnstile && widgetId !== undefined) w.turnstile.reset(widgetId);
+	}
 
 	function setMode(mode: 'signin' | 'signup') {
 		auth.mode = mode;
@@ -25,19 +74,23 @@
 	async function submit(e: SubmitEvent) {
 		e.preventDefault();
 		if (busy) return;
+		if (siteKey && !turnstileToken) {
+			error = 'Please complete the human check.';
+			return;
+		}
 		busy = true;
 		error = '';
 		notice = '';
 		try {
 			if (auth.mode === 'signup') {
-				const res = await auth.signUp(email.trim(), password);
+				const res = await auth.signUp(email.trim(), password, turnstileToken);
 				if (res.error) error = res.error;
 				else if (res.needsConfirmation) {
 					notice = 'Check your inbox — a confirmation link is on its way.';
 					showResend = true;
 				}
 			} else {
-				const err = await auth.signIn(email.trim(), password);
+				const err = await auth.signIn(email.trim(), password, turnstileToken);
 				if (err) {
 					error = err;
 					showResend = /confirm/i.test(err);
@@ -45,6 +98,9 @@
 			}
 		} finally {
 			busy = false;
+			// Token is consumed by the backend (or invalid on error) — always
+			// re-arm so a retry from this still-mounted gate has a fresh one.
+			if (siteKey) resetTurnstile();
 		}
 	}
 
@@ -109,6 +165,10 @@
 				bind:value={password}
 			/>
 
+			{#if siteKey}
+				<div class="mt-3" bind:this={widgetEl}></div>
+			{/if}
+
 			<div class="min-h-[1.25rem] pt-2 text-sm text-rose-400">{error}</div>
 			<div class="min-h-[1.25rem] text-sm text-emerald-300">{notice}</div>
 			{#if showResend}
@@ -120,7 +180,7 @@
 				</div>
 			{/if}
 
-			<button class="gate-btn mt-2" type="submit" disabled={busy}>
+			<button class="gate-btn mt-2" type="submit" disabled={busy || (!!siteKey && !turnstileToken)}>
 				{busy
 					? auth.mode === 'signup'
 						? 'Creating…'

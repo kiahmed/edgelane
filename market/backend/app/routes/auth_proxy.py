@@ -28,7 +28,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
 from ..config import get_settings
-from .. import supabase_admin
+from .. import session_auth, supabase_admin
 
 log = logging.getLogger("edgelane.market.authproxy")
 router = APIRouter()
@@ -126,6 +126,10 @@ class Credentials(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=6, max_length=200)
     product: str = Field(default=_DEFAULT_PRODUCT, max_length=32)
+    # Cloudflare Turnstile token (signup/login only). Verified server-side before
+    # we touch GoTrue — but ONLY when turnstile_secret is configured, so dev and
+    # tests (no secret) are unaffected.
+    turnstile_token: str | None = Field(default=None, max_length=4096)
 
     @field_validator("email")
     @classmethod
@@ -196,8 +200,23 @@ async def _enforce_product(sess: dict, product: str) -> None:
     raise HTTPException(403, f"{name} isn't enabled for this account. Contact the operator.")
 
 
+async def _require_turnstile(token: str | None, request: Request) -> None:
+    """Gate a human-entry endpoint (signup/login) on a valid Cloudflare Turnstile
+    token. No-op when turnstile_secret is unset (dev/tests), so the check only
+    turns on where it's configured. 400 when the token is missing, 403 when
+    Cloudflare rejects it — checked BEFORE we touch GoTrue, so bots never reach
+    the credential path."""
+    if not getattr(get_settings(), "turnstile_secret", ""):
+        return
+    if not token:
+        raise HTTPException(400, "human verification required")
+    if not await session_auth.verify_turnstile(token, _client_ip(request)):
+        raise HTTPException(403, "human verification failed")
+
+
 @router.post("/auth/signup")
 async def signup(body: Credentials, request: Request):
+    await _require_turnstile(body.turnstile_token, request)
     # Stamp the product onto the GoTrue user's metadata; migration 0013's
     # handle_new_user() reads signup_product to seed tools_enabled at insert.
     data = await _post("/signup",
@@ -211,6 +230,7 @@ async def signup(body: Credentials, request: Request):
 
 @router.post("/auth/login")
 async def login(body: Credentials, request: Request):
+    await _require_turnstile(body.turnstile_token, request)
     data = await _post("/token", {"email": body.email, "password": body.password},
                        params={"grant_type": "password"},
                        client_ip=_client_ip(request))
