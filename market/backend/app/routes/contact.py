@@ -66,14 +66,16 @@ _GREETING = re.compile(r"^(hi|hello|hey|dear|good (morning|afternoon|evening))\b
 
 def _auto_subject(message: str, name: str, product_key: str) -> str:
     """Subject summarised from the message itself - no LLM: the first sentence,
-    minus a leading greeting, shortened at a word boundary, then the product tag,
+    minus a leading greeting, shortened at a word boundary, then the product tag
+    ([MATRIX] / [SIMMER] / [TORQUE] / [REFLEX]; [FACADES] when unidentified),
     e.g. "Alerts didn't arrive after the 8:30 release [REFLEX]"."""
     text = _GREETING.sub("", " ".join((message or "").split()))
     first = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0].strip(" .") if text else ""
     if not re.search(r"\w", first):
         first = ""
     summary = textwrap.shorten(first, width=70, placeholder="…") if first else f"Message from {name}"
-    return f"{summary[:1].upper()}{summary[1:]} [{product_key.upper()}]"
+    tag = product_key.upper() if product_key in _PRODUCTS else "FACADES"
+    return f"{summary[:1].upper()}{summary[1:]} [{tag}]"
 
 
 def _safe_name(name: str) -> str:
@@ -178,12 +180,8 @@ async def submit_contact(
     # ── notify support (best-effort; never fails the request) ──────────────────
     sent = await emailer.send_email(
         settings.support_email,
-        # Prefix kept verbatim so any existing support-inbox filter on
-        # "[EdgeLane contact" keeps matching; the product is appended, not swapped in.
-        # Reflex: subject summarised from the message + [REFLEX] tag. Others keep
-        # the "[EdgeLane contact" prefix their inbox filters match.
-        subject=(_auto_subject(message, name, product_key) if product_key == "reflex"
-                 else f"[EdgeLane contact · {product_label}] {name}"),
+        # Every product: subject summarised from the message + product tag.
+        subject=_auto_subject(message, name, product_key),
         html=_ticket_email_html(name, email, message, att_name, user_id, product_label),
         reply_to=email,
         attachment=att_for_email,
