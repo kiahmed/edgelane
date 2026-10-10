@@ -42,7 +42,7 @@ DATA_DUMP    = deploy/edgelane-data.tar.gz
         test test-e2e test-all \
         webhook-debug webhook-post ext-version ext-policy \
         ui \
-        frontend-setup deploy-be deploy-fe deploy-prod deploy-dry \
+        frontend-setup deploy-be deploy-market_matrix deploy-prod deploy-dry \
         deploy-down deploy-be-down deploy-be-restart deploy-prune deploy-builder \
         db-push db-push-dry torque-test-signal torque-test-cancel \
         deploy-data-dump deploy-data-restore \
@@ -150,7 +150,7 @@ frontend-setup: ## One-time: create/link the Matrix + Simmer Vercel projects + E
 deploy-be: deploy-builder ## Backend → Docker container + tunnel (DEPLOY=local_container)
 	@BUILDX_BUILDER=$(BUILDER) $(DEPLOY_SH) -b --target $(DEPLOY) $(ARGS)
 
-deploy-fe: ## Market UI → Vercel (CLEAN=1 to wipe first)
+deploy-market_matrix: ## Matrix UI (market/ui, the original EdgeLane "market" frontend) → Vercel (CLEAN=1 to wipe first)
 	@$(DEPLOY_SH) -f $(CLEAN_FLAG) $(ARGS)
 
 deploy-prod: deploy-builder ## Backend + frontend together (pushes Supabase migrations first; CLEAN=1 to wipe first)

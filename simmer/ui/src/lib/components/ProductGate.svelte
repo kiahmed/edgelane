@@ -6,6 +6,7 @@
 	import { asset } from '$app/paths';
 	import { auth } from '$lib/stores/auth.svelte';
 	import ContactModal from './ContactModal.svelte';
+	import GateFooter from './GateFooter.svelte';
 
 	// This screen is the likeliest place someone needs support — they are signed
 	// in and stuck — so "contact the operator" has to actually do something.
@@ -41,6 +42,7 @@
 		<button class="gate-btn mt-6" type="button" onclick={() => auth.signOut()}>
 			Sign in with a different account
 		</button>
+		<GateFooter />
 	</div>
 </div>
 

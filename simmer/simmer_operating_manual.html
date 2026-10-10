@@ -678,7 +678,7 @@
         <code>make deploy-be</code> (full rebuild) or <code>make deploy-be-restart</code>
         (rebuilds &amp; recreates only the backend container — tunnel untouched). A config-only change just
         needs a restart (the file is bind-mounted).</li>
-      <li><strong>Matrix UI changed</strong> → <code>make deploy-fe</code> (also re-syncs Supabase
+      <li><strong>Matrix UI changed</strong> → <code>make deploy-market_matrix</code> (also re-syncs Supabase
         <code>site_url</code> + redirect allow-list).</li>
       <li><strong>Simmer UI changed</strong> → <code>make deploy-simmer</code> (npm ci + build can take &gt; 2 min).</li>
       <li><strong>Always finish</strong> → <code>make check-tunnel</code> — container health, tunnel
@@ -715,7 +715,7 @@
       <tr><td>After a restart, neither UI can reach the backend</td>
           <td>The hostname is permanent, so this is the connector, not a rotation. Check <code>docker compose … logs edgelane-cloudflared</code> for a registered connector and that the tunnel still routes <code>edge.facades.trade</code> → <code>http://edgelane-backend:8789</code>.</td></tr>
       <tr><td>Simmer email confirmation / reset link rejected on redirect</td>
-          <td>The Simmer origin isn't in Supabase <code>uri_allow_list</code>. Run <code>make frontend-setup</code> or <code>make deploy-fe</code>.</td></tr>
+          <td>The Simmer origin isn't in Supabase <code>uri_allow_list</code>. Run <code>make frontend-setup</code> or <code>make deploy-market_matrix</code>.</td></tr>
     </table>
     <p class="small muted" style="margin-top:24px">Source of truth for the engine: <code>market/backend/app/simmer_engine.py</code>,
     <code>simmer_config.py</code>, <code>simmer_calendar.py</code>; UI: <code>simmer/ui/src/lib/</code>.

@@ -93,7 +93,7 @@ Project **edgelane** (ref `wfezpfswpywsmbnjrbri`, org Solution Jet) — not shar
 with RelativeQs. Migrations live in `supabase/migrations/*.sql` and are applied
 idempotently with **`make db-push`** (`make db-push-dry` to preview). A full
 `make deploy-prod` runs the push automatically first (`--skip-db` to opt out);
-`deploy-be`/`deploy-fe` never touch the DB. Needs `SUPABASE_PROJECT_REF` +
+`deploy-be`/`deploy-market_matrix` never touch the DB. Needs `SUPABASE_PROJECT_REF` +
 `SUPABASE_ACCESS_TOKEN` in `deploy/.env`.
 
 ### Broker token encryption at rest (migration `0004`)

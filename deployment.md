@@ -56,14 +56,14 @@ between a one-command deploy and chasing a change that never went live:
 | Deployable | Source | Served from | Shipped by |
 |---|---|---|---|
 | **Market backend API + Torque page** | `market/backend/` (`app/` + `ui/torque.html`) | **Docker container** (FastAPI, behind a Cloudflare tunnel) | `make deploy-be` / `make deploy-be-restart` |
-| **Matrix UI** | `market/ui/index.html` | **Vercel** (`matrix.facades.trade`) | `make deploy-fe` |
+| **Matrix UI** | `market/ui/index.html` | **Vercel** (`matrix.facades.trade`) | `make deploy-market_matrix` |
 | **Simmer UI** | `simmer/ui/` | **Vercel** (`simmer.facades.trade`) | `make deploy-simmer` |
 
 > ⚠️ **Torque is part of the backend, not Vercel.** `market/backend/ui/torque.html`
 > is `COPY`-baked into the backend Docker image (`Dockerfile`: `COPY ui ./ui`) and
 > served by FastAPI at `GET /torque`. So a Torque UI change ships with
-> **`make deploy-be-restart`** (which rebuilds the image), **not** `make deploy-fe`.
-> `deploy-fe` only pushes `market/ui/index.html` to Vercel. See
+> **`make deploy-be-restart`** (which rebuilds the image), **not** `make deploy-market_matrix`.
+> `deploy-market_matrix` only pushes `market/ui/index.html` to Vercel. See
 > [Production deployment](#production-deployment) for the full serving model.
 
 ---
@@ -134,7 +134,7 @@ same trade pick, and no LLM is in the decision path. Torque itself does
 | File | Role | Commit? |
 |---|---|---|
 | `deploy.sh` | Orchestrator (frontend Vercel + backend Docker/tunnel). | ✓ |
-| `Makefile` (repo root) | `deploy-be` / `deploy-fe` / `deploy-be-restart` / `doctor` / … targets. | ✓ |
+| `Makefile` (repo root) | `deploy-be` / `deploy-market_matrix` / `deploy-be-restart` / `doctor` / … targets. | ✓ |
 | `deploy/docker-compose.yml` | Backend + cloudflared quick-tunnel/publisher sidecar. | ✓ |
 | `market/backend/Dockerfile` | Backend image (`COPY app` + `COPY ui`; serves API + Torque). | ✓ |
 | `market/backend/.dockerignore` | Keeps secrets/tests out of the build context. | ✓ |
@@ -385,7 +385,7 @@ v4.7.56+ handles the NDX/NDXP/SPX/SPXW family. If you see this on a non-index ti
 The browser auto-retries with exponential backoff. If you hit the limit repeatedly, you're probably running tests + UI clicks against the same token in parallel — Tradier sandbox is especially strict. Switch to production or space the calls out.
 
 ### Torque UI change didn't show up after deploy
-You almost certainly ran `deploy-fe` (Vercel) instead of `deploy-be-restart`. Torque
+You almost certainly ran `deploy-market_matrix` (Vercel) instead of `deploy-be-restart`. Torque
 is served by the **backend** image — rebuild it: `make deploy-be-restart`. In the
 container the HTML is baked at build time, so a plain browser reload won't pull it
 until the image is rebuilt.
@@ -417,7 +417,7 @@ exactly what `deploy-be-restart` does.
 |---|---|---|
 | `market/backend/ui/torque.html` (Torque UI) | **`make deploy-be-restart`** | HTML is baked into the backend image |
 | `market/backend/app/**` (API, guardrails, engine) | **`make deploy-be-restart`** | Python is baked into the backend image |
-| `market/ui/index.html` (Matrix) | **`make deploy-fe`** | that file goes to Vercel |
+| `market/ui/index.html` (Matrix) | **`make deploy-market_matrix`** | that file goes to Vercel |
 | `simmer/ui/**` (Simmer) | **`make deploy-simmer`** | separate Vercel project |
 | both backend + dashboard | `make deploy-prod` | backend first, then Vercel |
 
@@ -433,7 +433,7 @@ exactly what `deploy-be-restart` does.
 make doctor        # list ONLY missing build/deploy prerequisites (run this first)
 make vercel-setup  # install Vercel CLI on Ubuntu (+ Node) and log in (browser)
 make deploy-be     # backend → Docker container + Cloudflare tunnel (DEPLOY=local_container)
-make deploy-fe     # market UI → Vercel
+make deploy-market_matrix     # Matrix (market) UI → Vercel
 make deploy-prod   # both, backend first (+ db-push first)
 make deploy-dry    # dry-run everything (prints commands, runs nothing)
 
@@ -503,7 +503,7 @@ it. Advisories like the `AUTH_ENABLED`/`DEVMODE` warnings don't fail it.
    Networks → Tunnels → Create tunnel), add public hostname `edge.facades.trade`
    → `http://edgelane-backend:8789`, and put the connector token in `deploy/.env`
    as `CF_TUNNEL_TOKEN`. The DNS record is created for you.
-3. **Vercel** — `npm i -g vercel && vercel login`. First `deploy-fe` links the
+3. **Vercel** — `npm i -g vercel && vercel login`. First `deploy-market_matrix` links the
    repo to the `edgelane-matrix` Vercel project. Set
    `EDGELANE_API_BASE=https://edge.facades.trade` in `deploy/.env`.
 
@@ -632,7 +632,7 @@ redeployed with a baked base — an older deployed build still reads its pointer
 
 **If you ever change the hostname:** update the tunnel's public hostname in
 Cloudflare, set the new `EDGELANE_API_BASE` in `deploy/.env`, then redeploy **both**
-frontends (`make deploy-fe` + `make deploy-simmer`). There is no runtime fallback to
+frontends (`make deploy-market_matrix` + `make deploy-simmer`). There is no runtime fallback to
 catch a mismatch — `deploy.sh` fails fast on a blank base, but it cannot know a
 non-blank one is wrong.
 
@@ -658,7 +658,7 @@ make run-prod         # production (real money)
 # ─── ship to production (from repo root) ───
 make doctor                                # prerequisites check
 make deploy-be-restart                     # backend + Torque UI (image rebuild)
-make deploy-fe                             # Matrix → Vercel
+make deploy-market_matrix                             # Matrix → Vercel
 make deploy-simmer                         # Simmer → Vercel
 make deploy-prod                           # backend + Matrix, backend first
 make check-tunnel                          # end-to-end health via edge.facades.trade

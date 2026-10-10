@@ -10,7 +10,7 @@
 #
 # Run `./deploy.sh --help` for usage. Normally invoked via the Makefile:
 #   make deploy-be      backend only   (DEPLOY=local_container)
-#   make deploy-fe      frontend only  (Vercel)
+#   make deploy-market_matrix      frontend only  (Vercel)
 #   make deploy-prod    both
 
 set -euo pipefail
@@ -340,7 +340,7 @@ frontend_setup() {
   info "2/2  Supabase Auth redirect allow-list (Matrix + Simmer origins)"
   _sync_auth_allow_list
 
-  ok "frontend setup complete. Now: make deploy-fe  and  make deploy-simmer"
+  ok "frontend setup complete. Now: make deploy-market_matrix  and  make deploy-simmer"
 }
 
 # Redirect patterns for the facades.trade product subdomains, as a comma-prefixed

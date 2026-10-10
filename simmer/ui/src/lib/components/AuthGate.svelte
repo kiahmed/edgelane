@@ -5,6 +5,7 @@
 	// never talks to Supabase. Turnstile and the SSO ticket flow are
 	// deliberately absent in Simmer v1 (auth required or dev-bypass).
 	import { asset } from '$app/paths';
+	import GateFooter from './GateFooter.svelte';
 	import { auth } from '$lib/stores/auth.svelte';
 
 	let email = $state('');
@@ -140,5 +141,6 @@
 				{auth.mode === 'signup' ? 'Sign in' : 'Create one'}
 			</button>
 		</p>
+		<GateFooter />
 	</div>
 </div>

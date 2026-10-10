@@ -194,6 +194,12 @@
     #productGateMask { background: #07090d; }
     /* The contact modal opens FROM the product gate, so it must sit above it. */
     .modal-mask.over-gate { z-index: 80; }
+    /* About · Contact inside the sign-in / access cards. The page footer sits
+       under the gate overlay (and scroll is locked while it's up), so without
+       this a visitor who hasn't signed in can't reach either. */
+    .gate-footer { display:flex; align-items:center; justify-content:center; gap:.4rem;
+                   margin-top:1.25rem; padding-top:.9rem; border-top:1px solid rgba(51,65,85,.6);
+                   font-size:11px; color:#64748b; }
     .gate-link { color:#34d399; text-decoration: underline; cursor:pointer; background:none; border:none; padding:0; font: inherit; }
     .gate-card { width: min(440px, calc(100vw - 2rem)); position: relative;
                  margin-top: 12vh; pointer-events: auto;
@@ -659,6 +665,11 @@
     <p id="pgBody" class="mt-1.5 text-sm leading-relaxed text-slate-400"></p>
     <button id="pgRetry" type="button" class="gate-btn mt-5 hidden">Try again</button>
     <button id="pgSignOut" type="button" class="gate-btn mt-5">Sign in with a different account</button>
+    <div class="gate-footer">
+      <span>© Facades Matrix</span><span class="text-slate-700">·</span>
+      <button type="button" class="footer-link" data-open-over-gate="aboutModal">About</button><span class="text-slate-700">·</span>
+      <button type="button" class="footer-link" data-open-over-gate="contactModal">Contact</button>
+    </div>
   </div>
 </div>
 
@@ -716,6 +727,11 @@
 
     <div id="gateConfigWarn" class="hidden mt-4 text-[11px] text-amber-400/90 border border-amber-500/30 rounded-lg p-2 leading-snug">
       Auth is not configured yet (no Supabase keys). Running in local dev-bypass mode — the full dashboard is open.
+    </div>
+    <div class="gate-footer">
+      <span>© Facades Matrix</span><span class="text-slate-700">·</span>
+      <button type="button" class="footer-link" data-open-over-gate="aboutModal">About</button><span class="text-slate-700">·</span>
+      <button type="button" class="footer-link" data-open-over-gate="contactModal">Contact</button>
     </div>
   </div>
 </div>
@@ -2512,9 +2528,17 @@
   $('contactCloseBtn').addEventListener('click', () => _closeModal('contactModal'));
   // Opened from the product gate it sits above it; restore the normal stacking
   // when it closes (however it closes — button, Escape, backdrop, auto-close).
-  new MutationObserver(() => {
-    if (!$('contactModal').classList.contains('show')) $('contactModal').classList.remove('over-gate');
-  }).observe($('contactModal'), { attributes: true, attributeFilter: ['class'] });
+  ['contactModal', 'aboutModal'].forEach(id => new MutationObserver(() => {
+    if (!$(id).classList.contains('show')) $(id).classList.remove('over-gate');
+  }).observe($(id), { attributes: true, attributeFilter: ['class'] }));
+  // About · Contact from inside the sign-in / access cards.
+  document.querySelectorAll('[data-open-over-gate]').forEach(btn => btn.addEventListener('click', (e) => {
+    e.preventDefault();
+    const id = btn.getAttribute('data-open-over-gate');
+    if (id === 'contactModal') $('contactStatus').textContent = '';
+    $(id).classList.add('over-gate');
+    _openModal(id);
+  }));
 
   // Share — native share sheet where available, clipboard fallback.
   $('shareBtn').addEventListener('click', async () => {

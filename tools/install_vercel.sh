@@ -42,4 +42,4 @@ else
   vercel login
 fi
 
-printf "\033[0;32m✓ Vercel CLI ready — you can now run 'make deploy-fe' or 'make deploy-prod'.\033[0m\n"
+printf "\033[0;32m✓ Vercel CLI ready — you can now run 'make deploy-market_matrix' or 'make deploy-prod'.\033[0m\n"
