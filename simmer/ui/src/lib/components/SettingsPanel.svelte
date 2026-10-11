@@ -2,7 +2,7 @@
 	// Consumer settings are intentionally TINY: a risk-appetite preset (an
 	// alert-strictness bar over the SHARED engine's output) and notifications.
 	// Engine behavior — DTE window, strike delta, structures, regime, soft
-	// vetoes — is admin-global (simmer_tickers.json), never per user, so a
+	// vetoes — is admin-global (Supabase simmer_engine_settings), never per user, so a
 	// consumer can't alter what the engine finds/validates. Presets only filter
 	// the already-analyzed result, and only tighten (never loosen) the floors.
 	import { settingsStore, PRESETS, type Preset } from '$lib/stores/settings.svelte';

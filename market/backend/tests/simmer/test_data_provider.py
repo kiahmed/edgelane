@@ -216,14 +216,16 @@ async def test_quote_maps_v8_chart_meta():
     assert sw._first_price(q) == pytest.approx(101.60)
 
 
-async def test_quote_uses_torque_config_symbol_map_for_indices():
+async def test_quote_uses_simmer_setup_symbol_map_for_indices():
+    # The spot-quote symbol map now lives in simmer_tickers_setup.yahoo_symbol
+    # (loaded by the autouse seed fixture), not borrowed from torque_config.
     tr = _Transport(chart_payload=_load("yahoo_chart_v8.json"))
     p = tr.provider()
-    await p.quote("SPX")
+    await p.quote("VIX")
     await p.quote("VIX3M")
     charted = " ".join(tr.urls("/v8/finance/chart/"))
-    assert "%5EGSPC" in charted or "^GSPC" in charted      # torque_config map
-    assert "%5EVIX3M" in charted or "^VIX3M" in charted    # regime extension
+    assert "%5EVIX" in charted or "^VIX" in charted        # simmer_tickers_setup yahoo_symbol
+    assert "%5EVIX3M" in charted or "^VIX3M" in charted    # regime term-structure
 
 
 async def test_chain_parses_v7_fixture_realistically():

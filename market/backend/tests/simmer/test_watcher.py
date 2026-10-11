@@ -47,6 +47,8 @@ async def test_sweep_persists_readiness_rows(fresh_db, monkeypatch):
     assert row is not None
     assert row["symbol"] == "NVDA"
     assert row["engine_version"] == simmer_config.engine_version()
+    # the settings fingerprint is stamped alongside the version (calibration honesty)
+    assert row["settings_fingerprint"] == simmer_config.settings_fingerprint()
     # cold start: no IV history → the volatility gate vetoes, score stays NULL
     assert row["vetoed"] is True
     assert row["score"] is None

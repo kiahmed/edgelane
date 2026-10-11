@@ -31,6 +31,7 @@ from .tradier_client import TradierClient
 from .mock_tradier import MockTradierClient
 from .external_gex import state as _external_gex_state
 from . import torque_config as tcfg
+from . import simmer_config as scfg
 from . import supabase_admin
 
 
@@ -170,6 +171,22 @@ async def lifespan(app: FastAPI):
     )
     app.state.eval_task = eval_task
 
+    # Simmer's ticker + engine setup (public.simmer_tickers_setup +
+    # simmer_engine_settings) — same pattern as Torque: load before the sweep,
+    # then refresh in the background so every container converges on table edits
+    # without a restart. Fails closed: until it loads, the sweep scores nothing
+    # (the code defaults differ from production, so a silent fallback would
+    # change verdicts).
+    if await scfg.refresh_setup():
+        txn("simmer setup loaded", tickers=",".join(scfg.tickers()))
+    else:
+        log.warning("  simmer setup unavailable — Simmer sweeps skip until it loads")
+    simmer_setup_task = asyncio.create_task(
+        scfg.setup_loop(settings.simmer_setup_refresh_sec),
+        name="edgelane.simmer_setup",
+    )
+    app.state.simmer_setup_task = simmer_setup_task
+
     simmer_task = asyncio.create_task(
         simmer_loop(client, db, runtime_settings),
         name="edgelane.simmer_loop",
@@ -180,9 +197,9 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         log.info("EdgeLane MARKET shutting down")
-        for t in (poll_task, eval_task, simmer_task, ticker_setup_task):
+        for t in (poll_task, eval_task, simmer_task, ticker_setup_task, simmer_setup_task):
             t.cancel()
-        for t in (poll_task, eval_task, simmer_task, ticker_setup_task):
+        for t in (poll_task, eval_task, simmer_task, ticker_setup_task, simmer_setup_task):
             try:
                 await t
             except (asyncio.CancelledError, Exception):

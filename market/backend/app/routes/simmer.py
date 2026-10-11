@@ -63,6 +63,19 @@ async def require_simmer_access(request: Request,
 _GATE = [Depends(require_simmer_access)]
 
 
+async def require_simmer_setup() -> None:
+    """Fail CLOSED on the on-demand scoring/validating routes until the DB-held
+    setup has loaded. Without this they'd run on the code defaults (dte_min 7,
+    empty blocked_tickers so SPX/NDX pass, empty universe) — the exact wrong
+    verdicts the watcher's own setup_loaded() guard exists to prevent. 503 so the
+    client retries rather than acting on a bad answer."""
+    if not simmer_config.setup_loaded():
+        raise HTTPException(503, "simmer configuration not loaded yet — try again shortly")
+
+
+_SETUP_GATE = [Depends(require_simmer_setup)]
+
+
 def _tradier(request: Request):
     c = getattr(request.app.state, "tradier", None)
     if c is None:
@@ -341,7 +354,7 @@ async def _validate_symbol(request: Request, symbol: str,
             "expirations": listed[:20], "write_model": "client_rls"}
 
 
-@router.get("/simmer/validate/{symbol}", dependencies=_GATE)
+@router.get("/simmer/validate/{symbol}", dependencies=_GATE + _SETUP_GATE)
 async def validate_symbol(symbol: str, request: Request,
                           expiration: str | None = Query(default=None)):
     return await _validate_symbol(request, symbol, expiration)
@@ -353,7 +366,7 @@ class WatchlistAdd(BaseModel):
     expiration: str | None = None
 
 
-@router.post("/simmer/watchlist")
+@router.post("/simmer/watchlist", dependencies=_SETUP_GATE)
 async def post_watchlist(body: WatchlistAdd, request: Request,
                          user: dict = Depends(require_simmer_access)):
     """Validate, then WRITE the row on behalf of the verified user
@@ -433,7 +446,7 @@ async def patch_watchlist(symbol: str, body: WatchlistPatch, request: Request,
 
 
 # ── Analyze / expirations ───────────────────────────────────────────────────
-@router.get("/simmer/analyze/{symbol}")
+@router.get("/simmer/analyze/{symbol}", dependencies=_SETUP_GATE)
 async def analyze(symbol: str, request: Request,
                   expiration: str | None = Query(default=None),
                   earnings: str = Query(default="on"),
@@ -597,7 +610,7 @@ async def earnings_bias(symbol: str, request: Request,
     return {"symbol": symbol, "in_window": True, "earnings_date": edate, "bias": row}
 
 
-@router.get("/simmer/expirations/{symbol}", dependencies=_GATE)
+@router.get("/simmer/expirations/{symbol}", dependencies=_GATE + _SETUP_GATE)
 async def expirations(symbol: str, request: Request):
     tradier = _tradier(request)
     exps = await tradier.option_expirations(symbol.upper())

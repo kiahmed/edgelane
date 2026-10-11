@@ -31,8 +31,9 @@ services:
       - "127.0.0.1:${EDGELANE_PORT:-8789}:8789"
     environment:
       EDGELANE_MARKET_CONFIG: /config/edgelane_market.config
-      # Admin-global Simmer engine overrides (DTE/delta/IV floors etc.).
-      SIMMER_TICKERS_CONFIG: /config/simmer_tickers.json
+      # Simmer's ticker + engine setup now lives in Supabase
+      # (public.simmer_tickers_setup + simmer_engine_settings, migration 0022),
+      # read by every container and refreshed in memory — no mounted JSON file.
       # GCP creds for Pub/Sub event publishing. One variable, two namespaces:
       # deploy/.env holds the HOST path, and this is the CONTAINER path the
       # Google client library reads. Empty unless the host path is set, so the
@@ -41,8 +42,6 @@ services:
     volumes:
       # Live config (Tradier tokens, DEVMODE, symbols) — read-only.
       - ../edgelane_market.config:/config/edgelane_market.config:ro
-      # Admin-global engine tuning — edit + restart to retune for everyone.
-      - ../simmer/simmer_tickers.json:/config/simmer_tickers.json:ro
       # GCP service-account key for Pub/Sub (read-only). Defaults to /dev/null
       # when the host path is unset so compose never errors; the empty
       # GOOGLE_APPLICATION_CREDENTIALS above then leaves it unused.

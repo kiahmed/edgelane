@@ -290,10 +290,12 @@ CREATE TABLE IF NOT EXISTS simmer_readiness (
     pop_breakeven     DOUBLE,             -- POP at the BREAKEVEN, not the short strike
     expected_value    DOUBLE,             -- payoff-integrated, not the binary formula
     alpha             DOUBLE,             -- EV / MaxLoss
-    engine_version    VARCHAR
+    engine_version    VARCHAR,
+    settings_fingerprint VARCHAR          -- hash of the resolved engine settings
 );
 CREATE INDEX IF NOT EXISTS idx_simmer_readiness_lookup
     ON simmer_readiness (symbol, expiration, ts);
+ALTER TABLE simmer_readiness ADD COLUMN IF NOT EXISTS settings_fingerprint VARCHAR;
 
 -- Earnings-bias cache (Simmer's opt-in "earnings mode"). Written by the
 -- standalone earnings analyzer (app/earnings_engine.py) only when an expiry
@@ -373,10 +375,12 @@ CREATE TABLE IF NOT EXISTS simmer_outcomes (
     max_adverse_pct   DOUBLE,
     score_at_entry    DOUBLE,
     components        VARCHAR,            -- snapshot, so components can be retired
-    engine_version    VARCHAR
+    engine_version    VARCHAR,
+    settings_fingerprint VARCHAR          -- hash of the resolved engine settings at entry
 );
 CREATE INDEX IF NOT EXISTS idx_simmer_outcomes_symbol
     ON simmer_outcomes (symbol, expiration);
+ALTER TABLE simmer_outcomes ADD COLUMN IF NOT EXISTS settings_fingerprint VARCHAR;
 
 -- Intraday ATM-IV snapshots — one row per market-hours sweep, per symbol.
 -- Powers the short-tier `iv_change` signal (docs/simmer_dte_tiers.md §1): is IV
@@ -1011,7 +1015,7 @@ class Database:
         "ts", "symbol", "expiration", "spot", "score", "vetoed", "veto_reasons",
         "components", "regime", "structure", "short_strike", "long_strike",
         "width", "credit_mid", "credit_fill", "max_loss", "pop_breakeven",
-        "expected_value", "alpha", "engine_version",
+        "expected_value", "alpha", "engine_version", "settings_fingerprint",
     )
 
     def insert_simmer_readiness(self, row: dict) -> int:
@@ -1255,7 +1259,7 @@ class Database:
     _SIMMER_OUTCOME_COLS = (
         "readiness_id", "symbol", "expiration", "evaluated_at", "spot_at_expiry",
         "short_strike", "held", "touched", "max_adverse_pct", "score_at_entry",
-        "components", "engine_version",
+        "components", "engine_version", "settings_fingerprint",
     )
 
     def insert_simmer_outcome(self, row: dict) -> None:

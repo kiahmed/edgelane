@@ -57,7 +57,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
-from . import torque_config as tcfg
+from . import simmer_config as scfg
 from .poller import _normalize_tradier_contract
 from .simmer_engine import bs_call, bs_delta, bs_put, bs_vega, d1_d2, norm_cdf, norm_pdf
 
@@ -227,21 +227,17 @@ _YAHOO_HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
-# Index symbols the sweep quotes that Torque's ticker setup (yahoo_symbol) doesn't map
-# (torque never trades them; the regime computation quotes them every sweep).
-_YAHOO_EXTRA_SYMBOLS = {"VIX": "^VIX", "VIX3M": "^VIX3M"}
-
 # range strings for the v8 chart endpoint, smallest window that covers `days`
 # TRADING days (calendar ranges hold ~21 trading days/month).
 _RANGE_LADDER = ((20, "3mo"), (100, "6mo"), (230, "1y"), (480, "2y"))
 
 
 def _yahoo_symbol(symbol: str) -> str:
-    """Reuse torque_config's Yahoo symbol map (indices need ^-prefixes), extend
-    it with the regime tickers, and fall back to the bare symbol (US equities
-    map 1:1)."""
+    """Simmer's own spot-quote symbol map, now in public.simmer_tickers_setup
+    (`yahoo_symbol`: indices and VIX/VIX3M need ^-prefixes). Falls back to the
+    bare symbol (US equities map 1:1). No longer borrows Torque's table."""
     sym = (symbol or "").upper()
-    return tcfg.yahoo_symbol(sym) or _YAHOO_EXTRA_SYMBOLS.get(sym) or sym
+    return scfg.yahoo_symbol(sym) or sym
 
 
 def _f(v: Any, default: float = 0.0) -> float:

@@ -1,42 +1,37 @@
-"""Simmer readiness-engine configuration — global knobs + per-ticker overrides.
+"""Simmer readiness-engine configuration — code defaults ⊕ Supabase setup.
 
-Follows the **Torque config precedent** exactly (`torque_config.py`): a Python
-module of defaults, optionally deep-merged with a JSON override file, rather
-than a second KEY=VALUE settings file. Nothing here is a secret — Gemini/news
-API keys belong in `edgelane_market.config` via `config.Settings`, NOT in
-`simmer_tickers.json` (that file is not covered by the repo's gitignore
-patterns).
+Follows the **Torque config precedent** exactly (`torque_config.py`): the code
+holds the algorithm's built-in defaults; everything that is *data* rather than
+algorithm lives in two Supabase tables (migration 0022) and is read into an
+in-memory snapshot, loaded in `main.py` before the sweep starts and refreshed
+every `SIMMER_SETUP_REFRESH_SEC`, so an edit reaches every backend container
+without a redeploy and nothing per-ticker is hardcoded or read from a JSON file:
 
-The override file is discovered via `$SIMMER_TICKERS_CONFIG`, then by walking
-`Path(__file__).parents` looking for `simmer/simmer_tickers.json` (its home in
-the dev tree) and then `simmer_tickers.json` beside each ancestor. Walking rather
-than indexing `parents[3]` is deliberate: in the container the package sits at
-`/srv/app`, `parents[3]` does not exist, and compose points
-`$SIMMER_TICKERS_CONFIG` at the bind-mounted `/config/simmer_tickers.json`
-anyway.
+  * `public.simmer_tickers_setup`   — one row per symbol (default universe,
+    data-only symbols, blocked names, per-ticker rule, commission, spot symbol).
+  * `public.simmer_engine_settings` — one row per section (`weights`, `gates`,
+    …, `engine`), each **deep-merged over the code defaults** below.
 
-Override-file shape (every key optional, deep-merged over the defaults):
+A failed refresh keeps the last good copy. The config **fails closed** until the
+first successful load: `setup_loaded()` is False and the watcher skips its sweep
+rather than scoring with the code defaults (which differ from production —
+`dte_min` 7 in code vs 0 in use — so a silent fallback would change verdicts).
 
-    {
-      "tickers": ["NVDA", "AMD"],
-      "weights": {"structural_safety": 0.35, "credit_quality": 0.10},
-      "gates":   {"vrp_ratio_floor": 1.20},
-      "targets": {"short_delta": 0.30},
-      "overrides": {"NVDA": {"min_open_interest": 1000}},
-      "commissions": {"NVDA": 0.35}
-    }
-
-Everything the engine reads goes through an accessor, so a tuning change is a
-JSON edit and a process restart — never a code change. `resolved()` returns the
-whole merged blob in one dict, which is what `simmer_engine.evaluate_readiness`
-takes so a test can inject a fully synthetic config.
+Everything the engine reads goes through an accessor reading that snapshot, so
+`simmer_engine` stays a pure function of (inputs, cfg) and no caller changed.
+`resolved()` returns the whole merged blob in one dict, which is what
+`simmer_engine.evaluate_readiness` takes so a test can inject a synthetic config.
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
-import os
-from pathlib import Path
+import logging
+import time
 from typing import Any
+
+log = logging.getLogger("edgelane.simmer.config")
 
 ENGINE_VERSION = "simmer-engine-1.0.0"
 
@@ -181,8 +176,9 @@ MANAGEMENT: dict[str, float] = {
 
 # ── Social / sharing (frontend chips; display-only, no secrets) ─────────────
 # Served to the browser via GET /simmer/config so the UI reads it at runtime:
-# change these in simmer/simmer_tickers.json (the SAME override file as the gates) and
-# restart the backend to publish — no frontend rebuild.
+# edit the `social` section row in public.simmer_engine_settings (it refreshes
+# into every container within SIMMER_SETUP_REFRESH_SEC) — no redeploy, no
+# frontend rebuild.
 #
 # Chips default HIDDEN (enabled False, empty URLs): linking to an unregistered
 # handle would send users to a page a squatter could claim. Fill the real URLs +
@@ -421,40 +417,30 @@ REGIME: dict[str, Any] = {
 
 # ── Execution fees (per contract, PER LEG, one way) ────────────────────────
 DEFAULT_COMMISSION = 0.35
-COMMISSION_PER_CONTRACT: dict[str, float] = {}
 
-# ── Tickers ────────────────────────────────────────────────────────────────
-# Simmer trades SINGLE NAMES. Index products are excluded from *trading*, not
-# from *data* — the regime gate needs SPY/QQQ/VIX chains every sweep.
-TICKERS: list[str] = [
-    "AAPL", "AMD", "AMZN", "AVGO", "GOOGL", "META", "MSFT", "MU", "NFLX", "NVDA",
-    "PLTR", "SMCI", "TSLA",
-]
-INDEX_DATA_SYMBOLS: list[str] = ["SPY", "QQQ", "VIX"]   # data only, never traded
-BLOCKED_TICKERS: list[str] = ["SPX", "NDX", "RUT", "DJX", "VIX"]
-
+# ── Per-ticker base rule ────────────────────────────────────────────────────
+# The algorithm's built-in per-ticker defaults. A simmer_tickers_setup row
+# overrides any of these for a symbol; a symbol with no row gets exactly this.
 _BASE_RULE: dict[str, Any] = {
-    "eligible":           True,
-    "tick":               0.01,
-    "min_open_interest":  GATES["min_open_interest"],
+    "eligible":            True,
+    "tick":                0.01,
     "wall_strength_floor": "low",       # low|medium|high
-    "structures":         ["bull_put", "bear_call", "iron_condor"],
-    "is_index":           False,        # index underlyings use the 1-day sentiment half-life
-    "squeeze_veto":       True,
+    "structures":          ["bull_put", "bear_call", "iron_condor"],
+    "is_index":            False,        # index underlyings use the 1-day sentiment half-life
+    "squeeze_veto":        True,
+    "sector":              "unknown",
 }
 
-# Per-ticker overrides. Some names have chains too thin to sell — set
-# `eligible: false` rather than letting the liquidity gate discover it every
-# sweep.
-_TICKER_OVERRIDES: dict[str, dict[str, Any]] = {
-    "NVDA": {"min_open_interest": 1000},
-    "TSLA": {"min_open_interest": 1000},
-    "SPY":  {"is_index": True, "eligible": False},   # data only
-    "QQQ":  {"is_index": True, "eligible": False},
+# Engine-settings sections: the code default each table row is deep-merged over.
+_SECTION_DEFAULTS: dict[str, dict] = {
+    "weights": WEIGHTS, "sub_weights": SUB_WEIGHTS, "gates": GATES, "targets": TARGETS,
+    "decision": DECISION, "earnings": EARNINGS, "management": MANAGEMENT, "social": SOCIAL,
+    "vol": VOL, "dte_tiers": DTE_TIERS, "catalyst": CATALYST, "intraday": INTRADAY,
+    "cadence": CADENCE, "ttl": TTL, "velocity": VELOCITY, "news": NEWS,
+    "sentiment": SENTIMENT, "squeeze": SQUEEZE, "regime": REGIME,
 }
 
 
-# ── Override-file plumbing (mirrors torque_config) ─────────────────────────
 def _deep_merge(base: dict, over: dict) -> dict:
     out = dict(base)
     for k, v in (over or {}).items():
@@ -465,122 +451,183 @@ def _deep_merge(base: dict, over: dict) -> dict:
     return out
 
 
-def _load_overrides_file() -> dict[str, Any]:
-    """Optional JSON override file, deep-merged over the module defaults.
+# ── In-memory setup snapshots (Supabase; same pattern as torque_config) ─────
+# simmer_tickers_setup: ticker -> row, in sort order (dict keeps insertion order).
+# simmer_engine_settings: section -> settings dict.
+_TICKERS: dict[str, dict[str, Any]] = {}
+_ENGINE: dict[str, dict[str, Any]] = {}
+_STATE: dict[str, Any] = {"loaded": False, "loaded_at": 0.0, "_prev_fp": None}
 
-    Discovery order: `$SIMMER_TICKERS_CONFIG`, then, for every ancestor of this
-    file, `simmer/simmer_tickers.json` (where it lives in the dev tree) followed
-    by `simmer_tickers.json` beside that ancestor. Walking `parents` (rather than
-    indexing `parents[3]`) is deliberate — in the container the package sits at
-    `/srv/app` and `parents[3]` does not exist.
 
-    The bare-`simmer_tickers.json` fallback is kept so an existing deployment
-    that still has the file at the repo root keeps working after the move."""
-    path = os.environ.get("SIMMER_TICKERS_CONFIG")
-    candidates = [Path(path)] if path else []
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        candidates.append(parent / "simmer" / "simmer_tickers.json")
-        candidates.append(parent / "simmer_tickers.json")
-    for p in candidates:
-        try:
-            if p and p.is_file():
-                return json.loads(p.read_text())
-        except Exception:
+def apply_tickers_setup(rows: list[dict[str, Any]]) -> None:
+    norm = []
+    for r in rows or []:
+        t = str(r.get("ticker") or "").strip().upper()
+        if not t:
             continue
-    return {}
+        norm.append({**r, "ticker": t})
+    norm.sort(key=lambda r: (int(r.get("sort_order") or 0), r["ticker"]))
+    _TICKERS.clear()
+    _TICKERS.update({r["ticker"]: r for r in norm})
 
 
-def _merged(section: str, defaults: dict) -> dict:
-    over = _load_overrides_file().get(section)
-    return _deep_merge(defaults, over) if isinstance(over, dict) else dict(defaults)
+def apply_engine_settings(rows: list[dict[str, Any]]) -> None:
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows or []:
+        sec = str(r.get("section") or "").strip()
+        if not sec:
+            continue
+        s = r.get("settings")
+        if isinstance(s, str):
+            try:
+                s = json.loads(s)
+            except Exception:
+                s = None
+        if isinstance(s, dict):
+            out[sec] = s
+    _ENGINE.clear()
+    _ENGINE.update(out)
 
 
-# ── Accessors ──────────────────────────────────────────────────────────────
+def apply_setup(tickers_rows, engine_rows) -> None:
+    """Replace both in-memory snapshots and mark the setup loaded. Used by the
+    refresh loop and, with the migration seed, by the test conftest."""
+    apply_tickers_setup(tickers_rows)
+    apply_engine_settings(engine_rows)
+    _STATE.update(loaded=True, loaded_at=time.time())
+
+
+async def refresh_setup() -> bool:
+    """Reload both snapshots from Supabase. False (snapshots untouched) when
+    either read failed — a transient outage must never wipe a good copy or,
+    worse, silently swap production config for the code defaults."""
+    from . import supabase_admin
+    try:
+        trows = await supabase_admin.get_simmer_tickers_setup()
+        erows = await supabase_admin.get_simmer_engine_settings()
+    except Exception as e:
+        log.warning("simmer setup read failed: %s", e)
+        trows = erows = None
+    if trows is None or erows is None:
+        if not _STATE["loaded"]:
+            log.warning("simmer setup not loaded yet - sweeps skip until it loads")
+        return False
+    before_fp = _STATE.get("_prev_fp")
+    before_ver = engine_version()
+    apply_setup(trows, erows)
+    after_fp, after_ver = _fingerprint(), engine_version()
+    # Calibration honesty: a verdict-affecting change must come with a version
+    # bump, or the outcomes table can't tell two engines apart (docs Calibration).
+    if before_fp is not None and after_fp != before_fp and after_ver == before_ver:
+        log.warning("simmer engine settings changed but engine_version did not - "
+                    "calibration can't distinguish the configs; bump the engine row")
+    _STATE["_prev_fp"] = after_fp
+    return True
+
+
+async def setup_loop(interval_sec: float) -> None:
+    """Background refresh so every container converges on the tables within
+    `interval_sec`. Retries every 10s while never loaded (no sweeps until then)."""
+    interval = max(5.0, float(interval_sec))
+    while True:
+        await asyncio.sleep(interval if _STATE["loaded"] else min(10.0, interval))
+        await refresh_setup()
+
+
+def setup_loaded() -> bool:
+    return bool(_STATE["loaded"])
+
+
+# ── Engine-settings accessors (code default over the table section) ─────────
+def _section(name: str, default: dict) -> dict:
+    over = _ENGINE.get(name)
+    return _deep_merge(default, over) if isinstance(over, dict) else dict(default)
+
+
 def weights() -> dict[str, float]:
     """Composite weights, normalized to sum to 1.0 so an override that forgets
-    to rebalance still produces a 0–100 score."""
-    w = _merged("weights", WEIGHTS)
+    to rebalance still produces a 0-100 score."""
+    w = _section("weights", WEIGHTS)
     total = sum(float(v) for v in w.values()) or 1.0
     return {k: float(v) / total for k, v in w.items()}
 
 
 def sub_weights() -> dict[str, dict[str, float]]:
-    return _merged("sub_weights", SUB_WEIGHTS)
+    return _section("sub_weights", SUB_WEIGHTS)
 
 
 def gates() -> dict[str, Any]:
-    return _merged("gates", GATES)
+    return _section("gates", GATES)
 
 
 def targets() -> dict[str, float]:
-    return _merged("targets", TARGETS)
+    return _section("targets", TARGETS)
 
 
 def decision_bands() -> dict[str, float]:
-    return _merged("decision", DECISION)
+    return _section("decision", DECISION)
 
 
 def earnings() -> dict[str, float]:
-    return _merged("earnings", EARNINGS)
+    return _section("earnings", EARNINGS)
 
 
 def management() -> dict[str, float]:
-    return _merged("management", MANAGEMENT)
+    return _section("management", MANAGEMENT)
 
 
 def social() -> dict[str, Any]:
-    """Frontend social/share config (display-only). Overridable in
-    simmer_tickers.json under "social"; see SOCIAL for the shape."""
-    return _merged("social", SOCIAL)
+    """Frontend social/share config (display-only). Overridable in the
+    `social` section of simmer_engine_settings; see SOCIAL for the shape."""
+    return _section("social", SOCIAL)
 
 
 def vol() -> dict[str, Any]:
-    return _merged("vol", VOL)
+    return _section("vol", VOL)
 
 
 def dte_tiers() -> dict[str, Any]:
-    return _merged("dte_tiers", DTE_TIERS)
+    return _section("dte_tiers", DTE_TIERS)
 
 
 def catalyst() -> dict[str, Any]:
-    return _merged("catalyst", CATALYST)
+    return _section("catalyst", CATALYST)
 
 
 def intraday() -> dict[str, Any]:
-    return _merged("intraday", INTRADAY)
+    return _section("intraday", INTRADAY)
 
 
 def cadence() -> dict[str, int]:
-    return _merged("cadence", CADENCE)
+    return _section("cadence", CADENCE)
 
 
 def ttls() -> dict[str, int]:
-    return _merged("ttl", TTL)
+    return _section("ttl", TTL)
 
 
 def velocity() -> dict[str, Any]:
-    return _merged("velocity", VELOCITY)
+    return _section("velocity", VELOCITY)
 
 
 def news() -> dict[str, Any]:
-    return _merged("news", NEWS)
+    return _section("news", NEWS)
 
 
 def sentiment() -> dict[str, Any]:
-    return _merged("sentiment", SENTIMENT)
+    return _section("sentiment", SENTIMENT)
 
 
 def squeeze() -> dict[str, float]:
-    return _merged("squeeze", SQUEEZE)
+    return _section("squeeze", SQUEEZE)
 
 
 def regime() -> dict[str, Any]:
-    return _merged("regime", REGIME)
+    return _section("regime", REGIME)
 
 
 def user_clamps() -> dict[str, tuple[float, float]]:
-    over = _load_overrides_file().get("user_clamps")
+    over = _ENGINE.get("user_clamps")
     out = {k: tuple(v) for k, v in USER_CLAMPS.items()}
     if isinstance(over, dict):
         for k, v in over.items():
@@ -593,41 +640,72 @@ def user_clamps() -> dict[str, tuple[float, float]]:
 
 def clamp_setting(name: str, value: float) -> float:
     """Hard-clamp a user-supplied knob into its allowed band. Server-side
-    enforcement is authoritative — a client asking for a 0.05 short delta is
+    enforcement is authoritative - a client asking for a 0.05 short delta is
     clamped, not honoured."""
     lo, hi = user_clamps().get(name, (float("-inf"), float("inf")))
     return max(lo, min(hi, float(value)))
 
 
+def engine_version() -> str:
+    eng = _ENGINE.get("engine") or {}
+    return str(eng.get("engine_version") or ENGINE_VERSION)
+
+
+# ── Ticker accessors (read the simmer_tickers_setup snapshot) ───────────────
+def _enabled_rows() -> list[dict[str, Any]]:
+    return [r for r in _TICKERS.values() if r.get("enabled", True)]
+
+
 def tickers() -> list[str]:
-    f = _load_overrides_file().get("tickers")
-    return list(f) if isinstance(f, list) and f else list(TICKERS)
+    """The default universe (today's TICKERS): enabled rows flagged
+    default_watchlist, in sort order. Also the dev fallback when the per-user
+    watchlist can't be read."""
+    return [r["ticker"] for r in _enabled_rows() if r.get("default_watchlist")]
 
 
 def index_data_symbols() -> list[str]:
-    f = _load_overrides_file().get("index_data_symbols")
-    return list(f) if isinstance(f, list) and f else list(INDEX_DATA_SYMBOLS)
+    """Quoted every sweep for the regime gate, never traded (SPY, QQQ, VIX)."""
+    return [r["ticker"] for r in _enabled_rows() if r.get("index_data")]
 
 
 def blocked_tickers() -> set[str]:
-    f = _load_overrides_file().get("blocked_tickers")
-    src = f if isinstance(f, list) and f else BLOCKED_TICKERS
-    return {str(t).upper() for t in src}
+    """Can't be traded or added to a watchlist (SPX, NDX, RUT, DJX, VIX)."""
+    return {r["ticker"] for r in _TICKERS.values() if r.get("blocked")}
+
+
+def yahoo_symbol(symbol: str) -> str | None:
+    """Spot-quote symbol for this ticker (e.g. ^VIX), or None to use the bare
+    ticker. The Simmer-only spot map now lives here, not in simmer_data_provider."""
+    row = _TICKERS.get((symbol or "").upper())
+    return (row or {}).get("yahoo_symbol") or None
+
+
+def commission_per_contract(symbol: str) -> float:
+    """Per contract, PER LEG, one way. The round-trip cost of a 2-leg vertical
+    is 4 x this, and it is what the dollar-friction gate measures against."""
+    row = _TICKERS.get((symbol or "").upper()) or {}
+    v = row.get("commission_per_contract")
+    return float(v) if v is not None else DEFAULT_COMMISSION
 
 
 def ticker_rule(symbol: str) -> dict[str, Any]:
-    """Resolved per-ticker rule: base ⊕ ticker-override ⊕ file-override.
-
-    Returns e.g. {"eligible": True, "tick": 0.01, "min_open_interest": 1000,
-    "wall_strength_floor": "low", "structures": [...], "is_index": False,
-    "squeeze_veto": True, "commission": 0.35, "symbol": "NVDA"}."""
+    """Resolved per-ticker rule: base over the simmer_tickers_setup row. A symbol
+    with no row gets the base defaults. Keys match the pre-DB shape so callers
+    and verdicts are unchanged."""
     tk = (symbol or "").upper()
-    rule = _deep_merge({}, _BASE_RULE)
-    rule = _deep_merge(rule, _TICKER_OVERRIDES.get(tk, {}))
-    file_over = _load_overrides_file().get("overrides", {})
-    if isinstance(file_over, dict) and isinstance(file_over.get(tk), dict):
-        rule = _deep_merge(rule, file_over[tk])
-    if tk in blocked_tickers():
+    row = _TICKERS.get(tk, {})
+    rule = dict(_BASE_RULE)
+    rule["min_open_interest"] = int(gates().get("min_open_interest", 250))
+    for key in ("eligible", "tick", "wall_strength_floor", "is_index", "squeeze_veto"):
+        if row.get(key) is not None:
+            rule[key] = row[key]
+    if row.get("min_open_interest") is not None:
+        rule["min_open_interest"] = int(row["min_open_interest"])
+    if isinstance(row.get("structures"), list) and row["structures"]:
+        rule["structures"] = list(row["structures"])
+    if row.get("sector"):
+        rule["sector"] = str(row["sector"])
+    if bool(row.get("blocked")) or tk in blocked_tickers():
         rule["eligible"] = False
         rule["ineligible_reason"] = "index_product_excluded_from_trading"
     rule["symbol"] = tk
@@ -635,27 +713,14 @@ def ticker_rule(symbol: str) -> dict[str, Any]:
     return rule
 
 
-def commission_per_contract(symbol: str) -> float:
-    """Per contract, PER LEG, one way. The round-trip cost of a 2-leg vertical
-    is therefore 4 × this, and it is what the dollar-friction gate measures
-    against."""
-    tk = (symbol or "").upper()
-    f = _load_overrides_file().get("commissions", {})
-    if isinstance(f, dict) and tk in f:
-        return float(f[tk])
-    return float(COMMISSION_PER_CONTRACT.get(tk, DEFAULT_COMMISSION))
-
-
-def engine_version() -> str:
-    return str(_load_overrides_file().get("engine_version") or ENGINE_VERSION)
-
-
+# ── Resolved blob + settings fingerprint ────────────────────────────────────
 def resolved(symbol: str | None = None) -> dict[str, Any]:
-    """The whole merged config in one dict — what `simmer_engine` takes so the
+    """The whole merged config in one dict - what `simmer_engine` takes so the
     engine stays a pure function of (inputs, cfg) and a test can inject a fully
     synthetic configuration."""
     cfg: dict[str, Any] = {
         "engine_version": engine_version(),
+        "settings_fingerprint": _fingerprint(),
         "weights":        weights(),
         "sub_weights":    sub_weights(),
         "gates":          gates(),
@@ -678,3 +743,21 @@ def resolved(symbol: str | None = None) -> dict[str, Any]:
     if symbol:
         cfg["ticker"] = ticker_rule(symbol)
     return cfg
+
+
+def _fingerprint() -> str:
+    """A stable hash of the verdict-affecting engine settings (NOT per-ticker),
+    recorded on every alert payload and simmer_outcomes row so a config change is
+    visible to the calibration loop even when engine_version is unchanged."""
+    blob = {
+        "weights": weights(), "sub_weights": sub_weights(), "gates": gates(),
+        "targets": targets(), "decision": decision_bands(), "earnings": earnings(),
+        "vol": vol(), "dte_tiers": dte_tiers(), "catalyst": catalyst(),
+        "sentiment": sentiment(), "squeeze": squeeze(), "regime": regime(),
+    }
+    s = json.dumps(blob, sort_keys=True, default=str)
+    return hashlib.sha256(s.encode()).hexdigest()[:16]
+
+
+def settings_fingerprint() -> str:
+    return _fingerprint()

@@ -18,7 +18,7 @@ export type Strikes = StrikesVertical | StrikesCondor;
 
 export interface ComponentDetail {
 	score: number;
-	/** Resolved composite weight (after simmer_tickers.json overrides). Emitted
+	/** Resolved composite weight (after simmer_engine_settings overrides). Emitted
 	 *  by the engine so the UI never hardcodes weights. Absent on pre-emit
 	 *  cached envelopes. */
 	weight?: number;

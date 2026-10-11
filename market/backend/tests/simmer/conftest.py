@@ -18,13 +18,36 @@ independently written** implementation of each formula and are checked in below.
 from __future__ import annotations
 
 import copy
+import json
 import math
 import random
+import re
 from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 
 from app import simmer_config
+
+# ── Simmer setup seed, loaded straight from migration 0022 ──────────────────
+# Tests load the SAME JSON the migration installs, so the test fixtures and the
+# database can never drift (the Torque convention).
+_MIGRATION = (Path(__file__).resolve().parents[4]
+              / "supabase" / "migrations" / "0022_simmer_setup.sql")
+
+
+def _seed_block(marker: str) -> list[dict]:
+    # Match the dollar-quoted ARRAY (`$marker$[ … ]$marker$`); requiring the
+    # brackets skips the stray `$seed$` mention in the migration's header comment.
+    txt = _MIGRATION.read_text()
+    m = re.search(rf"\${marker}\$(\[.*?\])\${marker}\$", txt, re.S)
+    return json.loads(m.group(1)) if m else []
+
+
+SIMMER_TICKER_SEED = _seed_block("seed")       # simmer_tickers_setup rows
+SIMMER_ENGINE_SEED = [                          # simmer_engine_settings rows
+    {"section": r["section"], "settings": r["settings"]} for r in _seed_block("eng")
+]
 
 # ── Option chain: spot 100, 30 DTE, r = q = 0 ──────────────────────────────
 #   (side, strike, bid, ask, iv, delta)
@@ -302,17 +325,20 @@ def _no_real_services(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _pin_default_engine_config():
-    """Same guard as above, for the ENGINE knobs: `simmer_config` deep-merges an
-    optional `simmer_tickers.json` discovered by walking parent dirs, so the
-    repo-root admin override file retunes the engine mid-suite (e.g. dte_min=0
-    to allow 0DTE) and a gate test then passes or fails purely on how this
-    deployment happens to be tuned. Pin the overrides to empty so these tests
-    always assert the CODE defaults — the override file is deployment config,
-    not code. A test that wants override behavior can patch this back."""
-    prev = simmer_config._load_overrides_file
-    simmer_config._load_overrides_file = lambda: {}
+    """Pin the DB-held setup for every test. Loads the TICKER seed from migration
+    0022 (so tickers()/ticker_rule()/index_data/blocked match production's
+    universe), but keeps the ENGINE sections at the CODE defaults (empty engine
+    snapshot) — exactly as the old JSON-pinned-empty fixture did, so gate tests
+    assert the code defaults (dte_min 7), not the deployment's tuning (dte_min 0).
+    A test that wants the seeded engine settings loads SIMMER_ENGINE_SEED itself.
+    Also marks the setup loaded so the watcher's fail-closed guard doesn't skip."""
+    simmer_config.apply_tickers_setup(copy.deepcopy(SIMMER_TICKER_SEED))
+    simmer_config.apply_engine_settings([])        # code defaults
+    simmer_config._STATE.update(loaded=True, loaded_at=0.0, _prev_fp=None)
     yield
-    simmer_config._load_overrides_file = prev
+    simmer_config._TICKERS.clear()
+    simmer_config._ENGINE.clear()
+    simmer_config._STATE.update(loaded=False, loaded_at=0.0, _prev_fp=None)
 
 
 @pytest.fixture(autouse=True)

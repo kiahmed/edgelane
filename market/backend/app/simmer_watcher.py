@@ -900,6 +900,7 @@ def _persist_readiness(db, env: dict) -> int:
         "expected_value": env.get("expected_value"),
         "alpha": env.get("alpha"),
         "engine_version": env.get("engine_version"),
+        "settings_fingerprint": env.get("settings_fingerprint"),
     })
 
 
@@ -1434,6 +1435,8 @@ async def process_alerts(results: dict[str, dict], regime: dict | None,
                         "score": env.get("score"),
                         "structure": env.get("structure"),
                         "decision": env.get("decision"),
+                        "engine_version": env.get("engine_version"),
+                        "settings_fingerprint": env.get("settings_fingerprint"),
                     })
         except asyncio.CancelledError:
             raise
@@ -1499,6 +1502,8 @@ async def process_off_hours_catalyst_events(results: dict[str, dict],
                     "score": env.get("score"),
                     "structure": env.get("structure"),
                     "decision": env.get("decision"),
+                    "engine_version": env.get("engine_version"),
+                    "settings_fingerprint": env.get("settings_fingerprint"),
                     "off_hours_catalyst": True,
                 })
         except asyncio.CancelledError:
@@ -1747,6 +1752,7 @@ async def evaluate_paper_outcomes(tradier, db, as_of: date | None = None) -> int
                 "score_at_entry": row.get("score"),
                 "components": row.get("components"),
                 "engine_version": row.get("engine_version"),
+                "settings_fingerprint": row.get("settings_fingerprint"),
             })
             n += 1
             log.info("paper outcome %s@%s: spot=%.2f short=%s held=%s",
@@ -2025,6 +2031,7 @@ def _row_to_envelope(row: dict) -> dict:
         "expected_value": _num(row.get("expected_value")),
         "alpha": _num(row.get("alpha")),
         "engine_version": row.get("engine_version"),
+        "settings_fingerprint": row.get("settings_fingerprint"),
     }
     return env
 
@@ -2123,6 +2130,14 @@ async def simmer_loop(tradier_client, db, settings) -> None:
     try:
         while True:
             try:
+                # Fail closed: until the DB-held setup (tickers + engine settings)
+                # has loaded at least once, score nothing — the code defaults
+                # differ from production (dte_min 7 vs 0), so sweeping on them
+                # would publish wrong verdicts. Retry on the next tick.
+                if not simmer_config.setup_loaded():
+                    log.warning("simmer setup not loaded yet — skipping sweep")
+                    await asyncio.sleep(10.0)
+                    continue
                 open_, reason = _is_market_open(tz_name)
                 state.market_open = open_
                 state.market_reason = reason

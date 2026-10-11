@@ -3,7 +3,7 @@
 	// deep-link to the product pages, and a Share button that snapshots the board
 	// center and copies it for a post on the chosen channel. Everything is driven
 	// by the backend config (loadSocialConfig → /simmer/config), so URLs/visibility
-	// change via simmer_tickers.json without a frontend rebuild. data-no-capture so
+	// change via the simmer_engine_settings `social` row without a frontend rebuild. data-no-capture so
 	// the cluster never appears in its own screenshot.
 	import { onMount } from 'svelte';
 	import { loadSocialConfig, shareBoard, SOCIAL_DEFAULT, type SocialConfig } from '$lib/social';

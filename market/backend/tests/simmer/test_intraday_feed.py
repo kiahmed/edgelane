@@ -273,9 +273,9 @@ async def test_short_tier_activates_intraday_branch_end_to_end(fresh_db, monkeyp
     """Market open, a ~1-DTE expiry, real fed intraday inputs → the engine's
     metrics reflect the intraday vol reference and the IV-change gate, live."""
     sw.state.market_open = True
-    # allow a 1-DTE expiry through the DTE window (calibration override)
-    monkeypatch.setattr(simmer_config, "_load_overrides_file",
-                        lambda: {"gates": {"dte_min": 0}})
+    # allow a 1-DTE expiry through the DTE window (engine-settings override,
+    # now in the simmer_engine_settings snapshot, not a JSON file)
+    simmer_config.apply_engine_settings([{"section": "gates", "settings": {"dte_min": 0}}])
 
     near = (date.today() + timedelta(days=1)).isoformat()
     base = FakeSimmerTradier(exp=near)

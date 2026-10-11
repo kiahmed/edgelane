@@ -127,6 +127,24 @@ def auth_off(monkeypatch):
     monkeypatch.setattr(config, "_cached", None)
 
 
+@pytest.mark.parametrize("method,path,body", [
+    ("get", "/simmer/analyze/NVDA", None),
+    ("get", "/simmer/validate/NVDA", None),
+    ("get", "/simmer/expirations/NVDA", None),
+    ("post", "/simmer/watchlist", {"symbol": "NVDA"}),
+])
+def test_scoring_routes_fail_closed_until_setup_loaded(auth_off, method, path, body):
+    """If the DB-held setup hasn't loaded, the on-demand scoring/validating routes
+    503 instead of running on the code defaults (dte_min 7, empty blocked list,
+    empty universe) — the same fail-closed stance as the watcher sweep."""
+    from app import simmer_config
+    simmer_config._STATE["loaded"] = False       # reset to True by the autouse fixture
+    c = _make_client()
+    r = c.post(path, json=body) if method == "post" else c.get(path)
+    assert r.status_code == 503
+    assert "not loaded" in r.json()["detail"]
+
+
 def test_analyze_route_calls_the_watcher_function(auth_off, monkeypatch):
     """During MARKET HOURS the route MUST delegate to analyze_symbol with
     persist=False (on-demand, no engine-verdict rows) — the paths can't diverge."""

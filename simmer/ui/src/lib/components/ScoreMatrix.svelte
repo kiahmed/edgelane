@@ -4,7 +4,7 @@
 	// that decides the number once a name is un-vetoed:
 	//   score = 100 × Σ(weightᵢ · componentᵢ) × regime_mult  (+ earnings lift)
 	// Weights are read LIVE from the envelope (component.weight, emitted by the
-	// engine after simmer_tickers.json overrides) — never hardcoded here, so a
+	// engine after simmer_engine_settings overrides) — never hardcoded here, so a
 	// backend retune can't make this reconciliation silently stop adding up.
 	import { money } from '$lib/fmt';
 	import type { ReadinessEnvelope } from '$lib/types';

@@ -640,11 +640,11 @@
     <table>
       <tr><th>What</th><th>Where</th></tr>
       <tr><td>Engine tunables — weights, gate thresholds, cadence, TTLs, universe</td>
-          <td><code>market/backend/app/simmer_config.py</code> (defaults), overridable per-section by <code>simmer/simmer_tickers.json</code> / <code>$SIMMER_TICKERS_CONFIG</code>.</td></tr>
+          <td><code>market/backend/app/simmer_config.py</code> (defaults), overridable per-section by the Supabase <code>simmer_engine_settings</code> table (migration 0022; refreshed in-memory per container).</td></tr>
       <tr><td>Providers &amp; keys — data source, news, Alpaca/Gemini keys, DEVMODE</td>
           <td><code>edgelane_market.config</code> (KEY=VALUE, gitignored) → parsed by <code>config.py</code>.</td></tr>
       <tr><td>Plain env flags — Nasdaq earnings, macro-table path, tickers-config path</td>
-          <td><code>SIMMER_EARNINGS_NASDAQ</code>, <code>SIMMER_MACRO_CALENDAR</code>, <code>SIMMER_TICKERS_CONFIG</code>.</td></tr>
+          <td><code>SIMMER_EARNINGS_NASDAQ</code>, <code>SIMMER_MACRO_CALENDAR</code>, <code>SIMMER_SETUP_REFRESH_SEC</code>.</td></tr>
       <tr><td>Per-user preferences — DTE/IV/delta bounds, risk profile, <strong>sweep interval</strong></td>
           <td>Supabase <code>simmer_settings</code> (migration <code>0010</code>/<code>0011</code>), edited via the API/UI or the <code>supabase_admin.py</code> CLI.</td></tr>
     </table>

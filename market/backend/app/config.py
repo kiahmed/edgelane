@@ -301,6 +301,9 @@ class Settings(BaseModel):
     # An edit in the table reaches every container within this window.
     torque_tickers_refresh_sec: int = Field(default=60)
 
+    # Same, for Simmer's public.simmer_tickers_setup + simmer_engine_settings.
+    simmer_setup_refresh_sec: int = Field(default=60)
+
     # External GEX override (private GEX provider extension webhook)
     use_external_gex: bool = Field(default=True)         # prefer extension data over Tradier-OI walls when fresh
     external_gex_timeout_sec: int = Field(default=30)    # how stale before falling back
@@ -525,6 +528,8 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
         out["news_signal_max_expiry_retries"] = int(raw["NEWS_SIGNAL_MAX_EXPIRY_RETRIES"])
     if "TORQUE_TICKERS_REFRESH_SEC" in raw:
         out["torque_tickers_refresh_sec"] = int(raw["TORQUE_TICKERS_REFRESH_SEC"])
+    if "SIMMER_SETUP_REFRESH_SEC" in raw:
+        out["simmer_setup_refresh_sec"] = int(raw["SIMMER_SETUP_REFRESH_SEC"])
 
     if "USE_EXTERNAL_GEX" in raw:
         out["use_external_gex"] = raw["USE_EXTERNAL_GEX"].strip().lower() in ("true", "1", "yes", "on")
