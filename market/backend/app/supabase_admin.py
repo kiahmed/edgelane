@@ -480,6 +480,69 @@ async def get_simmer_engine_settings() -> Optional[list[dict]]:
     return await select_many("simmer_engine_settings", order="section.asc")
 
 
+# ── Torque stop guardian (migration 0024) ────────────────────────────────────
+async def get_sl_settings(account_key: str) -> Optional[list[dict]]:
+    """Saved stop-loss settings for one broker account (all tickers). None =
+    unknown (read failed) — the caller must not treat that as "all off"."""
+    return await select_many("torque_sl_settings", filters={"account_key": f"eq.{account_key}"})
+
+
+async def upsert_sl_setting(row: dict) -> bool:
+    return await upsert_row("torque_sl_settings", row, on_conflict="account_key,ticker")
+
+
+async def get_guarded_positions(account_key: str) -> Optional[list[dict]]:
+    return await select_many("torque_guarded_positions", filters={"account_key": f"eq.{account_key}"})
+
+
+async def upsert_guarded_position(row: dict) -> bool:
+    return await upsert_row("torque_guarded_positions", row, on_conflict="account_key,unit_key")
+
+
+async def delete_guarded_position(account_key: str, unit_key: str) -> bool:
+    return await delete_rows("torque_guarded_positions",
+                             {"account_key": f"eq.{account_key}", "unit_key": f"eq.{unit_key}"})
+
+
+async def acquire_guardian_lease(name: str, holder: str, ttl_sec: float) -> bool:
+    """Take or renew the stop guardian's single-runner lease (migration 0025).
+    True only if `holder` now holds `name` — a fresh row, its own row, or an
+    expired one. False when someone else holds it, or on any error: fail
+    closed, a guardian that can't prove it's the only one doesn't act."""
+    settings = get_settings()
+    if not (settings.supabase_url and settings.supabase_service_key):
+        return False
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    iso = lambda d: d.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    row = {"name": name, "holder": holder, "expires_at": iso(now + timedelta(seconds=ttl_sec))}
+    base, headers = _rest(settings)
+    headers = {**headers, "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(f"{base}/torque_guardian_lease",
+                             headers={**headers, "Prefer": "return=representation,resolution=ignore-duplicates"},
+                             params={"on_conflict": "name"}, json=row)
+            if r.status_code < 300 and r.json():
+                return True
+            r = await c.patch(f"{base}/torque_guardian_lease",
+                              headers={**headers, "Prefer": "return=representation"},
+                              params={"name": f"eq.{name}",
+                                      "or": f"(holder.eq.{holder},expires_at.lt.{iso(now)})"},
+                              json={"holder": holder, "expires_at": row["expires_at"]})
+            return r.status_code < 300 and bool(r.json())
+    except Exception as exc:
+        log.warning("[supabase] guardian lease %s error: %s", name, exc)
+        return False
+
+
+async def get_open_reflex_orders(uid: str) -> Optional[list[dict]]:
+    """A user's Reflex (news-signal) orders still on file — the guardian marks
+    positions in these contracts as Reflex (always protected)."""
+    return await select_many("torque_orders", select="entry_order_id,legs,symbol,status",
+                             filters={"uid": f"eq.{uid}"})
+
+
 async def upsert_torque_watcher(row: dict) -> bool:
     """Checkpoint a watcher's current state (see docs/torque.md 'Multi-user
     order persistence'). Called at state TRANSITIONS, not every price tick —

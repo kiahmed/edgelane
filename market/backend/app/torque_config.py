@@ -250,7 +250,16 @@ DEFAULT_CLOSE_TARGET_PCT = 30.0   # +30% profit target for the auto-close order
 # profit target — the close limit would sit inside the spread forever. Observed on
 # DJX 0DTE once premium decays to a few cents (net_mid 0.02, net_bid -0.06). We
 # refuse to arm auto-close rather than place an entry whose exit can never fill.
-MAX_AUTO_CLOSE_SPREAD_PCT = 100.0
+MAX_AUTO_CLOSE_SPREAD_PCT = 100.0     # global default; per ticker: max_spread_pct
+
+
+def max_spread_pct(ticker: str) -> float:
+    """Widest package bid/ask, as % of mid, this ticker trades / arms a profit
+    target on (`max_spread_pct` in torque_tickers_setup; null = the global
+    default). Entries are priced at mid either way — this only decides whether
+    to trade at all (XLE/XLF: 150)."""
+    v = _row(ticker).get("max_spread_pct")
+    return float(v) if v is not None else MAX_AUTO_CLOSE_SPREAD_PCT
 
 # ── Stop-loss ────────────────────────────────────────────────────────────────
 # Global default 30%, mirroring DEFAULT_CLOSE_TARGET_PCT — every order gets both

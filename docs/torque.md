@@ -315,6 +315,7 @@ backend container reads the same data:
 | `commission_per_contract`, `extra_fee_per_contract` | Per contract per leg, one way (null = global default). |
 | `stop_loss_default`, `close_target_default`, `close_target_min`, `close_target_spread_scaled`, `close_target_required` | Exit defaults / floors (null = global default). |
 | `market_orders_allowed` | False forces limits (DJX). |
+| `max_spread_pct` | Widest package bid/ask, as % of mid, the ticker trades, arms a profit target on, or calls tradeable (null = global 100; XLE/XLF 150 — their 0DTE books routinely run 50–120%). Entries are priced at mid either way; this only decides whether to trade at all. Migration `0023`. |
 | `richness_floor` | Counter Read noise floor in $ (null = global default 0.03) — see [Counter Read](torque_operating_manual.html#counter). |
 | `daily_min_range`, `daily_max_range` | Reserved for later use; not read by Torque yet. |
 
@@ -545,6 +546,30 @@ the same account-wide orders list but aren't news-signal-driven.
 - **Quantity** is `NEWS_SIGNAL_QUANTITY` (default 1) — raise it once the flow
   is proven.
 
+### Entry step-up (fill chasing)
+
+A news-signal entry goes in at **mid**. If it hasn't filled after
+`NEWS_SIGNAL_ENTRY_STEP_SEC` (default 5s), it's re-placed **one price step
+higher** — up to `NEWS_SIGNAL_ENTRY_STEPS` times (default 5), never above the
+ask captured at build — and if it still hasn't filled after the last step it's
+**cancelled** (no fill, no trade). News signals only; manual orders keep the
+price you set. Each step cancels the resting bracket, confirms the cancel
+took, then re-places a fresh bracket at the new price (its own `torque_orders`
+row; the superseded one is recorded `canceled` with `repriced: step N → price`).
+It stops the moment the entry fills, the order closes out, or a cancel signal
+for the trade arrives — on this container (in memory) or any other (the signal
+log). Rare race: a fill landing between the last read and the cancel leaves the
+position with its bracket exits cancelled — recorded `needs_attention`, never
+re-placed on top of. Not persisted across a restart: a step-up in progress when
+the backend restarts leaves its current order resting as a day order.
+
+**Brackets are read by their entry leg.** Tradier reports a bracket's entry
+fill on its first leg; the parent can still read "open" (exits resting) after
+the entry filled and carries no fill quantity of its own. The step-up and the
+cancel handler both read the entry leg, and a cancel market-closes only what's
+still open (entry fill minus anything the profit/stop legs already executed;
+`already_closed` if they closed it all).
+
 ### CANCEL: unwinding a prior signal
 
 The same endpoint also accepts a **cancel** for a signal it already acted on —
@@ -577,6 +602,87 @@ qualified account it fanned out to — and, **for each account independently**:
   of the rest (`action: "skipped"` / `"needs_attention"` respectively) — same
   "one account's failure can't stop the others" posture as the entry
   fan-out. Same fail-closed market-hours gate as an entry signal.
+
+## Stop guardian (stop-loss on every position)
+
+Torque's order-level protections only cover orders Torque placed — and even
+those had gaps: a broker bracket's exits are day orders (gone at 4pm on a
+position that outlives the day), cancelling a filled bracket removed its stop,
+the app watcher gave up after 6 hours, and nothing watched positions opened on
+Tradier's own site or the `tp` CLI. The **stop guardian**
+(`app/torque_guardian.py`, migration `0024`) closes all of these by watching
+what each account actually **holds**:
+
+- **Every ~`GUARDIAN_INTERVAL_SEC` (10s), market hours only** (any time in
+  DEVMODE/sandbox), for every account Torque trades on — the house account and
+  every user entitled to Torque with an active Tradier connection — it reads
+  the open option positions in **Torque tickers** (others are ignored).
+- **Units.** A lone option is one unit. Several on the same ticker are grouped
+  only as far as **today's order history confirms** (Tradier lists only the
+  current session's orders): a filled multi-leg order whose legs match open
+  positions in the same proportion is one spread; a leg whose filled
+  single-option opening orders today account for the **whole** held quantity,
+  on the held side, is a single (a leg partly from an earlier day — e.g. one more long put
+  added to a prior-day put spread — is not: selling it all would strip the
+  short leg's cover). Anything it can't confirm is **left alone and
+  flagged** (`unconfirmed`) — stopping one leg of a spread could leave the
+  other naked.
+- **Which stop applies — by who opened it** (the source is saved in the guard
+  row once seen, so it survives today's orders rolling off; the strongest wins):
+  - **Reflex** (its contract is on a news-signal order in `torque_orders`):
+    **always** protected at the ticker default (or 30%), whatever the page says.
+  - **Torque** (a filled entry today tagged `torque…` — Torque's exits,
+    `torqueClose/Stop/Cancel…`, don't count): the page's saved per-ticker
+    stop-loss setting (`torque_sl_settings`, per broker account); **no row = on**
+    at the ticker default.
+  - **Outside Torque** (Tradier's site, the `tp` CLI, anything else): guarded
+    **only once stop-loss is saved ON** for that ticker on the page; **no row =
+    not guarded** (`sl_off`, "opened outside Torque"). The page shows "default ·
+    save to guard outside positions" until the setting is saved.
+- **Breach** is measured at mid against the position's cost basis, the same
+  `stop_breached` rule the watcher uses.
+- **Who acts.** A position Torque's own app watcher manages is never touched.
+  If a **broker-held stop** is resting (a bracket's stop leg or a stop order),
+  the guardian stands back — but if the price is past the stop and that stop
+  hasn't filled within `GUARDIAN_TAKEOVER_SEC` (10s), it **takes over**. With
+  no stop resting, it acts on the breach (after one re-check if the book is
+  wider than `STOP_MAX_EXIT_SPREAD_PCT`).
+- **The exit.** First cancel every working order that would close the position
+  (bracket exits, a resting profit target, a stale exit) so the exit isn't
+  rejected as over-closing; then **re-read the position** — if it already
+  closed, nothing more happens; if its size changed, `needs_attention`, never a
+  guessed size — then run the normal stop-exit ladder (bounded re-quotes, then
+  market) for exactly what's held. Exit pricing quotes the legs directly when
+  they're not on the nearest-expiry chain.
+- **Already past the stop when first seen** (e.g. at first deploy): **alert
+  only** (`past_stop_alert`) — never auto-closed; it re-arms once the price is
+  back above the stop.
+- **State** per unit is persisted in `torque_guarded_positions` (source,
+  stop, state, note) and removed when the position is gone; the Orders panel
+  shows it.
+- **Where it runs.** `GUARDIAN_ENABLED` is **off** by default and off in the
+  shared `edgelane_market.config`; the production compose file turns it on with
+  the `GUARDIAN_ENABLED=true` env var (which overrides the file), so a local
+  `make run` / `run-dev` never starts a second guardian. In DEVMODE/sandbox it
+  guards **sandbox accounts only** — users' own Tradier connections are
+  production whatever DEVMODE says, and those are refused (logged once).
+  Each pass it must hold the **single-runner lease** (`torque_guardian_lease`,
+  migration `0025`; one row per environment, `guardian:live` /
+  `guardian:sandbox`, TTL 3× the interval, min 30s) — a second container, or a
+  misconfigured one, finds it held and stands by. No lease (or Supabase
+  unreachable) = no action.
+- **No market orders where they're off.** For a ticker with
+  `market_orders_allowed = false` (DJX), the guardian's no-quote exit doesn't
+  go to market — it marks the unit `needs_attention` — and a cancel signal on a
+  filled entry closes with a marketable limit at the live bid/ask
+  (`closing_at_limit`), or `needs_attention` with no quote.
+
+**Order status in the panel.** A bracket's own (parent) status doesn't say
+whether the entry filled or which exits are still working, so the panel shows
+what's actually live, read from its legs: `pending`, `filled · TP + SL live`,
+`filled · SL live`, `filled · TP live · SL by guardian`, `filled · SL by
+guardian`, `filled · no SL (turned off)`, `closed · TP`, `closed · SL`.
+`torque_orders.status` for signal orders uses the same entry-leg reading.
 
 ## Multi-user order persistence
 

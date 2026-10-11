@@ -138,6 +138,14 @@ async def lifespan(app: FastAPI):
         tcfg.ticker_setup_loop(settings.torque_tickers_refresh_sec),
         name="edgelane.torque_ticker_setup",
     )
+    # Stop guardian: stop-loss on every open position in Torque tickers,
+    # whoever placed it (see app/torque_guardian.py). One container only.
+    from . import torque_guardian
+    guardian_task = (asyncio.create_task(torque_guardian.guardian_loop(app), name="edgelane.stop_guardian")
+                     if settings.guardian_enabled else None)
+    if guardian_task:
+        txn("stop guardian started", interval_sec=settings.guardian_interval_sec,
+            takeover_sec=settings.guardian_takeover_sec)
 
     # Resume any Torque watcher that was still in-flight when this process
     # last stopped (see docs/torque.md "Multi-user order persistence"). Named
@@ -197,9 +205,9 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         log.info("EdgeLane MARKET shutting down")
-        for t in (poll_task, eval_task, simmer_task, ticker_setup_task, simmer_setup_task):
+        for t in [x for x in (poll_task, eval_task, simmer_task, ticker_setup_task, simmer_setup_task, guardian_task) if x]:
             t.cancel()
-        for t in (poll_task, eval_task, simmer_task, ticker_setup_task, simmer_setup_task):
+        for t in [x for x in (poll_task, eval_task, simmer_task, ticker_setup_task, simmer_setup_task, guardian_task) if x]:
             try:
                 await t
             except (asyncio.CancelledError, Exception):

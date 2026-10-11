@@ -31,6 +31,10 @@ services:
       - "127.0.0.1:${EDGELANE_PORT:-8789}:8789"
     environment:
       EDGELANE_MARKET_CONFIG: /config/edgelane_market.config
+      # Torque stop guardian runs ONLY here (production); the shared config file
+      # keeps it off so a local dev backend never runs a second one. A Supabase
+      # lease (torque_guardian_lease) still lets only one container act.
+      GUARDIAN_ENABLED: "true"
       # Simmer's ticker + engine setup now lives in Supabase
       # (public.simmer_tickers_setup + simmer_engine_settings, migration 0022),
       # read by every container and refreshed in memory — no mounted JSON file.

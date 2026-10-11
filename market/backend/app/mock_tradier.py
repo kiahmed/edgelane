@@ -270,6 +270,10 @@ class MockTradierClient:
         """Synthetic order list (empty in demo)."""
         return []
 
+    async def get_positions(self, account_id: str) -> list[dict]:
+        """Synthetic positions (none in demo)."""
+        return []
+
     async def cancel_order(self, account_id: str, order_id) -> dict:
         return {"order": {"id": order_id, "status": "ok"}}
 

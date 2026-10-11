@@ -296,6 +296,7 @@ function App(){
   // exactly like close_target_pct's own default already does. Sending 0
   // explicitly disables it server-side (see PlaceRequest.stop_loss_pct).
   const [stopLoss,setStopLoss]=useState(true);
+  const [slSaved,setSlSaved]=useState(false);   // a saved row exists for this ticker
   const [stopPct,setStopPct]=useState(30);
   const [confirm,setConfirm]=useState(null);    // {order_type}
   const [placing,setPlacing]=useState(false);
@@ -337,7 +338,19 @@ function App(){
   // ticker across a switch, silently sending e.g. a stale 30% for DJX instead
   // of its own wider, noise-tolerant default.
   const slDefault=(cfg&&cfg.stop_loss_defaults&&ticker&&cfg.stop_loss_defaults[ticker])||30;
-  useEffect(()=>{setStopPct(slDefault);},[ticker]);   // eslint-disable-line
+  // The stop-loss toggle + % is a SAVED per-ticker setting (per broker account):
+  // load it on every ticker switch, save it on every change. The backend's stop
+  // guardian applies it to Torque-placed positions in the ticker (never saved =
+  // on, at the default) and — only once SAVED with stop-loss on — to positions
+  // opened outside Torque (Tradier's site, tp CLI). Reflex: always on.
+  useEffect(()=>{if(!ticker)return;setStopPct(slDefault);setSlSaved(false);
+    j('/torque/sl-setting?symbol='+encodeURIComponent(ticker))
+      .then(r=>{setStopLoss(!!r.enabled);setStopPct(r.pct);setSlSaved(!!r.saved);}).catch(()=>{});},[ticker]);   // eslint-disable-line
+  const saveStopLoss=(enabled,pct)=>{if(!ticker)return;const p=Number(pct);
+    j('/torque/sl-setting',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbol:ticker,enabled,pct:(p>=1&&p<100)?p:null})})
+      .then(()=>setSlSaved(true))
+      .catch(e=>setErr('stop-loss setting not saved: '+e.message));};
 
   const sdef=cfg&&strategy?cfg.strategies.find(s=>s.key===strategy):null;
   // Options-data polling pauses outside market hours in PRODUCTION only; sandbox/dev
@@ -722,15 +735,18 @@ function App(){
                 {acRequired&&<span className="muted" style={{fontSize:11,marginLeft:6,fontWeight:700}}>required</span>}
               </div>
               <div className={"toggle"+(stopLoss?' on':'')}
-                onClick={()=>setStopLoss(v=>!v)}
-                title="Auto sell at a drawdown from entry — a stop-loss, symmetric to auto-close's profit target. Single-leg orders get a native broker-held bracket (both exits resting on Tradier, survive this page being closed); spreads use an app-managed watcher, same mechanism as the profit-target close."
+                onClick={()=>{const n=!stopLoss;setStopLoss(n);saveStopLoss(n,stopPct);}}
+                title="Stop-loss for this ticker (saved). Applies to this order and, through Torque's stop guardian, to every Torque-placed position in this ticker (on by default). Positions opened on Tradier's site or the tp CLI are guarded only once this is SAVED on for the ticker. Reflex orders are always protected regardless."
                 style={{alignSelf:'center',marginBottom:4,cursor:'pointer'}}>
                 <span className="sw"></span> stop-loss −
                 <input type="number" min="1" max="99" value={stopPct}
                   onClick={e=>e.stopPropagation()}
                   onChange={e=>setStopPct(e.target.value)}
-                  onBlur={e=>{const v=Number(e.target.value);if(!(v>=1))setStopPct(1);}}
+                  onBlur={e=>{let v=Number(e.target.value);if(!(v>=1)){v=1;setStopPct(1);}saveStopLoss(stopLoss,v);}}
                   style={{width:54,padding:'4px 6px',fontSize:12}}/>%
+                {stopLoss&&!slSaved&&<span className="muted" style={{fontSize:11,marginLeft:6,textDecoration:'underline'}}
+                  title="Using the default. Positions opened outside Torque in this ticker are NOT guarded until it's saved on."
+                  onClick={e=>{e.stopPropagation();saveStopLoss(true,stopPct);}}>default · save to guard outside positions</span>}
               </div>
             </div>
 
@@ -935,12 +951,23 @@ function OrdersPanel({data,onCancel,onModify,busy,ticks}){
   const past=(data&&data.history)||[];        // account-wide Torque-tagged orders, any status
   const empty=orders.length===0&&watchers.length===0;
   const needsAttn=watchers.filter(w=>w.state==='stop_needs_attention').length;
+  // Positions Torque's stop guardian is tracking on this account — every open
+  // position in a Torque ticker, whoever placed it (Torque, Reflex, Tradier, tp).
+  // Reflex: always guarded. Torque: per the ticker's SL setting (on by default).
+  // Opened outside Torque: only once SL is switched ON for that ticker.
+  const guarded=(data&&data.guardian)||[];
+  const G_LABEL={watching:'protected',broker_stop:'protected (broker stop live)',wide_book:'past stop — book too wide, re-checking',
+    no_quote:'protected (no quote yet)',exiting:'EXITING',exited:'closed by guardian',sl_off:'SL turned off',
+    past_stop_alert:'ALERT — already past stop when first seen (not auto-closed)',unconfirmed:'not guarded — unconfirmed spread',
+    watcher_managed:'managed by Torque watcher',no_settings:'waiting for settings',needs_attention:'NEEDS ATTENTION'};
+  const gAlert=guarded.filter(g=>['past_stop_alert','needs_attention','exiting'].includes(g.state)).length;
   const arming=watchers.length-needsAttn;
   return <div className="panel orders">
     <div className="otabs">
       <button className={"otab"+(tab==='working'?' on':'')} onClick={()=>setTab('working')}>
         Working{data?' · '+orders.length:''}{arming?' · '+arming+' arming':''}
-        {needsAttn?<span style={{color:'var(--bad)'}}>{' · '+needsAttn+' NEEDS ATTENTION'}</span>:''}</button>
+        {needsAttn?<span style={{color:'var(--bad)'}}>{' · '+needsAttn+' NEEDS ATTENTION'}</span>:''}
+        {gAlert?<span style={{color:'var(--bad)'}}>{' · guardian '+gAlert}</span>:''}</button>
       <button className={"otab"+(tab==='past'?' on':'')} onClick={()=>setTab('past')}>
         Past Orders{past.length?' · '+past.length:''}</button>
     </div>
@@ -961,6 +988,15 @@ function OrdersPanel({data,onCancel,onModify,busy,ticks}){
         {w.close_reason?<span className="err"> ({w.close_reason})</span>:''}
       </div>)}
     </div>}
+    {guarded.length>0&&<div className="watchers">
+      {guarded.map(g=><div key={g.unit_key} className={"watch"+(['past_stop_alert','needs_attention','exiting'].includes(g.state)?' attn':'')}>
+        <span className={['past_stop_alert','needs_attention','exiting'].includes(g.state)?'dotwarn':'dotpulse'}></span>
+        {' '}stop guardian — {g.ticker} {(g.symbols||[]).join(' + ')}
+        {g.source==='reflex'?' (Reflex)':g.source==='outside'?' (opened outside Torque)':''} · {g.state==='sl_off'&&g.source==='outside'?'not guarded — SL off for this ticker':(G_LABEL[g.state]||g.state)}
+        {g.stop_pct?' · stop '+fmt0(g.stop_pct)+'%':''}
+        {g.note?<div style={{marginTop:2,opacity:.85,fontSize:11}}>{g.note}</div>:''}
+      </div>)}
+    </div>}
     {!data&&<div className="spin">loading…</div>}
     {data&&empty&&<div className="muted">no working orders.</div>}
     {orders.length>0&&<table className="otable">
@@ -972,7 +1008,7 @@ function OrdersPanel({data,onCancel,onModify,busy,ticks}){
         <td><span className={"side "+(/credit|sell/i.test((o.type||'')+(o.side||''))?'put':'call')}>{(o.type||o.side||'').toUpperCase()}</span></td>
         <td>{o.exec_quantity||0}/{o.quantity||0}</td>
         <td><PriceEdit o={o} onModify={onModify} busy={busy} ticks={ticks}/></td>
-        <td><span className={"ostat "+o.status}>{o.status}</span></td>
+        <td><span className={"ostat "+o.status} title={o.bracket_status?'bracket order — status of its entry and exit legs':''}>{o.bracket_status||o.status}</span></td>
         <td className="muted" style={{fontSize:10}}>{o.tag}</td>
         <td><button className="btn xcancel" disabled={busy} onClick={()=>onCancel(o.id)}>cancel</button></td>
       </tr>)}</tbody>
@@ -993,7 +1029,7 @@ function PastList({past}){
       <td>{o.news_signal?'news signal':tagLabel(o.tag)}</td>
       <td>{o.price!=null?'$'+fmt(o.price):(o.type||'').toUpperCase()}</td>
       <td>{(o.exec_quantity||0)}/{(o.quantity||0)}{o.avg_fill_price!=null?' @$'+fmt(o.avg_fill_price):''}</td>
-      <td><span className={"ostat "+o.status}>{o.status}</span></td>
+      <td><span className={"ostat "+o.status} title={o.bracket_status?'bracket order — status of its entry and exit legs':''}>{o.bracket_status||o.status}</span></td>
     </tr>)}</tbody>
   </table>;
 }

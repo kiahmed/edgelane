@@ -246,3 +246,36 @@ async def test_cancel_on_an_account_with_no_broker_connection_is_skipped_not_err
     r = await news_signal(_cancel_payload(), FakeRequest(client))
     assert r["accepted"] is True
     assert r["results"][0]["action"] == "skipped"
+
+
+@pytest.mark.parametrize("px, action, order_type", [
+    ({"complete": True, "abs_mid": 2.0, "net_bid": 1.9, "net_ask": 2.1}, "closing_at_limit", "limit"),
+    (None, "needs_attention", None),
+])
+async def test_cancel_close_never_sends_market_where_market_orders_are_off(enabled, monkeypatch,
+                                                                           px, action, order_type):
+    """Review: a market close on a ticker like DJX pays ~2x fair. With market
+    orders off it crosses at the live bid/ask, or — no quote — is left for a
+    human rather than sent at market."""
+    client = FakeTradier(place_responses=[{"order": {"id": 1, "status": "ok"}}],
+                         order_status={"status": "filled", "exec_quantity": 2.0})
+    await _place_entry(monkeypatch, client)
+
+    async def _resolve_uid(uid):
+        return "tradier", client, "TEST123"
+
+    async def _price(client, symbol, legs):
+        return px
+    monkeypatch.setattr(troute, "resolve_client_for_uid", _resolve_uid)
+    monkeypatch.setattr(troute.tcfg, "market_orders_allowed", lambda t: False)
+    monkeypatch.setattr(troute, "_package_price", _price)
+
+    r = await news_signal(_cancel_payload(), FakeRequest(client))
+    result = r["results"][0]
+    assert result["action"] == action
+    real_orders = [p for p in client.placed if "_modify" not in p]
+    assert all(p.get("type") != "market" for p in real_orders)
+    if order_type:
+        assert real_orders[-1]["type"] == "limit" and real_orders[-1]["tag"].startswith("torqueCancelLmt")
+    else:
+        assert len(real_orders) == 1 and "manually" in result["reason"]

@@ -195,9 +195,25 @@ NEWS_SIGNAL_MAX_AGE_SEC=180
 # Same-contract rejection: walk this many later expiries (one at a time) looking
 # for one without a conflicting open bracket before giving up.
 NEWS_SIGNAL_MAX_EXPIRY_RETRIES=1
+# News-signal entry step-up: the entry goes in at mid; still unfilled after
+# NEWS_SIGNAL_ENTRY_STEP_SEC it's re-placed one price step higher, up to
+# NEWS_SIGNAL_ENTRY_STEPS times (never above the ask), then cancelled. 0 = off.
+NEWS_SIGNAL_ENTRY_STEPS=5
+NEWS_SIGNAL_ENTRY_STEP_SEC=5
 # How often each backend container re-reads Torque's ticker setup
 # (Supabase public.torque_tickers_setup). Edits there apply within this window.
 TORQUE_TICKERS_REFRESH_SEC=60
+# Stop guardian: enforces stop-loss on EVERY open position in Torque tickers,
+# whoever placed it (Torque, Reflex, Tradier's site, the tp CLI). Reflex
+# positions always; others per the Torque page's saved per-ticker stop-loss
+# setting. Leave it off here: the production compose file switches it on
+# (env GUARDIAN_ENABLED=true overrides this file), so local dev never runs a
+# second guardian. In DEVMODE it only ever guards sandbox accounts.
+GUARDIAN_ENABLED=false
+GUARDIAN_INTERVAL_SEC=10
+# Past the stop with a broker-held stop resting that hasn't filled this long →
+# the guardian cancels it and runs its own exit ladder.
+GUARDIAN_TAKEOVER_SEC=10
 # Tradier-fallback GEX weighting (used only when no fresh external feed):
 #   oi     = gamma × open_interest  (resting positioning; default)
 #   volume = gamma × volume         (today's traded gamma; lands closer to the

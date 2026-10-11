@@ -347,3 +347,75 @@ async def test_weekly_name_conflict_retries_on_the_following_listed_expiry(enabl
     r = await news_signal(_payload(symbol="SMH"), FakeRequest(client))
     assert r["accepted"] is True
     assert [row["expiration"] for row in _world.inserted] == ["2030-01-04", "2030-01-11"]
+
+
+# ── per-ticker wide-book limit (max_spread_pct, migration 0023) ─────────────
+WIDE = 1.71          # raw_chain quotes mid±1 → bid 0.71 / ask 2.71 = 117% of mid
+
+
+def test_xle_and_xlf_allow_wider_books_others_keep_100():
+    from app import torque_config as tc
+    assert tc.max_spread_pct("XLE") == 150 and tc.max_spread_pct("XLF") == 150
+    for t in ("SPY", "QQQ", "SMH", "IWM", "DJX", "NDX"):
+        assert tc.max_spread_pct(t) == tc.MAX_AUTO_CLOSE_SPREAD_PCT == 100
+
+
+async def test_wide_xle_signal_is_traded_at_mid(enabled, monkeypatch, _world):
+    client = WeeklyTradier(["2030-01-04"], root="XLE", premium=WIDE, spot=90.0,
+                           place_responses=[{"order": {"id": 1, "status": "ok"}}])
+    _broker(monkeypatch, client, {"1": ("pending", None)})
+    r = await news_signal(_payload(symbol="XLE"), FakeRequest(client))
+    assert r["accepted"] is True and r["limit_price"] == WIDE        # entry at mid
+    assert client.placed and client.placed[0]["price[0]"] == f"{WIDE:.2f}"
+
+
+async def test_same_wide_book_on_spy_is_still_refused(enabled, monkeypatch, _world):
+    client = WeeklyTradier(["2030-01-04"], root="SPY", premium=WIDE, spot=700.0)
+    _broker(monkeypatch, client, {})
+    r = await news_signal(_payload(symbol="SPY"), FakeRequest(client))
+    assert r["accepted"] is False and "spread too wide" in r["reason"]
+    assert client.placed == []
+
+
+async def test_price_endpoint_flags_tradeable_per_ticker():
+    from app.routes.torque import PriceRequest, torque_price
+    for sym, root, spot, expect_untradeable in (("XLE", "XLE", 90.0, False), ("SPY", "SPY", 700.0, True)):
+        client = WeeklyTradier(["2030-01-04"], root=root, premium=WIDE, spot=spot)
+        legs = [{"symbol": f"{root}300104C{int(spot * 1000):08d}", "action": "buy_to_open", "quantity": 1}]
+        p = await torque_price(PriceRequest(legs=legs, symbol=sym), FakeRequest(client))
+        assert p["package_spread_pct"] > 100
+        assert p["untradeable"] is expect_untradeable, sym
+
+
+async def test_near_empty_xle_book_is_still_refused(enabled, monkeypatch, _world):
+    """150% cap: a book with almost no bid (≈190% of mid) is still refused."""
+    client = WeeklyTradier(["2030-01-04"], root="XLE", premium=1.05, spot=90.0)   # bid 0.05 / ask 2.05
+    _broker(monkeypatch, client, {})
+    r = await news_signal(_payload(symbol="XLE"), FakeRequest(client))
+    assert r["accepted"] is False and "spread too wide" in r["reason"]
+
+
+async def test_news_signal_hands_the_step_up_its_mid_ask_and_step(enabled, monkeypatch, _world):
+    client = WeeklyTradier(["2030-01-04"], root="XLE", premium=2.37, spot=90.0,
+                           place_responses=[{"order": {"id": 1, "status": "ok"}}])
+    _broker(monkeypatch, client, {"1": ("pending", None)})
+    spawned = []
+    monkeypatch.setattr(troute, "_spawn_entry_chase",
+                        lambda uid, oid, info, common: spawned.append((uid, oid, info, common)))
+    r = await news_signal(_payload(symbol="XLE"), FakeRequest(client))
+    assert r["accepted"] is True and "_chase" not in r["results"][0]      # internal key never leaks
+    (uid, oid, info, common), = spawned
+    assert uid == "u1" and oid == "1"
+    assert info["limit_price"] == 2.37 and info["ask"] == 3.37            # mid, and the ask cap
+    assert info["tick"].at(3.5) == 0.05 and info["expiration"] == "2030-01-04"
+    assert common["source_event_id"] == "evt-1"
+
+
+async def test_rejected_entries_are_not_stepped(enabled, monkeypatch, _world):
+    client = WeeklyTradier(["2030-01-04"], root="XLE", premium=2.37, spot=90.0,
+                           place_responses=[{"order": {"id": 1, "status": "ok"}}])
+    _broker(monkeypatch, client, {"1": ("rejected", "insufficient buying power")})
+    spawned = []
+    monkeypatch.setattr(troute, "_spawn_entry_chase", lambda *a: spawned.append(a))
+    await news_signal(_payload(symbol="XLE"), FakeRequest(client))
+    assert spawned == []

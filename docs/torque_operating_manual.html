@@ -181,12 +181,15 @@
 </div>
 <div class="btn-ref">
   <div class="name">stop-loss −N% <span class="pill dim">toggle + %</span></div>
-  <div class="desc">Arms a stop-loss exit alongside auto-close — see
-  <a href="#autoclose">Auto-close</a>. Default 30%, editable; DJX keeps a wider 50% default (its
-  book is too wide for a tight stop to be meaningful). Toggle off (or set the field to 0) to trade
-  without a stop. For a single-leg limit entry with both toggles on, the profit and stop legs ride
-  together as one native broker bracket; everywhere else the stop is watched and exited
-  reactively — see below.</div>
+  <div class="desc">The ticker's stop-loss setting — <strong>saved</strong> per ticker for your
+  account, so it's remembered across reloads and devices. Default on at 30% (DJX 50% — its book is
+  too wide for a tight stop to be meaningful). It arms the stop on the order you place, <em>and</em>
+  Torque's <a href="#guardian">stop guardian</a> applies the same setting to <strong>every
+  position you hold in this ticker</strong> — including ones opened on Tradier's site or the tp
+  CLI. Turning it off for a ticker is the only way to leave that ticker's positions unprotected.
+  Reflex (automatic news) orders ignore it and are always protected at the default. For a
+  single-leg limit entry with both toggles on, the profit and stop legs ride together as one
+  native broker bracket; everywhere else the stop is watched and exited reactively — see below.</div>
 </div>
 <div class="btn-ref">
   <div class="name">SEND LIMIT <span class="pill dim">button</span></div>
@@ -700,10 +703,41 @@ as reliable as the backend process — the broker itself is not holding a restin
 because Tradier has no native stop-trigger order type for multi-leg spreads. If the entry is
 rejected, canceled, or never fills, <strong>no close or stop is placed</strong> — a rejected/unfilled
 entry never leaves a naked close behind.</p>
-<p><strong>Scope:</strong> both only arm for orders placed through Torque itself. An order placed by
-hand on the broker's site, or through a separate tool that talks to the broker directly, gets no
-auto-close and no stop-loss from Torque — it may still <em>appear</em> in the Orders panel (which
-lists every live order on the account), but that's just a read-only display, not tracking.</p>
+<p><strong>Scope:</strong> auto-close (the profit target) only arms for orders placed through Torque
+itself. The <strong>stop-loss</strong> reaches further: the stop guardian (below) protects every
+position in a Torque ticker, however it was opened.</p>
+
+<h3 id="guardian">Stop guardian</h3>
+<p>Every ~10 seconds during market hours, Torque checks what your account actually
+<strong>holds</strong> in its tickers — whoever placed it — and makes sure each position's stop is
+honoured:</p>
+<ul>
+  <li><strong>Which stop:</strong> Reflex positions always, at the ticker default (30%, DJX 50%).
+  Positions Torque placed follow the ticker's stop-loss setting on this page — on at the default
+  until you change it.</li>
+  <li><strong>Positions opened outside Torque</strong> (Tradier's site, the tp CLI) are guarded
+  <strong>only once you save stop-loss ON</strong> for that ticker. Until then the stop-loss control
+  shows <em>default · save to guard outside positions</em> — click it (or change the toggle or %) to
+  save. The Orders panel lists them as <em>opened outside Torque · not guarded — SL off for this
+  ticker</em>.</li>
+  <li><strong>Broker stop first:</strong> if the broker already holds a stop for the position
+  (e.g. a bracket's stop leg), Torque lets it work — but if the price is past the stop and it
+  hasn't filled within ~10 seconds, Torque takes over and closes the position itself.</li>
+  <li><strong>Nothing else covers it</strong> (you cancelled the bracket, its exits expired at the
+  close, or you opened it elsewhere): Torque closes it when the stop is crossed — first clearing any
+  resting orders on it, then checking it's still open, then exiting with bounded prices and, as a
+  last resort, at market.</li>
+  <li><strong>Already past the stop when first seen</strong> (e.g. the first time this runs):
+  <span class="pill amber">alert only</span> — Torque flags it but never closes it on its own; it
+  re-arms once the price is back above the stop.</li>
+  <li><strong>Spreads opened outside Torque</strong> are only guarded when today's order history
+  confirms which legs belong together; otherwise they're flagged and left to you. A leg is guarded
+  on its own only if today's orders opened <em>all</em> of it — adding a contract to a spread leg from
+  an earlier day never turns that leg into a standalone position.</li>
+  <li><strong>Tickers that forbid market orders</strong> (DJX): if there's no live quote to price the
+  exit, Torque doesn't send a market order — it flags the position <span class="pill amber">needs
+  attention</span> for you to close.</li>
+</ul>
 
 <h3>Dry Run</h3>
 <p>Submits entry <em>and</em> close to the broker with <code>preview=true</code> — validates
@@ -729,6 +763,15 @@ modify), and has a <strong>cancel</strong> button. An auto-close watcher strip s
 still waiting on its entry to fill; once the close is actually placed it becomes a normal working
 order in the table. Polls every ~4s. A price you edit snaps to the ticker's price step, the same
 as the Limit Price field.</p>
+<p><strong>Bracket status.</strong> A single-leg order with a profit target is one bracket (entry +
+profit target + stop). Its status shows what's actually live: <code>pending</code> (entry not
+filled), <code>filled · TP + SL live</code>, <code>filled · SL live</code>, <code>filled · TP live ·
+SL by guardian</code> (the broker's stop is gone, Torque's guardian is enforcing it),
+<code>filled · no SL (turned off)</code>, <code>closed · TP</code> / <code>closed · SL</code>.</p>
+<p><strong>Stop guardian strip.</strong> Lists every position the guardian is tracking — ticker,
+contract(s), Reflex or not, its stop %, and its state: protected, protected (broker stop live),
+SL turned off, <span class="pill amber">alert — already past stop</span>, exiting, or not guarded
+(unconfirmed spread). Alerts and exits also show on the Working tab's title.</p>
 
 <h3>Past Orders</h3>
 <p><strong>Account-wide</strong>, newest-first: every Torque-tagged order today at any status
@@ -749,12 +792,16 @@ fire still gets noticed), and are labelled <strong>news signal</strong> in Past 
   <li><strong>Unwound automatically.</strong> If later news invalidates the call, a cancel arrives
   and Torque closes it out on its own: a still-unfilled entry is simply cancelled; a filled one is
   closed at market for exactly the filled quantity, whatever its P/L.</li>
+  <li><strong>Chasing a fill.</strong> The entry starts at mid; if it hasn't filled after about
+  5 seconds, Torque raises it one price step and tries again — up to 5 steps, never above the ask.
+  Still no fill after that, the entry is cancelled. (Only automatic news-signal entries do this;
+  your own orders keep the price you set.)</li>
   <li><strong>Same contract already in use.</strong> If an earlier signal's bracket already sits on
   the exact same contract, the broker refuses a second one; Torque then tries the next listed
   expiry once, and otherwise skips the signal.</li>
   <li><strong>What gets skipped.</strong> Signals older than about 3 minutes, signals while the
-  market is closed, tickers that aren't configured, or a package spread too wide to trade blind —
-  nothing is placed for those.</li>
+  market is closed, tickers that aren't configured, or a package spread too wide to trade blind
+  (wider than 100% of mid — 150% on XLE/XLF, whose books run wide) — nothing is placed for those.</li>
   <li><strong>You can still act on them by hand.</strong> Cancel or edit them like any order;
   Torque records what you did.</li>
 </ul>

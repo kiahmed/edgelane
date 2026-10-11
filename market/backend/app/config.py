@@ -297,9 +297,26 @@ class Settings(BaseModel):
     # Same-contract rejection: how many later expiries to walk (one at a time)
     # looking for one without a conflicting open bracket before giving up.
     news_signal_max_expiry_retries: int = Field(default=1)
+    # Entry step-up for news-signal orders: placed at mid, and if not filled
+    # after NEWS_SIGNAL_ENTRY_STEP_SEC it's re-placed one price step higher, up
+    # to NEWS_SIGNAL_ENTRY_STEPS times (never above the ask); still unfilled
+    # after the last step → cancelled. 0 steps = off (rest at mid).
+    news_signal_entry_steps: int = Field(default=5)
+    news_signal_entry_step_sec: float = Field(default=5.0)
     # How often each backend container re-reads public.torque_tickers_setup (s).
     # An edit in the table reaches every container within this window.
     torque_tickers_refresh_sec: int = Field(default=60)
+    # Stop guardian (app/torque_guardian.py): enforces stop-loss on every open
+    # position in Torque tickers, whoever placed it. OFF by default: the
+    # production compose file turns it on with the GUARDIAN_ENABLED env var
+    # (which overrides this file), so a local `make run` / `run-dev` sharing
+    # the same config never runs a second guardian. Even when on, DEVMODE
+    # guards sandbox accounts only, and a Supabase lease lets one container act.
+    guardian_enabled: bool = Field(default=False)
+    guardian_interval_sec: float = Field(default=10.0)
+    # Past the stop with a broker-held stop resting that hasn't filled for this
+    # long → the guardian cancels it and runs its own exit ladder.
+    guardian_takeover_sec: float = Field(default=10.0)
 
     # Same, for Simmer's public.simmer_tickers_setup + simmer_engine_settings.
     simmer_setup_refresh_sec: int = Field(default=60)
@@ -526,8 +543,18 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
         out["news_signal_max_age_sec"] = int(raw["NEWS_SIGNAL_MAX_AGE_SEC"])
     if "NEWS_SIGNAL_MAX_EXPIRY_RETRIES" in raw:
         out["news_signal_max_expiry_retries"] = int(raw["NEWS_SIGNAL_MAX_EXPIRY_RETRIES"])
+    if "NEWS_SIGNAL_ENTRY_STEPS" in raw:
+        out["news_signal_entry_steps"] = int(raw["NEWS_SIGNAL_ENTRY_STEPS"])
+    if "NEWS_SIGNAL_ENTRY_STEP_SEC" in raw:
+        out["news_signal_entry_step_sec"] = float(raw["NEWS_SIGNAL_ENTRY_STEP_SEC"])
     if "TORQUE_TICKERS_REFRESH_SEC" in raw:
         out["torque_tickers_refresh_sec"] = int(raw["TORQUE_TICKERS_REFRESH_SEC"])
+    if "GUARDIAN_ENABLED" in raw:
+        out["guardian_enabled"] = raw["GUARDIAN_ENABLED"].strip().lower() in ("true", "1", "yes", "on")
+    if "GUARDIAN_INTERVAL_SEC" in raw:
+        out["guardian_interval_sec"] = float(raw["GUARDIAN_INTERVAL_SEC"])
+    if "GUARDIAN_TAKEOVER_SEC" in raw:
+        out["guardian_takeover_sec"] = float(raw["GUARDIAN_TAKEOVER_SEC"])
     if "SIMMER_SETUP_REFRESH_SEC" in raw:
         out["simmer_setup_refresh_sec"] = int(raw["SIMMER_SETUP_REFRESH_SEC"])
 
@@ -552,6 +579,10 @@ def load_settings(path: Path | str | None = None) -> Settings:
     if not p.is_file():
         return Settings()
     raw = _parse_config_file(p)
+    # Deploy-time switches that must NOT come from the shared config file
+    # (local dev and the production container read the same file).
+    if os.environ.get("GUARDIAN_ENABLED"):
+        raw["GUARDIAN_ENABLED"] = os.environ["GUARDIAN_ENABLED"]
     return Settings(**_coerce(raw))
 
 

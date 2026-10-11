@@ -359,6 +359,19 @@ class TradierClient:
         except Exception:
             return {"raw": resp.text[:500]}
 
+    async def get_positions(self, account_id: str) -> list[dict]:
+        """GET the account's open positions: [{symbol, quantity, cost_basis,
+        date_acquired, id}]. Option positions carry the OCC symbol; a negative
+        quantity is short; cost_basis is the signed total (debit > 0)."""
+        d = await self._get(f"accounts/{account_id}/positions")
+        pos = (d.get("positions") if isinstance(d, dict) else None) or None
+        if not pos or pos == "null":
+            return []
+        arr = pos.get("position") if isinstance(pos, dict) else pos
+        if arr is None:
+            return []
+        return arr if isinstance(arr, list) else [arr]
+
     async def get_orders(self, account_id: str) -> list[dict]:
         """GET all of today's orders for the account (open + filled + closed).
         Returns a list of order dicts (empty if none)."""

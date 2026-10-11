@@ -57,12 +57,13 @@ class FakeTradier:
     """Configurable async stand-in for TradierClient used in route tests."""
     def __init__(self, spot=22000.0, exp="2026-06-18", raw=None,
                  place_responses=None, order_status=None, orders=None,
-                 order_status_by_id=None, calendar_days=None):
+                 order_status_by_id=None, calendar_days=None, positions=None):
         self._spot = spot
         self._exp = exp
         self._raw = raw if raw is not None else raw_chain(spot, exp=exp)
         self._place = list(place_responses or [])
         self._orders = list(orders or [])
+        self._positions = list(positions or [])
         self._calendar_days = dict(calendar_days or {})
         self._order_status = order_status or {
             "id": 1, "status": "filled", "avg_fill_price": 1.0,
@@ -139,6 +140,9 @@ class FakeTradier:
 
     async def get_orders(self, account_id):
         return list(getattr(self, "_orders", []) or [])
+
+    async def get_positions(self, account_id):
+        return list(getattr(self, "_positions", []) or [])
 
     async def cancel_order(self, account_id, order_id):
         # Realistic broker semantics: cancelling an order that already filled
@@ -234,5 +238,32 @@ def _signal_order_tracking(monkeypatch):
     monkeypatch.setattr(troute.supabase_admin, "get_recent_torque_orders", _recent)
     monkeypatch.setattr(troute.supabase_admin, "update_torque_order_status", _update)
     monkeypatch.setattr(troute, "_confirm_entry_status", _confirm)
+
+    # stop guardian state + saved stop-loss settings (migration 0024)
+    async def _none_rows(*a, **k):
+        return []
+
+    async def _ok(*a, **k):
+        return True
+    for name in ("get_guarded_positions", "get_sl_settings"):
+        monkeypatch.setattr(troute.supabase_admin, name, _none_rows)
+    for name in ("upsert_sl_setting", "upsert_guarded_position", "delete_guarded_position"):
+        monkeypatch.setattr(troute.supabase_admin, name, _ok)
+    troute._GUARD_VIEW.clear()
     yield
+    troute._GUARD_VIEW.clear()
     troute._SIGNAL_ORDERS.update(t=0.0, status={})
+
+
+REAL_SPAWN_ENTRY_CHASE = troute._spawn_entry_chase   # the real spawner, for the tests that need it
+
+
+@pytest.fixture(autouse=True)
+def _no_background_entry_chase(monkeypatch):
+    """The news-signal entry step-up runs as a background task that sleeps and
+    talks to a broker. Off by default in tests (it would outlive them); the
+    step-up tests drive `_chase_entry_fill` directly."""
+    monkeypatch.setattr(troute, "_spawn_entry_chase", lambda *a, **k: None)
+    troute._CANCELLED_SIGNALS.clear()
+    yield
+    troute._CANCELLED_SIGNALS.clear()

@@ -37,6 +37,7 @@ from ..config import get_settings
 from ..broker_resolver import resolve_broker, resolve_client_for_uid
 from ..entitlements import ensure_tool
 from .. import supabase_admin
+from .. import torque_guardian as guardian
 from ..logsetup import TXN, txn
 from ..order_builder import build_tradier_order_payload
 from .. import torque_config as tcfg
@@ -613,7 +614,7 @@ async def torque_price(req: PriceRequest, request: Request):
     out["package_spread_pct"] = round(sp, 2) if sp is not None else None
     out["market_orders_allowed"] = tcfg.market_orders_allowed(sym)
     out["auto_close_required"] = tcfg.close_target_required(sym)
-    out["untradeable"] = bool(sp is not None and sp > tcfg.MAX_AUTO_CLOSE_SPREAD_PCT)
+    out["untradeable"] = bool(sp is not None and sp > tcfg.max_spread_pct(sym))
     if out.get("complete"):
         if out["type"] == "credit":
             out["marketable_price"] = out["abs_bid"]          # you receive the bid
@@ -888,7 +889,7 @@ async def torque_place(req: PlaceRequest, request: Request,
             live_spread_pct = teng.package_spread_pct(_px)
         except Exception:
             live_spread_pct = None
-        if live_spread_pct is not None and live_spread_pct > tcfg.MAX_AUTO_CLOSE_SPREAD_PCT:
+        if live_spread_pct is not None and live_spread_pct > tcfg.max_spread_pct(req.symbol):
             if req.auto_close:
                 # Can't arm an exit that provably cannot fill. Where auto-close is
                 # mandatory that also means the ENTRY is refused: no exit, no trade.
@@ -1259,7 +1260,7 @@ async def _place_news_signal_for_uid(uid, *, request, source_event_id, symbol, s
                                      legs, is_single, entry_type, tick,
                                      limit_price, stop_pct, quantity,
                                      sandbox_only: bool = False, expiration=None,
-                                     attempt: int = 1) -> dict:
+                                     attempt: int = 1, entry_ask: float | None = None) -> dict:
     """One qualified account's attempt: entitlement + broker checks, then a
     fresh PlaceRequest through the real place() path. Never raises — every
     outcome (not entitled, no broker, rejected) comes back as a dict so one
@@ -1324,7 +1325,10 @@ async def _place_news_signal_for_uid(uid, *, request, source_event_id, symbol, s
                 "position_conflict": _is_position_conflict(why),
                 "reason": f"broker rejected: {why or 'no reason given'}"}
     return {"uid": uid, "accepted": True, "entry_order_id": entry_order_id,
-            "expiration": expiration, "attempt": attempt, "place_result": result}
+            "expiration": expiration, "attempt": attempt, "place_result": result,
+            # internal — what the entry step-up needs; popped before responding
+            "_chase": {"limit_price": limit_price, "ask": entry_ask, "tick": tick, "legs": legs,
+                       "expiration": expiration, "attempt": attempt}}
 
 
 # Poll the just-submitted entry a few times: a rejection lands within
@@ -1418,16 +1422,44 @@ def _supersede_watcher(entry_order_id: str, reason: str) -> None:
         w["superseded_reason"] = reason
 
 
+_BRACKET_CLASSES = {"oto", "otoco", "oco"}
+
+
+def _entry_state(o: dict) -> tuple[str, float, float]:
+    """(entry status, entry exec qty, qty still open) for an order.
+
+    A news-signal entry is an OTOCO bracket (entry + profit leg + stop leg).
+    Tradier reports the ENTRY's fill on the bracket's first leg, not on the
+    parent — the parent can still read "open" (exits resting) after the entry
+    has filled, and carries no exec_quantity of its own. Reading the parent
+    alone mistakes a filled bracket for an unfilled one. For a bracket, "still
+    open" is the entry's fill minus whatever the exit legs have executed."""
+    parent_st = str(o.get("status") or "").lower()
+    legs = o.get("leg") or o.get("legs")
+    if isinstance(legs, dict):
+        legs = [legs]
+    if str(o.get("class") or "").lower() in _BRACKET_CLASSES and isinstance(legs, list) and legs:
+        entry = legs[0] or {}
+        filled = teng._f(entry.get("exec_quantity")) or 0.0
+        exited = sum(teng._f((lg or {}).get("exec_quantity")) or 0.0 for lg in legs[1:])
+        st = str(entry.get("status") or parent_st).lower()
+        return st, filled, max(filled - exited, 0.0)
+    filled = teng._f(o.get("exec_quantity")) or 0.0
+    return parent_st, filled, filled
+
+
 async def _cancel_or_close_entry(client, account_id, order_id, quantity):
     """Ground truth for an ENTRY order when a cancel-signal arrives — same
     "cancel best-effort, then a fresh get_order read decides" discipline as
     `_resolve_stalled_stop`, but answering a different question: not "how much
-    is still unfilled and needs a fresh stop," but "how much already executed
-    and needs a market close" (a cancel already kills whatever never filled).
+    is still unfilled and needs a fresh stop," but "how much is executed and
+    still open, and needs a market close" (a cancel already kills whatever
+    never filled — and, for a bracket, its resting exits too).
 
     Returns one of:
       ("canceled", 0)              — never executed; the cancel alone was enough
-      ("close_market", exec_qty)   — fully or partially executed; must market-close this much
+      ("close_market", open_qty)   — executed and still open; must market-close this much
+      ("already_closed", 0)        — executed, but its own exits already closed it
       ("needs_attention", 0)       — final state unconfirmed; do NOT act further
     """
     try:
@@ -1440,6 +1472,15 @@ async def _cancel_or_close_entry(client, account_id, order_id, quantity):
     except Exception as e:
         log.warning("cancel-signal: could not confirm order %s's state: %s", order_id, e)
         return "needs_attention", 0.0
+    st, filled, open_qty = _entry_state(o)
+    if filled > 0:
+        return ("close_market", open_qty) if open_qty > 0 else ("already_closed", 0.0)
+    if st in ("rejected", "expired", "canceled"):
+        return "canceled", 0.0
+    if st in ("filled", "partially_filled"):
+        return "needs_attention", 0.0      # reported filled with no exec quantity — don't guess
+    # Still open/pending even after a cancel attempt — not safe to act on.
+    return "needs_attention", 0.0
     st = str(o.get("status") or "").lower()
     exec_qty = teng._f(o.get("exec_quantity")) or 0.0
     if st in ("rejected", "expired"):
@@ -1450,6 +1491,139 @@ async def _cancel_or_close_entry(client, account_id, order_id, quantity):
         return ("close_market", exec_qty) if exec_qty > 0 else ("needs_attention", 0.0)
     # Still open/pending even after a cancel attempt — not safe to act on.
     return "needs_attention", 0.0
+
+
+# ── news-signal entry step-up ─────────────────────────────────────────────
+_CANCELLED_SIGNALS: set[str] = set()    # source_event_ids a cancel signal has targeted (this container)
+_CHASE_TASKS: set = set()               # strong refs, so running step-ups aren't garbage-collected
+
+
+def _spawn_entry_chase(uid: str, entry_order_id: str, info: dict, common: dict) -> None:
+    if int(get_settings().news_signal_entry_steps) <= 0:
+        return
+    t = asyncio.create_task(_chase_entry_fill(uid, str(entry_order_id), common=common, **info))
+    _CHASE_TASKS.add(t)
+    t.add_done_callback(_CHASE_TASKS.discard)
+
+
+async def _signal_cancelled(source_event_id: str) -> bool:
+    """Has a cancel for this signal arrived — on this container (in memory), or
+    on any container (the signal log, `cancels_event_id`)? A failed read counts
+    as not cancelled; the in-memory check still covers this container."""
+    if str(source_event_id) in _CANCELLED_SIGNALS:
+        return True
+    try:
+        rows = await supabase_admin.select_many(
+            "news_reactor_signals", select="source_event_id",
+            filters={"cancels_event_id": f"eq.{source_event_id}"}, limit=1)
+    except Exception:
+        rows = None
+    return bool(rows)
+
+
+async def _chase_entry_fill(uid: str, entry_order_id: str, *, limit_price: float, ask: float | None,
+                            tick, legs: list[dict], expiration, attempt: int, common: dict) -> None:
+    """Step a news-signal entry up from mid until it fills.
+
+    Every NEWS_SIGNAL_ENTRY_STEP_SEC: if the entry is still unfilled, cancel
+    it, confirm the cancel took (a fill can land in between — never re-place
+    on top of one), then re-place the same bracket one price step higher,
+    never above the ask captured at build. After NEWS_SIGNAL_ENTRY_STEPS steps
+    a still-unfilled entry is cancelled. Stops the moment the entry fills, the
+    order dies, or a cancel signal for this trade arrives (the cancel handler
+    then owns the order). Each re-placed order is its own torque_orders row;
+    each superseded one is recorded as canceled with the reason."""
+    settings = get_settings()
+    steps = max(0, int(settings.news_signal_entry_steps))
+    wait = max(0.0, float(settings.news_signal_entry_step_sec))
+    sid = str(common["source_event_id"])
+    resolved = await resolve_client_for_uid(uid)
+    if not resolved:
+        log.warning("entry step-up: no broker for %s — leaving %s at %s", uid, entry_order_id, limit_price)
+        return
+    _broker, client, account_id = resolved
+    cur_id, cur_px = str(entry_order_id), float(limit_price)
+
+    async def _state(oid):
+        try:
+            return _entry_state(await client.get_order(account_id, oid))
+        except Exception as e:
+            log.warning("entry step-up: could not read %s: %s", oid, e)
+            return None
+
+    async def _record(oid, status, reason):
+        try:
+            await supabase_admin.update_torque_order_status(oid, status, reason)
+        except Exception as e:
+            log.warning("entry step-up: status update failed for %s: %s", oid, e)
+
+    async def _cancel_unfilled(oid, reason) -> str:
+        """Cancel a still-unfilled entry: 'canceled' | 'filled' | 'unknown'."""
+        try:
+            await client.cancel_order(account_id, oid)
+            txn("order cancel requested", account=account_id, order_id=oid, via="entry step-up")
+        except Exception as e:
+            log.warning("entry step-up: cancel failed for %s (may have filled): %s", oid, e)
+        st = await _state(oid)
+        if st is None:
+            return "unknown"
+        status, filled, _open = st
+        if filled > 0:
+            # The fill landed between the last read and the cancel: the entry is
+            # live but cancelling the bracket took its exits with it.
+            await _record(oid, "needs_attention",
+                          "entry filled while being repriced; its bracket exits were cancelled — "
+                          "position has no profit target or stop, review")
+            log.warning("entry step-up: %s filled during cancel — no exits, needs review", oid)
+            return "filled"
+        if status in ("canceled", "rejected", "expired"):
+            await _record(oid, "canceled", reason)
+            return "canceled"
+        return "unknown"
+
+    try:
+        for n in range(1, steps + 2):
+            await asyncio.sleep(wait)
+            if await _signal_cancelled(sid):
+                return
+            st = await _state(cur_id)
+            if st is None:
+                return                     # can't confirm — leave it resting rather than guess
+            status, filled, _open = st
+            if filled > 0 or status not in _WORKING_STATES:
+                return                     # filled (bracket exits live) or already closed out
+            if n > steps:
+                if await _cancel_unfilled(cur_id, f"no fill after {steps} price steps (last {cur_px})") == "canceled":
+                    txn("news_signal entry gave up", id=sid, uid=uid, order_id=cur_id, last=cur_px)
+                return
+            new_px = teng.round_to_tick(cur_px + teng._tick_at(cur_px, tick), tick)
+            if ask:
+                new_px = min(new_px, teng.round_to_tick(float(ask), tick))
+            if new_px <= cur_px:
+                continue                   # already at the ask — wait out the remaining steps
+            if await _cancel_unfilled(cur_id, f"repriced: step {n} → {new_px}") != "canceled":
+                return
+            if await _signal_cancelled(sid):
+                return
+            res = await _place_news_signal_for_uid(
+                uid, legs=legs, tick=tick, limit_price=new_px, expiration=expiration,
+                attempt=attempt, entry_ask=ask, **common)
+            res.pop("_chase", None)
+            if not res.get("accepted"):
+                log.warning("entry step-up: re-place at %s failed for %s: %s", new_px, uid, res.get("reason"))
+                return
+            cur_id, cur_px = str(res["entry_order_id"]), new_px
+            txn("news_signal entry stepped", id=sid, uid=uid, step=n, price=new_px, order_id=cur_id)
+            if await _signal_cancelled(sid):
+                await _cancel_unfilled(cur_id, "cancel signal arrived during step-up")
+                return
+    except Exception as e:                 # never let the task die silently
+        log.warning("entry step-up failed for %s/%s: %s", sid, uid, e)
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
 
 
 async def _close_one_signal_order(row: dict, *, sandbox_only: bool = False) -> dict:
@@ -1479,17 +1653,31 @@ async def _close_one_signal_order(row: dict, *, sandbox_only: bool = False) -> d
             client, account_id, entry_order_id, float(row.get("quantity") or 1))
         result = {"uid": uid, "entry_order_id": entry_order_id, "action": outcome}
         if outcome == "close_market":
-            payload = _build_close_payload(
-                account_id=account_id, symbol=row["symbol"], strategy=row["strategy"],
-                legs=row["legs"], is_single=bool(row["is_single"]), entry_type=row["entry_type"],
-                close_px=None, quantity=int(round(exec_qty)), entry_order_id=entry_order_id,
-                market=True, tag_prefix="torqueCancelMkt")
-            close_res = await _submit(client, account_id, payload)
-            crej, cwhy = _is_rejected(close_res)
-            result["action"] = "close_rejected" if crej else "closed_at_market"
+            use_market = tcfg.market_orders_allowed(row["symbol"])
+            close_px = None
+            if not use_market:
+                # A market order on this ticker pays ~2x fair — cross at the
+                # live bid/ask instead; with no live quote, leave it to a human.
+                px = await _package_price(client, row["symbol"], row["legs"])
+                tick = tcfg.structure_tick(row["symbol"], single=bool(row["is_single"]))
+                close_px = teng.stop_exit_price(px, row["entry_type"], tick) if px else None
             result["exec_quantity"] = exec_qty
-            if crej:
-                result["reason"] = cwhy
+            if not use_market and close_px is None:
+                result["action"] = "needs_attention"
+                result["reason"] = (f"filled position left open: no live quote and market orders are off "
+                                    f"for {row['symbol']} — close it manually")
+            else:
+                payload = _build_close_payload(
+                    account_id=account_id, symbol=row["symbol"], strategy=row["strategy"],
+                    legs=row["legs"], is_single=bool(row["is_single"]), entry_type=row["entry_type"],
+                    close_px=close_px, quantity=int(round(exec_qty)), entry_order_id=entry_order_id,
+                    market=use_market, tag_prefix="torqueCancelMkt" if use_market else "torqueCancelLmt")
+                close_res = await _submit(client, account_id, payload)
+                crej, cwhy = _is_rejected(close_res)
+                result["action"] = ("close_rejected" if crej
+                                    else "closed_at_market" if use_market else "closing_at_limit")
+                if crej:
+                    result["reason"] = cwhy
         elif outcome == "needs_attention":
             result["reason"] = "entry order's final state could not be confirmed after cancel — needs manual review"
         _supersede_watcher(entry_order_id, f"cancel-signal: {result['action']}")
@@ -1510,6 +1698,7 @@ async def _handle_cancel_signal(payload: "NewsSignalPayload", request: Request) 
     everything that isn't itself the cancel decision."""
     if not payload.cancels_event_id:
         return {"ok": True, "accepted": False, "reason": "cancel signal missing cancels_event_id"}
+    _CANCELLED_SIGNALS.add(str(payload.cancels_event_id))   # stops a step-up still running here
     sandbox_only = await _market_gate_sandbox_only(request)
     if sandbox_only is None:
         return {"ok": True, "accepted": False, "reason": "market is closed or its state is unknown"}
@@ -1734,7 +1923,7 @@ async def _news_signal_after_claim(payload: NewsSignalPayload, request: Request,
     # carries no price, so there is no snapshot to fall back to (by design,
     # per the proposal). Reject rather than trade against a garbage book.
     spread_pct = teng.package_spread_pct(price)
-    if spread_pct is not None and spread_pct > tcfg.MAX_AUTO_CLOSE_SPREAD_PCT:
+    if spread_pct is not None and spread_pct > tcfg.max_spread_pct(symbol):
         return {"ok": True, "accepted": False,
                 "reason": f"package spread too wide to trade blind ({spread_pct:.0f}% of mid)"}
     limit_price = teng.suggested_limit(price, build["tick"])
@@ -1748,7 +1937,7 @@ async def _news_signal_after_claim(payload: NewsSignalPayload, request: Request,
     results = [
         await _place_news_signal_for_uid(
             uid, legs=build["legs"], tick=build["tick"], limit_price=limit_price,
-            expiration=build.get("expiration"), **common)
+            expiration=build.get("expiration"), entry_ask=price.get("abs_ask"), **common)
         for uid in uids
     ]
 
@@ -1770,7 +1959,7 @@ async def _news_signal_after_claim(payload: NewsSignalPayload, request: Request,
                 lim = None
                 if nxt:
                     sp = teng.package_spread_pct(nxt["price"])
-                    if sp is None or sp <= tcfg.MAX_AUTO_CLOSE_SPREAD_PCT:
+                    if sp is None or sp <= tcfg.max_spread_pct(symbol):
                         lim = teng.suggested_limit(nxt["price"], nxt["tick"])
                 next_after[after_exp] = (nxt, lim)
             return next_after[after_exp]
@@ -1786,7 +1975,8 @@ async def _news_signal_after_claim(payload: NewsSignalPayload, request: Request,
                     break
                 cur = await _place_news_signal_for_uid(
                     cur["uid"], legs=nxt["legs"], tick=nxt["tick"], limit_price=lim,
-                    expiration=nxt["expiration"], attempt=attempt, **common)
+                    expiration=nxt["expiration"], attempt=attempt,
+                    entry_ask=nxt["price"].get("abs_ask"), **common)
                 cur["retried_after"] = first_reason
                 last_exp = nxt["expiration"]
                 if not cur.get("position_conflict"):
@@ -1795,6 +1985,11 @@ async def _news_signal_after_claim(payload: NewsSignalPayload, request: Request,
                 if cur.get("position_conflict"):
                     cur["reason"] += f" — still conflicting after {max_hops} later expiries"
             results[i] = cur
+
+    for r in results:
+        info = r.pop("_chase", None)
+        if info and r.get("accepted"):
+            _spawn_entry_chase(r["uid"], r["entry_order_id"], info, common)
 
     placed = [r for r in results if r["accepted"]]
     TXN.info("news_signal %s %s %s @ %.2f: %d/%d accounts placed",
@@ -1861,12 +2056,28 @@ def _build_close_payload(*, account_id, symbol, strategy, legs, is_single,
 
 
 async def _package_price(client, symbol: str, legs: list[dict]) -> dict | None:
-    """Live net bid/mid/ask for the open position's legs, or None."""
+    """Live net bid/mid/ask for the open position's legs, or None.
+
+    Priced from the cached nearest-expiry chain where it can be; a leg on any
+    other expiry (a next-expiry retry, a weekly name, a position opened
+    outside Torque) isn't in that chain, so it's quoted directly instead —
+    without this an exit on such a position could never re-quote and fell
+    straight through to a market order."""
+    px_map: dict = {}
     try:
         _, _, contracts = await _get_chain(client, symbol)
+        px_map = {c["symbol"]: c for c in contracts}
     except Exception:
-        return None
-    px = teng.price_structure(legs, {c["symbol"]: c for c in contracts})
+        px_map = {}
+    missing = [lg["symbol"] for lg in legs if lg.get("symbol") and lg["symbol"] not in px_map]
+    if missing:
+        try:
+            for q in await client.quotes(missing):
+                if q.get("symbol"):
+                    px_map[q["symbol"]] = q
+        except Exception:
+            pass
+    px = teng.price_structure(legs, px_map)
     return px if px.get("complete") else None
 
 
@@ -2260,7 +2471,88 @@ _WORKING_STATES = {"open", "pending", "partially_filled", "calculated", "accepte
 # Statuses that record what TORQUE did to a signal order (not a broker state)
 # — the broker poll must not overwrite them with the entry's raw status
 # (e.g. "filled" for a position a cancel signal then closed at market).
-_TORQUE_ACTION_STATUSES = {"closed_at_market", "close_rejected", "needs_attention"}
+_TORQUE_ACTION_STATUSES = {"closed_at_market", "closing_at_limit", "close_rejected", "needs_attention"}
+
+
+# ── bracket status + the stop guardian's view, for the Orders panel ───────
+_GUARD_VIEW: dict[str, tuple[float, dict, dict]] = {}
+_GUARD_LABEL = {
+    "watching": "SL by guardian", "broker_stop": "SL by guardian", "wide_book": "SL by guardian",
+    "no_quote": "SL by guardian", "exiting": "guardian exiting", "exited": "closed by guardian",
+    "sl_off": "no SL (turned off)", "past_stop_alert": "past stop — alert only",
+    "unconfirmed": "no SL (unconfirmed spread)", "watcher_managed": "SL by watcher",
+    "no_settings": "SL pending", "needs_attention": "guardian needs attention",
+}
+
+
+async def _guardian_view(akey: str) -> tuple[dict, dict]:
+    """(guard row by option symbol, ticker -> SL enabled) for an account,
+    cached ~10s so the 4s orders poll doesn't hit the database every time."""
+    hit = _GUARD_VIEW.get(akey)
+    if hit and time.time() - hit[0] < 10:
+        return hit[1], hit[2]
+    by_sym: dict = {}
+    for r in await supabase_admin.get_guarded_positions(akey) or []:
+        for sym in r.get("symbols") or []:
+            by_sym[str(sym).upper()] = r
+    settings = {str(r.get("ticker") or "").upper(): bool(r.get("enabled"))
+                for r in await supabase_admin.get_sl_settings(akey) or []}
+    _GUARD_VIEW[akey] = (time.time(), by_sym, settings)
+    return by_sym, settings
+
+
+def _guard_suffix(sym: str, by_sym: dict, settings: dict) -> str:
+    r = by_sym.get(sym)
+    if r:
+        return _GUARD_LABEL.get(str(r.get("state") or ""), "SL by guardian")
+    t = guardian.ticker_of(sym)
+    if t is None:
+        return "no SL"
+    return "SL by guardian" if settings.get(t, True) else "no SL (turned off)"
+
+
+def _bracket_label(o: dict, by_sym: dict, settings: dict) -> str | None:
+    """What a bracket (oto/otoco) actually has live, from its LEGS — the
+    parent's own status doesn't say whether the entry filled or which exits
+    are still working. None for a non-bracket order."""
+    if str(o.get("class") or "").lower() not in _BRACKET_CLASSES:
+        return None
+    legs = guardian._legs_of(o)
+    if not legs:
+        return None
+    est, filled, _open = _entry_state(o)
+    if not filled:
+        return "pending" if est in _WORKING_STATES else est
+    tp = next((lg for lg in legs[1:] if str(lg.get("type") or "").lower() == "limit"), None)
+    sl = next((lg for lg in legs[1:] if str(lg.get("type") or "").lower() in ("stop", "stop_limit")), None)
+
+    def st(lg):
+        return str((lg or {}).get("status") or "").lower()
+    if st(tp) == "filled":
+        return "closed · TP"
+    if st(sl) == "filled":
+        return "closed · SL"
+    live_tp, live_sl = st(tp) in _WORKING_STATES, st(sl) in _WORKING_STATES
+    if live_tp and live_sl:
+        return "filled · TP + SL live"
+    if live_sl:
+        return "filled · SL live"
+    suffix = _guard_suffix(str(legs[0].get("option_symbol") or "").upper(), by_sym, settings)
+    return f"filled · TP live · {suffix}" if live_tp else f"filled · {suffix}"
+
+
+def _signal_status_code(o: dict) -> str:
+    """torque_orders.status for a signal order — read from the entry leg for
+    a bracket (pending / filled / closed_tp / closed_sl / canceled …)."""
+    if str(o.get("class") or "").lower() in _BRACKET_CLASSES and guardian._legs_of(o):
+        lab = _bracket_label(o, {}, {}) or ""
+        if lab.startswith("closed · TP"):
+            return "closed_tp"
+        if lab.startswith("closed · SL"):
+            return "closed_sl"
+        est, filled, _open = _entry_state(o)
+        return "filled" if filled else est
+    return str(o.get("status") or "").lower()
 
 
 async def _known_signal_orders() -> dict[str, str | None]:
@@ -2295,6 +2587,60 @@ async def _record_signal_order_status(order_id: str, status: str, reason: str | 
         log.warning("torque_orders status sync failed for %s: %s", order_id, e)
 
 
+# ── stop-loss setting per account + ticker (the page's toggle, saved) ──────
+class SLSettingRequest(BaseModel):
+    symbol: str
+    enabled: bool
+    pct: float | None = Field(default=None, gt=0, lt=100)
+    account_id: str | None = None
+
+
+async def _sl_account_key(request: Request, user: dict, account_id: str | None) -> str:
+    broker, client, aid, per_user = await _resolve_torque_broker(request, user, account_id)
+    try:
+        return guardian.account_key(client, aid)
+    finally:
+        if per_user:
+            await client.close()
+
+
+@router.get("/torque/sl-setting", dependencies=_GATE)
+async def torque_sl_setting_get(symbol: str, request: Request, account_id: str | None = None,
+                                user: dict = Depends(get_current_user)):
+    """The page's stop-loss toggle + % for this ticker on the caller's broker
+    account. The stop guardian applies the same setting to every non-Reflex
+    position in the ticker, including ones opened outside Torque. Never
+    saved = on, at the ticker's default."""
+    sym = symbol.upper()
+    key = await _sl_account_key(request, user, account_id)
+    rows = await supabase_admin.get_sl_settings(key)
+    row = next((r for r in (rows or []) if str(r.get("ticker") or "").upper() == sym), None)
+    default_pct = guardian.default_stop_pct(sym)
+    if row:
+        pct = row.get("pct")
+        return {"symbol": sym, "enabled": bool(row.get("enabled")), "saved": True,
+                "pct": float(pct) if pct is not None else default_pct}
+    return {"symbol": sym, "enabled": True, "pct": default_pct, "saved": False}
+
+
+@router.post("/torque/sl-setting", dependencies=_GATE)
+async def torque_sl_setting_set(req: SLSettingRequest, request: Request,
+                                user: dict = Depends(get_current_user)):
+    sym = req.symbol.upper()
+    if sym not in tcfg.known_tickers():
+        raise HTTPException(400, f"{sym} is not a configured Torque ticker")
+    key = await _sl_account_key(request, user, req.account_id)
+    ok = await supabase_admin.upsert_sl_setting({
+        "account_key": key, "ticker": sym, "enabled": bool(req.enabled),
+        "pct": req.pct, "updated_by": str(user.get("id") or ""),
+    })
+    if not ok:
+        raise HTTPException(502, "could not save the stop-loss setting")
+    txn("stop-loss setting saved", account=key, ticker=sym, enabled=req.enabled, pct=req.pct,
+        user=user.get("id"))
+    return {"symbol": sym, "enabled": bool(req.enabled), "pct": req.pct, "saved": True}
+
+
 @router.get("/torque/orders", dependencies=_GATE)
 async def torque_orders(request: Request, account_id: str | None = None,
                         user: dict = Depends(get_current_user)):
@@ -2312,6 +2658,8 @@ async def torque_orders(request: Request, account_id: str | None = None,
         orders = []
         history = []
         signal_status = await _known_signal_orders()
+        akey = guardian.account_key(client, aid)
+        g_by_sym, g_settings = await _guardian_view(akey)
         for o in raw:
             st = str(o.get("status") or "").lower()
             tag = str(o.get("tag") or "")
@@ -2326,6 +2674,8 @@ async def torque_orders(request: Request, account_id: str | None = None,
                 "duration": o.get("duration"), "tag": tag,
                 "create_date": o.get("create_date"),
                 "news_signal": is_signal,
+                # what a bracket actually has live (entry / TP / SL / guardian)
+                "bracket_status": _bracket_label(o, g_by_sym, g_settings),
             }
             if st in _WORKING_STATES:
                 orders.append({**row, "working": True})
@@ -2340,8 +2690,10 @@ async def torque_orders(request: Request, account_id: str | None = None,
             # The broker is the source of truth: carry any status change on a
             # signal order (a fill, a cancel done here or directly at the broker,
             # expiry) into torque_orders.
-            if is_signal and st and signal_status.get(oid) != st:
-                await _record_signal_order_status(oid, st, o.get("reason_description"))
+            code = _signal_status_code(o) if is_signal else ""
+            if is_signal and code and signal_status.get(oid) != code:
+                await _record_signal_order_status(
+                    oid, code, row["bracket_status"] or o.get("reason_description"))
         orders.sort(key=lambda x: x.get("create_date") or "", reverse=True)
         history.sort(key=lambda x: x.get("create_date") or "", reverse=True)
         history = history[:100]
@@ -2361,7 +2713,12 @@ async def torque_orders(request: Request, account_id: str | None = None,
                     for w in _WATCHERS.values()
                     if w.get("state") in ("watching_fill", "stop_needs_attention")
                     and w.get("uid") == my_uid]
-        return {"account_id": aid, "orders": orders, "watchers": watchers, "history": history}
+        # Positions the stop guardian is tracking on this account (any source).
+        guarded = list({r["unit_key"]: {k: r.get(k) for k in ("unit_key", "ticker", "symbols", "source",
+                                                             "state", "note", "stop_pct")}
+                        for r in g_by_sym.values()}.values())
+        return {"account_id": aid, "orders": orders, "watchers": watchers, "history": history,
+                "guardian": guarded}
     finally:
         if per_user:
             await client.close()
