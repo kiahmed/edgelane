@@ -268,8 +268,13 @@ async def refresh_analysis(provider, *, sentiment_by_symbol: Optional[dict] = No
             baseline=row["baseline"], latest=live["latest"],
             spot_baseline=float(row.get("spot_baseline") or 0.0),
             spot_now=live.get("spot_now"), news_bad=news_bad)
+        # NOTE: this is an INSERT-on-conflict (PostgREST upsert), so the payload
+        # must satisfy the table's NOT NULL columns (dir, gap) even though the row
+        # already exists — carry them from the row being refreshed. On conflict,
+        # only the provided columns update; baseline/strikes/thesis are preserved.
         await supabase_admin.upsert_simmer_overnight({
             "symbol": row["symbol"], "expiration": row["expiration"], "session_date": session,
+            "dir": row["dir"], "gap": float(row.get("gap") or 0.0),
             "latest": live["latest"], "volume": live["volume"], "verdict": verdict,
         })
         updated += 1

@@ -98,7 +98,7 @@ async def test_capture_baseline_freezes_strikes_and_premiums():
     snap = await ov.capture_baseline(_FakeProvider(100.0), "NVDA", "2026-11-20", "down")
     assert snap["side"] == "put"
     assert snap["strikes"] == [98.0, 96.0, 94.0]              # OTM puts below spot
-    assert snap["baseline"] == {"98.0": 1.1, "96.0": 1.1, "94.0": 1.1}
+    assert snap["baseline"] == {"98": 1.1, "96": 1.1, "94": 1.1}
     assert snap["spot_baseline"] == 100.0
 
 
@@ -209,7 +209,7 @@ async def test_refresh_analysis_updates_verdict_from_live(mock_supabase, monkeyp
     mock_supabase["overnight"][("NVDA", "2026-11-20", session)] = {
         "symbol": "NVDA", "expiration": "2026-11-20", "session_date": session,
         "dir": "down", "gap": -0.06, "crowd": "sector_wide", "side": "put",
-        "strikes": [98.0, 96.0], "baseline": {"98.0": 1.0, "96.0": 1.0},
+        "strikes": [98.0, 96.0], "baseline": {"98": 1.0, "96": 1.0},
         "spot_baseline": 100.0, "latest": {}, "verdict": {"call": "wait"},
     }
 

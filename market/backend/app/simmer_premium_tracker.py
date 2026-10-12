@@ -46,6 +46,14 @@ def _mid(c: dict) -> float | None:
     return m if m > 0 else None
 
 
+def strike_key(strike: float) -> str:
+    """Canonical string key for a strike, matching how the UI stringifies the
+    number in `strikes` (JSON number → String): 180.0→'180', 182.5→'182.5'. Using
+    str(float(s)) would give '180.0', which the UI's String(180) would never
+    match — the bug that left most premium cells blank."""
+    return "%g" % float(strike)
+
+
 def toward_move_side(direction: str) -> str:
     """The option side whose premiums INFLATE on the move — the strikes we track.
     A drop pumps put premium; a pop pumps call premium."""
@@ -81,7 +89,7 @@ def premium_map(chain: list[dict], strikes: list[float], side: str) -> dict[str,
         if k in want:
             m = _mid(c)
             if m is not None:
-                out[str(k)] = round(m, 4)
+                out[strike_key(k)] = round(m, 4)
     return out
 
 
@@ -90,7 +98,7 @@ def volume_map(chain: list[dict], strikes: list[float], side: str) -> dict[str, 
     out: dict[str, int] = {}
     for c in chain:
         if c.get("side") == side and c.get("strike") is not None and float(c["strike"]) in want:
-            out[str(float(c["strike"]))] = int(c.get("volume") or 0)
+            out[strike_key(float(c["strike"]))] = int(c.get("volume") or 0)
     return out
 
 

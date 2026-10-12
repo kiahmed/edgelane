@@ -47,9 +47,14 @@
 	 *  shows key:value. The row-level `overrides` column is toggleable-tier
 	 *  only (migration 0010), so this stays tiny. */
 	function overrideChips(row: WatchlistRow): string[] {
-		return Object.entries(row.overrides ?? {}).map(([k, v]) =>
-			v === false ? `${k.replace(/_/g, ' ')} off` : `${k.replace(/_/g, ' ')}: ${v}`
-		);
+		return Object.entries(row.overrides ?? {})
+			// `overnight` is structured metadata (the RQ import overlay), surfaced
+			// via the RQ badge + the Overnight tab — not a toggleable-gate chip, so
+			// it must not be dumped here as "overnight: [object Object]".
+			.filter(([k]) => k !== 'overnight')
+			.map(([k, v]) =>
+				v === false ? `${k.replace(/_/g, ' ')} off` : `${k.replace(/_/g, ' ')}: ${v}`
+			);
 	}
 
 	async function pin(expiration: string | null) {

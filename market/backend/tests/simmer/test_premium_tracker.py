@@ -27,11 +27,13 @@ def test_picks_otm_calls_on_a_pop_nearest_first():
     assert s == [102.0, 104.0, 106.0]
 
 
-def test_premium_and_volume_maps():
+def test_premium_and_volume_maps_use_canonical_keys():
+    # keys match how the UI stringifies the strike (180.0 → '180', not '180.0')
     pm = pt.premium_map(_chain(), [98.0, 96.0], "put")
-    assert pm == {"98.0": 1.1, "96.0": 1.1}
+    assert pm == {"98": 1.1, "96": 1.1}
     vm = pt.volume_map(_chain(), [98.0], "put")
-    assert vm == {"98.0": 100}
+    assert vm == {"98": 100}
+    assert pt.strike_key(180.0) == "180" and pt.strike_key(182.5) == "182.5"
 
 
 # ── classification ──────────────────────────────────────────────────────────
