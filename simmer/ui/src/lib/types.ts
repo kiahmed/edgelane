@@ -278,6 +278,9 @@ export interface SimmerSettings {
 	structures_enabled?: string[];
 	gate_overrides?: Record<string, boolean>;
 	notify_email?: boolean;
+	/** Overnight movers (docs/simmer.md → "Overnight movers"). */
+	import_rq_overnight?: boolean;
+	overnight_analyze_all?: boolean;
 	prefs?: Record<string, unknown>;
 }
 export interface SettingsResponse {
@@ -293,4 +296,29 @@ export interface OutcomesSummary {
 	basis: string;
 	last_run_at: string | null;
 	[k: string]: unknown;
+}
+
+/** The "Overnight" card tab (docs/simmer.md → "Overnight movers"). `active`
+ *  false = the tab stays dark (no overnight analysis for this name). */
+export interface OvernightVerdict {
+	call: 'sell_bear_call' | 'sell_bull_put' | 'wait' | 'skip';
+	premium_trend: 'building' | 'holding' | 'fading' | null;
+	underlying_trend: 'extending' | 'holding' | 'retracing' | null;
+	confidence: number;
+	reasons: string[];
+	mean_ratio?: number | null;
+}
+export interface OvernightData {
+	active: boolean;
+	thesis?: string | null;
+	verdict?: OvernightVerdict;
+	dir?: 'up' | 'down';
+	gap?: number;
+	crowd?: string | null;
+	side?: string | null;
+	strikes?: number[];
+	baseline?: Record<string, number>;
+	latest?: Record<string, number>;
+	spot_baseline?: number | null;
+	as_of?: string | null;
 }

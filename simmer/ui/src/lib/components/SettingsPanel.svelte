@@ -30,6 +30,17 @@
 		const err = await settingsStore.save({ notify_email: on });
 		toast(err ?? (on ? 'Email alerts on' : 'Email alerts off'));
 	}
+
+	async function toggleImportRq(on: boolean) {
+		const err = await settingsStore.save({ import_rq_overnight: on });
+		toast(err ?? (on ? 'Overnight import on' : 'Overnight import off'));
+	}
+	async function toggleAnalyzeAll(on: boolean) {
+		const err = await settingsStore.save({ overnight_analyze_all: on });
+		toast(
+			err ?? (on ? 'Overnight analysis: all watchlist items' : 'Overnight analysis: imported names only')
+		);
+	}
 </script>
 
 <div class="space-y-4">
@@ -59,6 +70,36 @@
 				</button>
 			{/each}
 		</div>
+	</div>
+
+	<!-- Overnight movers (docs/simmer.md → "Overnight movers") -->
+	<div class="card p-4">
+		<h2 class="mb-1 text-[0.7rem] font-bold tracking-wider text-slate-400 uppercase">
+			Overnight movers
+		</h2>
+		<p class="mb-3 text-[0.72rem] text-slate-500">
+			RelativeQs's biggest overnight movers (≥2%) are imported into your watchlist just before
+			the open and analyzed for a sell / wait / skip call once the market opens — shown in each
+			card's Overnight tab.
+		</p>
+		<label class="toggle-row cursor-pointer">
+			<span>Import RelativeQs overnight moves</span>
+			<input
+				type="checkbox"
+				checked={s.import_rq_overnight ?? false}
+				disabled={settingsStore.saving}
+				onchange={(e) => toggleImportRq((e.currentTarget as HTMLInputElement).checked)}
+			/>
+		</label>
+		<label class="toggle-row mt-2 cursor-pointer">
+			<span>Run overnight analysis on all watchlist items</span>
+			<input
+				type="checkbox"
+				checked={s.overnight_analyze_all ?? false}
+				disabled={settingsStore.saving}
+				onchange={(e) => toggleAnalyzeAll((e.currentTarget as HTMLInputElement).checked)}
+			/>
+		</label>
 	</div>
 
 	<!-- Notifications -->

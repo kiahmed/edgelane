@@ -608,3 +608,20 @@ async def test_sweep_survives_a_fully_rate_limited_yahoo(fresh_db, monkeypatch):
     assert sw.state.regime is not None
     assert sw.state.regime["state"] == "calm"      # degraded, noted
     assert sw.state.sweep_count == 1
+
+
+async def test_yahoo_pace_enforces_min_interval(monkeypatch):
+    """The global throttle spaces consecutive Yahoo requests by >= the interval."""
+    import time as _t
+    from app import simmer_data_provider as dp
+    monkeypatch.setattr(dp, "_YAHOO_MIN_INTERVAL", 0.05)
+    monkeypatch.setattr(dp, "_yahoo_last_req", 0.0)
+    t0 = _t.monotonic()
+    await dp._yahoo_pace()
+    await dp._yahoo_pace()
+    await dp._yahoo_pace()
+    assert _t.monotonic() - t0 >= 0.10          # >= 2 gaps of 0.05s
+    monkeypatch.setattr(dp, "_YAHOO_MIN_INTERVAL", 0.0)
+    t1 = _t.monotonic()
+    await dp._yahoo_pace()                        # disabled → no wait
+    assert _t.monotonic() - t1 < 0.02

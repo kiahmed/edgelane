@@ -70,6 +70,8 @@ _FULL_PAYLOAD = {
     "regime_strictness": "strict",
     "notify_email": True,
     "gate_overrides": {},
+    "import_rq_overnight": True,
+    "overnight_analyze_all": False,
 }
 
 

@@ -321,6 +321,13 @@ class Settings(BaseModel):
     # Same, for Simmer's public.simmer_tickers_setup + simmer_engine_settings.
     simmer_setup_refresh_sec: int = Field(default=60)
 
+    # Overnight movers (docs/simmer.md → "Overnight movers"). Master kill-switch
+    # for the 09:25 RelativeQs import + the premium-decision analyzer. The base
+    # URL is normally read from public.app_config (relativeqs_api_base); this is
+    # a fallback for local/dev.
+    relativeqs_overnight_enabled: bool = Field(default=True)
+    relativeqs_api_base: str = Field(default="")
+
     # External GEX override (private GEX provider extension webhook)
     use_external_gex: bool = Field(default=True)         # prefer extension data over Tradier-OI walls when fresh
     external_gex_timeout_sec: int = Field(default=30)    # how stale before falling back
@@ -557,6 +564,10 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
         out["guardian_takeover_sec"] = float(raw["GUARDIAN_TAKEOVER_SEC"])
     if "SIMMER_SETUP_REFRESH_SEC" in raw:
         out["simmer_setup_refresh_sec"] = int(raw["SIMMER_SETUP_REFRESH_SEC"])
+    if "RELATIVEQS_OVERNIGHT_ENABLED" in raw:
+        out["relativeqs_overnight_enabled"] = raw["RELATIVEQS_OVERNIGHT_ENABLED"].strip().lower() in ("true", "1", "yes", "on")
+    if "RELATIVEQS_API_BASE" in raw:
+        out["relativeqs_api_base"] = raw["RELATIVEQS_API_BASE"].strip()
 
     if "USE_EXTERNAL_GEX" in raw:
         out["use_external_gex"] = raw["USE_EXTERNAL_GEX"].strip().lower() in ("true", "1", "yes", "on")

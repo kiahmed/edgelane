@@ -301,6 +301,15 @@ def _pin_default_settings():
 
 
 @pytest.fixture(autouse=True)
+def _no_yahoo_pacing(monkeypatch):
+    """Disable the global Yahoo request throttle in tests (it would add real
+    sleeps to every mocked _get_json call). Production keeps the default pace."""
+    from app import simmer_data_provider
+    monkeypatch.setattr(simmer_data_provider, "_YAHOO_MIN_INTERVAL", 0.0)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_real_services(monkeypatch):
     """Ledger/events work must NEVER touch real Supabase or Pub/Sub from the
     suite. During the Matrix build the tests wrote fixture rows into the LIVE

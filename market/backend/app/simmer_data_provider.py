@@ -52,6 +52,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
+import time
 from datetime import date, datetime, timezone
 from typing import Any, Protocol, runtime_checkable
 
@@ -62,6 +64,32 @@ from .poller import _normalize_tradier_contract
 from .simmer_engine import bs_call, bs_delta, bs_put, bs_vega, d1_d2, norm_cdf, norm_pdf
 
 log = logging.getLogger("edgelane.simmer.provider")
+
+# ── Global Yahoo request pacing ─────────────────────────────────────────────
+# Yahoo 429s under bursty load. The sweep walks every watched name back-to-back
+# (quote + expirations + chain each), and the overnight-movers loop runs
+# alongside it — at boot the two together hammered Yahoo and every chain came
+# back empty. Pace ALL Yahoo requests process-wide through one lock so they go
+# out at a steady rate (default ~2/s) instead of in bursts. Tunable via
+# SIMMER_YAHOO_MIN_INTERVAL_MS (0 disables). Shared across every YahooDataProvider
+# instance + the sweep + the overnight loop, since they run in one process.
+_YAHOO_MIN_INTERVAL = max(
+    0.0, float(os.environ.get("SIMMER_YAHOO_MIN_INTERVAL_MS", "500")) / 1000.0)
+_yahoo_pace_lock = asyncio.Lock()
+_yahoo_last_req = 0.0
+
+
+async def _yahoo_pace() -> None:
+    """Block until at least _YAHOO_MIN_INTERVAL has passed since the last Yahoo
+    request, so concurrent callers can't burst past the rate limit."""
+    if _YAHOO_MIN_INTERVAL <= 0:
+        return
+    global _yahoo_last_req
+    async with _yahoo_pace_lock:
+        wait = _YAHOO_MIN_INTERVAL - (time.monotonic() - _yahoo_last_req)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _yahoo_last_req = time.monotonic()
 
 # IV sanity bounds for Yahoo's per-contract impliedVolatility (annualized).
 IV_MIN, IV_MAX = 0.01, 5.0
@@ -404,6 +432,7 @@ class YahooDataProvider(_NotesMixin):
         req_params = dict(params or {})
         if self._crumb:
             req_params["crumb"] = self._crumb
+        await _yahoo_pace()                    # global pacing — avoid 429 bursts
         try:
             resp = await client.get(url, params=req_params)
         except httpx.TimeoutException as e:

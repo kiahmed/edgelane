@@ -467,6 +467,52 @@ async def get_torque_ticker_setup() -> Optional[list[dict]]:
     return await select_many("torque_tickers_setup", order="sort_order.asc,ticker.asc")
 
 
+async def get_app_config(key: str) -> Optional[str]:
+    """One public.app_config value by key (e.g. relativeqs_api_base), or None."""
+    rows = await select_many("app_config", select="value", filters={"key": f"eq.{key}"})
+    if rows:
+        return rows[0].get("value")
+    return None
+
+
+# ── Overnight movers (docs/simmer.md → "Overnight movers") ──────────────────
+async def users_with_overnight_import() -> Optional[list[str]]:
+    """user_ids who turned on toggle 1 (import_rq_overnight). None on read error."""
+    rows = await select_many("simmer_settings", select="user_id",
+                             filters={"import_rq_overnight": "eq.true"})
+    return None if rows is None else [r["user_id"] for r in rows if r.get("user_id")]
+
+
+async def users_with_overnight_analyze_all() -> Optional[list[str]]:
+    """user_ids who turned on toggle 2 (overnight_analyze_all). None on read error."""
+    rows = await select_many("simmer_settings", select="user_id",
+                             filters={"overnight_analyze_all": "eq.true"})
+    return None if rows is None else [r["user_id"] for r in rows if r.get("user_id")]
+
+
+async def get_watchlist_row(user_id: str, symbol: str) -> Optional[dict]:
+    rows = await select_many("simmer_watchlist", filters={
+        "user_id": f"eq.{user_id}", "symbol": f"eq.{str(symbol).upper()}"}, limit=1)
+    return rows[0] if rows else None
+
+
+async def get_simmer_overnight(symbol: str, expiration: str, session_date: str) -> Optional[dict]:
+    rows = await select_many("simmer_overnight", filters={
+        "symbol": f"eq.{str(symbol).upper()}", "expiration": f"eq.{str(expiration)[:10]}",
+        "session_date": f"eq.{str(session_date)[:10]}"}, limit=1)
+    return rows[0] if rows else None
+
+
+async def list_simmer_overnight(session_date: str) -> Optional[list[dict]]:
+    return await select_many("simmer_overnight",
+                             filters={"session_date": f"eq.{str(session_date)[:10]}"})
+
+
+async def upsert_simmer_overnight(row: dict) -> bool:
+    return await upsert_row("simmer_overnight", row,
+                            on_conflict="symbol,expiration,session_date")
+
+
 async def get_simmer_tickers_setup() -> Optional[list[dict]]:
     """Every row of public.simmer_tickers_setup (Simmer's per-ticker setup), in
     list order. None = unknown (Supabase not configured or the read failed) — the

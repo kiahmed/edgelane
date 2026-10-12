@@ -58,6 +58,34 @@ changes. This is only relevant if a real off-hours catalyst alert is wanted.
    Omit it (or set anything else) for a routine off-hours event — the
    default is silence, not a post.
 
+## Related: the overnight-movers importer + premium analyzer (planned)
+
+A separate, larger pre-open feature shares this document's two core ideas — the
+**market-closed / last-available-chain** posture and the **catalyst drives it,
+never promotes it** rule — but it is an IMPORT + ANALYSIS feature, not a posting
+one, so the off-hours *posting* contract above is unchanged.
+
+The full implementation contract is in **`docs/simmer.md` → "Overnight movers —
+RelativeQs import + premium-decision analyzer"**. In brief:
+
+- At **09:25 ET** (pre-open, market closed) Simmer imports the overnight's
+  biggest movers from the sibling **RelativeQs** app (`GET /api/premarket`,
+  |gap| ≥ 2%, Simmer-eligible) into each opted-in user's watchlist for the next
+  expiry, badged **(RQ)**, and researches a one-line thesis for why each moved
+  (Gemini + grounded web / our news). A duplicate (user, symbol, expiry) is
+  **overridden** with the fresh overnight overlay, not skipped.
+- Once open, a standalone **premium-decision analyzer**
+  (`app/simmer_premium_tracker.py`) compares live option premiums on strikes
+  toward the move against the **frozen 9:25 baseline** (last-night close) and
+  collapses it into ONE **decision per name — sell bear-call / sell bull-put /
+  wait / skip** — shown decision-first in a new "Overnight" card tab. Like the
+  off-hours flag here, it **never auto-promotes** a credit sell; it only flags a
+  side the deterministic engine has already built and gated.
+
+If an off-hours *post* is ever wanted for an RQ overnight name, it flows through
+the exact `off_hours_catalyst="true"` attribute described above — no new posting
+path.
+
 ## Summary
 
 Net new here, if ever built: one attribute on the existing publisher, gated

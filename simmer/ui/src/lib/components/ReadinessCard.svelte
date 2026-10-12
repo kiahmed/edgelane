@@ -23,7 +23,14 @@
 		strike,
 		structureName
 	} from '$lib/fmt';
-	import type { ReadinessEnvelope, StrikesCondor, StrikesVertical } from '$lib/types';
+	import OvernightPanel from './OvernightPanel.svelte';
+	import { getJSON } from '$lib/api';
+	import type {
+		OvernightData,
+		ReadinessEnvelope,
+		StrikesCondor,
+		StrikesVertical
+	} from '$lib/types';
 
 	let {
 		env,
@@ -52,6 +59,31 @@
 	onMount(() => {
 		if (startExpanded) expanded = true;
 	});
+
+	// Overnight tab (docs/simmer.md → "Overnight movers"). Lazy-loaded from the
+	// backend when the card expands; the tab only appears when there's an
+	// analysis for this name, and lights up when the call is decisive.
+	let tab = $state<'readiness' | 'overnight'>('readiness');
+	let overnight = $state<OvernightData | null>(null);
+	let overnightLoaded = $state(false);
+	async function loadOvernight() {
+		overnightLoaded = true;
+		try {
+			const res = await getJSON<{ data: OvernightData }>(
+				`/simmer/overnight/${encodeURIComponent(env.symbol)}`
+			);
+			overnight = res?.data ?? null;
+			if (overnight?.active) tab = 'overnight'; // auto-focus the lit tab
+		} catch {
+			overnight = null;
+		}
+	}
+	$effect(() => {
+		if (expanded && !overnightLoaded) loadOvernight();
+	});
+	const ovnLit = $derived(
+		!!overnight?.active && !!overnight?.verdict && overnight.verdict.call !== 'wait'
+	);
 
 	const isReady = $derived(env.decision === 'ready');
 	const condor = $derived(
@@ -89,6 +121,9 @@
 	<!-- Header (always visible; carries the summary chip + collapse toggle) -->
 	<div class="flex flex-wrap items-center gap-x-3 gap-y-1" class:mb-3={expanded}>
 		<span class="text-lg font-black tracking-tight">{env.symbol}</span>
+		{#if overnight?.active}
+			<span class="rq-badge" title="Imported from RelativeQs overnight movers">RQ</span>
+		{/if}
 		<span class="pill {decisionBadgeClass(env.decision)}">{DECISION_LABEL[env.decision] ?? env.decision}</span>
 		<span class="text-xs text-slate-400">
 			{env.expiration ?? '—'} · {sigInt(env.dte)} DTE
@@ -154,6 +189,21 @@
 	</div>
 
 	{#if expanded}
+	<!-- Tabs: the standard readiness view + the Overnight tab (only when there is
+	     an overnight analysis for this name; lit when the call is decisive). -->
+	{#if overnight?.active}
+		<div class="ovn-tabs mb-3">
+			<button type="button" class="ovn-tab" class:active={tab === 'readiness'}
+				onclick={() => (tab = 'readiness')}>Readiness</button>
+			<button type="button" class="ovn-tab" class:active={tab === 'overnight'}
+				onclick={() => (tab = 'overnight')}>
+				Overnight<span class="ovn-dot" class:lit={ovnLit} aria-hidden="true"></span>
+			</button>
+		</div>
+	{/if}
+	{#if tab === 'overnight' && overnight?.active}
+		<OvernightPanel data={overnight} />
+	{:else}
 	<!-- Active override warnings — a guard is down; say so where the user looks -->
 	{#each activeOverrides as ov (ov)}
 		<div class="override-warn mb-2">
@@ -313,6 +363,7 @@
 		</div>
 	{/if}
 	{/if}
+	{/if}
 
 	<!-- Footer: per-symbol news link, anchored to the card bottom (visible while
 	     collapsed too, so it lives inside the chip rather than in the gap below). -->
@@ -335,6 +386,50 @@
 		font-size: 0.72rem;
 		line-height: 1.1rem;
 		white-space: nowrap;
+	}
+	.rq-badge {
+		display: inline-block;
+		border-radius: 0.25rem;
+		border: 1px solid rgba(96, 165, 250, 0.5);
+		background: rgba(96, 165, 250, 0.12);
+		color: #93c5fd;
+		padding: 0 0.3rem;
+		font-size: 0.6rem;
+		font-weight: 700;
+		letter-spacing: 0.03em;
+		vertical-align: middle;
+	}
+	.ovn-tabs {
+		display: flex;
+		gap: 0.25rem;
+		border-bottom: 1px solid rgba(100, 116, 139, 0.25);
+	}
+	.ovn-tab {
+		border: none;
+		background: transparent;
+		padding: 0.3rem 0.6rem;
+		font-size: 0.78rem;
+		font-weight: 600;
+		color: #94a3b8;
+		border-bottom: 2px solid transparent;
+		cursor: pointer;
+	}
+	.ovn-tab.active {
+		color: #e2e8f0;
+		border-bottom-color: #10b981;
+	}
+	.ovn-dot {
+		display: inline-block;
+		width: 0.42rem;
+		height: 0.42rem;
+		margin-left: 0.35rem;
+		border-radius: 9999px;
+		background: rgba(100, 116, 139, 0.6);
+		vertical-align: middle;
+	}
+	.ovn-dot.lit {
+		background: #f59e0b;
+		box-shadow: 0 0 6px rgba(245, 158, 11, 0.8);
 	}
 	.summary-chip--sell {
 		background: #ffffff;

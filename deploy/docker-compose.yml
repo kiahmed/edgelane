@@ -62,7 +62,7 @@ services:
     networks:
       - edgelane-network
 
-  # Cloudflare *named* tunnel — a permanent hostname (edge.facades.trade) routed
+# Cloudflare *named* tunnel — a permanent hostname (edge.facades.trade) routed
   # to http://edgelane-backend:8789. The hostname and its DNS record live in the
   # Cloudflare dashboard and belong to the tunnel, not to this container, so a
   # restart (or a rebuild, or a move to another host) keeps the same URL.

@@ -66,6 +66,7 @@ from . import simmer_email
 from . import simmer_engine
 from . import simmer_events
 from . import simmer_ledger
+from . import simmer_overnight as overnight
 from . import supabase_admin
 from .config import get_settings
 from .dealer_exposures import compute_dealer_exposures
@@ -2079,6 +2080,70 @@ async def _resolve_sweep_seconds() -> int:
     return max(60, min(mins) * 60) if mins else cfg_default
 
 
+def _seconds_until(now, hh: int, mm: int) -> float:
+    """Seconds from `now` (tz-aware) to the next hh:mm, same day or tomorrow."""
+    from datetime import timedelta
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if target <= now:
+        target = target + timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+async def overnight_loop(provider, tz_name: str) -> None:
+    """Dedicated overnight scheduler (docs/simmer.md → "Overnight movers").
+
+    Wakes near **09:25 ET** for the one-shot RelativeQs import + frozen baseline,
+    then — once open — refreshes the premium-decision verdicts every ~3 min
+    (tighter, ~1 min, for the first 30 min) until close. Separate from the sweep
+    so the 9:25 capture lands on time regardless of sweep cadence. Best-effort;
+    only cancellation propagates."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(tz_name) if tz_name else ZoneInfo("America/New_York")
+    imported_date: str | None = None
+    while True:
+        try:
+            if not simmer_config.setup_loaded():
+                await asyncio.sleep(30.0)
+                continue
+            now = datetime.now(tz)
+            today = now.date().isoformat()
+            # Once-per-session import. Window opens at 9:25 ET; if the process
+            # starts later it still imports (baseline is then intraday, logged).
+            if now.weekday() < 5 and imported_date != today \
+                    and (now.hour, now.minute) >= (9, 25) and now.hour < 16:
+                try:
+                    res = await overnight.run_import(provider)
+                    log.info("overnight import: %s", res)
+                    # Only mark the session done once we actually imported — so
+                    # enabling the toggle after 9:25, or a transient empty-chain
+                    # window at the open (rate-limited data), still imports on a
+                    # later tick instead of being skipped for the whole day.
+                    if res.get("imported", 0) > 0:
+                        imported_date = today
+                except Exception:
+                    log.exception("overnight import failed")
+            open_, _ = _is_market_open(tz_name)
+            if open_:
+                try:
+                    n = await overnight.refresh_analysis(provider)
+                    if n:
+                        log.info("overnight refresh updated %d row(s)", n)
+                except Exception:
+                    log.exception("overnight refresh failed")
+                mins_since_open = (now.hour - 9) * 60 + (now.minute - 30)
+                sleep = 60.0 if 0 <= mins_since_open < 30 else 180.0
+            elif (now.hour, now.minute) < (9, 25):
+                sleep = min(_seconds_until(now, 9, 25), 600.0)   # wake near 9:25
+            else:
+                sleep = 600.0
+            await asyncio.sleep(sleep)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("overnight loop error — retrying in 30s")
+            await asyncio.sleep(30.0)
+
+
 async def simmer_loop(tradier_client, db, settings) -> None:
     """Started by main.py lifespan as `edgelane.simmer_loop`, alongside
     poll_task and eval_task. Market-hours gated via poller._is_market_open;
@@ -2127,6 +2192,13 @@ async def simmer_loop(tradier_client, db, settings) -> None:
         log.warning("EDGAR client unavailable: %s", e)
     log.info("simmer loop started — interval=%ss tz=%s closed_policy=%s",
              interval, tz_name, "sweep-anytime" if poll_when_closed else "skip-off-hours")
+    # Overnight movers: a dedicated child scheduler (docs/simmer.md → "Overnight
+    # movers") so the 09:25 import + frozen baseline land on time regardless of
+    # the sweep cadence. Gated by the master switch; cancelled with the loop.
+    ovn_task = None
+    if bool(getattr(settings, "relativeqs_overnight_enabled", True)):
+        ovn_task = asyncio.create_task(overnight_loop(provider, tz_name),
+                                       name="edgelane.simmer_overnight")
     try:
         while True:
             try:
@@ -2180,6 +2252,12 @@ async def simmer_loop(tradier_client, db, settings) -> None:
                 await asyncio.sleep(10)
     finally:
         state.is_running = False
+        if ovn_task is not None:
+            ovn_task.cancel()
+            try:
+                await ovn_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if edgar is not None:
             try:
                 await edgar.close()

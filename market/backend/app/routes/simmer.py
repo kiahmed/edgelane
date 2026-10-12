@@ -100,7 +100,34 @@ def _dte(exp_iso: str) -> int:
 # it exposes the sweep's already-computed verdicts to the posting pipeline and
 # never writes. Blank token ⇒ 401 (dark until provisioned).
 _SIMMER_SYM_RE = re.compile(r"^[A-Z.\-]{1,10}$")
-_SIMMER_STATE_BLOCKS = ("card", "score", "gates", "sentiment", "evolution")
+_SIMMER_STATE_BLOCKS = ("card", "score", "gates", "sentiment", "evolution", "overnight")
+
+
+async def _overnight_block(sym: str, expiration) -> dict:
+    """The "Overnight" card tab's data (docs/simmer.md → "Overnight movers").
+    `active` False → the tab stays dark (no overnight analysis for this name)."""
+    if not expiration:
+        return {"active": False}
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    session = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    row = await supabase_admin.get_simmer_overnight(sym, str(expiration)[:10], session)
+    if not row:
+        return {"active": False}
+    return {
+        "active": True,
+        "thesis": row.get("thesis"),
+        "verdict": row.get("verdict") or {},
+        "dir": row.get("dir"),
+        "gap": float(row.get("gap") or 0.0),
+        "crowd": row.get("crowd"),
+        "side": row.get("side"),
+        "strikes": row.get("strikes") or [],
+        "baseline": row.get("baseline") or {},
+        "latest": row.get("latest") or {},
+        "spot_baseline": row.get("spot_baseline"),
+        "as_of": row.get("updated_at"),
+    }
 
 
 def require_simmer_api_token(authorization: str | None = Header(default=None)) -> None:
@@ -216,7 +243,23 @@ async def simmer_state_block(symbol: str, request: Request,
     env = _readiness_for(sym, None)
     if env is None:
         raise HTTPException(404, f"no readiness for {sym}")
+    if block == "overnight":
+        return {"symbol": sym, "block": block,
+                "data": await _overnight_block(sym, env.get("expiration"))}
     return {"symbol": sym, "block": block, "data": _state_block(env, block, _db(request))}
+
+
+@router.get("/simmer/overnight/{symbol}", dependencies=_GATE)
+async def simmer_overnight_block(symbol: str):
+    """The Overnight card tab's data for a signed-in user (docs/simmer.md →
+    "Overnight movers"). User-JWT gated (unlike /simmer/state, which is for the
+    token-bearing snap/postiz readers). `active` false → the tab stays dark."""
+    sym = (symbol or "").upper()
+    if not _SIMMER_SYM_RE.match(sym):
+        raise HTTPException(422, f"invalid symbol {symbol!r}")
+    env = _readiness_for(sym, None)
+    expiration = env.get("expiration") if env else None
+    return {"symbol": sym, "data": await _overnight_block(sym, expiration)}
 
 
 @router.get("/simmer/snap/{symbol}", dependencies=_API_TOKEN_GATE,
@@ -849,6 +892,11 @@ def sanitize_settings(payload: dict) -> dict:
         out["risk_profile"] = rp
     if payload.get("notify_email") is not None:
         out["notify_email"] = bool(payload["notify_email"])
+    # Overnight-movers toggles (docs/simmer.md → "Overnight movers").
+    if payload.get("import_rq_overnight") is not None:
+        out["import_rq_overnight"] = bool(payload["import_rq_overnight"])
+    if payload.get("overnight_analyze_all") is not None:
+        out["overnight_analyze_all"] = bool(payload["overnight_analyze_all"])
     if payload.get("gate_overrides") is not None:
         overrides = payload["gate_overrides"]
         if not isinstance(overrides, dict):
@@ -886,7 +934,8 @@ async def get_settings_endpoint(user: dict = Depends(require_simmer_access)):
         "simmer_settings", "user_id", str(user["id"]),
         "min_score,min_iv_percentile,min_dte,max_dte,short_delta_min,"
         "short_delta_max,notify_email,risk_profile,structures_enabled,"
-        "gate_overrides,regime_strictness,max_concurrent,sweep_interval,prefs")
+        "gate_overrides,regime_strictness,max_concurrent,sweep_interval,prefs,"
+        "import_rq_overnight,overnight_analyze_all")
     return {"settings": row or {}, "defaults": {
         "min_score": simmer_config.decision_bands()["ready"],
         "structures_enabled": list(STRUCTURES),

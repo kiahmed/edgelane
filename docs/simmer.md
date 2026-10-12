@@ -57,6 +57,7 @@ for the risk.
 - [Deployment](#deployment)
 - [Configuration](#configuration)
 - [Database-held ticker and engine setup (planned)](#database-held-ticker-and-engine-setup-planned)
+- [Overnight movers — RelativeQs import + premium-decision analyzer (planned)](#overnight-movers--relativeqs-import--premium-decision-analyzer-planned)
 - [Testing](#testing)
 - [Gap analysis and open risks](#gap-analysis-and-open-risks)
 - [Phased build plan](#phased-build-plan)
@@ -2411,6 +2412,182 @@ calibration loop ([The hard requirement: calibration is config-independent](#the
   resolved config (`resolved()` before == after, per ticker).
 - **Rollout:** run `make db-setup` before deploying the code; remove the JSON
   file and its mount in the same deploy.
+
+---
+
+## Overnight movers — RelativeQs import + premium-decision analyzer (planned)
+
+**Status: planned, not built.** Brief approved 2026-10-11. This section is the
+implementation contract — build to it exactly.
+
+### What it does
+
+Right before the open, import the overnight's biggest movers from the sibling
+**RelativeQs** app into each opted-in user's watchlist for the next expiry,
+research *why* each moved, then — once the market opens — watch how the options
+premiums on those names behave versus last night's close and collapse all of it
+into **ONE decision per name: sell this credit side / wait / skip**, shown in a
+new "Overnight" tab on the expanded card.
+
+**Decision-first, not a dashboard.** The premium sampling and smoothing run under
+the hood; the card surfaces the call, the one-line thesis, and two supporting
+lines — never EMA numbers or a minute-by-minute readout the user has to assemble.
+
+### 1. Data source — RelativeQs `/api/premarket`
+
+- Sibling repo `../RelativeQs` (Nasdaq-100 overnight board). The source of truth
+  is **`GET {base}/api/premarket`**, which is **unauthenticated today** — the
+  RelativeQs UI calls it with no token (`src/services/marketApi.ts`); only its
+  Pro routes use a Supabase bearer.
+- Response carries a `movers[]` array (`backend/app/core/premarket.py`). Per
+  mover Simmer consumes: `symbol`, `gap` (signed overnight fractional move, e.g.
+  `-0.06` = −6%), `dir` (`up`/`down`), `sector`, `crowd`
+  (`sector_wide`/`lone`/`mixed`, or `with_market`/`against_market`), `vs_tape`,
+  `sustain`. **`crowd` is the peer-confirmation signal** (sector-wide =
+  systemic/durable; lone = idiosyncratic/revert-prone), so Simmer does NOT
+  recompute peers — it reads RelativeQs's.
+- **Config:** the base URL lives in `public.app_config` under key
+  `relativeqs_api_base` (non-sensitive; service-role read, same posture as the
+  existing `api_base` row). No token today. The client
+  (`app/simmer_relativeqs.py`) accepts an **optional** bearer so a future
+  lockdown is a one-line change here.
+- **RelativeQs-repo checklist (NOT EdgeLane's work):** `/api/premarket` is open —
+  add a checklist item in the RelativeQs repo to require a token / allow-listed
+  caller later. EdgeLane's client already sends one when configured.
+
+### 2. Config + schema changes
+
+- `app_config`: new row `relativeqs_api_base`.
+- `config.py` Settings: `relativeqs_overnight_enabled` (master kill-switch,
+  default true). The fetch time is fixed at **09:25 ET** in code, not a knob.
+- `simmer_settings` (per-user) — migration adds two booleans:
+  - `import_rq_overnight boolean default false` — **toggle 1**, "Import
+    RelativeQs Overnight Moves".
+  - `overnight_analyze_all boolean default false` — **toggle 2**, "Run overnight
+    analysis on all watchlist items". Default scope is RQ-imported names only;
+    this extends the analyzer to the whole active watchlist.
+- `simmer_watchlist`: migration adds `source text not null default 'user'`
+  (`'user'` | `'rq'`) — drives the **(RQ)** badge. Overnight metadata lives in
+  the existing `overrides` jsonb under an `overnight` key
+  (`{gap, dir, crowd, imported_at, thesis}`).
+- New table `public.simmer_overnight` — shared, multi-container analyzer state,
+  keyed **user-agnostic** `(symbol, expiration, session_date)` so one analysis
+  serves every user watching that name (the readiness math is already
+  user-agnostic). Columns: `symbol`, `expiration`, `session_date`, `dir`, `gap`,
+  `crowd`, `thesis`, `strikes` jsonb (chosen strikes toward the move), `baseline`
+  jsonb (frozen last-night-close premiums+OI per strike, set once at 9:25),
+  `latest` jsonb (most recent live premiums+volume per strike), `verdict` jsonb
+  (`{call, premium_trend, underlying_trend, confidence, reasons}`), `created_at`,
+  `updated_at`. RLS on, no policies (service-role; the UI reads it via a backend
+  route, never directly). Seeded by `make db-setup` migration, next free number.
+
+### 3. The 09:25 ET pre-open import job
+
+A time-gated branch in `simmer_watcher.simmer_loop` (mirrors the existing
+market-open gating), firing **once per session at 09:25 America/New_York**:
+
+1. Fetch via `simmer_relativeqs.fetch_movers()`.
+2. Keep movers with **|gap| ≥ 0.02 (2%)** that are **Simmer-eligible**
+   (`ticker_rule(sym)["eligible"]` and not in `blocked_tickers()`).
+3. Resolve the **next available expiry** (existing `choose_expiration`).
+4. For each user with `import_rq_overnight = true`, upsert
+   `simmer_watchlist (user_id, symbol, expiration)` with `source='rq'` and the
+   `overrides.overnight` overlay.
+   - **Override, not skip:** if an active row already exists for that
+     (user, symbol, expiry), **UPDATE** it — merge the `overnight` overlay and
+     flag it RQ — so an existing name is refreshed with last night's news, never
+     left stale. (This reverses the initial "skip duplicates" idea.)
+5. For each imported (symbol, expiry), ensure a `simmer_overnight` row exists and
+   run the thesis + baseline step (§4–5). User-agnostic — computed once.
+
+Fetch failures are best-effort (logged; no import that session) — never block the
+sweep. Honors `setup_loaded()` fail-closed like the rest of the watcher.
+
+### 4. Overnight thesis — "why it moved"
+
+- At 9:25 the market is closed → chain quotes are last-night close. Run one
+  research pass per imported name: `app/simmer_overnight.py::research_thesis(sym,
+  gap, dir)` → a **one-line** cause via **Gemini with Google-Search grounding**
+  (real web), falling back to summarizing the overnight Finnhub/Alpaca
+  company-news we already pull. Stored on `simmer_overnight.thesis` and mirrored
+  into `overrides.overnight.thesis`.
+- **Social (X/Reddit/StockTwits) is out of v1** — a later source behind the same
+  `research_thesis` seam; grounded web + our news carries most of the signal.
+- Gemini stays **prose-only** (Simmer rule): the thesis is narrative; it never
+  feeds scoring.
+
+### 5. The premium-decision analyzer (standalone routine)
+
+New module `app/simmer_premium_tracker.py` — takes `(baseline, live samples, dir,
+crowd, thesis)` → a verdict. Invoked by a **dedicated loop** AND callable from the
+normal sweep (so it can run for all watched items under toggle 2).
+
+- **Strikes:** pick a few strikes **toward the move** off the last-night chain —
+  `dir=down` → the call strikes that become sellable **above** the new level (and
+  the OTM puts below for the deflation read); `dir=up` → OTM **calls above**.
+  Reuse the engine's strike picker / `strike_profiles`; store in
+  `simmer_overnight.strikes`.
+- **Baseline (frozen):** ONE snapshot at 9:25 of those strikes' premiums (+ OI) =
+  last-night close. Written **once** to `simmer_overnight.baseline`; **never
+  overwritten** — this is the immutable "table 1", so a later read can't replace
+  it.
+- **Live:** after the open, re-fetch the **same strikes** → `simmer_overnight.latest`
+  (premium + volume per strike); per strike `ratio = premium_now /
+  premium_baseline`.
+- **Cadence (under the hood):** normal sweep cadence, tightened to ~1-min for the
+  first ~30 min after open; recompute the verdict each sample. Nothing per-sample
+  is surfaced — only the current verdict.
+- **Classification (internal):** smooth each strike's ratio (short EMA) and
+  classify premium as **holding / building / fading** (slope with a dead-band),
+  confirmed by volume (premium↑ + volume↑ = conviction; premium↑ + volume thin =
+  weak). Track the underlying separately: holding the gap level vs retracing.
+- **Verdict (the only thing surfaced):** `{call, premium_trend, underlying_trend,
+  confidence, reasons[]}`, `call ∈ {sell_bear_call, sell_bull_put, wait, skip}`.
+  Heuristic mapping — **never auto-promotes**, only flags a side the deterministic
+  engine has already built & gated (Simmer's "catalyst never promotes" rule):
+  - down move + confirmed bad news + premiums holding/building + sector-wide →
+    **sell_bear_call** above the new level.
+  - underlying holding + premiums fading + not violently rebounding →
+    **sell_bull_put** (IV-crush / time-decay) once gates clear.
+  - premiums collapsing fast / move reversing / news debunked → **skip** (fade).
+  - mixed / too early → **wait**.
+- **Calibration:** every verdict snapshot is logged (reuse the
+  `settings_fingerprint` + outcomes posture) so the heuristic can be validated
+  and tuned. It is explicitly unproven on day one — ship it labeled.
+
+### 6. Backend read surface + the "Overnight" card tab
+
+- New state block: **`GET /simmer/state/{symbol}?block=overnight`** →
+  `{thesis, verdict, baseline, latest, strikes, dir, crowd, as_of}` from
+  `simmer_overnight` (503 until `setup_loaded()`, like the other scoring routes).
+- Frontend (SvelteKit expanded card): a second **"Overnight"** tab that **lights
+  up only when** a `simmer_overnight` row exists for the name, showing
+  decision-first:
+  1. **The call** — sell bear-call / sell bull-put / wait / skip + confidence.
+  2. **Thesis** — one line.
+  3. **Two supporting lines** — premium trend (holding/building/fading) and peer
+     context (sector-wide/lone).
+  4. Optional **collapsible** drill-down: the baseline-vs-live premium tables,
+     collapsed by default — not the headline.
+- Settings tab: the two toggles, between RISK PRESET and NOTIFICATIONS.
+- Watchlist: **(RQ)** badge on `source='rq'` rows.
+
+### 7. Phasing
+
+1. RQ client + `app_config`/`config` + 9:25 import + toggle 1 + `source` badge +
+   override-not-skip.
+2. Thesis (grounded Gemini) + `simmer_overnight` table + `block=overnight` route +
+   the card tab (thesis only to start).
+3. Premium tracker (baseline + live + classification) + the verdict + toggle 2.
+4. Calibration logging + peer/strategy tuning.
+
+### 8. Open risks
+
+- Grounded-search quality/latency for the thesis (why the fetch is at 9:25, not
+  9:28 — leaves headroom before the open).
+- The verdict heuristic is unvalidated — ship labeled, log it, tune from outcomes.
+- RelativeQs's universe is Nasdaq-100; movers outside Simmer's eligible set are
+  dropped at import.
 
 ---
 
