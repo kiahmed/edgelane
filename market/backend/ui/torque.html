@@ -100,7 +100,7 @@
   .ptype.debit{color:var(--debit);background:#1c1606}
   .ptype.credit{color:var(--credit);background:#06160e}
   .sendrow{display:flex;gap:10px;align-items:flex-end;margin-top:16px;flex-wrap:wrap}
-  .counterband{flex:1 1 160px;min-width:0;overflow:hidden;align-self:stretch;
+  .counterband{flex:1 1 160px;min-width:160px;overflow:hidden;align-self:stretch;
     background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
   .cband-name{font-size:13px;font-weight:800;line-height:1.3}
   .cband-bar2{position:relative;height:8px;border-radius:4px;background:var(--line2);margin-top:8px;margin-bottom:6px;overflow:visible}
@@ -126,6 +126,27 @@
     display:flex;align-items:center;gap:12px}
   .confirm .summary{font-size:12px;color:#fff;margin-bottom:0;line-height:1.5;flex:1;min-width:0}
   .confirm .btns{display:flex;gap:8px;flex-shrink:0}
+  /* A fixed, slim strip right under the send buttons holds the confirm bar (or
+     an error). It's always there, same height, so showing/clearing the confirm
+     never changes the builder's height and the orders panel never moves. The
+     send result (auto-clears) floats from the same spot over what's below. */
+  .legsbox{min-height:172px}
+  .sendslot{position:relative;height:50px;margin-top:8px;contain:inline-size}   /* never widens the column */
+  /* the confirm fills the strip and, if its text needs more lines (4-leg
+     orders), grows DOWN over what's below — every leg and the exit stay fully
+     visible before CONFIRM, and nothing in the page moves */
+  .sendslot .confirm{position:absolute;left:0;right:0;top:0;z-index:20;margin-top:0;min-height:100%;
+    box-sizing:border-box;padding:4px 10px;gap:10px;box-shadow:0 6px 18px rgba(0,0,0,.55)}
+  .sendslot .confirm .summary{font-size:11.5px;line-height:1.4;white-space:normal;overflow-wrap:anywhere}
+  .sendslot .confirm .btn{padding:6px 12px;font-size:12px}
+  .sendslot .err{margin-top:0;font-size:12px;line-height:1.35;max-height:100%;overflow:auto}
+  .sendslot .respop{position:absolute;left:0;right:0;top:0;z-index:20}
+  .sendslot .respop .result{margin-top:0;max-height:38vh;overflow-y:auto;background:var(--panel);box-shadow:0 6px 18px rgba(0,0,0,.55)}
+  .sendslot .respop .result.good{background:#08160e}
+  .sendslot .respop .result.bad{background:#160808}
+  /* hint ABOVE a toggle — absolutely placed so it never widens/heightens the row */
+  .tglhint{position:absolute;left:0;bottom:100%;margin-bottom:2px;white-space:nowrap;font-size:10px;
+    color:var(--dim);text-decoration:underline;cursor:pointer}
   .muted{color:var(--dim)}
   .result{margin-top:14px;padding:12px;border-radius:8px;border:1px solid var(--line2);font-size:12px;white-space:pre-wrap}
   .result.good{border-color:#1c4a32;background:#08160e}
@@ -669,7 +690,8 @@ function App(){
         {build&&build.missing_legs&&build.missing_legs.length>0&&
           <div className="err">⚠ no listed strike for legs: {build.missing_legs.join(', ')} — step them into the grid.</div>}
 
-        <table className="legs">
+        {/* room for 4 legs always, so switching strategy never moves what's below */}
+        <div className="legsbox"><table className="legs">
           <thead><tr><th>Leg</th><th>Side</th><th>Action</th><th>Strike</th><th>Mid</th></tr></thead>
           <tbody>
             {build&&build.legs.map((l,i)=>{
@@ -691,7 +713,7 @@ function App(){
             })}
             {!build&&<tr><td colSpan="5" className="spin">{mktOpen?'building…':'market closed — options data paused'}</td></tr>}
           </tbody>
-        </table>
+        </table></div>
 
         {/* net price */}
         {p?<div className="netcard">
@@ -703,7 +725,7 @@ function App(){
 
         {/* order controls */}
         <div style={{display:'flex',gap:14,alignItems:'flex-start'}}>
-          <div style={{flex:'0 0 auto'}}>
+          <div style={{flex:'0 0 auto',position:'relative'}}>
             <div className="sendrow">
               <label className="fld">Limit Price
                 <input type="number" step={stepAt(tkInfo,limit)} value={limit}
@@ -734,19 +756,21 @@ function App(){
                 {tgtMin>1&&<span className="muted" style={{fontSize:11,marginLeft:6}}>min {fmt0(tgtMin)}%</span>}
                 {acRequired&&<span className="muted" style={{fontSize:11,marginLeft:6,fontWeight:700}}>required</span>}
               </div>
+              <div style={{position:'relative',alignSelf:'center',marginBottom:4}}>
+              {stopLoss&&!slSaved&&<span className="tglhint"
+                title="Using the default. Positions opened outside Torque in this ticker are NOT guarded until it's saved on. Click to save."
+                onClick={()=>saveStopLoss(true,stopPct)}>default · click to save</span>}
               <div className={"toggle"+(stopLoss?' on':'')}
                 onClick={()=>{const n=!stopLoss;setStopLoss(n);saveStopLoss(n,stopPct);}}
                 title="Stop-loss for this ticker (saved). Applies to this order and, through Torque's stop guardian, to every Torque-placed position in this ticker (on by default). Positions opened on Tradier's site or the tp CLI are guarded only once this is SAVED on for the ticker. Reflex orders are always protected regardless."
-                style={{alignSelf:'center',marginBottom:4,cursor:'pointer'}}>
+                style={{cursor:'pointer'}}>
                 <span className="sw"></span> stop-loss −
                 <input type="number" min="1" max="99" value={stopPct}
                   onClick={e=>e.stopPropagation()}
                   onChange={e=>setStopPct(e.target.value)}
                   onBlur={e=>{let v=Number(e.target.value);if(!(v>=1)){v=1;setStopPct(1);}saveStopLoss(stopLoss,v);}}
                   style={{width:54,padding:'4px 6px',fontSize:12}}/>%
-                {stopLoss&&!slSaved&&<span className="muted" style={{fontSize:11,marginLeft:6,textDecoration:'underline'}}
-                  title="Using the default. Positions opened outside Torque in this ticker are NOT guarded until it's saved on."
-                  onClick={e=>{e.stopPropagation();saveStopLoss(true,stopPct);}}>default · save to guard outside positions</span>}
+              </div>
               </div>
             </div>
 
@@ -760,6 +784,22 @@ function App(){
               <button className="btn" disabled={!build||placing||!limit} title="Validate format against the broker — places nothing"
                 onClick={()=>place('limit',true)}>DRY RUN</button>
               {placing&&<span className="spin" style={{alignSelf:'center'}}>working…</span>}
+            </div>
+            <div className="sendslot">
+              {confirm&&<div className="confirm">
+                <div className="summary">
+                  <b>{confirm.t==='market'?'MARKET':'LIMIT $'+limit}</b> · {sdef.name} · {ticker} · {qty} contract{qty>1?'s':''} · {duration.toUpperCase()}
+                  <br/><span className="muted">{build.legs.map(l=>(l.action.startsWith('buy')?'+':'-')+(l.quantity>1?l.quantity:'')+l.side[0].toUpperCase()+fmt(l.strike,0)).join('  ')}
+                  {(autoClose||acRequired)&&<>{' · auto-close +'+targetPct+'%'}
+                    {sdef.legs===1&&confirm.t==='limit'?' (OTO bracket)':' (place→confirm→close)'}</>}</span>
+                </div>
+                <div className="btns">
+                  <button className="btn limit" disabled={placing} onClick={()=>place(confirm.t)}>CONFIRM & SEND</button>
+                  <button className="btn" onClick={()=>setConfirm(null)}>cancel</button>
+                </div>
+              </div>}
+              {!confirm&&err&&<div className="err">{err}</div>}
+              {result&&<div className="respop"><ResultView r={result}/></div>}
             </div>
           </div>
           {counterRead&&(()=>{
@@ -828,21 +868,6 @@ function App(){
             book too wide — no profit target can fill{blocked?'; auto-close is required, so this trade is blocked':'; auto-close is blocked'}</span></>}
         </div>}
 
-        {confirm&&<div className="confirm">
-          <div className="summary">
-            <b>{confirm.t==='market'?'MARKET':'LIMIT $'+limit}</b> · {sdef.name} · {ticker} · {qty} contract{qty>1?'s':''} · {duration.toUpperCase()}
-            {(autoClose||acRequired)&&<><br/><span className="muted">↳ auto-close at +{targetPct}% once the entry confirms FILLED
-              {sdef.legs===1&&confirm.t==='limit'?' (native OTO bracket)':' (place→confirm→close)'}</span></>}
-            <br/><span className="muted">{build.legs.map(l=>(l.action.startsWith('buy')?'+':'-')+(l.quantity>1?l.quantity:'')+l.side[0].toUpperCase()+fmt(l.strike,0)).join('  ')}</span>
-          </div>
-          <div className="btns">
-            <button className="btn limit" disabled={placing} onClick={()=>place(confirm.t)}>CONFIRM & SEND</button>
-            <button className="btn" onClick={()=>setConfirm(null)}>cancel</button>
-          </div>
-        </div>}
-
-        {err&&<div className="err">{err}</div>}
-        {result&&<ResultView r={result}/>}
       </div>
 
       {/* ── analysis ── */}
