@@ -103,15 +103,20 @@ _SIMMER_SYM_RE = re.compile(r"^[A-Z.\-]{1,10}$")
 _SIMMER_STATE_BLOCKS = ("card", "score", "gates", "sentiment", "evolution", "overnight")
 
 
-async def _overnight_block(sym: str, expiration) -> dict:
+async def _overnight_block(sym: str) -> dict:
     """The "Overnight" card tab's data (docs/simmer.md → "Overnight movers").
-    `active` False → the tab stays dark (no overnight analysis for this name)."""
-    if not expiration:
-        return {"active": False}
+    `active` False → the tab stays dark (no overnight analysis for this name).
+
+    Keyed to (symbol, today's session) only — NOT the readiness card's current
+    expiration. The import captures one overnight row per name per day on the
+    expiry it chose at 09:25; the sweep may later settle the card on a different
+    expiry (near-dated 0DTE for mega-caps, chain gaps, etc.). Matching on
+    expiration left the tab dark for exactly those names despite a live row, so
+    the tab now follows the name, not the expiry."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
     session = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
-    row = await supabase_admin.get_simmer_overnight(sym, str(expiration)[:10], session)
+    row = await supabase_admin.get_simmer_overnight_by_symbol(sym, session)
     if not row:
         return {"active": False}
     return {
@@ -245,7 +250,7 @@ async def simmer_state_block(symbol: str, request: Request,
         raise HTTPException(404, f"no readiness for {sym}")
     if block == "overnight":
         return {"symbol": sym, "block": block,
-                "data": await _overnight_block(sym, env.get("expiration"))}
+                "data": await _overnight_block(sym)}
     return {"symbol": sym, "block": block, "data": _state_block(env, block, _db(request))}
 
 
@@ -257,9 +262,7 @@ async def simmer_overnight_block(symbol: str):
     sym = (symbol or "").upper()
     if not _SIMMER_SYM_RE.match(sym):
         raise HTTPException(422, f"invalid symbol {symbol!r}")
-    env = _readiness_for(sym, None)
-    expiration = env.get("expiration") if env else None
-    return {"symbol": sym, "data": await _overnight_block(sym, expiration)}
+    return {"symbol": sym, "data": await _overnight_block(sym)}
 
 
 @router.get("/simmer/snap/{symbol}", dependencies=_API_TOKEN_GATE,
@@ -940,4 +943,8 @@ async def get_settings_endpoint(user: dict = Depends(require_simmer_access)):
         "min_score": simmer_config.decision_bands()["ready"],
         "structures_enabled": list(STRUCTURES),
         "regime_strictness": "balanced",
+        # Overnight movers: import OFF, analyze-intersection ON by default (see
+        # migration 0027). The UI falls back to these when a row/column is absent.
+        "import_rq_overnight": False,
+        "overnight_analyze_all": True,
     }}

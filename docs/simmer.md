@@ -2463,9 +2463,19 @@ lines — never EMA numbers or a minute-by-minute readout the user has to assemb
 - `simmer_settings` (per-user) — migration adds two booleans:
   - `import_rq_overnight boolean default false` — **toggle 1**, "Import
     RelativeQs Overnight Moves".
-  - `overnight_analyze_all boolean default false` — **toggle 2**, "Run overnight
-    analysis on all watchlist items". Default scope is RQ-imported names only;
-    this extends the analyzer to the whole active watchlist.
+  - `overnight_analyze_all boolean default true` — **toggle 2**, "Run overnight
+    analysis on my overnight-mover watchlist names". Scope is the **intersection**
+    of the user's active watchlist and today's RQ board — a watched name that
+    *also* gapped overnight — NOT the whole watchlist (a name that didn't move has
+    no baseline, thesis, or move to analyze). It attaches the same read-only
+    overnight overlay to a name the user already watches; it never imports a new
+    name and never touches the 10-gate readiness score. **Default ON** (migration
+    0027): the analysis depends on the frozen 09:25 baseline, so enabling it
+    mid-day would be pointless — it must be on before the open to be useful.
+    Backend default-ON is authoritative — `users_with_overnight_analyze_all()`
+    returns the watchlist universe minus explicit opt-outs, so a user with no
+    `simmer_settings` row is still ON — with the column default/backfill in 0027
+    only keeping the UI checkbox in sync.
 - `simmer_watchlist`: migration adds `source text not null default 'user'`
   (`'user'` | `'rq'`) — drives the **(RQ)** badge. Overnight metadata lives in
   the existing `overrides` jsonb under an `overnight` key
@@ -2490,15 +2500,22 @@ market-open gating), firing **once per session at 09:25 America/New_York**:
 2. Keep movers with **|gap| ≥ 0.02 (2%)** that are **Simmer-eligible**
    (`ticker_rule(sym)["eligible"]` and not in `blocked_tickers()`).
 3. Resolve the **next available expiry** (existing `choose_expiration`).
-4. For each user with `import_rq_overnight = true`, upsert
+4. For each eligible (symbol, expiry), ensure a `simmer_overnight` row exists and
+   run the thesis + baseline step (§4–5) **first** — user-agnostic, computed once,
+   before any per-user write. A name with no usable baseline is dropped (not
+   imported, not analyzed).
+5. **Toggle 1 (import)** — for each user with `import_rq_overnight = true`, upsert
    `simmer_watchlist (user_id, symbol, expiration)` with `source='rq'` and the
-   `overrides.overnight` overlay.
-   - **Override, not skip:** if an active row already exists for that
-     (user, symbol, expiry), **UPDATE** it — merge the `overnight` overlay and
-     flag it RQ — so an existing name is refreshed with last night's news, never
-     left stale. (This reverses the initial "skip duplicates" idea.)
-5. For each imported (symbol, expiry), ensure a `simmer_overnight` row exists and
-   run the thesis + baseline step (§4–5). User-agnostic — computed once.
+   `overrides.overnight` overlay (adds the name if new).
+   - **Override, not skip:** if a row already exists for that (user, symbol),
+     **UPDATE** it — merge *only* the `overnight` overlay, leaving the user's
+     pinned expiry / active flag / `source='user'` untouched — so an existing name
+     is refreshed with last night's news, never left stale and never hijacked.
+6. **Toggle 2 (analyze intersection)** — for each user with
+   `overnight_analyze_all` on (default) who did *not* opt into toggle 1, attach the
+   same non-destructive `overrides.overnight` overlay **only** to movers the user
+   **already watches** (watchlist ∩ board). Never adds a name; the shared
+   `simmer_overnight` row from step 4 is what lights up the Overnight tab.
 
 Fetch failures are best-effort (logged; no import that session) — never block the
 sweep. Honors `setup_loaded()` fail-closed like the rest of the watcher.
@@ -2519,8 +2536,12 @@ sweep. Honors `setup_loaded()` fail-closed like the rest of the watcher.
 ### 5. The premium-decision analyzer (standalone routine)
 
 New module `app/simmer_premium_tracker.py` — takes `(baseline, live samples, dir,
-crowd, thesis)` → a verdict. Invoked by a **dedicated loop** AND callable from the
-normal sweep (so it can run for all watched items under toggle 2).
+crowd, thesis)` → a verdict. Invoked by a **dedicated loop** (`overnight_loop`)
+that runs the import once at 09:25 and refreshes verdicts every ~3 min after the
+open. It is a **separate pluggable**: it writes only `simmer_overnight` + the
+read-only watchlist overlay and never participates in the regular sweep's 10-gate
+scoring or model data. (Whether a premium-trend signal should later feed a sweep
+gate is a deliberately deferred exploration, not part of this.)
 
 - **Strikes:** pick a few strikes **toward the move** off the last-night chain —
   `dir=down` → the call strikes that become sellable **above** the new level (and

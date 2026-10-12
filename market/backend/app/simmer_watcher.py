@@ -2114,11 +2114,13 @@ async def overnight_loop(provider, tz_name: str) -> None:
                 try:
                     res = await overnight.run_import(provider)
                     log.info("overnight import: %s", res)
-                    # Only mark the session done once we actually imported — so
-                    # enabling the toggle after 9:25, or a transient empty-chain
-                    # window at the open (rate-limited data), still imports on a
-                    # later tick instead of being skipped for the whole day.
-                    if res.get("imported", 0) > 0:
+                    # Mark the session done once at least one overnight row was
+                    # captured (a frozen baseline landed) — NOT on imported>0,
+                    # since toggle 1 (import) may be off while toggle 2 (analyze
+                    # intersection) is on, which writes no new watchlist rows. A
+                    # zero-row result (empty board or a boot-time rate-limit
+                    # blackout) leaves the flag unset so a later tick retries.
+                    if res.get("rows", 0) > 0:
                         imported_date = today
                 except Exception:
                     log.exception("overnight import failed")

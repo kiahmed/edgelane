@@ -484,10 +484,24 @@ async def users_with_overnight_import() -> Optional[list[str]]:
 
 
 async def users_with_overnight_analyze_all() -> Optional[list[str]]:
-    """user_ids who turned on toggle 2 (overnight_analyze_all). None on read error."""
-    rows = await select_many("simmer_settings", select="user_id",
-                             filters={"overnight_analyze_all": "eq.true"})
-    return None if rows is None else [r["user_id"] for r in rows if r.get("user_id")]
+    """user_ids opted in to toggle 2 — "run overnight analysis on my
+    overnight-mover watchlist names" (intersection of a user's watchlist and
+    today's RQ movers). Default ON: everyone who has a watchlist and has NOT
+    explicitly turned it off. Returning the watchlist universe minus explicit
+    opt-outs (rather than `overnight_analyze_all eq.true`) makes the default
+    correct even for a user with no simmer_settings row yet, and independent of
+    when migration 0027 backfills the column. None on read error."""
+    wl = await select_many("simmer_watchlist", select="user_id")
+    if wl is None:
+        return None
+    universe = {r["user_id"] for r in wl if r.get("user_id")}
+    opted_out_rows = await select_many("simmer_settings", select="user_id",
+                                       filters={"overnight_analyze_all": "eq.false"})
+    if opted_out_rows is None:
+        return None     # fail CLOSED: can't read opt-outs → skip toggle 2 this run,
+                        # never write the overlay to a user who may have turned it off
+    opted_out = {r["user_id"] for r in opted_out_rows if r.get("user_id")}
+    return sorted(universe - opted_out)
 
 
 async def get_watchlist_row(user_id: str, symbol: str) -> Optional[dict]:
@@ -506,6 +520,16 @@ async def get_simmer_overnight(symbol: str, expiration: str, session_date: str) 
 async def list_simmer_overnight(session_date: str) -> Optional[list[dict]]:
     return await select_many("simmer_overnight",
                              filters={"session_date": f"eq.{str(session_date)[:10]}"})
+
+
+async def get_simmer_overnight_by_symbol(symbol: str, session_date: str) -> Optional[dict]:
+    """The overnight row for a symbol in today's session, whatever expiry it was
+    captured on — so the card's Overnight tab doesn't depend on the readiness
+    card's current expiration matching the import's chosen expiry."""
+    rows = await select_many("simmer_overnight", filters={
+        "symbol": f"eq.{str(symbol).upper()}", "session_date": f"eq.{str(session_date)[:10]}"},
+        order="updated_at.desc", limit=1)
+    return rows[0] if rows else None
 
 
 async def upsert_simmer_overnight(row: dict) -> bool:

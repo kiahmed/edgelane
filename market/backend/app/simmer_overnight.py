@@ -215,23 +215,41 @@ async def run_import(provider, *, summarize=None) -> dict:
     token = await supabase_admin.get_app_config("relativeqs_api_token")   # optional, future
     movers = eligible_movers(await simmer_relativeqs.fetch_movers(base, token))
     if not movers:
-        return {"movers": 0, "imported": 0}
-    users = await supabase_admin.users_with_overnight_import() or []
+        return {"movers": 0, "imported": 0, "analyzed": 0}
+    # Toggle 1: import EVERY mover into these users' watchlists (adds new names).
+    import_users = await supabase_admin.users_with_overnight_import() or []
+    # Toggle 2 (default ON): for these users, analyze ONLY movers they ALREADY
+    # watch — the intersection of their watchlist and today's RQ board. Never
+    # imports a new name; only attaches the overnight overlay to an existing row.
+    analyze_users = [u for u in (await supabase_admin.users_with_overnight_analyze_all() or [])
+                     if u not in set(import_users)]
     session = session_date()
     imported = 0
+    analyzed = 0
+    rows = 0
     for m in movers:
         exp = await _next_expiry(provider, m["symbol"])
         if not exp:
             continue
-        # Only import a name we can actually analyze: _next_expiry already proved
-        # it has listed options, and this requires a usable baseline too.
+        # The analysis row (frozen baseline + thesis) is user-agnostic and must
+        # exist before any user can see the Overnight tab. Only create it for a
+        # name we can actually analyze (listed options + a usable baseline).
         if not await _ensure_overnight_row(provider, m, exp, session, summarize=summarize):
             continue
-        for uid in users:
+        rows += 1
+        for uid in import_users:                       # toggle 1 — import the name
             await _upsert_watchlist_rq(uid, m, exp)
             imported += 1
-    log.info("[overnight] import: %d movers, %d user-rows", len(movers), imported)
-    return {"movers": len(movers), "imported": imported, "users": len(users)}
+        for uid in analyze_users:                      # toggle 2 — intersection only
+            if await supabase_admin.get_watchlist_row(uid, m["symbol"]):
+                # Non-destructive: _upsert_watchlist_rq only merges overrides.overnight
+                # on an existing row — never adds a name, never touches gate scoring.
+                await _upsert_watchlist_rq(uid, m, exp)
+                analyzed += 1
+    log.info("[overnight] import: %d movers, %d rows, %d imported, %d analyzed (intersection)",
+             len(movers), rows, imported, analyzed)
+    return {"movers": len(movers), "rows": rows, "imported": imported, "analyzed": analyzed,
+            "import_users": len(import_users), "analyze_users": len(analyze_users)}
 
 
 def _news_bad(mover_dir: str, sentiment: Optional[dict]) -> Optional[bool]:

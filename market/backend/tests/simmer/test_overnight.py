@@ -115,13 +115,17 @@ async def test_research_thesis_templated_and_injected():
 # ── 09:25 import orchestration (mocked Supabase) ────────────────────────────
 @pytest.fixture
 def mock_supabase(monkeypatch):
-    state = {"overnight": {}, "watchlist": [], "config": {"relativeqs_api_base": "http://rq.test"}}
+    state = {"overnight": {}, "watchlist": [], "config": {"relativeqs_api_base": "http://rq.test"},
+             "import_users": ["user-1", "user-2"], "analyze_users": []}
 
     async def get_app_config(key):
         return state["config"].get(key)
 
     async def users_with_overnight_import():
-        return ["user-1", "user-2"]
+        return list(state["import_users"])
+
+    async def users_with_overnight_analyze_all():
+        return list(state["analyze_users"])
 
     async def get_simmer_overnight(sym, exp, session):
         return state["overnight"].get((sym, exp, session))
@@ -149,6 +153,7 @@ def mock_supabase(monkeypatch):
 
     for name, fn in [("get_app_config", get_app_config),
                      ("users_with_overnight_import", users_with_overnight_import),
+                     ("users_with_overnight_analyze_all", users_with_overnight_analyze_all),
                      ("get_simmer_overnight", get_simmer_overnight),
                      ("upsert_simmer_overnight", upsert_simmer_overnight),
                      ("get_watchlist_row", get_watchlist_row),
@@ -166,7 +171,8 @@ async def test_run_import_filters_imports_and_freezes_baseline(mock_supabase, mo
 
     res = await ov.run_import(_FakeProvider(100.0))
     # NVDA + AMD imported (MSFT<2%, SPX blocked), to 2 users each
-    assert res["movers"] == 2 and res["users"] == 2 and res["imported"] == 4
+    assert res["movers"] == 2 and res["import_users"] == 2 and res["imported"] == 4
+    assert res["rows"] == 2 and res["analyzed"] == 0     # no analyze-only users here
 
     wl = mock_supabase["watchlist"]
     assert len(wl) == 4
@@ -204,6 +210,35 @@ async def test_run_import_is_nondestructive_on_an_existing_user_row(mock_supabas
     assert u2["source"] == "rq" and u2["expiration"] == "2026-11-20"
 
 
+async def test_toggle2_analyzes_only_intersection_never_imports(mock_supabase, monkeypatch):
+    """Toggle 2 (analyze): for a user who did NOT opt into import, attach the
+    overnight overlay ONLY to a mover they ALREADY watch — never add a new name,
+    and always create the user-agnostic analysis row."""
+    mock_supabase["import_users"] = []            # nobody imports
+    mock_supabase["analyze_users"] = ["user-9"]   # one analyze-only user
+    # user-9 already watches NVDA (their own pick) but NOT AMD
+    mock_supabase["watchlist"].append({
+        "user_id": "user-9", "symbol": "NVDA", "expiration": "2026-10-16",
+        "active": True, "source": "user", "overrides": {}})
+
+    async def _fetch(base, token=None, timeout=10.0):
+        return rq.normalize_movers(_BOARD)        # NVDA + AMD eligible
+    monkeypatch.setattr(ov.simmer_relativeqs, "fetch_movers", _fetch)
+
+    res = await ov.run_import(_FakeProvider(100.0))
+    assert res["imported"] == 0 and res["analyzed"] == 1 and res["rows"] == 2
+
+    wl = mock_supabase["watchlist"]
+    # NVDA (watched) got the overlay, source preserved; AMD (not watched) NOT added
+    nvda = next(r for r in wl if r["user_id"] == "user-9" and r["symbol"] == "NVDA")
+    assert nvda["source"] == "user" and nvda["expiration"] == "2026-10-16"
+    assert nvda["overrides"]["overnight"]["dir"] == "down"
+    assert not any(r["user_id"] == "user-9" and r["symbol"] == "AMD" for r in wl)
+    # the shared analysis row exists for BOTH movers regardless of users
+    assert ("NVDA", "2026-11-20", ov.session_date()) in mock_supabase["overnight"]
+    assert ("AMD", "2026-11-20", ov.session_date()) in mock_supabase["overnight"]
+
+
 async def test_refresh_analysis_updates_verdict_from_live(mock_supabase, monkeypatch):
     session = ov.session_date()
     mock_supabase["overnight"][("NVDA", "2026-11-20", session)] = {
@@ -231,6 +266,31 @@ async def test_refresh_analysis_updates_verdict_from_live(mock_supabase, monkeyp
     assert v["call"] == "sell_bear_call" and v["premium_trend"] == "holding"
 
 
+# ── toggle-2 opt-in resolver (default ON, fail-closed) ──────────────────────
+async def test_analyze_all_default_on_excludes_optouts_and_fails_closed(monkeypatch):
+    """Default ON = watchlist universe minus explicit opt-outs; a failed opt-out
+    read must fail CLOSED (None → caller skips toggle 2), never write the overlay
+    to a user who may have turned it off."""
+    async def sm_normal(table, **kw):
+        if table == "simmer_watchlist":
+            return [{"user_id": "a"}, {"user_id": "b"}, {"user_id": "a"}]  # a,b (deduped)
+        if table == "simmer_settings":
+            return [{"user_id": "b"}]                                       # b opted out
+        return []
+    monkeypatch.setattr(supabase_admin, "select_many", sm_normal)
+    assert await supabase_admin.users_with_overnight_analyze_all() == ["a"]
+
+    async def sm_optout_err(table, **kw):
+        return [{"user_id": "a"}] if table == "simmer_watchlist" else None  # opt-out read fails
+    monkeypatch.setattr(supabase_admin, "select_many", sm_optout_err)
+    assert await supabase_admin.users_with_overnight_analyze_all() is None
+
+    async def sm_wl_err(table, **kw):
+        return None                                                         # watchlist read fails
+    monkeypatch.setattr(supabase_admin, "select_many", sm_wl_err)
+    assert await supabase_admin.users_with_overnight_analyze_all() is None
+
+
 # ── /simmer/overnight route ─────────────────────────────────────────────────
 def _route_client():
     from fastapi import FastAPI
@@ -246,16 +306,14 @@ def _route_client():
 
 def test_overnight_route_active(monkeypatch):
     client, sroute = _route_client()
-    monkeypatch.setattr(sroute, "_readiness_for",
-                        lambda sym, exp: {"symbol": sym, "expiration": "2026-11-20"})
 
-    async def _row(sym, exp, session):
-        return {"symbol": sym, "expiration": exp, "dir": "down", "gap": -0.06,
+    async def _row(sym, session):
+        return {"symbol": sym, "expiration": "2026-11-13", "dir": "down", "gap": -0.06,
                 "crowd": "sector_wide", "thesis": "guidance cut", "side": "put",
                 "strikes": [98.0], "baseline": {"98.0": 1.0}, "latest": {"98.0": 1.05},
                 "verdict": {"call": "sell_bear_call", "confidence": 70},
                 "updated_at": "2026-10-12T14:00:00Z"}
-    monkeypatch.setattr(sroute.supabase_admin, "get_simmer_overnight", _row)
+    monkeypatch.setattr(sroute.supabase_admin, "get_simmer_overnight_by_symbol", _row)
 
     r = client.get("/simmer/overnight/NVDA")
     assert r.status_code == 200
@@ -264,14 +322,31 @@ def test_overnight_route_active(monkeypatch):
     assert data["thesis"] == "guidance cut"
 
 
+def test_overnight_route_active_regardless_of_readiness_expiry(monkeypatch):
+    """The tab follows the name, not the card's expiry: a row captured on
+    2026-11-13 must still surface even when the sweep settled the readiness card
+    on a different (near-dated) expiration — the panel-visibility bug."""
+    client, sroute = _route_client()
+    # readiness card sits on a near-dated 0DTE expiry, unlike the import's row
+    monkeypatch.setattr(sroute, "_readiness_for",
+                        lambda sym, exp: {"symbol": sym, "expiration": "2026-10-12"})
+
+    async def _row(sym, session):
+        return {"symbol": sym, "expiration": "2026-11-13", "dir": "up", "gap": 0.05,
+                "verdict": {"call": "sell_bull_put", "confidence": 66},
+                "updated_at": "2026-10-12T14:00:00Z"}
+    monkeypatch.setattr(sroute.supabase_admin, "get_simmer_overnight_by_symbol", _row)
+
+    data = client.get("/simmer/overnight/MU").json()["data"]
+    assert data["active"] is True and data["verdict"]["call"] == "sell_bull_put"
+
+
 def test_overnight_route_inactive_when_no_row(monkeypatch):
     client, sroute = _route_client()
-    monkeypatch.setattr(sroute, "_readiness_for",
-                        lambda sym, exp: {"symbol": sym, "expiration": "2026-11-20"})
 
-    async def _none(sym, exp, session):
+    async def _none(sym, session):
         return None
-    monkeypatch.setattr(sroute.supabase_admin, "get_simmer_overnight", _none)
+    monkeypatch.setattr(sroute.supabase_admin, "get_simmer_overnight_by_symbol", _none)
     r = client.get("/simmer/overnight/AMD")
     assert r.status_code == 200 and r.json()["data"]["active"] is False
 

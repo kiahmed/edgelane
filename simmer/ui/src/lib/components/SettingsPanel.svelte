@@ -78,12 +78,12 @@
 			Overnight movers
 		</h2>
 		<p class="mb-3 text-[0.72rem] text-slate-500">
-			RelativeQs's biggest overnight movers (≥2%) are imported into your watchlist just before
-			the open and analyzed for a sell / wait / skip call once the market opens — shown in each
-			card's Overnight tab.
+			RelativeQs's biggest overnight movers (≥2%) are analyzed just before the open and once the
+			market opens for a sell / wait / skip call — shown in each card's Overnight tab. It's a
+			separate, read-only overlay; it never changes the regular readiness score or its gates.
 		</p>
 		<label class="toggle-row cursor-pointer">
-			<span>Import RelativeQs overnight moves</span>
+			<span>Import RelativeQs overnight moves into my watchlist</span>
 			<input
 				type="checkbox"
 				checked={s.import_rq_overnight ?? false}
@@ -92,10 +92,10 @@
 			/>
 		</label>
 		<label class="toggle-row mt-2 cursor-pointer">
-			<span>Run overnight analysis on all watchlist items</span>
+			<span>Run overnight analysis on my overnight-mover watchlist names</span>
 			<input
 				type="checkbox"
-				checked={s.overnight_analyze_all ?? false}
+				checked={s.overnight_analyze_all ?? true}
 				disabled={settingsStore.saving}
 				onchange={(e) => toggleAnalyzeAll((e.currentTarget as HTMLInputElement).checked)}
 			/>
