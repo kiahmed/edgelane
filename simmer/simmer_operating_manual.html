@@ -163,6 +163,7 @@
     <li><a href="#catalysts">Catalysts: earnings &amp; macro</a></li>
     <li><a href="#news-page">Reading the news &amp; sentiment page</a></li>
     <li><a href="#config">Configuration</a></li>
+    <li><a href="#overnight-llm">Overnight analyzer settings</a></li>
     <li><a href="#deploy">Deploy &amp; update</a></li>
     <li><a href="#trouble">Troubleshooting</a></li>
   </ol>
@@ -665,6 +666,51 @@
       <em>and</em> the DuckDB file to sandbox in one switch — a prod container with it on serves sandbox quotes
       while looking perfectly alive. It must be <code>false</code> in production.</p>
     </div>
+  </section>
+
+  <section id="overnight-llm">
+    <h2>Overnight catalyst analyzer settings</h2>
+    <p>The grounded-LLM "why it moved / will it hold" read on overnight movers
+    (<code>docs/simmer_overnight_llm_spec.md</code>). All knobs live in the
+    <code>overnight_llm</code> section of the Supabase <code>simmer_engine_settings</code>
+    table — <strong>changeable with no restart</strong> (<code>run_catalyst</code> re-reads
+    the table before each run). Only the API keys live in the config file.
+    <strong>Phase&nbsp;0 is read-only</strong>: predictions + outcomes are logged to
+    <code>simmer_overnight_analysis</code>; the user-facing verdict is never changed.</p>
+    <table>
+      <tr><th>Setting</th><th>Valid values</th><th>Default</th><th>Notes</th></tr>
+      <tr><td><code>enabled</code></td><td><code>true</code> | <code>false</code></td><td><code>false</code></td>
+          <td>Master switch. Off → no LLM calls, no analysis rows, no quote reads.</td></tr>
+      <tr><td><code>provider</code></td><td><code>openai</code> | <code>gemini</code></td><td><code>openai</code></td>
+          <td>The live provider whose call is logged as <code>final</code>.</td></tr>
+      <tr><td><code>model</code></td><td>any provider model id — OpenAI: <code>gpt-6-luna</code>, <code>gpt-6-sol</code>; Gemini: <code>gemini-3.8-flash</code>, <code>gemini-3.1-pro-preview</code>, <code>gemini-2.5-pro</code>. <code>""</code> = adapter default</td><td><code>gpt-6-luna</code></td>
+          <td>Luna matched Sol's calls at lower cost in testing.</td></tr>
+      <tr><td><code>thinking</code></td><td><code>low</code> | <code>medium</code> | <code>high</code></td><td><code>medium</code></td>
+          <td>Gemini-3 <code>thinkingLevel</code> / OpenAI reasoning effort. (Gemini-2.5 ignores it — dynamic budget.) Higher models gave no better answer in testing.</td></tr>
+      <tr><td><code>context_size</code></td><td><code>low</code> | <code>medium</code> | <code>high</code></td><td><code>medium</code></td>
+          <td>OpenAI <code>web_search.search_context_size</code> only (Gemini ignores it). <code>low</code> did <em>not</em> cut tokens materially in testing.</td></tr>
+      <tr><td><code>premium_context_to_llm</code></td><td><code>true</code> | <code>false</code></td><td><code>true</code></td>
+          <td>Feed the one-line premium-trend into the grounded read so the sustain judgment is premium-aware (no math handed to the LLM).</td></tr>
+      <tr><td><code>decision_mode</code></td><td><code>llm_only</code> | <code>combiner_blended</code></td><td><code>llm_only</code></td>
+          <td>Which mode is marked <code>final</code>. <strong>Both</strong> are logged every run for the bake-off regardless.</td></tr>
+      <tr><td><code>shadow_provider</code></td><td><code>gemini</code> | <code>openai</code> | <code>""</code> (empty disables)</td><td><code>gemini</code></td>
+          <td>Parallel model, logged to <code>llm_shadow</code> — never acted on. The bake-off's challenger.</td></tr>
+      <tr><td><code>shadow_model</code></td><td>any provider model id (as <code>model</code> above)</td><td><code>gemini-3.8-flash</code></td>
+          <td>Model for the shadow provider.</td></tr>
+    </table>
+    <p>API keys are <strong>not</strong> here — they stay in <code>edgelane_market.config</code>
+    (<code>GEMINI_API_KEY</code>, <code>OPENAI_API_KEY</code>) and need a backend restart to change.</p>
+    <p>Change a setting (no restart; takes effect at the next run). A string value must be
+    JSON-quoted, a bool/number must not:</p>
+    <pre><code># turn it on
+python3 tools/supabase_admin.py update simmer_engine_settings \
+    --where "section=overnight_llm" \
+    --set "settings=r:jsonb_set(settings, '{enabled}', 'true')" -y
+
+# trim OpenAI tokens — context_size = "low" (note the JSON quotes on a string)
+python3 tools/supabase_admin.py update simmer_engine_settings \
+    --where "section=overnight_llm" \
+    --set "settings=r:jsonb_set(settings, '{context_size}', '\"low\"')" -y</code></pre>
   </section>
 
   <section id="deploy">

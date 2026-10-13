@@ -537,6 +537,35 @@ async def upsert_simmer_overnight(row: dict) -> bool:
                             on_conflict="symbol,expiration,session_date")
 
 
+# ── Overnight catalyst analyzer (migration 0028, separate from simmer_overnight) ──
+async def upsert_simmer_overnight_analysis(row: dict) -> bool:
+    """Merge into the (symbol, session_date) analysis row. PostgREST upsert =
+    INSERT-on-conflict, so on conflict only the provided columns update — callers
+    pass just what changed (readings / llm / combiner / close / outcome)."""
+    return await upsert_row("simmer_overnight_analysis", row,
+                            on_conflict="symbol,session_date")
+
+
+async def get_simmer_overnight_analysis(symbol: str, session_date: str) -> Optional[dict]:
+    rows = await select_many("simmer_overnight_analysis", filters={
+        "symbol": f"eq.{str(symbol).upper()}", "session_date": f"eq.{str(session_date)[:10]}"},
+        limit=1)
+    return rows[0] if rows else None
+
+
+async def list_simmer_overnight_analysis(session_date: str) -> Optional[list[dict]]:
+    return await select_many("simmer_overnight_analysis",
+                             filters={"session_date": f"eq.{str(session_date)[:10]}"})
+
+
+async def get_overnight_analysis_history(symbol: str, limit: int = 10) -> Optional[list[dict]]:
+    """Prior days' analysis rows for a symbol (most recent first) — the lookback
+    for "last time this name gapped". Reference/plot only, not a decision input."""
+    return await select_many("simmer_overnight_analysis",
+                             filters={"symbol": f"eq.{str(symbol).upper()}"},
+                             order="session_date.desc", limit=limit)
+
+
 async def get_simmer_tickers_setup() -> Optional[list[dict]]:
     """Every row of public.simmer_tickers_setup (Simmer's per-ticker setup), in
     list order. None = unknown (Supabase not configured or the read failed) — the

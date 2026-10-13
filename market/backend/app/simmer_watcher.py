@@ -67,6 +67,7 @@ from . import simmer_engine
 from . import simmer_events
 from . import simmer_ledger
 from . import simmer_overnight as overnight
+from . import simmer_overnight_catalyst as catalyst
 from . import supabase_admin
 from .config import get_settings
 from .dealer_exposures import compute_dealer_exposures
@@ -2089,6 +2090,60 @@ def _seconds_until(now, hh: int, mm: int) -> float:
     return (target - now).total_seconds()
 
 
+# ── Overnight scheduler: pure timing predicates (unit-tested) ────────────────
+# Extracted from overnight_loop so the "when does X fire" logic is testable with a
+# faked clock, independent of the live while-loop. Each is a pure function of the
+# ET `now` + the per-day flags. See tests/simmer/test_overnight_schedule.py.
+def _should_import(now, imported_today: bool) -> bool:
+    """09:25 pre-open import, once/session, weekdays, until 16:00 (late start still
+    imports). `imported_today` True once a baseline row landed today."""
+    return (now.weekday() < 5 and not imported_today
+            and (now.hour, now.minute) >= (9, 25) and now.hour < 16)
+
+
+def _should_catalyst(now, imported_today: bool, catalyst_done: bool) -> bool:
+    """Catalyst LLM pass: once/day after the import landed, until 16:00. Evaluated
+    AFTER the import step so it can fire the same tick the baseline lands."""
+    return imported_today and not catalyst_done and now.hour < 16
+
+
+def _combiner_lock(now) -> bool:
+    """Past the 10:00 ET decision cutoff → freeze the scored combiner call."""
+    return (now.hour, now.minute) >= (10, 0)
+
+
+def _captures_due(now, *, open_: bool, readings_done) -> list[str]:
+    """Which forward-test readings are due now (weekdays only): 10:00 needs the
+    market open; the 16:00 close reading fires on a 15:58–16:30 window so a 180s
+    sleep tick or a market-closed state can't miss it. 09:25 is handled in the
+    catalyst step, not here."""
+    if now.weekday() >= 5:
+        return []
+    hm = (now.hour, now.minute)
+    due = []
+    if open_ and hm >= (10, 0) and "10:00" not in readings_done:
+        due.append("10:00")
+    if (15, 58) <= hm <= (16, 30) and "16:00" not in readings_done:
+        due.append("16:00")
+    return due
+
+
+def _overnight_sleep(now, open_: bool) -> float:
+    """Loop cadence: 60s in the first 30 min and from 15:45 (so a tick lands in the
+    16:00 window), else 180s while open; pre-09:25 wake near the open; 120s across
+    16:00–16:30 to catch the close reading; otherwise 600s."""
+    hm = (now.hour, now.minute)
+    if open_:
+        mins_since_open = (now.hour - 9) * 60 + (now.minute - 30)
+        near_close = hm >= (15, 45)
+        return 60.0 if (0 <= mins_since_open < 30 or near_close) else 180.0
+    if hm < (9, 25):
+        return min(_seconds_until(now, 9, 25), 600.0)
+    if (16, 0) <= hm <= (16, 30):
+        return 120.0
+    return 600.0
+
+
 async def overnight_loop(provider, tz_name: str) -> None:
     """Dedicated overnight scheduler (docs/simmer.md → "Overnight movers").
 
@@ -2100,6 +2155,9 @@ async def overnight_loop(provider, tz_name: str) -> None:
     from zoneinfo import ZoneInfo
     tz = ZoneInfo(tz_name) if tz_name else ZoneInfo("America/New_York")
     imported_date: str | None = None
+    catalyst_date: str | None = None
+    readings_done: set[str] = set()      # reading labels captured today (reset per day)
+    readings_day: str | None = None
     while True:
         try:
             if not simmer_config.setup_loaded():
@@ -2107,10 +2165,11 @@ async def overnight_loop(provider, tz_name: str) -> None:
                 continue
             now = datetime.now(tz)
             today = now.date().isoformat()
+            if readings_day != today:        # new session → reset the per-day reading flags
+                readings_done = set(); readings_day = today
             # Once-per-session import. Window opens at 9:25 ET; if the process
             # starts later it still imports (baseline is then intraday, logged).
-            if now.weekday() < 5 and imported_date != today \
-                    and (now.hour, now.minute) >= (9, 25) and now.hour < 16:
+            if _should_import(now, imported_date == today):
                 try:
                     res = await overnight.run_import(provider)
                     log.info("overnight import: %s", res)
@@ -2124,6 +2183,21 @@ async def overnight_loop(provider, tz_name: str) -> None:
                         imported_date = today
                 except Exception:
                     log.exception("overnight import failed")
+            # Catalyst analyzer (read-only, Phase 0): once/day after the baseline
+            # exists, grounded-LLM read → persist to simmer_overnight_analysis. Gated
+            # by overnight_llm.enabled inside run_catalyst; never affects the verdict.
+            # Evaluated with the live imported flag so it fires the SAME tick import did.
+            if _should_catalyst(now, imported_date == today, catalyst_date == today):
+                try:
+                    cres = await catalyst.run_catalyst(today)
+                    if cres.get("enabled"):
+                        log.info("overnight catalyst: %s", cres)
+                        catalyst_date = today
+                        if "09:25" not in readings_done:
+                            await catalyst.capture_reading(provider, "09:25", today)
+                            readings_done.add("09:25")
+                except Exception:
+                    log.exception("overnight catalyst failed")
             open_, _ = _is_market_open(tz_name)
             if open_:
                 try:
@@ -2132,13 +2206,25 @@ async def overnight_loop(provider, tz_name: str) -> None:
                         log.info("overnight refresh updated %d row(s)", n)
                 except Exception:
                     log.exception("overnight refresh failed")
-                mins_since_open = (now.hour - 9) * 60 + (now.minute - 30)
-                sleep = 60.0 if 0 <= mins_since_open < 30 else 180.0
-            elif (now.hour, now.minute) < (9, 25):
-                sleep = min(_seconds_until(now, 9, 25), 600.0)   # wake near 9:25
-            else:
-                sleep = 600.0
-            await asyncio.sleep(sleep)
+                # Re-combine the (frozen 09:25) catalyst read against the LIVE premium
+                # verdict — pure math, NO new LLM call. The combiner FREEZES past the
+                # 10:00 cutoff so the scored call isn't late-session lookahead.
+                try:
+                    if simmer_config.overnight_llm().get("enabled"):
+                        await catalyst.refresh_combiner(today, lock=_combiner_lock(now))
+                except Exception:
+                    log.exception("overnight combiner refresh failed")
+            # Forward-test readings (read-only), gated on the analyzer being enabled so
+            # nothing is written / no quote reads on days it's off. Which labels are due
+            # is pure timing (see _captures_due); capture_reading is idempotent per label.
+            if simmer_config.overnight_llm().get("enabled"):
+                for label in _captures_due(now, open_=open_, readings_done=readings_done):
+                    try:
+                        await catalyst.capture_reading(provider, label, today)
+                        readings_done.add(label)
+                    except Exception:
+                        log.exception("overnight reading %s failed", label)
+            await asyncio.sleep(_overnight_sleep(now, open_))
         except asyncio.CancelledError:
             raise
         except Exception:

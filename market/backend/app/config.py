@@ -259,6 +259,9 @@ class Settings(BaseModel):
     # Scores are NOT reproducible across models — the model id is recorded on
     # every scored row. flash-lite is the cheapest with thinking off by default.
     gemini_model: str = Field(default="gemini-2.5-flash-lite")
+    # OpenAI (overnight catalyst analyzer, docs/simmer_overnight_llm_spec.md). No
+    # key → the OpenAI provider is unavailable (factory returns None, logged).
+    openai_api_key: str = Field(default="")
     # News layer, primary→fallback (both swappable). PRIMARY:
     #   finnhub (default; per-symbol company-news, fresh + symbol-specific),
     #   alpaca (batch, needs the keys above), rss (keyless wire firehose), off.
@@ -522,6 +525,7 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
     if "ALPACA_SECRET_KEY" in raw:           out["alpaca_secret_key"] = raw["ALPACA_SECRET_KEY"].strip()
     if "FINNHUB_API_KEY" in raw:             out["finnhub_api_key"] = raw["FINNHUB_API_KEY"].strip()
     if "GEMINI_API_KEY" in raw:              out["gemini_api_key"] = raw["GEMINI_API_KEY"].strip()
+    if "OPENAI_API_KEY" in raw:              out["openai_api_key"] = raw["OPENAI_API_KEY"].strip()
     if "GEMINI_MODEL" in raw:
         v = raw["GEMINI_MODEL"].strip()
         if v:

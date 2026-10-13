@@ -196,6 +196,26 @@ SOCIAL: dict[str, Any] = {
     "linkedin_share_url": "https://www.linkedin.com/feed/?shareActive=true",
 }
 
+# ── Overnight catalyst analyzer (docs/simmer_overnight_llm_spec.md) ──────────
+# The grounded-LLM "why it moved / will it hold" read on overnight movers. All
+# DB-held in the `overnight_llm` section of simmer_engine_settings — swap provider
+# / model / mode with no redeploy (refreshes within SIMMER_SETUP_REFRESH_SEC). API
+# KEYS are NOT here — they stay in edgelane_market.config (gemini_api_key /
+# openai_api_key), never in the DB. Phase 0 runs read-only: predictions persist to
+# simmer_overnight_analysis, the user-facing verdict is untouched.
+OVERNIGHT_LLM: dict[str, Any] = {
+    "enabled":          False,          # master switch (Phase 0: read-only logging only)
+    "provider":         "openai",       # live provider: openai | gemini
+    "model":            "gpt-6-luna",   # "" → the adapter's per-provider default
+    "thinking":         "medium",       # gemini thinkingLevel / openai reasoning effort
+    "context_size":     "medium",       # openai web_search.search_context_size: medium | low
+    "premium_context_to_llm": True,     # feed the one-line premium-trend into the grounded read
+    "decision_mode":    "llm_only",     # how the LOGGED final call is chosen (read-only in Phase 0):
+                                        #   llm_only | combiner_blended  (both are logged for comparison)
+    "shadow_provider":  "gemini",       # parallel model, logged not acted on; "" to disable
+    "shadow_model":     "gemini-3.8-flash",
+}
+
 # ── Volatility estimation ──────────────────────────────────────────────────
 VOL: dict[str, Any] = {
     "annualization_days":   252,   # trading days
@@ -438,6 +458,7 @@ _SECTION_DEFAULTS: dict[str, dict] = {
     "vol": VOL, "dte_tiers": DTE_TIERS, "catalyst": CATALYST, "intraday": INTRADAY,
     "cadence": CADENCE, "ttl": TTL, "velocity": VELOCITY, "news": NEWS,
     "sentiment": SENTIMENT, "squeeze": SQUEEZE, "regime": REGIME,
+    "overnight_llm": OVERNIGHT_LLM,
 }
 
 
@@ -580,6 +601,13 @@ def social() -> dict[str, Any]:
     """Frontend social/share config (display-only). Overridable in the
     `social` section of simmer_engine_settings; see SOCIAL for the shape."""
     return _section("social", SOCIAL)
+
+
+def overnight_llm() -> dict[str, Any]:
+    """Overnight catalyst-analyzer config (provider/model/mode/shadow).
+    Overridable in the `overnight_llm` section of simmer_engine_settings; see
+    OVERNIGHT_LLM for the shape. API keys live in config, not here."""
+    return _section("overnight_llm", OVERNIGHT_LLM)
 
 
 def vol() -> dict[str, Any]:
