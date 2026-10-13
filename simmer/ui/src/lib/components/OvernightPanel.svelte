@@ -110,7 +110,7 @@
 				<div class="sustain sustain--{cat.sustain}">{SUSTAIN_LABEL[cat.sustain] ?? cat.sustain}</div>
 			{/if}
 			{#if cat.why_moved || cat.one_liner}
-				<p class="cat-why">{cat.why_moved ?? cat.one_liner}</p>
+				<p class="cat-why">{cat.why_moved || cat.one_liner}</p>
 			{/if}
 			<div class="chips">
 				{#if cat.catalyst_type}<span class="chip">{cat.catalyst_type}</span>{/if}

@@ -1405,6 +1405,86 @@ async def fanout_alert(env: dict, regime: dict | None) -> int:
     return written
 
 
+# ── Overnight catalyst alerts (docs/simmer_overnight_llm_spec.md) ────────────
+OVERNIGHT_ALERT_MIN = 70        # fire when a play's confidence reaches this
+OVERNIGHT_ALERT_RISE = 5        # re-fire only when conviction rises by at least this
+
+
+async def _should_fire_overnight(user_id: str, symbol: str, conf: float, call: str) -> bool:
+    """Re-trigger rule: fire if the user has NO open overnight alert for this name,
+    the play FLIPPED (e.g. bear_call → bull_put), or conviction ROSE meaningfully.
+    Otherwise the existing open-alert collapses the repeat."""
+    rows = await supabase_admin.select_many(
+        "simmer_alerts", "score,structure",
+        {"user_id": f"eq.{user_id}", "symbol": f"eq.{symbol}",
+         "state": "eq.overnight", "acknowledged": "eq.false"},
+        order="created_at.desc", limit=1)
+    if not rows:
+        return True
+    last = rows[0]
+    if str(last.get("structure") or "") != str(call):
+        return True
+    return float(conf) >= float(last.get("score") or 0) + OVERNIGHT_ALERT_RISE
+
+
+async def overnight_alert_fanout(session: str) -> int:
+    """One in-app alert per watching user for each overnight play scored ≥70,
+    re-triggered on a call flip or a confidence rise. Per-user gated by
+    notify_overnight (default ON; column absent pre-migration → treated as ON).
+    The analysis row is user-agnostic; alerts are per user. Best-effort."""
+    analyses = await supabase_admin.list_simmer_overnight_analysis(session) or []
+    written = 0
+    for a in analyses:
+        final = (a.get("combiner") or {}).get("final") or {}
+        call, conf = final.get("call"), final.get("confidence")
+        if call in (None, "wait", "skip") or conf is None or float(conf) < OVERNIGHT_ALERT_MIN:
+            continue
+        symbol = str(a.get("symbol") or "").upper()
+        watchers = await supabase_admin.select_many(
+            "simmer_watchlist", "user_id", {"symbol": f"eq.{symbol}", "active": "eq.true"})
+        uids = [str(w["user_id"]) for w in (watchers or []) if w.get("user_id")]
+        if not uids:
+            continue
+        # Read every watcher's opt-out in ONE call. select_many returns None on a
+        # read ERROR (vs [] / rows when it succeeds) — unlike _select_one, which
+        # swallows errors into None. So a hiccup is distinguishable from "no row":
+        # None → FAIL CLOSED (skip the fan-out this run); a missing row → default ON.
+        srows = await supabase_admin.select_many(
+            "simmer_settings", "user_id,notify_overnight",
+            {"user_id": f"in.({','.join(uids)})"})
+        if srows is None:
+            log.warning("[overnight] notify_overnight read failed for %s — skipping fan-out", symbol)
+            continue
+        opted_out = {str(r["user_id"]) for r in srows
+                     if r.get("user_id") and r.get("notify_overnight") is False}
+        for uid in uids:
+            if uid in opted_out:
+                continue
+            if not await _should_fire_overnight(uid, symbol, float(conf), str(call)):
+                continue
+            llm = a.get("llm") or {}
+            cfinal = (a.get("combiner") or {}).get("final") or {}
+            ok = await supabase_admin.insert_row("simmer_alerts", {
+                "user_id": uid, "symbol": symbol, "expiration": None,
+                "score": round(float(conf), 2), "state": "overnight", "structure": call,
+                # SUMMARY only (same fields the Phase 2 route exposes) — never the raw
+                # llm dict (provider/model/queries/tokens/latency/notes are internal).
+                "payload": _json_safe({
+                    "why_moved": llm.get("why_moved"), "one_liner": llm.get("one_liner"),
+                    "catalyst_type": llm.get("catalyst_type"), "deserved": llm.get("deserved"),
+                    "sentiment": llm.get("web_social_sentiment"), "sustain": llm.get("sustain"),
+                    "confidence": llm.get("confidence"), "call": llm.get("call"),
+                    "combiner": {"call": cfinal.get("call"), "confidence": cfinal.get("confidence"),
+                                 "decided_at": (a.get("combiner") or {}).get("decided_at")},
+                    "dir": a.get("dir"), "gap": a.get("gap"),
+                }),
+            })
+            written += 1 if ok else 0
+    if written:
+        log.info("[overnight] fired %d overnight alert(s) (conf>=%d)", written, OVERNIGHT_ALERT_MIN)
+    return written
+
+
 async def process_alerts(results: dict[str, dict], regime: dict | None,
                          db=None) -> None:
     bands = simmer_config.decision_bands()
@@ -2232,8 +2312,11 @@ async def overnight_loop(provider, tz_name: str) -> None:
                 try:
                     if simmer_config.overnight_llm().get("enabled"):
                         await catalyst.refresh_combiner(today, lock=_combiner_lock(now))
+                        # Fire in-app alerts for plays that reached ≥70 (re-trigger
+                        # on a call flip or a conviction rise; per-user opt-out).
+                        await overnight_alert_fanout(today)
                 except Exception:
-                    log.exception("overnight combiner refresh failed")
+                    log.exception("overnight combiner refresh / alerts failed")
             # Forward-test readings (read-only), gated on the analyzer being enabled so
             # nothing is written / no quote reads on days it's off. Which labels are due
             # is pure timing (see _captures_due); capture_reading is idempotent per label.

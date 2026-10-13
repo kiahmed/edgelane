@@ -349,6 +349,69 @@ async def test_reset_rq_end_of_day_deletes_rq_strips_overlay(monkeypatch):
     assert "overnight" not in stripped[0]["overrides"] and stripped[0]["overrides"]["note"] == "keep"
 
 
+# ── overnight ≥70 alert fan-out (fire / re-trigger / opt-out) ───────────────
+async def test_overnight_alert_fanout_fires_retriggers_and_opts_out(monkeypatch):
+    from app import simmer_watcher as sw
+    final = {"call": "sell_bear_call", "confidence": 88}
+    analyses = [{"symbol": "MU", "dir": "down", "gap": -0.05,
+                 "llm": {"call": "sell_bear_call", "why_moved": "CXMT DRAM competition",
+                         "provider": "openai", "model": "gpt-6-luna",
+                         "tokens": {"in": 30000}, "queries": ["mu stock"]},
+                 "combiner": {"final": final, "decided_at": "2026-10-13T10:00:00-04:00"}}]
+    open_alert: dict = {}            # the user's last open overnight alert for MU
+    settings_mode = {"v": "on"}      # on → no row (default ON) | off → opted out | error → None
+    inserted = []
+
+    async def _list_an(session):
+        return analyses
+
+    async def _sm(table, select="*", filters=None, **kw):
+        if table == "simmer_watchlist":
+            return [{"user_id": "u1"}]
+        if table == "simmer_settings":
+            m = settings_mode["v"]
+            if m == "error":
+                return None                       # read ERROR (distinct from "no row")
+            if m == "off":
+                return [{"user_id": "u1", "notify_overnight": False}]
+            return []                             # no row → default ON
+        if table == "simmer_alerts":
+            return [open_alert] if open_alert else []
+        return []
+
+    async def _ins(table, row):
+        inserted.append(row)
+        open_alert.clear(); open_alert.update(score=row["score"], structure=row["structure"])
+        return True
+    monkeypatch.setattr(sw.supabase_admin, "list_simmer_overnight_analysis", _list_an)
+    monkeypatch.setattr(sw.supabase_admin, "select_many", _sm)
+    monkeypatch.setattr(sw.supabase_admin, "insert_row", _ins)
+
+    assert await sw.overnight_alert_fanout("2026-10-13") == 1      # first fire (88)
+    # payload is SUMMARY only — no provider/model/tokens/queries leak into the row
+    pay = inserted[0]["payload"]
+    assert pay["why_moved"] == "CXMT DRAM competition" and pay["call"] == "sell_bear_call"
+    assert "provider" not in pay and "model" not in pay and "tokens" not in pay and "queries" not in pay
+    assert pay["combiner"]["decided_at"] == "2026-10-13T10:00:00-04:00"
+    assert await sw.overnight_alert_fanout("2026-10-13") == 0      # same play/conf → no repeat
+    final["confidence"] = 95
+    assert await sw.overnight_alert_fanout("2026-10-13") == 1      # conviction rose → re-fire
+    final["call"] = "sell_bull_put"; final["confidence"] = 72
+    assert await sw.overnight_alert_fanout("2026-10-13") == 1      # play flipped → re-fire
+    final["call"] = "wait"; final["confidence"] = 99
+    assert await sw.overnight_alert_fanout("2026-10-13") == 0      # wait never alerts
+    final["call"] = "sell_bear_call"; final["confidence"] = 60
+    open_alert.clear()
+    assert await sw.overnight_alert_fanout("2026-10-13") == 0      # below 70 → no alert
+    final["confidence"] = 99; settings_mode["v"] = "off"
+    assert await sw.overnight_alert_fanout("2026-10-13") == 0      # user opted out
+
+    # a settings READ ERROR must FAIL CLOSED (skip the fan-out, no alert) — not be
+    # mistaken for "no row → default ON".
+    settings_mode["v"] = "error"; open_alert.clear()
+    assert await sw.overnight_alert_fanout("2026-10-13") == 0
+
+
 # ── /simmer/overnight route ─────────────────────────────────────────────────
 def _route_client():
     from fastapi import FastAPI

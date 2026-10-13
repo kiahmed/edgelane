@@ -31,6 +31,11 @@
 		toast(err ?? (on ? 'Email alerts on' : 'Email alerts off'));
 	}
 
+	async function toggleOvernightAlert(on: boolean) {
+		const err = await settingsStore.save({ notify_overnight: on });
+		toast(err ?? (on ? 'Overnight play alerts on' : 'Overnight play alerts off'));
+	}
+
 	async function toggleImportRq(on: boolean) {
 		const err = await settingsStore.save({ import_rq_overnight: on });
 		toast(err ?? (on ? 'Overnight import on' : 'Overnight import off'));
@@ -112,6 +117,15 @@
 				checked={s.notify_email ?? false}
 				disabled={settingsStore.saving}
 				onchange={(e) => toggleNotify((e.currentTarget as HTMLInputElement).checked)}
+			/>
+		</label>
+		<label class="toggle-row mt-2 cursor-pointer">
+			<span>Overnight play alerts (confidence ≥70)</span>
+			<input
+				type="checkbox"
+				checked={s.notify_overnight ?? true}
+				disabled={settingsStore.saving}
+				onchange={(e) => toggleOvernightAlert((e.currentTarget as HTMLInputElement).checked)}
 			/>
 		</label>
 	</div>

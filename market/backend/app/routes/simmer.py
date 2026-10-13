@@ -924,6 +924,8 @@ def sanitize_settings(payload: dict) -> dict:
         out["risk_profile"] = rp
     if payload.get("notify_email") is not None:
         out["notify_email"] = bool(payload["notify_email"])
+    if payload.get("notify_overnight") is not None:
+        out["notify_overnight"] = bool(payload["notify_overnight"])
     # Overnight-movers toggles (docs/simmer.md → "Overnight movers").
     if payload.get("import_rq_overnight") is not None:
         out["import_rq_overnight"] = bool(payload["import_rq_overnight"])
@@ -965,7 +967,7 @@ async def get_settings_endpoint(user: dict = Depends(require_simmer_access)):
     row = await supabase_admin._select_one(
         "simmer_settings", "user_id", str(user["id"]),
         "min_score,min_iv_percentile,min_dte,max_dte,short_delta_min,"
-        "short_delta_max,notify_email,risk_profile,structures_enabled,"
+        "short_delta_max,notify_email,notify_overnight,risk_profile,structures_enabled,"
         "gate_overrides,regime_strictness,max_concurrent,sweep_interval,prefs,"
         "import_rq_overnight,overnight_analyze_all")
     return {"settings": row or {}, "defaults": {

@@ -278,6 +278,7 @@ export interface SimmerSettings {
 	structures_enabled?: string[];
 	gate_overrides?: Record<string, boolean>;
 	notify_email?: boolean;
+	notify_overnight?: boolean;
 	/** Overnight movers (docs/simmer.md → "Overnight movers"). */
 	import_rq_overnight?: boolean;
 	overnight_analyze_all?: boolean;

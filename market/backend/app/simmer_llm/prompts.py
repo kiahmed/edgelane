@@ -46,5 +46,8 @@ def step2(note: str, ctx: CatalystCtx) -> str:
         f"extract the structured read. `call` is the credit spread to sell: "
         f"sell_bull_put if it should hold/rise, sell_bear_call if it should "
         f"fade/fall, else wait/skip. `sustain`: fade=reverses, hold_*=stays at "
-        f"level, extend=keeps going. NOTE:\n{note}"
+        f"level, extend=keeps going. `why_moved` MUST be a concrete <=12-word "
+        f"cause (the catalyst itself, never empty, e.g. 'analyst downgrade on "
+        f"margin guidance'); `one_liner` is the call plus its single most "
+        f"important reason. NOTE:\n{note}"
     )

@@ -69,6 +69,7 @@ _FULL_PAYLOAD = {
     "structures_enabled": ["bull_put"],
     "regime_strictness": "strict",
     "notify_email": True,
+    "notify_overnight": True,
     "gate_overrides": {},
     "import_rq_overnight": True,
     "overnight_analyze_all": False,
