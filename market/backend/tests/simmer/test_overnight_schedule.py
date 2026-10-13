@@ -6,7 +6,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from app.simmer_watcher import (_captures_due, _combiner_lock, _overnight_sleep,
-                                 _should_catalyst, _should_import)
+                                 _should_catalyst, _should_import, _should_reset)
 
 MON, SAT = 12, 17          # 2026-10-12 is a Monday; 2026-10-17 a Saturday
 
@@ -40,6 +40,14 @@ def test_combiner_lock_at_1000():
     assert _combiner_lock(dt(13, 30))
 
 
+def test_should_reset_eod():
+    assert not _should_reset(dt(15, 59), False)        # before the close
+    assert _should_reset(dt(16, 0), False)             # from 16:00
+    assert _should_reset(dt(18, 0), False)             # later still fine
+    assert not _should_reset(dt(16, 30), True)         # already done today
+    assert not _should_reset(dt(16, 30, SAT), False)   # weekend
+
+
 # ── which readings are due ───────────────────────────────────────────────────
 def test_captures_due():
     assert _captures_due(dt(10, 0), open_=True, readings_done=set()) == ["10:00"]
@@ -63,3 +71,6 @@ def test_overnight_sleep_buckets():
     pre = _overnight_sleep(dt(9, 20), False)                # wake near 09:25
     assert 0 < pre <= 600.0
     assert _overnight_sleep(dt(6, 0), False) == 600.0       # far pre-open → capped
+    # import not yet landed in-window → brisk 60s retry (no 600s pre-open strand)
+    assert _overnight_sleep(dt(9, 26), False, import_pending=True) == 60.0
+    assert _overnight_sleep(dt(11, 0), True, import_pending=True) == 60.0

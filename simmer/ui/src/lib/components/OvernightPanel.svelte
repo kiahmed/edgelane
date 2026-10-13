@@ -38,9 +38,35 @@
 		v.premium_trend ? `premiums ${v.premium_trend}` : 'premiums — waiting for the open'
 	);
 
-	let showTables = $state(false);
+	let showTables = $state(true);     // open with the premium detail expanded
 	const strikes = $derived((data.strikes ?? []).map((s) => String(s)));
 	const fmt = (n: number | undefined) => (n == null ? '—' : n.toFixed(2));
+
+	// ── Catalyst (LLM) read — the "why it moved / will it hold" layer ──────────
+	const cat = $derived(data.catalyst ?? null);
+	// Per the design: both llm_only and combiner calls are computed server-side;
+	// this toggle picks which to show (on → combiner, off → the raw LLM call).
+	let showCombiner = $state(true);
+	const catCall = $derived(
+		cat ? (showCombiner ? cat.combiner_call : cat.llm_only_call) ?? cat.llm_only_call : null
+	);
+	const catCallClass = $derived(
+		catCall === 'sell_bear_call' ? 'call--bear'
+			: catCall === 'sell_bull_put' ? 'call--bull'
+				: catCall === 'skip' ? 'call--skip' : 'call--wait'
+	);
+	const SUSTAIN_LABEL: Record<string, string> = {
+		extend: 'Extending — move still running',
+		hold_to_close: 'Holding — into the close',
+		hold_to_midday: 'Holding — through midday',
+		fade: 'Fading — reversing'
+	};
+	const DESERVED_LABEL: Record<string, string> = {
+		deserved: 'deserved', overreaction: 'overreaction', unclear: 'unclear'
+	};
+	const OUTCOME_LABEL: Record<string, string> = {
+		extended: 'extended ✓', held: 'held', faded: 'faded'
+	};
 </script>
 
 <div class="ovn">
@@ -58,10 +84,41 @@
 	<!-- 3. Two supporting lines -->
 	<div class="support">
 		<div>↕ {data.dir === 'down' ? 'Gapped down' : 'Gapped up'} {dirPct} · {premiumLabel}</div>
-		<div>👥 {crowdLabel}</div>
+		<div class="crowd-line">👥 {crowdLabel}</div>
 	</div>
 	{#if v.reasons?.length}
 		<div class="why">{v.reasons[0]}</div>
+	{/if}
+
+	<!-- 3b. Catalyst read (LLM) — why it moved + will it hold -->
+	{#if cat}
+		<div class="catalyst">
+			<div class="cat-head">
+				<span class="cat-tag">Catalyst read{cat.provider ? ` · ${cat.provider}` : ''}</span>
+				<div class="toggle" role="group" aria-label="call source">
+					<button type="button" class:on={!showCombiner} onclick={() => (showCombiner = false)}>LLM</button>
+					<button type="button" class:on={showCombiner} onclick={() => (showCombiner = true)}>Combiner</button>
+				</div>
+			</div>
+			{#if catCall}
+				<div class="cat-call {catCallClass}">
+					<span>{CALL_LABEL[catCall] ?? catCall}</span>
+					{#if cat.confidence != null}<span class="cat-conf">confidence {cat.confidence}%</span>{/if}
+				</div>
+			{/if}
+			{#if cat.sustain}
+				<div class="sustain sustain--{cat.sustain}">{SUSTAIN_LABEL[cat.sustain] ?? cat.sustain}</div>
+			{/if}
+			{#if cat.why_moved || cat.one_liner}
+				<p class="cat-why">{cat.why_moved ?? cat.one_liner}</p>
+			{/if}
+			<div class="chips">
+				{#if cat.catalyst_type}<span class="chip">{cat.catalyst_type}</span>{/if}
+				{#if cat.deserved}<span class="chip">{DESERVED_LABEL[cat.deserved] ?? cat.deserved}</span>{/if}
+				{#if cat.sentiment}<span class="chip">vibe: {cat.sentiment}</span>{/if}
+				{#if cat.outcome}<span class="chip chip--outcome">today: {OUTCOME_LABEL[cat.outcome] ?? cat.outcome}</span>{/if}
+			</div>
+		</div>
 	{/if}
 
 	<!-- 4. Optional drill-down: baseline vs live premiums (collapsed) -->
@@ -154,6 +211,9 @@
 		font-size: 0.76rem;
 		color: #94a3b8;
 	}
+	.crowd-line {
+		color: #c4b5fd;     /* light purple — make the peer-context line noticeable */
+	}
 	.why {
 		margin-top: 0.35rem;
 		font-size: 0.72rem;
@@ -199,5 +259,93 @@
 		margin-top: 0.5rem;
 		font-size: 0.65rem;
 		color: #64748b;
+	}
+	.catalyst {
+		margin-top: 0.7rem;
+		padding-top: 0.6rem;
+		border-top: 1px solid rgba(100, 116, 139, 0.2);
+	}
+	.cat-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.5rem;
+		margin-bottom: 0.4rem;
+	}
+	.cat-tag {
+		font-size: 0.6rem;
+		font-weight: 700;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		color: #818cf8;
+	}
+	.toggle {
+		display: inline-flex;
+		border: 1px solid rgba(100, 116, 139, 0.4);
+		border-radius: 0.4rem;
+		overflow: hidden;
+	}
+	.toggle button {
+		border: none;
+		background: transparent;
+		color: #94a3b8;
+		font-size: 0.65rem;
+		padding: 0.15rem 0.45rem;
+		cursor: pointer;
+	}
+	.toggle button.on {
+		background: rgba(129, 140, 248, 0.2);
+		color: #c7d2fe;
+	}
+	.cat-call {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 0.75rem;
+		border-radius: 0.5rem;
+		border: 1px solid;
+		padding: 0.4rem 0.65rem;
+		font-weight: 800;
+	}
+	.cat-conf {
+		font-size: 0.7rem;
+		font-weight: 600;
+		opacity: 0.8;
+	}
+	.sustain {
+		margin-top: 0.4rem;
+		font-size: 0.78rem;
+		font-weight: 700;
+	}
+	.sustain--extend,
+	.sustain--hold_to_close,
+	.sustain--hold_to_midday {
+		color: #a7f3d0;
+	}
+	.sustain--fade {
+		color: #fda4af;
+	}
+	.cat-why {
+		margin-top: 0.35rem;
+		font-size: 0.82rem;
+		line-height: 1.3rem;
+		color: #e2e8f0;
+	}
+	.chips {
+		margin-top: 0.4rem;
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.3rem;
+	}
+	.chip {
+		font-size: 0.65rem;
+		color: #cbd5e1;
+		background: rgba(100, 116, 139, 0.18);
+		border-radius: 0.3rem;
+		padding: 0.1rem 0.4rem;
+	}
+	.chip--outcome {
+		background: rgba(16, 185, 129, 0.15);
+		color: #a7f3d0;
 	}
 </style>

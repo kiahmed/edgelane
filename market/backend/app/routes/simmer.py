@@ -119,7 +119,7 @@ async def _overnight_block(sym: str) -> dict:
     row = await supabase_admin.get_simmer_overnight_by_symbol(sym, session)
     if not row:
         return {"active": False}
-    return {
+    out = {
         "active": True,
         "thesis": row.get("thesis"),
         "verdict": row.get("verdict") or {},
@@ -133,6 +133,29 @@ async def _overnight_block(sym: str) -> dict:
         "spot_baseline": row.get("spot_baseline"),
         "as_of": row.get("updated_at"),
     }
+    # Catalyst read (LLM) + combiner, when the analyzer has run for this name today.
+    # The row is user-agnostic (both llm_only and combiner_blended are computed);
+    # the UI's per-user toggle picks which call to show. Absent → the tab just
+    # shows the premium verdict above (the analyzer may be off or not yet run).
+    an = await supabase_admin.get_simmer_overnight_analysis(sym, session)
+    if an:
+        llm = an.get("llm") or {}
+        comb = an.get("combiner") or {}
+        out["catalyst"] = {
+            "why_moved": llm.get("why_moved"),
+            "one_liner": llm.get("one_liner"),
+            "catalyst_type": llm.get("catalyst_type"),
+            "deserved": llm.get("deserved"),
+            "sentiment": llm.get("web_social_sentiment"),
+            "sustain": llm.get("sustain"),
+            "confidence": llm.get("confidence"),
+            "provider": llm.get("provider"),
+            "llm_only_call": (comb.get("llm_only") or {}).get("call"),
+            "combiner_call": (comb.get("combiner_blended") or {}).get("call"),
+            "combiner_decided_at": comb.get("decided_at"),
+            "outcome": an.get("outcome"),
+        }
+    return out
 
 
 def require_simmer_api_token(authorization: str | None = Header(default=None)) -> None:
@@ -425,7 +448,10 @@ async def post_watchlist(body: WatchlistAdd, request: Request,
     if uid in ("admin", "dev-local"):
         raise HTTPException(422, "watchlist rows belong to a signed-in user "
                                  "account; the admin/dev bypass has none")
-    row = {"user_id": uid, "symbol": validated["symbol"], "active": True}
+    # A user add/re-add CLAIMS the row as source='user' — so if the name was an RQ
+    # import, the EOD reset only strips its overlay instead of deleting the row the
+    # user deliberately kept (reset deletes source='rq' only).
+    row = {"user_id": uid, "symbol": validated["symbol"], "active": True, "source": "user"}
     if body.position is not None:
         row["position"] = int(body.position)
     if body.expiration:
@@ -483,6 +509,9 @@ async def patch_watchlist(symbol: str, body: WatchlistPatch, request: Request,
         values["position"] = int(body.position)
     if not values:
         raise HTTPException(422, "nothing to update")
+    # A deliberate edit also claims the row as the user's (see post_watchlist) so
+    # the EOD RQ reset won't delete a name the user pinned/toggled.
+    values["source"] = "user"
     ok = await supabase_admin.update_rows(
         "simmer_watchlist",
         {"user_id": f"eq.{user['id']}", "symbol": f"eq.{sym}"}, values)

@@ -216,6 +216,15 @@ OVERNIGHT_LLM: dict[str, Any] = {
     "shadow_model":     "gemini-3.8-flash",
 }
 
+# ── Regular sweep master switch (engine-level, all users) ───────────────────
+# DB-held in the `sweep` section of simmer_engine_settings (no restart). False =
+# PAUSE the regular readiness sweep for everyone; overnight/RQ-intersected
+# tickers KEEP running (they're handled by the overnight path, carved out of the
+# pause). Use to freeze the engine without touching per-user watchlists.
+SWEEP: dict[str, Any] = {
+    "enabled": True,
+}
+
 # ── Volatility estimation ──────────────────────────────────────────────────
 VOL: dict[str, Any] = {
     "annualization_days":   252,   # trading days
@@ -458,7 +467,7 @@ _SECTION_DEFAULTS: dict[str, dict] = {
     "vol": VOL, "dte_tiers": DTE_TIERS, "catalyst": CATALYST, "intraday": INTRADAY,
     "cadence": CADENCE, "ttl": TTL, "velocity": VELOCITY, "news": NEWS,
     "sentiment": SENTIMENT, "squeeze": SQUEEZE, "regime": REGIME,
-    "overnight_llm": OVERNIGHT_LLM,
+    "overnight_llm": OVERNIGHT_LLM, "sweep": SWEEP,
 }
 
 
@@ -608,6 +617,13 @@ def overnight_llm() -> dict[str, Any]:
     Overridable in the `overnight_llm` section of simmer_engine_settings; see
     OVERNIGHT_LLM for the shape. API keys live in config, not here."""
     return _section("overnight_llm", OVERNIGHT_LLM)
+
+
+def sweep_enabled() -> bool:
+    """Engine-level master switch for the regular readiness sweep (DB-held in the
+    `sweep` section). False pauses the sweep for all users; overnight/RQ tickers
+    are carved out and keep running. Defaults ON."""
+    return bool(_section("sweep", SWEEP).get("enabled", True))
 
 
 def vol() -> dict[str, Any]:

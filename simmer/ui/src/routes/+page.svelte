@@ -38,13 +38,39 @@
 
 	const withEnv = $derived(watchlist.rows.filter((r) => r.readiness));
 	const readyCount = $derived(withEnv.filter((r) => r.readiness!.decision === 'ready').length);
+
+	// Filter/sort bar — revealed in the full-list view (after "show all"); a
+	// focused single card is never filtered. Overnight gap comes from the row's
+	// RQ overlay; readiness status/confidence from the sweep envelope.
+	let search = $state('');
+	let statusFilter = $state<'all' | 'ready' | 'watch' | 'avoid' | 'vetoed'>('all');
+	let minConf = $state(0);
+	let sortBy = $state<'expiry' | 'gap' | 'confidence'>('expiry');
+	let rqOnly = $state(false);
+	const ovnGap = (r: WatchlistRow) =>
+		Math.abs(Number((r.overrides?.overnight as { gap?: number } | undefined)?.gap ?? 0));
+
 	// Nearest expiry first; rows without an evaluated expiry sink to the bottom.
 	// Expirations are ISO YYYY-MM-DD, so a string compare is chronological.
 	const shown = $derived.by(() => {
-		const list = selected
+		let list = selected
 			? watchlist.rows.filter((r) => r.symbol === selected)
 			: watchlist.rows.slice();
+		if (!selected) {
+			const q = search.trim().toUpperCase();
+			list = list.filter((r) => {
+				if (q && !r.symbol.toUpperCase().includes(q)) return false;
+				const env = r.readiness;
+				if (statusFilter !== 'all' && env?.decision !== statusFilter) return false;
+				if (minConf > 0 && (env?.score ?? 0) < minConf) return false;
+				if (rqOnly && !r.overrides?.overnight) return false;
+				return true;
+			});
+		}
 		return list.sort((a, b) => {
+			if (!selected && sortBy === 'gap') return ovnGap(b) - ovnGap(a);
+			if (!selected && sortBy === 'confidence')
+				return (b.readiness?.score ?? -1) - (a.readiness?.score ?? -1);
 			const ax = a.readiness?.expiration ?? null;
 			const bx = b.readiness?.expiration ?? null;
 			if (ax && bx) return ax < bx ? -1 : ax > bx ? 1 : 0;
@@ -123,6 +149,47 @@
 					>
 				{/if}
 			</div>
+
+			{#if !selected && withEnv.length}
+				<div
+					class="flex flex-wrap items-center gap-2 rounded-lg border border-slate-700/40 bg-slate-800/30 px-2 py-1.5 text-xs">
+					<input
+						class="gate-input mt-0! w-28"
+						style="margin-top:0"
+						placeholder="search ticker"
+						bind:value={search}
+						autocomplete="off"
+						spellcheck="false"
+					/>
+					<select class="gate-input mt-0!" style="margin-top:0" bind:value={statusFilter}>
+						<option value="all">all status</option>
+						<option value="ready">ready</option>
+						<option value="watch">watch</option>
+						<option value="avoid">avoid</option>
+						<option value="vetoed">vetoed</option>
+					</select>
+					<label class="flex items-center gap-1 text-slate-400">
+						min conf
+						<input
+							class="gate-input mt-0! w-14"
+							style="margin-top:0"
+							type="number"
+							min="0"
+							max="100"
+							bind:value={minConf}
+						/>
+					</label>
+					<select class="gate-input mt-0!" style="margin-top:0" bind:value={sortBy}>
+						<option value="expiry">sort: expiry</option>
+						<option value="gap">sort: overnight gap ↓</option>
+						<option value="confidence">sort: readiness conf ↓</option>
+					</select>
+					<label class="flex items-center gap-1 text-violet-300">
+						<input type="checkbox" bind:checked={rqOnly} /> RQ only
+					</label>
+					<span class="ml-auto text-slate-500">{shown.length} shown</span>
+				</div>
+			{/if}
 		{/if}
 
 		{#each shown as row (row.id)}

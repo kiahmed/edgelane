@@ -210,6 +210,24 @@ async def test_run_import_is_nondestructive_on_an_existing_user_row(mock_supabas
     assert u2["source"] == "rq" and u2["expiration"] == "2026-11-20"
 
 
+async def test_run_import_pins_expiry_on_a_pending_row_without_one(mock_supabase, monkeypatch):
+    """A row already on the list but with NO expiration would sit 'pending' forever;
+    the import auto-assigns the overnight next-expiry (without clobbering a real pin)."""
+    mock_supabase["watchlist"].append({
+        "user_id": "user-1", "symbol": "NVDA", "expiration": None,
+        "active": True, "source": "user", "overrides": {}})
+
+    async def _fetch(base, token=None, timeout=10.0):
+        return [{"symbol": "NVDA", "gap": -0.06, "dir": "down", "crowd": "sector_wide"}]
+    monkeypatch.setattr(ov.simmer_relativeqs, "fetch_movers", _fetch)
+
+    await ov.run_import(_FakeProvider(100.0))
+    u1 = next(r for r in mock_supabase["watchlist"] if r["user_id"] == "user-1" and r["symbol"] == "NVDA")
+    assert u1["expiration"] == "2026-11-20"      # auto-pinned (was None)
+    assert u1["source"] == "user"                # still not flipped to rq
+    assert u1["overrides"]["overnight"]["gap"] == -0.06
+
+
 async def test_toggle2_analyzes_only_intersection_never_imports(mock_supabase, monkeypatch):
     """Toggle 2 (analyze): for a user who did NOT opt into import, attach the
     overnight overlay ONLY to a mover they ALREADY watch — never add a new name,
@@ -291,6 +309,46 @@ async def test_analyze_all_default_on_excludes_optouts_and_fails_closed(monkeypa
     assert await supabase_admin.users_with_overnight_analyze_all() is None
 
 
+# ── sweep carve-out + EOD RQ reset ──────────────────────────────────────────
+async def test_rq_symbols_active_reads_overlay(monkeypatch):
+    async def _sm(table, select="*", filters=None, **kw):
+        return [{"symbol": "mu", "overrides": {"overnight": {"gap": -0.05}}},
+                {"symbol": "AAPL", "overrides": {"note": "x"}},   # no overnight → not RQ
+                {"symbol": "stx", "overrides": {"overnight": {"gap": -0.03}}}]
+    monkeypatch.setattr(supabase_admin, "select_many", _sm)
+    assert await supabase_admin.rq_symbols_active() == {"MU", "STX"}
+
+
+async def test_reset_rq_end_of_day_deletes_rq_strips_overlay(monkeypatch):
+    rows = [
+        {"id": 1, "user_id": "u1", "symbol": "MU", "source": "rq",
+         "overrides": {"overnight": {"gap": -0.05}}},                     # purely-RQ → delete
+        {"id": 2, "user_id": "u2", "symbol": "NVDA", "source": "user",
+         "overrides": {"note": "keep", "overnight": {"gap": 0.04}}},       # user row → strip overlay
+        {"id": 3, "user_id": "u3", "symbol": "AMD", "source": "user", "overrides": {}},  # untouched
+    ]
+    deleted_filters = []
+    stripped = []
+
+    async def _sm(table, select="*", filters=None, **kw):
+        return rows
+
+    async def _del(table, filters):
+        deleted_filters.append(filters); return True
+
+    async def _up(table, row, on_conflict):
+        stripped.append(row); return True
+    monkeypatch.setattr(supabase_admin, "select_many", _sm)
+    monkeypatch.setattr(ov.supabase_admin, "delete_rows", _del)
+    monkeypatch.setattr(ov.supabase_admin, "upsert_row", _up)
+
+    res = await ov.reset_rq_end_of_day()
+    assert res == {"deleted": 1, "stripped": 1}
+    assert deleted_filters == [{"source": "eq.rq"}]          # rq rows deleted in one shot
+    assert stripped[0]["symbol"] == "NVDA"                    # user row stripped
+    assert "overnight" not in stripped[0]["overrides"] and stripped[0]["overrides"]["note"] == "keep"
+
+
 # ── /simmer/overnight route ─────────────────────────────────────────────────
 def _route_client():
     from fastapi import FastAPI
@@ -315,11 +373,25 @@ def test_overnight_route_active(monkeypatch):
                 "updated_at": "2026-10-12T14:00:00Z"}
     monkeypatch.setattr(sroute.supabase_admin, "get_simmer_overnight_by_symbol", _row)
 
+    async def _an(sym, session):      # the catalyst analysis row (Phase 2 surfacing)
+        return {"symbol": sym, "outcome": None,
+                "llm": {"provider": "openai", "call": "sell_bear_call", "sustain": "extend",
+                        "deserved": "overreaction", "web_social_sentiment": "doubt",
+                        "why_moved": "CXMT DRAM competition fears", "confidence": 74},
+                "combiner": {"llm_only": {"call": "sell_bear_call"},
+                             "combiner_blended": {"call": "wait"}, "decided_at": None}}
+    monkeypatch.setattr(sroute.supabase_admin, "get_simmer_overnight_analysis", _an)
+
     r = client.get("/simmer/overnight/NVDA")
     assert r.status_code == 200
     data = r.json()["data"]
     assert data["active"] is True and data["verdict"]["call"] == "sell_bear_call"
     assert data["thesis"] == "guidance cut"
+    # catalyst read surfaced for the UI (both calls + sustain/why)
+    cat = data["catalyst"]
+    assert cat["sustain"] == "extend" and cat["why_moved"] == "CXMT DRAM competition fears"
+    assert cat["llm_only_call"] == "sell_bear_call" and cat["combiner_call"] == "wait"
+    assert cat["deserved"] == "overreaction" and cat["sentiment"] == "doubt"
 
 
 def test_overnight_route_active_regardless_of_readiness_expiry(monkeypatch):
@@ -337,8 +409,13 @@ def test_overnight_route_active_regardless_of_readiness_expiry(monkeypatch):
                 "updated_at": "2026-10-12T14:00:00Z"}
     monkeypatch.setattr(sroute.supabase_admin, "get_simmer_overnight_by_symbol", _row)
 
+    async def _an(sym, session):
+        return None                   # analyzer hasn't run → tab shows premium only
+    monkeypatch.setattr(sroute.supabase_admin, "get_simmer_overnight_analysis", _an)
+
     data = client.get("/simmer/overnight/MU").json()["data"]
     assert data["active"] is True and data["verdict"]["call"] == "sell_bull_put"
+    assert "catalyst" not in data
 
 
 def test_overnight_route_inactive_when_no_row(monkeypatch):

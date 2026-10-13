@@ -504,6 +504,21 @@ async def users_with_overnight_analyze_all() -> Optional[list[str]]:
     return sorted(universe - opted_out)
 
 
+async def rq_symbols_active() -> set[str]:
+    """Symbols whose ACTIVE watchlist row carries the overnight (RQ) overlay today.
+    Used to carve RQ tickers out of a paused sweep and to find EOD-reset targets."""
+    rows = await select_many("simmer_watchlist", "symbol,overrides,active",
+                             {"active": "eq.true"})
+    out: set[str] = set()
+    for r in rows or []:
+        ov = r.get("overrides") or {}
+        if isinstance(ov, dict) and ov.get("overnight"):
+            sym = str(r.get("symbol") or "").strip().upper()
+            if sym:
+                out.add(sym)
+    return out
+
+
 async def get_watchlist_row(user_id: str, symbol: str) -> Optional[dict]:
     rows = await select_many("simmer_watchlist", filters={
         "user_id": f"eq.{user_id}", "symbol": f"eq.{str(symbol).upper()}"}, limit=1)

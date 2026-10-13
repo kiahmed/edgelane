@@ -1872,6 +1872,13 @@ async def sweep(tradier, db, edgar=None) -> dict[str, dict]:
         except ValueError:
             return False
     pairs = [(s, e) for s, e in pairs if not _still_expired(e)]
+    # Engine-level pause (DB-held `sweep.enabled`): freeze the regular sweep for
+    # everyone, but KEEP overnight/RQ-intersected tickers running (carve-out).
+    if not simmer_config.sweep_enabled():
+        rq = await supabase_admin.rq_symbols_active()
+        kept = [(s, e) for s, e in pairs if s in rq]
+        log.info("sweep paused (engine switch off) — %d RQ pair(s) kept of %d", len(kept), len(pairs))
+        pairs = kept
     symbols = sorted({s for s, _ in pairs})
     state.watched_count = len(symbols)
 
@@ -2112,6 +2119,12 @@ def _combiner_lock(now) -> bool:
     return (now.hour, now.minute) >= (10, 0)
 
 
+def _should_reset(now, reset_done: bool) -> bool:
+    """EOD RQ reset: once per weekday, from 16:00 ET — after the close reading has
+    stamped outcomes (it fires at 15:58), so grading is persisted first."""
+    return now.weekday() < 5 and not reset_done and (now.hour, now.minute) >= (16, 0)
+
+
 def _captures_due(now, *, open_: bool, readings_done) -> list[str]:
     """Which forward-test readings are due now (weekdays only): 10:00 needs the
     market open; the 16:00 close reading fires on a 15:58–16:30 window so a 180s
@@ -2128,10 +2141,16 @@ def _captures_due(now, *, open_: bool, readings_done) -> list[str]:
     return due
 
 
-def _overnight_sleep(now, open_: bool) -> float:
+def _overnight_sleep(now, open_: bool, import_pending: bool = False) -> float:
     """Loop cadence: 60s in the first 30 min and from 15:45 (so a tick lands in the
     16:00 window), else 180s while open; pre-09:25 wake near the open; 120s across
-    16:00–16:30 to catch the close reading; otherwise 600s."""
+    16:00–16:30 to catch the close reading; otherwise 600s.
+
+    `import_pending` (the baseline hasn't landed yet though we're in the 09:25–16:00
+    window) forces a brisk 60s retry — so a transient empty-chain/timeout at the
+    open doesn't strand the import behind a 600s pre-open sleep."""
+    if import_pending:
+        return 60.0
     hm = (now.hour, now.minute)
     if open_:
         mins_since_open = (now.hour - 9) * 60 + (now.minute - 30)
@@ -2156,6 +2175,7 @@ async def overnight_loop(provider, tz_name: str) -> None:
     tz = ZoneInfo(tz_name) if tz_name else ZoneInfo("America/New_York")
     imported_date: str | None = None
     catalyst_date: str | None = None
+    reset_date: str | None = None        # EOD RQ reset done for this session
     readings_done: set[str] = set()      # reading labels captured today (reset per day)
     readings_day: str | None = None
     while True:
@@ -2224,7 +2244,19 @@ async def overnight_loop(provider, tz_name: str) -> None:
                         readings_done.add(label)
                     except Exception:
                         log.exception("overnight reading %s failed", label)
-            await asyncio.sleep(_overnight_sleep(now, open_))
+            # EOD RQ reset (read-only path aside): delete purely-RQ watchlist rows +
+            # strip overlays once past 16:00, AFTER the close reading stamped
+            # outcomes. The analysis history is preserved. Runs regardless of the
+            # LLM analyzer being enabled (RQ import is a separate feature).
+            if _should_reset(now, reset_date == today):
+                try:
+                    rres = await overnight.reset_rq_end_of_day()
+                    log.info("overnight RQ EOD reset: %s", rres)
+                    reset_date = today
+                except Exception:
+                    log.exception("overnight RQ EOD reset failed")
+            await asyncio.sleep(_overnight_sleep(
+                now, open_, import_pending=_should_import(now, imported_date == today)))
         except asyncio.CancelledError:
             raise
         except Exception:

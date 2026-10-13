@@ -262,10 +262,27 @@ def test_watchlist_post_writes_for_real_user(auth_off, monkeypatch):
     r = c.post("/simmer/watchlist", json={"symbol": "NVDA", "expiration": EXP})
     assert r.status_code == 200
     assert r.json()["written"] is True
+    # source='user' CLAIMS the row — if NVDA was an RQ import, the EOD reset then
+    # only strips its overlay instead of deleting the user's deliberate add.
     assert wrote == [("simmer_watchlist",
                       {"user_id": "11111111-2222-3333-4444-555555555555",
-                       "symbol": "NVDA", "active": True, "expiration": EXP},
+                       "symbol": "NVDA", "active": True, "source": "user",
+                       "expiration": EXP},
                       "user_id,symbol")]
+
+
+def test_watchlist_patch_claims_row_as_user(auth_off, monkeypatch):
+    """A deliberate edit (pin an expiry) also claims the row source='user', so the
+    EOD RQ reset won't delete a name the user customized."""
+    updated = []
+    async def fake_update(table, filters, values):
+        updated.append((table, filters, values)); return True
+    monkeypatch.setattr(supabase_admin, "update_rows", fake_update)
+    c = _make_client(user={"id": "11111111-2222-3333-4444-555555555555",
+                           "auth": "supabase"})
+    r = c.patch("/simmer/watchlist/NVDA", json={"active": False})
+    assert r.status_code == 200
+    assert updated[0][2].get("source") == "user" and updated[0][2]["active"] is False
 
 
 def test_watchlist_post_rejects_bypass_identities(auth_off, monkeypatch):

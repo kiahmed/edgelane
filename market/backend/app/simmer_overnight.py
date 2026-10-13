@@ -196,10 +196,15 @@ async def _upsert_watchlist_rq(user_id: str, mover: dict, expiration: str) -> No
         overrides = dict(existing.get("overrides") or {})
         overrides["overnight"] = overnight
         # Only `overrides` in the payload → on-conflict updates ONLY that column;
-        # expiration / active / source are left exactly as the user had them.
-        await supabase_admin.upsert_row("simmer_watchlist", {
-            "user_id": user_id, "symbol": sym, "overrides": overrides,
-        }, on_conflict="user_id,symbol")
+        # active / source are left exactly as the user had them. EXCEPTION: if the
+        # row has NO expiration pinned (it would sit "pending" forever with no
+        # chain to evaluate), auto-assign the overnight's next-available expiry so
+        # it gets a readiness card — without clobbering a user's deliberate pin.
+        payload = {"user_id": user_id, "symbol": sym, "overrides": overrides}
+        if not existing.get("expiration"):
+            payload["expiration"] = expiration
+        await supabase_admin.upsert_row("simmer_watchlist", payload,
+                                        on_conflict="user_id,symbol")
     else:
         await supabase_admin.upsert_row("simmer_watchlist", {
             "user_id": user_id, "symbol": sym, "expiration": expiration,
@@ -250,6 +255,36 @@ async def run_import(provider, *, summarize=None) -> dict:
              len(movers), rows, imported, analyzed)
     return {"movers": len(movers), "rows": rows, "imported": imported, "analyzed": analyzed,
             "import_users": len(import_users), "analyze_users": len(analyze_users)}
+
+
+async def reset_rq_end_of_day() -> dict:
+    """End-of-day RQ reset (product decision): DELETE purely-RQ watchlist rows
+    (source='rq') and STRIP the overnight overlay from user-owned rows, so RQ
+    status clears and tomorrow re-imports whatever RelativeQs surfaces.
+
+    The ANALYSIS is explicitly NOT touched: simmer_overnight (frozen baseline +
+    premium verdict) and simmer_overnight_analysis (llm/combiner/outcome) are
+    separate history tables that persist for later reference/plots. Best-effort;
+    returns a small summary. Idempotent: a second run finds no rq rows/overlays."""
+    rows = await supabase_admin.select_many(
+        "simmer_watchlist", "id,user_id,symbol,source,overrides", {}) or []
+    deleted = stripped = 0
+    if any(r.get("source") == "rq" for r in rows):
+        if await supabase_admin.delete_rows("simmer_watchlist", {"source": "eq.rq"}):
+            deleted = sum(1 for r in rows if r.get("source") == "rq")
+    for r in rows:
+        if r.get("source") == "rq":
+            continue                           # already deleted above
+        ov = r.get("overrides") or {}
+        if isinstance(ov, dict) and ov.get("overnight"):
+            cleaned = {k: v for k, v in ov.items() if k != "overnight"}
+            await supabase_admin.upsert_row("simmer_watchlist", {
+                "user_id": r["user_id"], "symbol": r["symbol"], "overrides": cleaned,
+            }, on_conflict="user_id,symbol")
+            stripped += 1
+    log.info("[overnight] RQ EOD reset: %d rq rows deleted, %d overlays stripped "
+             "(analysis preserved)", deleted, stripped)
+    return {"deleted": deleted, "stripped": stripped}
 
 
 def _news_bad(mover_dir: str, sentiment: Optional[dict]) -> Optional[bool]:

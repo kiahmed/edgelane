@@ -321,4 +321,20 @@ export interface OvernightData {
 	latest?: Record<string, number>;
 	spot_baseline?: number | null;
 	as_of?: string | null;
+	catalyst?: OvernightCatalyst | null;
+}
+
+export interface OvernightCatalyst {
+	why_moved?: string | null;
+	one_liner?: string | null;
+	catalyst_type?: string | null;
+	deserved?: 'deserved' | 'overreaction' | 'unclear' | null;
+	sentiment?: 'embrace' | 'doubt' | 'mixed' | null;
+	sustain?: 'fade' | 'hold_to_midday' | 'hold_to_close' | 'extend' | null;
+	confidence?: number | null;
+	provider?: string | null;
+	llm_only_call?: string | null;
+	combiner_call?: string | null;
+	combiner_decided_at?: string | null;
+	outcome?: 'extended' | 'held' | 'faded' | null;
 }

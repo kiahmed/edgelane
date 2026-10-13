@@ -108,6 +108,11 @@
 					onclick={() => onselect?.(row)}
 				>
 					<span class="font-bold">{row.symbol}</span>
+					{#if row.overrides?.overnight}
+						<span
+							class="rounded bg-violet-500/20 px-1 text-[0.55rem] font-bold tracking-wide text-violet-300"
+							title="RelativeQs overnight mover">RQ</span>
+					{/if}
 					{#if row.expiration}
 						<span class="text-[0.65rem] text-sky-300" title="Expiration pinned">📌 {row.expiration}</span>
 					{/if}
