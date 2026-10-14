@@ -5,8 +5,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from app.simmer_watcher import (_captures_due, _combiner_lock, _overnight_sleep,
-                                 _should_catalyst, _should_import, _should_reset)
+from app.simmer_watcher import (_captures_due, _combiner_lock, _import_window_closed,
+                                 _overnight_sleep, _should_catalyst, _should_import,
+                                 _should_reset)
 
 MON, SAT = 12, 17          # 2026-10-12 is a Monday; 2026-10-17 a Saturday
 
@@ -15,22 +16,28 @@ def dt(h, m, day=MON):
     return datetime(2026, 10, day, h, m)
 
 
-# ── import window ────────────────────────────────────────────────────────────
+# ── import window (one-shot; `imported_today`=full board captured) ───────────
 def test_should_import_window():
     assert not _should_import(dt(9, 24), False)        # before 09:25
     assert _should_import(dt(9, 25), False)            # opens at 09:25
     assert _should_import(dt(15, 59), False)           # late start still imports
     assert not _should_import(dt(16, 0), False)        # not from 16:00
-    assert not _should_import(dt(9, 30), True)         # already imported today
+    assert not _should_import(dt(9, 30), True)         # full board already captured
     assert not _should_import(dt(9, 30, SAT), False)   # weekend
 
 
-# ── catalyst (evaluated with the live imported flag → same-tick) ─────────────
 def test_should_catalyst():
-    assert _should_catalyst(dt(9, 25), True, False)    # imported this tick, not done
-    assert not _should_catalyst(dt(9, 25), False, False)   # no baseline yet
-    assert not _should_catalyst(dt(9, 25), True, True)     # already done today
+    assert _should_catalyst(dt(9, 25), True, False)        # board landed, not done
+    assert not _should_catalyst(dt(9, 25), False, False)   # board not complete yet
+    assert not _should_catalyst(dt(9, 25), True, True)     # already done
     assert not _should_catalyst(dt(16, 1), True, False)    # not after 16:00
+
+
+def test_import_window_closed_caps_retries():
+    assert not _import_window_closed(dt(9, 25))            # retry while capturing stragglers
+    assert not _import_window_closed(dt(10, 29))
+    assert _import_window_closed(dt(10, 30))               # accept partial, stop retrying
+    assert _import_window_closed(dt(11, 0))
 
 
 # ── combiner freeze cutoff ───────────────────────────────────────────────────
@@ -71,6 +78,5 @@ def test_overnight_sleep_buckets():
     pre = _overnight_sleep(dt(9, 20), False)                # wake near 09:25
     assert 0 < pre <= 600.0
     assert _overnight_sleep(dt(6, 0), False) == 600.0       # far pre-open → capped
-    # import not yet landed in-window → brisk 60s retry (no 600s pre-open strand)
-    assert _overnight_sleep(dt(9, 26), False, import_pending=True) == 60.0
-    assert _overnight_sleep(dt(11, 0), True, import_pending=True) == 60.0
+    # full board not yet captured in-window → brisk 60s retry for the stragglers
+    assert _overnight_sleep(dt(9, 40), True, import_pending=True) == 60.0

@@ -149,19 +149,20 @@ async def _next_expiry(provider, symbol: str) -> Optional[str]:
 
 
 async def _ensure_overnight_row(provider, mover: dict, expiration: str, session: str,
-                                summarize=None) -> bool:
+                                summarize=None) -> tuple[bool, bool]:
     """Create the user-agnostic analysis row once: frozen baseline + thesis.
-    Never recaptures a baseline that already exists. Returns True when a usable
-    overnight row exists (baseline captured now or already present), False when we
-    couldn't get a baseline — so the caller can skip importing an unanalyzable
-    name into watchlists."""
+    Never recaptures a baseline that already exists. Returns (ok, created): `ok`
+    True when a usable overnight row exists (baseline captured now or already
+    present); `created` True ONLY on the run that newly captured it. The caller
+    imports into watchlists only when `created`, so a per-minute import retry never
+    re-inserts a name a user has since deleted or re-applies its overlay."""
     sym = mover["symbol"]
     existing = await supabase_admin.get_simmer_overnight(sym, expiration, session)
     if existing and existing.get("baseline"):
-        return True                           # baseline is immutable, already have it
+        return True, False                    # baseline is immutable, already have it
     snap = await capture_baseline(provider, sym, expiration, mover["dir"])
     if not snap:
-        return False
+        return False, False
     thesis = await research_thesis(sym, mover["gap"], mover["dir"], mover.get("crowd"),
                                    summarize=summarize)
     verdict = pt.analyze(direction=mover["dir"], crowd=mover.get("crowd"),
@@ -174,7 +175,7 @@ async def _ensure_overnight_row(provider, mover: dict, expiration: str, session:
         "baseline": snap["baseline"], "spot_baseline": snap["spot_baseline"],
         "latest": {}, "verdict": verdict,
     })
-    return True
+    return True, True
 
 
 async def _upsert_watchlist_rq(user_id: str, mover: dict, expiration: str) -> None:
@@ -239,9 +240,12 @@ async def run_import(provider, *, summarize=None) -> dict:
         # The analysis row (frozen baseline + thesis) is user-agnostic and must
         # exist before any user can see the Overnight tab. Only create it for a
         # name we can actually analyze (listed options + a usable baseline).
-        if not await _ensure_overnight_row(provider, m, exp, session, summarize=summarize):
+        ok, created = await _ensure_overnight_row(provider, m, exp, session, summarize=summarize)
+        if not ok:
             continue
         rows += 1
+        if not created:
+            continue                 # already captured on an earlier retry → never re-import
         for uid in import_users:                       # toggle 1 — import the name
             await _upsert_watchlist_rq(uid, m, exp)
             imported += 1

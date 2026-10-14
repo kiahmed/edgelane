@@ -228,6 +228,23 @@ async def test_run_import_pins_expiry_on_a_pending_row_without_one(mock_supabase
     assert u1["overrides"]["overnight"]["gap"] == -0.06
 
 
+async def test_run_import_second_pass_does_not_reimport(mock_supabase, monkeypatch):
+    """A retry pass re-captures nothing new → writes NO watchlist rows, so a name a
+    user deleted at 10:00 is never re-inserted (and overlays aren't re-applied)."""
+    async def _fetch(base, token=None, **kw):
+        return rq.normalize_movers(_BOARD)
+    monkeypatch.setattr(ov.simmer_relativeqs, "fetch_movers", _fetch)
+
+    r1 = await ov.run_import(_FakeProvider(100.0))
+    assert r1["rows"] == 2 and r1["imported"] == 4           # first pass: NVDA+AMD × 2 users
+    wl_count = len(mock_supabase["watchlist"])
+
+    r2 = await ov.run_import(_FakeProvider(100.0))
+    assert r2["rows"] == 2                                    # baselines still present
+    assert r2["imported"] == 0 and r2["analyzed"] == 0       # nothing newly created → no writes
+    assert len(mock_supabase["watchlist"]) == wl_count       # no watchlist rows re-inserted
+
+
 async def test_toggle2_analyzes_only_intersection_never_imports(mock_supabase, monkeypatch):
     """Toggle 2 (analyze): for a user who did NOT opt into import, attach the
     overnight overlay ONLY to a mover they ALREADY watch — never add a new name,
@@ -307,6 +324,50 @@ async def test_analyze_all_default_on_excludes_optouts_and_fails_closed(monkeypa
         return None                                                         # watchlist read fails
     monkeypatch.setattr(supabase_admin, "select_many", sm_wl_err)
     assert await supabase_admin.users_with_overnight_analyze_all() is None
+
+
+# ── RelativeQs fetch: synchronous retry until a COMPLETE board ───────────────
+class _Resp:
+    def __init__(self, status, body: bytes):
+        self.status_code = status; self.content = body; self.headers = {}
+    def json(self):
+        import json as _j; return _j.loads(self.content)
+
+
+def _fake_client(script):
+    calls = {"n": 0}
+
+    class _Client:
+        def __init__(self, timeout=None): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url, headers=None):
+            r = script[min(calls["n"], len(script) - 1)]; calls["n"] += 1
+            if isinstance(r, Exception):
+                raise r
+            return r
+    return _Client, calls
+
+
+async def test_fetch_movers_retries_until_complete(monkeypatch):
+    from app import simmer_relativeqs as rq
+    # attempt 1: network error; 2: 200 but INCOMPLETE (no movers list); 3: complete
+    script = [RuntimeError("drop"),
+              _Resp(200, b'{"status":"ok"}'),
+              _Resp(200, b'{"movers":[{"symbol":"MU","gap":-0.05,"dir":"down"}]}')]
+    Client, calls = _fake_client(script)
+    monkeypatch.setattr(rq.httpx, "AsyncClient", Client)
+    async def _nosleep(_): return None
+    monkeypatch.setattr(rq.asyncio, "sleep", _nosleep)
+    out = await rq.fetch_movers("http://rq.test", "tok")
+    assert calls["n"] == 3 and [m["symbol"] for m in out] == ["MU"]
+
+
+async def test_fetch_movers_does_not_retry_on_401(monkeypatch):
+    from app import simmer_relativeqs as rq
+    Client, calls = _fake_client([_Resp(401, b'{"detail":"no"}')])
+    monkeypatch.setattr(rq.httpx, "AsyncClient", Client)
+    assert await rq.fetch_movers("http://rq.test", "tok") == [] and calls["n"] == 1
 
 
 # ── sweep carve-out + EOD RQ reset ──────────────────────────────────────────

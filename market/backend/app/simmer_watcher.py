@@ -2182,16 +2182,24 @@ def _seconds_until(now, hh: int, mm: int) -> float:
 # faked clock, independent of the live while-loop. Each is a pure function of the
 # ET `now` + the per-day flags. See tests/simmer/test_overnight_schedule.py.
 def _should_import(now, imported_today: bool) -> bool:
-    """09:25 pre-open import, once/session, weekdays, until 16:00 (late start still
-    imports). `imported_today` True once a baseline row landed today."""
+    """09:25 pre-open import, weekdays, until 16:00 (a late start still imports).
+    `imported_today` is True once the FULL board has landed (all movers captured),
+    so a partial capture keeps retrying instead of stranding the rest."""
     return (now.weekday() < 5 and not imported_today
             and (now.hour, now.minute) >= (9, 25) and now.hour < 16)
 
 
 def _should_catalyst(now, imported_today: bool, catalyst_done: bool) -> bool:
-    """Catalyst LLM pass: once/day after the import landed, until 16:00. Evaluated
-    AFTER the import step so it can fire the same tick the baseline lands."""
+    """Catalyst LLM pass: once the import has fully landed, until 16:00. Evaluated
+    after the import step so it can fire the same tick the board completes."""
     return imported_today and not catalyst_done and now.hour < 16
+
+
+def _import_window_closed(now) -> bool:
+    """After 10:30 ET, accept whatever imported and stop retrying — so a mover that
+    never captures (no listed options / a persistently empty chain) can't hold the
+    done-flag open and make the loop re-fetch RelativeQs every 60s all day."""
+    return (now.hour, now.minute) >= (10, 30)
 
 
 def _combiner_lock(now) -> bool:
@@ -2226,9 +2234,10 @@ def _overnight_sleep(now, open_: bool, import_pending: bool = False) -> float:
     16:00 window), else 180s while open; pre-09:25 wake near the open; 120s across
     16:00–16:30 to catch the close reading; otherwise 600s.
 
-    `import_pending` (the baseline hasn't landed yet though we're in the 09:25–16:00
-    window) forces a brisk 60s retry — so a transient empty-chain/timeout at the
-    open doesn't strand the import behind a 600s pre-open sleep."""
+    `import_pending` (the full board hasn't landed yet though we're in the
+    09:25–16:00 window) forces a brisk 60s retry — so an at-open empty-chain that
+    left some movers uncaptured is retried promptly, not stranded behind a 600s
+    pre-open sleep."""
     if import_pending:
         return 60.0
     hm = (now.hour, now.minute)
@@ -2253,8 +2262,8 @@ async def overnight_loop(provider, tz_name: str) -> None:
     only cancellation propagates."""
     from zoneinfo import ZoneInfo
     tz = ZoneInfo(tz_name) if tz_name else ZoneInfo("America/New_York")
-    imported_date: str | None = None
-    catalyst_date: str | None = None
+    imported_date: str | None = None     # full board captured for this session
+    catalyst_date: str | None = None     # catalyst pass done for this session
     reset_date: str | None = None        # EOD RQ reset done for this session
     readings_done: set[str] = set()      # reading labels captured today (reset per day)
     readings_day: str | None = None
@@ -2267,26 +2276,29 @@ async def overnight_loop(provider, tz_name: str) -> None:
             today = now.date().isoformat()
             if readings_day != today:        # new session → reset the per-day reading flags
                 readings_done = set(); readings_day = today
-            # Once-per-session import. Window opens at 9:25 ET; if the process
-            # starts later it still imports (baseline is then intraday, logged).
+            # 09:25 import. fetch_movers already retries until it has the COMPLETE
+            # RelativeQs board, so a short board is never silently accepted. Mark the
+            # session done only when every mover's baseline has landed (rows >=
+            # movers) — a partial capture (an at-open empty Tradier chain on some
+            # names) leaves the flag unset so a later tick retries just the stragglers
+            # (import_pending → 60s). Idempotent: already-captured names are skipped.
             if _should_import(now, imported_date == today):
                 try:
                     res = await overnight.run_import(provider)
                     log.info("overnight import: %s", res)
-                    # Mark the session done once at least one overnight row was
-                    # captured (a frozen baseline landed) — NOT on imported>0,
-                    # since toggle 1 (import) may be off while toggle 2 (analyze
-                    # intersection) is on, which writes no new watchlist rows. A
-                    # zero-row result (empty board or a boot-time rate-limit
-                    # blackout) leaves the flag unset so a later tick retries.
-                    if res.get("rows", 0) > 0:
+                    movers = res.get("movers", 0)
+                    # Done when the FULL board's baselines have landed.
+                    if movers > 0 and res.get("rows", 0) >= movers:
                         imported_date = today
                 except Exception:
                     log.exception("overnight import failed")
-            # Catalyst analyzer (read-only, Phase 0): once/day after the baseline
-            # exists, grounded-LLM read → persist to simmer_overnight_analysis. Gated
+                # Hard cap regardless of outcome: past 10:30 accept whatever we have
+                # and stop retrying — so even run_import RAISING every tick can't keep
+                # the 60s re-fetch cadence running until 16:00.
+                if _import_window_closed(now):
+                    imported_date = today
+            # Catalyst analyzer: once the board has fully landed, until 16:00. Gated
             # by overnight_llm.enabled inside run_catalyst; never affects the verdict.
-            # Evaluated with the live imported flag so it fires the SAME tick import did.
             if _should_catalyst(now, imported_date == today, catalyst_date == today):
                 try:
                     cres = await catalyst.run_catalyst(today)

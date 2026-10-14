@@ -14,6 +14,7 @@ empty list — a missing board just means no import that session, never a crash.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import re
@@ -23,7 +24,7 @@ import httpx
 
 log = logging.getLogger("edgelane.simmer.relativeqs")
 
-_TIMEOUT = 10.0
+_TIMEOUT = 20.0        # per-attempt; RelativeQs can be slow computing the board at the open
 # Hard caps / shape guards on an EXTERNAL board we don't fully trust (even a
 # sibling app can be compromised or buggy): a well-formed ticker only, a finite
 # gap, and a bounded number of rows — so a hostile board can't inject junk
@@ -71,8 +72,17 @@ def normalize_movers(payload: Any) -> list[dict]:
 
 
 async def fetch_movers(base_url: str | None, token: str | None = None,
-                       timeout: float = _TIMEOUT) -> list[dict]:
-    """GET {base}/api/premarket and normalize it. [] on anything going wrong."""
+                       timeout: float = _TIMEOUT, attempts: int = 5) -> list[dict]:
+    """GET {base}/api/premarket and normalize it into the full board.
+
+    RelativeQs serves the WHOLE board (it tracks movers from ~04:00) in one
+    response, so a short board here means our read was disrupted, not that the
+    board is small. We therefore retry SYNCHRONOUSLY until we get a CONFIRMED
+    complete payload — HTTP 200 with a well-formed body whose `movers` is a list —
+    rather than silently accepting a truncated/timed-out read. A transient failure
+    (timeout, 5xx, connection drop, malformed/partial JSON) is retried with
+    backoff; a definitive 4xx (e.g. 401) or an oversized body is NOT retried. Only
+    after all attempts fail do we return [] (no import that cycle, logged loudly)."""
     base = (base_url or "").rstrip("/")
     if not base:
         log.info("[relativeqs] no base URL configured — skipping overnight import")
@@ -81,19 +91,33 @@ async def fetch_movers(base_url: str | None, token: str | None = None,
     headers = {"User-Agent": "edgelane-simmer/1.0", "Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as c:
-            r = await c.get(url, headers=headers)
-            if r.status_code >= 400:
-                log.warning("[relativeqs] %s -> HTTP %s", url, r.status_code)
+    for attempt in range(max(1, attempts)):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as c:
+                r = await c.get(url, headers=headers)
+            if 400 <= r.status_code < 500:       # auth/not-found → no point retrying
+                log.warning("[relativeqs] %s -> HTTP %s (not retried)", url, r.status_code)
                 return []
-            # Size guard: don't parse an unbounded body from an external host.
+            if r.status_code >= 500:             # server busy computing → retry
+                raise RuntimeError(f"HTTP {r.status_code}")
             clen = r.headers.get("content-length")
             if (clen and int(clen) > _MAX_BODY_BYTES) or len(r.content) > _MAX_BODY_BYTES:
                 log.warning("[relativeqs] response too large (%s bytes) — skipping",
                             clen or len(r.content))
                 return []
-            return normalize_movers(r.json())
-    except Exception as e:                       # noqa: BLE001 — best-effort
-        log.warning("[relativeqs] fetch failed (%s): %s", url, e)
-        return []
+            payload = r.json()
+            # Confirmation of a COMPLETE board: a dict whose `movers` is a list. A
+            # partial/garbled read fails this and is retried, not accepted as-is.
+            if not isinstance(payload, dict) or not isinstance(payload.get("movers"), list):
+                raise ValueError("payload missing a movers list (incomplete read)")
+            movers = normalize_movers(payload)
+            log.info("[relativeqs] board confirmed on attempt %d: %d movers", attempt + 1, len(movers))
+            return movers
+        except Exception as e:                   # noqa: BLE001 — transient; retry with backoff
+            wait = min(2.0 * (attempt + 1), 8.0)
+            log.warning("[relativeqs] fetch attempt %d/%d failed (%s): %s — retry in %.0fs",
+                        attempt + 1, attempts, url, e, wait if attempt + 1 < attempts else 0)
+            if attempt + 1 < attempts:
+                await asyncio.sleep(wait)
+    log.error("[relativeqs] no complete board after %d attempts — no import this cycle", attempts)
+    return []
