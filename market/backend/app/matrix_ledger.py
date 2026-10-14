@@ -44,7 +44,7 @@ STATE_VIEW = {
 
 # The snapshot keys a card or a data block can read. Copied (deep) at the moment
 # the event fires so later polls can't change what the row describes.
-_SNAP_KEYS = ("symbol", "expiration", "spot", "expected_move", "polled_at",
+_SNAP_KEYS = ("symbol", "expiration", "spot", "expected_move", "ts",
               "bias", "engine_pick", "strategies")
 
 
@@ -63,7 +63,12 @@ def build_row(*, event_id: str, symbol: str, state: str, expiry: Any,
 
     sym = str(symbol or "").upper()
     view = STATE_VIEW.get(state, "engine_pick")
+    at = event_at or datetime.now(timezone.utc)
     card_snap = dict(snap)
+    # The card's "as of" stamp (matrix_snap._fmt_as_of reads snap["ts"]) is the
+    # moment the event fired. Poll-time events run inside poll_symbol, before
+    # _poll_all sets out["ts"], so without this most cards had no stamp.
+    card_snap["ts"] = at.isoformat()
     if card_pick:                       # a past pick: its own card, not today's
         card_snap["engine_pick"] = card_pick
 
@@ -88,7 +93,7 @@ def build_row(*, event_id: str, symbol: str, state: str, expiry: Any,
         "symbol": sym,
         "state": state,
         "expiry": str(expiry or ""),
-        "event_at": (event_at or datetime.now(timezone.utc)).isoformat(),
+        "event_at": at.isoformat(),
         "attributes": {str(k): str(v) for k, v in (attrs or {}).items()},
         "data": data,
         "snap_view": view,

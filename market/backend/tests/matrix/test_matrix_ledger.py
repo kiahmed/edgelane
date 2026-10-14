@@ -53,6 +53,18 @@ def test_build_row_freezes_data_and_the_card():
     assert row["data"]["walls"]["key_levels"]["call_wall"] == 7800.0
 
 
+@pytest.mark.parametrize("state", ["pick_selected", "session_open", "grid_digest",
+                                   "win_rate_notable", "pick_result"])
+def test_every_card_carries_the_event_time_stamp(state):
+    # The snapshot a poll-time event sees has no "ts" yet (it's set after
+    # poll_symbol returns) — the card must still be stamped, with the event time.
+    from datetime import datetime, timezone
+    at = datetime(2026, 10, 14, 14, 31, tzinfo=timezone.utc)
+    row = matrix_ledger.build_row(event_id="e", symbol="SPX", state=state, expiry="",
+                                  attrs={}, snap=_snap(), event_at=at)
+    assert "as of Oct 14, 10:31 AM ET" in row["snap_html"]
+
+
 def test_a_past_pick_is_carded_as_itself_not_as_todays_pick():
     old = dict(_snap()["engine_pick"], strategy="bear_put", structure_text="PAST PICK",
                composite_score=71.0)
