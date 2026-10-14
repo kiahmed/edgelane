@@ -62,7 +62,8 @@
 				if (q && !r.symbol.toUpperCase().includes(q)) return false;
 				const env = r.readiness;
 				if (statusFilter !== 'all' && env?.decision !== statusFilter) return false;
-				if (minConf > 0 && (env?.score ?? 0) < minConf) return false;
+				// confidence is a 0–1 fraction (shown ×100%); min conf is entered as a percent
+				if (minConf > 0 && (env?.confidence ?? 0) * 100 < minConf) return false;
 				if (rqOnly && !r.overrides?.overnight) return false;
 				return true;
 			});
@@ -70,7 +71,7 @@
 		return list.sort((a, b) => {
 			if (!selected && sortBy === 'gap') return ovnGap(b) - ovnGap(a);
 			if (!selected && sortBy === 'confidence')
-				return (b.readiness?.score ?? -1) - (a.readiness?.score ?? -1);
+				return (b.readiness?.confidence ?? -1) - (a.readiness?.confidence ?? -1);
 			const ax = a.readiness?.expiration ?? null;
 			const bx = b.readiness?.expiration ?? null;
 			if (ax && bx) return ax < bx ? -1 : ax > bx ? 1 : 0;
@@ -152,42 +153,48 @@
 
 			{#if !selected && withEnv.length}
 				<div
-					class="flex flex-wrap items-center gap-2 rounded-lg border border-slate-700/40 bg-slate-800/30 px-2 py-1.5 text-xs">
+					class="flex flex-wrap items-center gap-2 overflow-x-auto rounded-lg border border-slate-700/40 bg-slate-800/30 px-2 py-1.5 text-xs">
 					<input
-						class="gate-input mt-0! w-28"
-						style="margin-top:0"
-						placeholder="search ticker"
+						class="gate-input mt-0!"
+						style="margin-top:0;width:7rem;flex:0 0 auto"
+						placeholder="search"
 						bind:value={search}
 						autocomplete="off"
 						spellcheck="false"
 					/>
-					<select class="gate-input mt-0!" style="margin-top:0" bind:value={statusFilter}>
+					<select
+						class="gate-input mt-0!"
+						style="margin-top:0;width:auto;flex:0 0 auto"
+						bind:value={statusFilter}>
 						<option value="all">all status</option>
 						<option value="ready">ready</option>
 						<option value="watch">watch</option>
 						<option value="avoid">avoid</option>
 						<option value="vetoed">vetoed</option>
 					</select>
-					<label class="flex items-center gap-1 text-slate-400">
-						min conf
+					<label class="flex items-center gap-1 whitespace-nowrap text-slate-400">
+						min&nbsp;conf
 						<input
-							class="gate-input mt-0! w-14"
-							style="margin-top:0"
+							class="gate-input mt-0!"
+							style="margin-top:0;width:3.25rem"
 							type="number"
 							min="0"
 							max="100"
 							bind:value={minConf}
 						/>
 					</label>
-					<select class="gate-input mt-0!" style="margin-top:0" bind:value={sortBy}>
+					<select
+						class="gate-input mt-0!"
+						style="margin-top:0;width:auto;flex:0 0 auto"
+						bind:value={sortBy}>
 						<option value="expiry">sort: expiry</option>
-						<option value="gap">sort: overnight gap ↓</option>
-						<option value="confidence">sort: readiness conf ↓</option>
+						<option value="gap">sort: gap ↓</option>
+						<option value="confidence">sort: conf ↓</option>
 					</select>
-					<label class="flex items-center gap-1 text-violet-300">
-						<input type="checkbox" bind:checked={rqOnly} /> RQ only
+					<label class="flex items-center gap-1 whitespace-nowrap text-violet-300">
+						<input type="checkbox" bind:checked={rqOnly} /> RQ
 					</label>
-					<span class="ml-auto text-slate-500">{shown.length} shown</span>
+					<span class="ml-auto whitespace-nowrap text-slate-500">{shown.length} shown</span>
 				</div>
 			{/if}
 		{/if}
