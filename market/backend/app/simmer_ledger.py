@@ -65,6 +65,14 @@ def build_row(*, event_id: str, symbol: str, state: str, expiry: Any,
     ready = float(bands.get("ready", 70.0))
     watch = float(bands.get("watch", 50.0))
 
+    # Stamp EVERY card with the event moment. render_snap_card reads the card's
+    # "as of" from env["computed_at"], but not every envelope reaching here carries
+    # a usable one (the watcher maps it from a DB `ts` that can be None/naive, and
+    # builders vary) — so the stamp showed on some posts and silently vanished on
+    # others. Pin one `at` = event_at or now(UTC), stamp the rendered COPY with it
+    # (never mutate the caller's env), and use the same `at` for the row's event_at.
+    at = event_at or datetime.now(timezone.utc)
+
     data: dict[str, Any] = {}
     for block in _DATA_BLOCKS:
         try:
@@ -73,7 +81,9 @@ def build_row(*, event_id: str, symbol: str, state: str, expiry: Any,
             log.exception("[simmer-ledger] block %s failed for %s", block, sym)
 
     try:
-        html = render_snap_card(env, ready=ready, watch=watch)
+        render_env = dict(env)                      # never mutate the caller's env
+        render_env["computed_at"] = at.isoformat()  # always stamped → always "as of"
+        html = render_snap_card(render_env, ready=ready, watch=watch)
     except Exception:
         log.exception("[simmer-ledger] snap render failed for %s", sym)
         html = None
@@ -84,7 +94,7 @@ def build_row(*, event_id: str, symbol: str, state: str, expiry: Any,
         "symbol": sym,
         "state": str(state),
         "expiry": str(expiry or ""),
-        "event_at": (event_at or datetime.now(timezone.utc)).isoformat(),
+        "event_at": at.isoformat(),
         "attributes": attrs or {},
         "data": data,
         "snap_html": html,

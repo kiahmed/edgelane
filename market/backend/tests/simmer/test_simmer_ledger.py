@@ -32,6 +32,22 @@ def test_build_row_freezes_the_blocks_and_the_card():
     assert row["attributes"]["off_hours_catalyst"] == "true"
 
 
+def test_build_row_always_stamps_as_of_even_without_computed_at():
+    """The card's "as of" is stamped from the event moment, so an envelope that
+    carries no usable computed_at still posts WITH a timestamp (the dropped-stamp
+    bug) — and the caller's env is never mutated."""
+    from datetime import datetime, timezone
+    env = _env(score=72.0)
+    env.pop("computed_at", None)                       # no usable stamp on the envelope
+    row = simmer_ledger.build_row(
+        event_id="SMR-NVDA-x", symbol="NVDA", state="ready", expiry=EXP,
+        attrs={}, env=env,
+        event_at=datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc))
+    assert "as of" in (row["snap_html"] or "")         # stamp present despite no computed_at
+    assert "computed_at" not in env                    # caller's env untouched
+    assert row["event_at"].startswith("2026-01-02T14:30")
+
+
 @pytest.fixture
 def wired(monkeypatch):
     """Enable events and stub the two network layers the background task hits:
