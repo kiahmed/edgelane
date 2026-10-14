@@ -138,14 +138,17 @@ async def refresh_live(provider, symbol: str, expiration: str,
 
 
 async def _next_expiry(provider, symbol: str) -> Optional[str]:
+    """The NEXT AVAILABLE listed expiry (nearest Friday after today), NOT the
+    engine's DTE-gated pick. An overnight gap play lives in the near weekly, and
+    the user wants RQ names pinned to the same near expiry they pin by hand — not
+    pushed out to ~30 DTE because the engine's dte_min (7) skips this Friday."""
     try:
         exps = await provider.expirations(symbol)
     except Exception:                        # noqa: BLE001
         return None
-    if not exps:
-        return None
-    from .simmer_watcher import choose_expiration    # lazy — avoid import cycle
-    return choose_expiration(sorted({str(e)[:10] for e in exps if e}), None, simmer_config.gates())
+    today = datetime.now(_ET).date().isoformat()
+    future = sorted({str(e)[:10] for e in (exps or []) if e and str(e)[:10] > today})
+    return future[0] if future else None
 
 
 async def _ensure_overnight_row(provider, mover: dict, expiration: str, session: str,

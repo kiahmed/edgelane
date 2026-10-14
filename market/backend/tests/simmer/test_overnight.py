@@ -102,6 +102,16 @@ async def test_capture_baseline_freezes_strikes_and_premiums():
     assert snap["spot_baseline"] == 100.0
 
 
+async def test_next_expiry_picks_nearest_not_dte_gated():
+    """The RQ pin is the NEXT AVAILABLE expiry (nearest future Friday), not the
+    engine's DTE-gated pick — so a name isn't pushed out to ~30 DTE past this
+    week's weekly (the user pins the near one by hand)."""
+    class _P:
+        async def expirations(self, sym):
+            return ["2099-03-20", "2099-01-16", "2099-02-20"]   # unsorted, all future
+    assert await ov._next_expiry(_P(), "ARM") == "2099-01-16"   # nearest, not farthest
+
+
 async def test_research_thesis_templated_and_injected():
     t = await ov.research_thesis("NVDA", -0.06, "down", "sector_wide")
     assert "NVDA" in t and "6.0%" in t and "sector-wide" in t
