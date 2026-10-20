@@ -6,6 +6,7 @@
 	// headline. The sampling/smoothing that produced the call lives on the
 	// backend; the user never assembles it.
 	import type { OvernightData } from '$lib/types';
+	import { etTime } from '$lib/fmt';
 
 	let { data }: { data: OvernightData } = $props();
 
@@ -72,7 +73,10 @@
 <div class="ovn">
 	<!-- 1. The call -->
 	<div class="call {callClass}">
-		<span class="call-label">{CALL_LABEL[v.call] ?? v.call}</span>
+		<span>
+			{#if data.as_of}<span class="call-time" title="when this call was last computed">{etTime(data.as_of)}</span>{/if}
+			<span class="call-label">{CALL_LABEL[v.call] ?? v.call}</span>
+		</span>
 		<span class="call-conf">confidence {v.confidence}%</span>
 	</div>
 
@@ -172,6 +176,12 @@
 		font-size: 1.05rem;
 		font-weight: 800;
 		letter-spacing: -0.01em;
+	}
+	.call-time {
+		margin-right: 0.45rem;
+		font-size: 0.72rem;
+		font-weight: 600;
+		opacity: 0.7;
 	}
 	.call-conf {
 		font-size: 0.72rem;

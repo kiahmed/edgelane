@@ -1433,6 +1433,16 @@ async def overnight_alert_fanout(session: str) -> int:
     notify_overnight (default ON; column absent pre-migration → treated as ON).
     The analysis row is user-agnostic; alerts are per user. Best-effort."""
     analyses = await supabase_admin.list_simmer_overnight_analysis(session) or []
+    # simmer_alerts.expiration is NOT NULL. The analysis row is user-agnostic and
+    # carries no expiry, so pin each alert to the overnight play's own expiry
+    # (from the simmer_overnight import row), falling back to the session date so
+    # the insert can never violate the constraint.
+    ov_rows = await supabase_admin.list_simmer_overnight(session) or []
+    exp_by_symbol = {
+        str(r.get("symbol") or "").upper(): r.get("expiration")
+        for r in ov_rows if r.get("expiration")
+    }
+    session_day = str(session)[:10]
     written = 0
     for a in analyses:
         final = (a.get("combiner") or {}).get("final") or {}
@@ -1465,7 +1475,8 @@ async def overnight_alert_fanout(session: str) -> int:
             llm = a.get("llm") or {}
             cfinal = (a.get("combiner") or {}).get("final") or {}
             ok = await supabase_admin.insert_row("simmer_alerts", {
-                "user_id": uid, "symbol": symbol, "expiration": None,
+                "user_id": uid, "symbol": symbol,
+                "expiration": exp_by_symbol.get(symbol) or session_day,
                 "score": round(float(conf), 2), "state": "overnight", "structure": call,
                 # SUMMARY only (same fields the Phase 2 route exposes) — never the raw
                 # llm dict (provider/model/queries/tokens/latency/notes are internal).
@@ -2189,10 +2200,20 @@ def _should_import(now, imported_today: bool) -> bool:
             and (now.hour, now.minute) >= (9, 25) and now.hour < 16)
 
 
-def _should_catalyst(now, imported_today: bool, catalyst_done: bool) -> bool:
-    """Catalyst LLM pass: once the import has fully landed, until 16:00. Evaluated
-    after the import step so it can fire the same tick the board completes."""
-    return imported_today and not catalyst_done and now.hour < 16
+def _should_catalyst(now, rows_captured: bool, catalyst_done: bool) -> bool:
+    """Catalyst LLM pass: RE-RUN every tick through the 10:30 window once AT LEAST
+    ONE overnight row has been captured today (run_catalyst skips names already
+    analyzed, so only the ones whose LLM read failed transiently at the open get
+    retried) — NOT a one-shot, which would leave the whole board unanalyzed on a
+    single rate-limited pass.
+
+    Gated on "any row captured", NOT the full-board import flag: on a partial-board
+    day (a mover that never captures — no listed options / a persistently empty
+    chain) the full-board flag only trips at the 10:30 window close, in the same
+    tick that sets catalyst_done, so the pass would never run for ANY name. Keying
+    off the first captured row lets the LLM analyze everything that did land."""
+    return (rows_captured and not catalyst_done
+            and (now.hour, now.minute) <= (10, 30) and now.hour < 16)
 
 
 def _import_window_closed(now) -> bool:
@@ -2263,6 +2284,7 @@ async def overnight_loop(provider, tz_name: str) -> None:
     from zoneinfo import ZoneInfo
     tz = ZoneInfo(tz_name) if tz_name else ZoneInfo("America/New_York")
     imported_date: str | None = None     # full board captured for this session
+    captured_date: str | None = None     # ≥1 overnight row landed for this session
     catalyst_date: str | None = None     # catalyst pass done for this session
     reset_date: str | None = None        # EOD RQ reset done for this session
     readings_done: set[str] = set()      # reading labels captured today (reset per day)
@@ -2287,29 +2309,43 @@ async def overnight_loop(provider, tz_name: str) -> None:
                     res = await overnight.run_import(provider)
                     log.info("overnight import: %s", res)
                     movers = res.get("movers", 0)
+                    # Any row landing this pass is enough to start the catalyst; the
+                    # full board gates only the import retry.
+                    if res.get("rows", 0) > 0:
+                        captured_date = today
                     # Done when the FULL board's baselines have landed.
                     if movers > 0 and res.get("rows", 0) >= movers:
                         imported_date = today
                 except Exception:
                     log.exception("overnight import failed")
-                # Hard cap regardless of outcome: past 10:30 accept whatever we have
-                # and stop retrying — so even run_import RAISING every tick can't keep
-                # the 60s re-fetch cadence running until 16:00.
-                if _import_window_closed(now):
-                    imported_date = today
-            # Catalyst analyzer: once the board has fully landed, until 16:00. Gated
-            # by overnight_llm.enabled inside run_catalyst; never affects the verdict.
-            if _should_catalyst(now, imported_date == today, catalyst_date == today):
+            # Restart-safe: run_import's later passes return rows=0 (nothing new to
+            # import), so after a mid-morning restart the in-memory capture flag would
+            # stay unset and strand the catalyst. While still in the catalyst window
+            # and nothing is confirmed captured yet, probe the DB once.
+            if (captured_date != today and catalyst_date != today
+                    and now.weekday() < 5 and (9, 25) <= (now.hour, now.minute) <= (10, 30)):
+                try:
+                    if await supabase_admin.list_simmer_overnight(today):
+                        captured_date = today
+                except Exception:
+                    log.exception("overnight capture-state probe failed")
+            # Catalyst analyzer: once ≥1 row has landed, until 10:30. Gated by
+            # overnight_llm.enabled inside run_catalyst; never affects the verdict.
+            if _should_catalyst(now, captured_date == today, catalyst_date == today):
                 try:
                     cres = await catalyst.run_catalyst(today)
                     if cres.get("enabled"):
                         log.info("overnight catalyst: %s", cres)
-                        catalyst_date = today
                         if "09:25" not in readings_done:
                             await catalyst.capture_reading(provider, "09:25", today)
                             readings_done.add("09:25")
                 except Exception:
                     log.exception("overnight catalyst failed")
+            # Close the import + catalyst retry window past 10:30 (accept whatever
+            # landed) so the loop stops re-running them for the rest of the day.
+            if _import_window_closed(now):
+                imported_date = today
+                catalyst_date = today
             open_, _ = _is_market_open(tz_name)
             if open_:
                 try:

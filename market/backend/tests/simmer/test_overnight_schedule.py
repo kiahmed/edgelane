@@ -27,10 +27,15 @@ def test_should_import_window():
 
 
 def test_should_catalyst():
-    assert _should_catalyst(dt(9, 25), True, False)        # board landed, not done
-    assert not _should_catalyst(dt(9, 25), False, False)   # board not complete yet
-    assert not _should_catalyst(dt(9, 25), True, True)     # already done
-    assert not _should_catalyst(dt(16, 1), True, False)    # not after 16:00
+    # 2nd arg is "≥1 row captured" (NOT the full-board flag) — a partial board at
+    # 09:30 must still run the catalyst for the names that did land.
+    assert _should_catalyst(dt(9, 30), True, False)        # a row landed, retry window open
+    assert _should_catalyst(dt(9, 25), True, False)        # retry window open
+    assert _should_catalyst(dt(10, 0), True, False)        # re-runs mid-window (retries failures)
+    assert _should_catalyst(dt(10, 30), True, False)       # inclusive window end
+    assert not _should_catalyst(dt(10, 31), True, False)   # past the retry window
+    assert not _should_catalyst(dt(9, 25), False, False)   # nothing captured yet
+    assert not _should_catalyst(dt(9, 25), True, True)     # window already closed (done)
 
 
 def test_import_window_closed_caps_retries():

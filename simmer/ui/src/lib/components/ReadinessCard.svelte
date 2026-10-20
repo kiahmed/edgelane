@@ -16,6 +16,7 @@
 		decisionBadgeClass,
 		DECISION_LABEL,
 		etDateTime,
+		etTime,
 		humanizeReason,
 		money,
 		prob,
@@ -55,8 +56,11 @@
 	// summary chip already carries the one thing that matters at a glance (the
 	// sell target, or the veto count). Expand to see the full evaluation.
 	let expanded = $state(false);
-	// A deep link (?symbol=SYM) opens this card once, on mount.
-	onMount(() => {
+	// Open expanded when asked — a deep link (?symbol=SYM) OR the user selecting
+	// this ticker in the left list (startExpanded flips true). Reactive, not just
+	// onMount, because the card component is reused (keyed) rather than remounted
+	// when the selection changes. Collapsing still sticks (startExpanded unchanged).
+	$effect(() => {
 		if (startExpanded) expanded = true;
 	});
 
@@ -122,7 +126,10 @@
 	<div class="flex flex-wrap items-center gap-x-3 gap-y-1" class:mb-3={expanded}>
 		<span class="text-lg font-black tracking-tight">{env.symbol}</span>
 		{#if overnight?.active}
-			<span class="rq-badge" title="Imported from RelativeQs overnight movers">RQ</span>
+			<span class="rq-badge" title="From RelativeQs overnight mover scans (Nasdaq-100 pre-market movers)">RQ</span>
+		{/if}
+		{#if env.computed_at}
+			<span class="text-[0.65rem] text-slate-500" title="when the engine last evaluated this">{etTime(env.computed_at)}</span>
 		{/if}
 		<span class="pill {decisionBadgeClass(env.decision)}">{DECISION_LABEL[env.decision] ?? env.decision}</span>
 		<span class="text-xs text-slate-400">

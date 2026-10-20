@@ -49,6 +49,9 @@
 	let rqOnly = $state(false);
 	const ovnGap = (r: WatchlistRow) =>
 		Math.abs(Number((r.overrides?.overnight as { gap?: number } | undefined)?.gap ?? 0));
+	// Best confidence across the two tabs, on a 0–100 scale, for sorting.
+	const confVal = (r: WatchlistRow) =>
+		Math.max((r.readiness?.confidence ?? 0) * 100, r.overnight_conf ?? 0);
 
 	// Nearest expiry first; rows without an evaluated expiry sink to the bottom.
 	// Expirations are ISO YYYY-MM-DD, so a string compare is chronological.
@@ -62,16 +65,22 @@
 				if (q && !r.symbol.toUpperCase().includes(q)) return false;
 				const env = r.readiness;
 				if (statusFilter !== 'all' && env?.decision !== statusFilter) return false;
-				// confidence is a 0–1 fraction (shown ×100%); min conf is entered as a percent
-				if (minConf > 0 && (env?.confidence ?? 0) * 100 < minConf) return false;
+				// Min confidence (percent). Pass if EITHER confidence clears it: the
+				// readiness confidence (0–1 fraction, shown ×100%) or the overnight
+				// catalyst confidence (already 0–100). A row with both passes on
+				// whichever matches; a row with only one is judged on that one.
+				if (minConf > 0) {
+					const rc = (env?.confidence ?? -1) * 100; // −100 ⇒ no readiness conf
+					const oc = r.overnight_conf ?? -1; // −1 ⇒ no overnight conf
+					if (rc < minConf && oc < minConf) return false;
+				}
 				if (rqOnly && !r.overrides?.overnight) return false;
 				return true;
 			});
 		}
 		return list.sort((a, b) => {
 			if (!selected && sortBy === 'gap') return ovnGap(b) - ovnGap(a);
-			if (!selected && sortBy === 'confidence')
-				return (b.readiness?.confidence ?? -1) - (a.readiness?.confidence ?? -1);
+			if (!selected && sortBy === 'confidence') return confVal(b) - confVal(a);
 			const ax = a.readiness?.expiration ?? null;
 			const bx = b.readiness?.expiration ?? null;
 			if (ax && bx) return ax < bx ? -1 : ax > bx ? 1 : 0;
@@ -153,11 +162,11 @@
 
 			{#if !selected && withEnv.length}
 				<div
-					class="flex flex-wrap items-center gap-2 overflow-x-auto rounded-lg border border-slate-700/40 bg-slate-800/30 px-2 py-1.5 text-xs">
+					class="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-slate-700/40 bg-slate-800/30 px-3 py-2 text-xs">
 					<input
 						class="gate-input mt-0!"
-						style="margin-top:0;width:7rem;flex:0 0 auto"
-						placeholder="search"
+						style="margin-top:0;flex:1 1 9rem;min-width:7rem"
+						placeholder="search ticker"
 						bind:value={search}
 						autocomplete="off"
 						spellcheck="false"
@@ -172,14 +181,15 @@
 						<option value="avoid">avoid</option>
 						<option value="vetoed">vetoed</option>
 					</select>
-					<label class="flex items-center gap-1 whitespace-nowrap text-slate-400">
-						min&nbsp;conf
+					<label class="flex items-center gap-1.5 whitespace-nowrap text-slate-400">
+						min&nbsp;conf&nbsp;%
 						<input
-							class="gate-input mt-0!"
-							style="margin-top:0;width:3.25rem"
+							class="gate-input mt-0! text-center"
+							style="margin-top:0;width:4rem"
 							type="number"
 							min="0"
 							max="100"
+							placeholder="0"
 							bind:value={minConf}
 						/>
 					</label>
@@ -207,7 +217,7 @@
 					watchBand={bands.watch}
 					activeOverrides={settingsStore.activeGateOverrides}
 					pinnedExpiration={row.expiration}
-					startExpanded={row.symbol === deepSymbol}
+					startExpanded={row.symbol === deepSymbol || row.symbol === selected}
 				/>
 			{:else}
 				<div class="card p-4 text-sm text-slate-500">

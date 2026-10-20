@@ -454,11 +454,17 @@ async def test_overnight_alert_fanout_fires_retriggers_and_opts_out(monkeypatch)
         inserted.append(row)
         open_alert.clear(); open_alert.update(score=row["score"], structure=row["structure"])
         return True
+    async def _list_ov(session):
+        return [{"symbol": "MU", "expiration": "2026-10-16"}]
     monkeypatch.setattr(sw.supabase_admin, "list_simmer_overnight_analysis", _list_an)
+    monkeypatch.setattr(sw.supabase_admin, "list_simmer_overnight", _list_ov)
     monkeypatch.setattr(sw.supabase_admin, "select_many", _sm)
     monkeypatch.setattr(sw.supabase_admin, "insert_row", _ins)
 
     assert await sw.overnight_alert_fanout("2026-10-13") == 1      # first fire (88)
+    # expiration is NOT NULL in simmer_alerts — pin it to the overnight play's own
+    # expiry (from the import row), never None.
+    assert inserted[0]["expiration"] == "2026-10-16"
     # payload is SUMMARY only — no provider/model/tokens/queries leak into the row
     pay = inserted[0]["payload"]
     assert pay["why_moved"] == "CXMT DRAM competition" and pay["call"] == "sell_bear_call"

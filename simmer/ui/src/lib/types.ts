@@ -147,6 +147,8 @@ export interface WatchlistRow {
 	created_at?: string;
 	updated_at?: string;
 	readiness: ReadinessEnvelope | null;
+	/** latest overnight catalyst confidence (0–100) for this name today, if any */
+	overnight_conf?: number | null;
 }
 
 export interface WatchlistResponse {

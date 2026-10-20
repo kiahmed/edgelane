@@ -46,6 +46,7 @@ def wired(monkeypatch):
 
     async def _refresh():    # keep run_catalyst's pre-read hermetic (no network)
         return True
+    cat._catalyst_attempts.clear()   # module-level retry counter — start each test clean
     monkeypatch.setattr(cat.simmer_config, "refresh_setup", _refresh)
     monkeypatch.setattr(cat.supabase_admin, "list_simmer_overnight", _list)
     monkeypatch.setattr(cat.supabase_admin, "upsert_simmer_overnight_analysis", _upsert)
@@ -136,6 +137,25 @@ async def test_run_catalyst_skips_already_analyzed_today(wired, monkeypatch):
     res = await cat.run_catalyst("2026-10-12")
     assert res["analyzed"] == 0 and res["skipped"] == 1
     assert wired["MU"]["llm"]["call"] == "sell_bull_put"   # untouched (no overwrite)
+
+
+async def test_run_catalyst_caps_retries_on_persistent_failure(wired, monkeypatch):
+    """Cost guard: a name whose read keeps failing is retried a few times, then
+    left — so one broken name can't rack up paid LLM calls every tick to 10:30."""
+    _ovn(monkeypatch)
+    cat._catalyst_attempts.clear()
+    calls = {"n": 0}
+
+    async def _boom(mv, premium, session, s, ovn):
+        calls["n"] += 1
+        raise RuntimeError("grounded read failed")
+    monkeypatch.setattr(cat, "analyze_one", _boom)
+
+    res = None
+    for _ in range(5):                     # loop would retry every tick
+        res = await cat.run_catalyst("2026-10-12")
+    assert calls["n"] == cat._MAX_CATALYST_ATTEMPTS     # tried 3×, then stopped
+    assert res["analyzed"] == 0 and res["gave_up"] == 1  # capped on the later passes
 
 
 async def test_capture_reading_idempotent_per_label(wired, monkeypatch):

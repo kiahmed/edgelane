@@ -382,6 +382,21 @@ async def get_watchlist(request: Request,
         {"user_id": f"eq.{user['id']}", "active": "eq.true"},
         order="position.asc,symbol.asc")
     supabase_ok = rows is not None
+    # Latest overnight catalyst confidence (0–100) per symbol today — ONE batch
+    # read — so the dashboard filter can rank RQ names by it alongside readiness
+    # confidence. Best-effort; absent → the row just has no overnight_conf.
+    ovn_conf: dict[str, Any] = {}
+    try:
+        from zoneinfo import ZoneInfo
+        session = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+        for a in (await supabase_admin.list_simmer_overnight_analysis(session) or []):
+            c = ((a.get("combiner") or {}).get("final") or {}).get("confidence")
+            if c is None:
+                c = (a.get("llm") or {}).get("confidence")
+            if c is not None:
+                ovn_conf[str(a.get("symbol") or "").upper()] = c
+    except Exception:
+        ovn_conf = {}
     out = []
     for r in rows or []:
         sym = str(r.get("symbol") or "").upper()
@@ -391,7 +406,7 @@ async def get_watchlist(request: Request,
             db = _db(request)
             if db is not None:
                 env = await asyncio.to_thread(db.latest_simmer_readiness, sym, exp)
-        out.append({**r, "readiness": env})
+        out.append({**r, "readiness": env, "overnight_conf": ovn_conf.get(sym)})
     return {"watchlist": out, "supabase": supabase_ok,
             "write_model": "api",   # ALL data writes via this API; Supabase in the browser is sign-in only
             "last_sweep_at": simmer_state.last_sweep_at}

@@ -36,6 +36,8 @@
 		toast(err ?? (on ? 'Overnight play alerts on' : 'Overnight play alerts off'));
 	}
 
+	let showRqInfo = $state(false);     // the "what is RelativeQs" popover
+
 	async function toggleImportRq(on: boolean) {
 		const err = await settingsStore.save({ import_rq_overnight: on });
 		toast(err ?? (on ? 'Overnight import on' : 'Overnight import off'));
@@ -83,9 +85,26 @@
 			Overnight movers
 		</h2>
 		<p class="mb-3 text-[0.72rem] text-slate-500">
-			RelativeQs's biggest overnight movers (≥2%) are analyzed just before the open and once the
-			market opens for a sell / wait / skip call — shown in each card's Overnight tab. It's a
-			separate, read-only overlay; it never changes the regular readiness score or its gates.
+			<span class="relative inline-block">
+				<button
+					type="button"
+					class="cursor-help font-bold text-violet-300 underline decoration-dotted underline-offset-2"
+					aria-expanded={showRqInfo}
+					onclick={() => (showRqInfo = !showRqInfo)}>RelativeQs's biggest overnight movers</button
+				>
+				{#if showRqInfo}
+					<span
+						class="absolute left-0 top-full z-10 mt-1 block w-64 rounded-lg border border-violet-500/30 bg-slate-900 p-2.5 text-[0.68rem] leading-relaxed font-normal text-slate-300 shadow-lg">
+						<strong class="text-violet-200">RelativeQs</strong> is a proprietary pre-market scanner
+						(our sibling app) that tracks the <strong>Nasdaq-100</strong> and surfaces the names that
+						gapped the most overnight — the biggest movers into the open. Simmer imports its ≥2%
+						movers for the catalyst read.
+					</span>
+				{/if}</span
+			>
+			(≥2%) are analyzed just before the open and once the market opens for a sell / wait / skip
+			call — shown in each card's Overnight tab. It's a separate, read-only overlay; it never
+			changes the regular readiness score or its gates.
 		</p>
 		<label class="toggle-row cursor-pointer">
 			<span>Import RelativeQs overnight moves into my watchlist</span>

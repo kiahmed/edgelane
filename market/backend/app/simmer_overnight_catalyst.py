@@ -114,6 +114,15 @@ async def analyze_one(mv: dict, premium: dict, session: str, s, ovn: dict) -> Op
             "premium": premium, "llm": live, "llm_shadow": shadow, "combiner": combiner}
 
 
+# Per-name LLM retry cap (cost guard). On a name whose grounded read keeps failing,
+# the loop retries every ~60s through the 10:30 window — ~65 passes, each up to 4
+# paid calls (live + shadow, 2 steps). Cap attempts per (session, name) so a broken
+# name is tried a few times, then left. Kept in memory (resets on a restart, which is
+# rare inside the 65-min window) rather than a new schema column.
+_MAX_CATALYST_ATTEMPTS = 3
+_catalyst_attempts: dict[tuple[str, str], int] = {}
+
+
 async def run_catalyst(session: str) -> dict:
     """Phase-0 batch: for every overnight row today, run the catalyst analyzer and
     persist to simmer_overnight_analysis. Read-only w.r.t. simmer_overnight. Gated
@@ -132,7 +141,8 @@ async def run_catalyst(session: str) -> dict:
     if not rows:
         return {"enabled": True, "names": 0}
     s = get_settings()
-    done = skipped = 0
+    day = str(session)[:10]
+    done = skipped = gave_up = 0
     for row in rows:
         # Restart-safe idempotency: if this name already has a PERSISTED llm read
         # for today, skip it. catalyst_date is in-memory only, so a mid-session
@@ -142,6 +152,12 @@ async def run_catalyst(session: str) -> dict:
         prior = await supabase_admin.get_simmer_overnight_analysis(row["symbol"], session)
         if prior and (prior.get("llm") or {}).get("call"):
             skipped += 1
+            continue
+        # Cost guard: a name whose read keeps failing is retried each tick; stop after
+        # a few tries so one broken name can't rack up paid calls all morning.
+        akey = (day, row["symbol"])
+        if _catalyst_attempts.get(akey, 0) >= _MAX_CATALYST_ATTEMPTS:
+            gave_up += 1
             continue
         verdict = row.get("verdict") or {}
         premium = {"call": verdict.get("call"), "premium_trend": verdict.get("premium_trend"),
@@ -156,10 +172,15 @@ async def run_catalyst(session: str) -> dict:
             built = None
         if built:
             await supabase_admin.upsert_simmer_overnight_analysis(built)
+            _catalyst_attempts.pop(akey, None)   # success → clear the failure count
             done += 1
-    log.info("[catalyst] analyzed %d, skipped %d (already done) of %d names (provider=%s mode=%s shadow=%s)",
-             done, skipped, len(rows), ovn.get("provider"), ovn.get("decision_mode"), ovn.get("shadow_provider"))
-    return {"enabled": True, "names": len(rows), "analyzed": done, "skipped": skipped}
+        else:
+            _catalyst_attempts[akey] = _catalyst_attempts.get(akey, 0) + 1
+    log.info("[catalyst] analyzed %d, skipped %d (already done), gave up %d (retry cap) of %d names "
+             "(provider=%s mode=%s shadow=%s)",
+             done, skipped, gave_up, len(rows), ovn.get("provider"), ovn.get("decision_mode"),
+             ovn.get("shadow_provider"))
+    return {"enabled": True, "names": len(rows), "analyzed": done, "skipped": skipped, "gave_up": gave_up}
 
 
 async def refresh_combiner(session: str, *, lock: bool = False) -> int:

@@ -75,6 +75,15 @@
 	);
 	const shownDecision = $derived(view === 'ignore' && alt ? alt.decision : env.decision);
 	const DIR: Record<string, string> = { bullish: '▲', bearish: '▼', neutral: '◆' };
+	// Short "why" — the first sentence of the rationale, kept tight. The full
+	// news-by-news read is one click away, not dumped as a wall of text.
+	let showFullRationale = $state(false);
+	const rationaleShort = $derived.by(() => {
+		const r = (bias?.rationale ?? '').trim();
+		if (!r) return '';
+		const first = r.split(/(?<=[.!?])\s/)[0] ?? r;
+		return first.length > 120 ? first.slice(0, 117).trimEnd() + '…' : first;
+	});
 </script>
 
 {#if relevant}
@@ -107,7 +116,14 @@
 				<div class="earn-flag close">↩ Run-up play — <b>close BEFORE the print</b>, never hold through earnings.</div>
 			{/if}
 
-			{#if bias.rationale}<div class="earn-why">{bias.rationale}</div>{/if}
+			{#if bias.rationale}
+				<div class="earn-why">
+					{showFullRationale ? bias.rationale : rationaleShort}
+					<button type="button" class="earn-more" onclick={() => (showFullRationale = !showFullRationale)}>
+						{showFullRationale ? 'less' : 'why'}
+					</button>
+				</div>
+			{/if}
 			<div class="earn-note">
 				Earnings is a folded factor, not a veto. Consider = bias in (go lifts ±15, no-go holds back);
 				Ignore = pure ex-earnings decision.
@@ -136,6 +152,16 @@
 		display: flex;
 		align-items: center;
 		gap: 0.5rem;
+	}
+	.earn-more {
+		margin-left: 0.35rem;
+		border: none;
+		background: transparent;
+		padding: 0;
+		font-size: 0.68rem;
+		color: #fbbf24;
+		cursor: pointer;
+		text-decoration: underline;
 	}
 	.earn-title {
 		font-weight: 700;
