@@ -216,6 +216,23 @@ OVERNIGHT_LLM: dict[str, Any] = {
     "shadow_model":     "gemini-3.8-flash",
 }
 
+# ── Overnight premium-drift override (Phase A; docs/simmer_overnight_rq_impl_spec.md) ──
+# The scored overnight call freezes at 10:00 for a clean bake-off, which also leaves it
+# stuck on the pre-market/09:25 read when the tape turns intraday. This makes premium
+# the MASTER signal: a never-frozen reactive call tracks the live premium verdict and
+# flips the scored side when it materially contradicts the frozen call. Thresholds are
+# DB-held so they're calibrated from simmer_overnight_analysis outcomes, not hand-fiddled.
+OVERNIGHT_DRIFT: dict[str, Any] = {
+    "enabled":           True,   # off → the reactive call just mirrors the frozen call
+    "flip_ratio":        0.12,   # toward-move premium must move ≥12% vs baseline to flip a frozen call
+    "require_underlying": True,  # also require the tape to be retracing/holding (not extending with you)
+    "min_premium_conf":  45,     # the live premium verdict needs this conviction to override
+    # Leading reversal signals (price + two-sided skew) — react BEFORE the toward-side
+    # premium has fully deflated, so a fast news-driven reversal isn't caught late:
+    "reclaim_frac":      0.6,    # ≥60% of the overnight gap given back intraday = reversal
+    "skew_flip":         0.10,   # opposite side building ≥10% more than the toward side (skew_shift)
+}
+
 # ── Regular sweep master switch (engine-level, all users) ───────────────────
 # DB-held in the `sweep` section of simmer_engine_settings (no restart). False =
 # PAUSE the regular readiness sweep for everyone; overnight/RQ-intersected
@@ -467,7 +484,7 @@ _SECTION_DEFAULTS: dict[str, dict] = {
     "vol": VOL, "dte_tiers": DTE_TIERS, "catalyst": CATALYST, "intraday": INTRADAY,
     "cadence": CADENCE, "ttl": TTL, "velocity": VELOCITY, "news": NEWS,
     "sentiment": SENTIMENT, "squeeze": SQUEEZE, "regime": REGIME,
-    "overnight_llm": OVERNIGHT_LLM, "sweep": SWEEP,
+    "overnight_llm": OVERNIGHT_LLM, "overnight_drift": OVERNIGHT_DRIFT, "sweep": SWEEP,
 }
 
 
@@ -617,6 +634,13 @@ def overnight_llm() -> dict[str, Any]:
     Overridable in the `overnight_llm` section of simmer_engine_settings; see
     OVERNIGHT_LLM for the shape. API keys live in config, not here."""
     return _section("overnight_llm", OVERNIGHT_LLM)
+
+
+def overnight_drift() -> dict[str, Any]:
+    """Phase A premium-drift override config (enable + flip thresholds). Overridable
+    in the `overnight_drift` section of simmer_engine_settings; see OVERNIGHT_DRIFT
+    for the shape. Thresholds are meant to be calibrated from realized outcomes."""
+    return _section("overnight_drift", OVERNIGHT_DRIFT)
 
 
 def sweep_enabled() -> bool:

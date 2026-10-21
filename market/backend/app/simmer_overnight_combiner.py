@@ -72,3 +72,92 @@ def combine(premium: dict, catalyst: Optional[dict], *, promote: bool = False) -
     reasons.append(f"premium {pcall}; catalyst unsure ({ccall}) — confidence trimmed")
     return {"call": pcall, "confidence": max(0, pconf - 20),
             "source": "premium_catalyst_unsure", "reasons": reasons}
+
+
+# ── Phase A: premium-is-master drift override (docs/simmer_overnight_rq_impl_spec.md) ──
+_SIDE_OPPOSITE = {"sell_bear_call": "sell_bull_put", "sell_bull_put": "sell_bear_call"}
+
+# Calibrated defaults (DB-held in the `overnight_drift` settings section; grade them
+# against simmer_overnight_analysis, don't fiddle by hand). `flip_ratio` is how far the
+# toward-move premium must travel vs its 09:25 baseline (mean ratio) before a FROZEN
+# scored call is allowed to flip — deliberately ABOVE the premium engine's own 0.08
+# dead-band so an intraday scored flip needs real, not marginal, divergence.
+DRIFT_DEFAULTS = {"enabled": True, "flip_ratio": 0.12, "require_underlying": True,
+                  "min_premium_conf": 45, "reclaim_frac": 0.6, "skew_flip": 0.10}
+
+
+def reactive_call(frozen: dict, live_premium: dict, *, drift_cfg: dict | None = None) -> dict[str, Any]:
+    """Premium-is-master override. The scored call (`combiner.final`) freezes at
+    10:00 so the bake-off isn't contaminated by late-session premiums — but that
+    same freeze is exactly what leaves a name stuck on its pre-market/09:25 read
+    when the tape turns against it intraday. This recomputes a SEPARATE, never-frozen
+    user-facing call each refresh from the LIVE premium verdict:
+
+      * live premium AGREES with / is quiet on the frozen call → hold the frozen call.
+      * live premium MATERIALLY contradicts it (opposite side, or a reversing+collapsing
+        `skip`) past `flip_ratio` AND, if required, the underlying retracing → premium
+        CANCELS the stale catalyst/pre-market read and the call flips to the tape.
+      * contradiction present but NOT yet material → stand down to `wait` (don't keep
+        holding a decaying thesis, don't commit to the flip on a wiggle either).
+
+    Pure fn: `frozen` = {call, confidence}; `live_premium` = a simmer_premium_tracker
+    verdict {call, premium_trend, underlying_trend, confidence, mean_ratio}."""
+    cfg = {**DRIFT_DEFAULTS, **(drift_cfg or {})}
+    fcall = str(frozen.get("call") or "wait")
+    fconf = int(frozen.get("confidence") or 0)
+    base = {"call": fcall, "confidence": fconf, "source": "frozen_hold", "reasons": []}
+    if not cfg.get("enabled"):
+        return {**base, "source": "disabled"}
+
+    lcall = str(live_premium.get("call") or "wait")
+    lconf = int(live_premium.get("confidence") or 0)
+    ratio = live_premium.get("mean_ratio")
+    utrend = live_premium.get("underlying_trend")
+    retraced = live_premium.get("gap_retraced")       # leading: price reclaiming the gap
+    skew = live_premium.get("skew_shift")             # leading: opposite side bid up vs toward
+
+    # Only a FROZEN directional call can go stale; a frozen wait/skip has nothing to
+    # protect, so just surface the live premium read.
+    if fcall not in _SIDE_OPPOSITE:
+        return {"call": lcall, "confidence": lconf, "source": "premium_live",
+                "reasons": ["no committed scored call to protect — tracking live premium"]}
+
+    # Leading reversal: price has reclaimed a big chunk of the gap, OR the two-sided
+    # option skew has tipped to the reversal side — EITHER fires before the toward-side
+    # premium has fully deflated (the fast-news-reversal case the magnitude bar misses).
+    leading = ((retraced is not None and float(retraced) >= float(cfg["reclaim_frac"]))
+               or (skew is not None and float(skew) >= float(cfg["skew_flip"])))
+
+    # The live premium still names the SAME side. Hold — UNLESS price/skew are already
+    # reversing ahead of the verdict, in which case stand down early (don't wait for
+    # the premium verdict to catch up — that's what made it late before).
+    if lcall == fcall:
+        if leading:
+            return {"call": "wait", "confidence": 30, "source": "premium_leading_standdown",
+                    "reasons": [f"{fcall} still named, but price/skew turning "
+                                f"(retraced {retraced}, skew {skew}) — stand down early"]}
+        return {**base, "reasons": [f"live premium still backs the scored {fcall}"]}
+
+    # The live premium no longer backs the frozen side (it went wait / skip / the
+    # opposite side). How far has the toward-move premium travelled from baseline?
+    # mean_ratio is latest/baseline on the toward side; |ratio-1| is the drift size.
+    drift = abs(float(ratio) - 1.0) if ratio is not None else 0.0
+    toward_material = drift >= float(cfg["flip_ratio"])
+    flip = (lcall == _SIDE_OPPOSITE[fcall]
+            and (toward_material or leading)       # magnitude OR a leading signal
+            and lconf >= int(cfg["min_premium_conf"]))
+    if cfg.get("require_underlying"):
+        flip = flip and utrend in ("retracing", "holding")
+
+    if flip:
+        # Premium / tape materially committed to the OTHER side → it cancels the stale
+        # catalyst / pre-market read and the call flips.
+        why = "drift" if toward_material else "price/skew reversal"
+        return {"call": lcall, "confidence": lconf, "source": "premium_override",
+                "reasons": [f"premium flipped to {lcall} ({why}; drift {drift:.0%}, "
+                            f"retraced {retraced}, skew {skew}, {utrend}) — cancels the stale {fcall}"]}
+    # Premium stopped backing the thesis but hasn't decisively flipped → stand down
+    # rather than hold a decaying call or chase a wiggle.
+    return {"call": "wait", "confidence": 30, "source": "premium_drift_standdown",
+            "reasons": [f"premium no longer backs the scored {fcall} "
+                        f"(now {lcall}, drift {drift:.0%}) — stand down, not yet a flip"]}

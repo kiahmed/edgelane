@@ -60,11 +60,30 @@ def toward_move_side(direction: str) -> str:
     return "put" if str(direction).lower() == "down" else "call"
 
 
-def pick_strikes(spot: float, chain: list[dict], direction: str, n: int = 3) -> list[float]:
-    """A few OTM strikes TOWARD the move, nearest-to-spot first. Down → OTM puts
-    below spot; up → OTM calls above spot. These are the strikes whose premiums we
-    snapshot at the baseline and re-read live."""
-    side = toward_move_side(direction)
+def opposite_move_side(direction: str) -> str:
+    """The side that inflates on a REVERSAL of the overnight move — calls on a
+    down-gap, puts on an up-gap. Reading this side (free from the same chain) is
+    the earliest option-tape sign that the market is rejecting the gap: the
+    opposite side bids up before the toward side fully deflates."""
+    return "call" if str(direction).lower() == "down" else "put"
+
+
+def gap_retraced(gap: float, spot_baseline: float, spot_now: float | None) -> float | None:
+    """Fraction of the overnight gap the underlying has GIVEN BACK intraday. 0.0 =
+    holding/extending the gap; 1.0 = the whole gap erased (full reclaim); >1 =
+    overshoot past the pre-gap level. The fastest, most honest reversal measure —
+    price reclaiming the gap leads premium decay."""
+    if spot_now is None or not spot_baseline or not gap:
+        return None
+    intraday = (spot_now - spot_baseline) / spot_baseline
+    sign = 1.0 if gap >= 0 else -1.0
+    signed = intraday * sign                      # >0 = extending the gap
+    return round(max(0.0, -signed) / abs(gap), 4)  # >0 = retracing against the gap
+
+
+def pick_otm_side(spot: float, chain: list[dict], side: str, n: int = 3) -> list[float]:
+    """A few OTM strikes on `side`, nearest-to-spot first (puts below spot, calls
+    above). Shared by the toward-side and opposite-side pickers."""
     strikes = sorted({float(c["strike"]) for c in chain
                       if c.get("side") == side and c.get("strike") is not None
                       and _mid(c) is not None})
@@ -75,6 +94,20 @@ def pick_strikes(spot: float, chain: list[dict], direction: str, n: int = 3) -> 
     else:                                  # OTM calls are ABOVE spot, nearest first
         otm = [s for s in strikes if s > spot]
     return otm[:n]
+
+
+def pick_strikes(spot: float, chain: list[dict], direction: str, n: int = 3) -> list[float]:
+    """A few OTM strikes TOWARD the move, nearest-to-spot first. Down → OTM puts
+    below spot; up → OTM calls above spot. These are the strikes whose premiums we
+    snapshot at the baseline and re-read live."""
+    return pick_otm_side(spot, chain, toward_move_side(direction), n)
+
+
+def pick_strikes_opposite(spot: float, chain: list[dict], direction: str, n: int = 3) -> list[float]:
+    """The OTM strikes on the OPPOSITE (reversal) side — calls on a down-gap, puts
+    on an up-gap. Snapshotted/tracked from the same chain so the two-sided skew is
+    free. See opposite_move_side / skew_shift."""
+    return pick_otm_side(spot, chain, opposite_move_side(direction), n)
 
 
 def premium_map(chain: list[dict], strikes: list[float], side: str) -> dict[str, float]:
@@ -218,17 +251,39 @@ def build_verdict(*, direction: str, crowd: str | None, gap: float,
 def analyze(*, direction: str, crowd: str | None, gap: float,
             baseline: dict[str, float], latest: dict[str, float] | None,
             spot_baseline: float, spot_now: float | None = None,
-            news_bad: bool | None = None) -> dict[str, Any]:
+            news_bad: bool | None = None,
+            opp_baseline: dict[str, float] | None = None,
+            opp_latest: dict[str, float] | None = None) -> dict[str, Any]:
     """Baseline + live → verdict. Before the open (no `latest`) the premium/
     underlying trends are None and the call is 'wait' — table 1 (baseline) is
-    populated, table 2 (live) fills after the open."""
+    populated, table 2 (live) fills after the open.
+
+    Two-sided (always, not just on a reversal): when the OPPOSITE-side baseline +
+    live maps are supplied, the verdict also carries `opp_mean_ratio` (reversal-side
+    premium vs its baseline), `skew_shift` (opposite building minus toward building —
+    >0 means the tape is leaning to the reversal), and `gap_retraced` (fraction of
+    the overnight gap price has given back). These are the leading reversal signals
+    the drift override reads; they are informational on the verdict regardless."""
     if not latest:
         return {"call": "wait", "premium_trend": None, "underlying_trend": None,
-                "confidence": 0, "reasons": ["baseline captured — waiting for the open"]}
+                "confidence": 0, "reasons": ["baseline captured — waiting for the open"],
+                "opp_mean_ratio": None, "skew_shift": None,
+                "gap_retraced": gap_retraced(gap, spot_baseline, spot_now),
+                "spot_now": float(spot_now) if spot_now else None}
     premium_trend, ratio = classify_premium(baseline, latest)
     underlying_trend = classify_underlying(gap, spot_baseline, spot_now)
     verdict = build_verdict(direction=direction, crowd=crowd, gap=gap,
                             premium_trend=premium_trend, underlying_trend=underlying_trend,
                             news_bad=news_bad)
     verdict["mean_ratio"] = round(ratio, 4) if ratio is not None else None
+    # Two-sided skew — opposite-side build vs toward-side build. Free from the same
+    # chain. skew_shift > 0 ⇒ the reversal side is being bid up relative to the move.
+    opp_ratio = mean_ratio(opp_baseline or {}, opp_latest or {}) if opp_latest else None
+    verdict["opp_mean_ratio"] = round(opp_ratio, 4) if opp_ratio is not None else None
+    verdict["skew_shift"] = (round(opp_ratio - ratio, 4)
+                             if (opp_ratio is not None and ratio is not None) else None)
+    verdict["gap_retraced"] = gap_retraced(gap, spot_baseline, spot_now)
+    # Carried so a call frozen intraday can be graded from the spot AT ITS DECISION,
+    # not the 09:25 level (else it's credited for the pre-decision move).
+    verdict["spot_now"] = float(spot_now) if spot_now else None
     return verdict

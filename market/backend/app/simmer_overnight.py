@@ -109,17 +109,27 @@ async def capture_baseline(provider, symbol: str, expiration: str, direction: st
     strikes = pt.pick_strikes(float(spot), chain, direction)
     if not strikes:
         return {}
+    # Opposite (reversal) side — picked + snapshotted from the SAME chain (zero extra
+    # calls) so the two-sided skew is available all session.
+    opp_side = pt.opposite_move_side(direction)
+    opp_strikes = pt.pick_strikes_opposite(float(spot), chain, direction)
     return {
         "side": side,
         "strikes": strikes,
         "baseline": pt.premium_map(chain, strikes, side),
         "spot_baseline": float(spot),
+        "opp_side": opp_side,
+        "opp_strikes": opp_strikes,
+        "opp_baseline": pt.premium_map(chain, opp_strikes, opp_side) if opp_strikes else {},
     }
 
 
 async def refresh_live(provider, symbol: str, expiration: str,
-                       strikes: list[float], side: str) -> dict:
-    """Re-read the SAME strikes live (premium + volume) + the live underlying."""
+                       strikes: list[float], side: str,
+                       opp_strikes: list[float] | None = None,
+                       opp_side: str | None = None) -> dict:
+    """Re-read the SAME strikes live (premium + volume) + the live underlying. Also
+    maps the OPPOSITE-side strikes off the same chain (free) for the two-sided skew."""
     try:
         chain = await provider.chain(symbol, expiration)
     except Exception as e:                   # noqa: BLE001
@@ -134,6 +144,8 @@ async def refresh_live(provider, symbol: str, expiration: str,
         "latest": pt.premium_map(chain, strikes, side),
         "volume": pt.volume_map(chain, strikes, side),
         "spot_now": float(spot_now) if spot_now else None,
+        "opp_latest": (pt.premium_map(chain, opp_strikes, opp_side)
+                       if opp_strikes and opp_side else {}),
     }
 
 
@@ -177,6 +189,9 @@ async def _ensure_overnight_row(provider, mover: dict, expiration: str, session:
         "thesis": thesis, "strikes": snap["strikes"], "side": snap["side"],
         "baseline": snap["baseline"], "spot_baseline": snap["spot_baseline"],
         "latest": {}, "verdict": verdict,
+        # Opposite (reversal) side — immutable baseline captured now; `latest` fills live.
+        "opp": {"side": snap.get("opp_side"), "strikes": snap.get("opp_strikes") or [],
+                "baseline": snap.get("opp_baseline") or {}, "latest": {}},
     })
     return True, True
 
@@ -318,8 +333,10 @@ async def refresh_analysis(provider, *, sentiment_by_symbol: Optional[dict] = No
     for row in rows:
         if not row.get("baseline") or not row.get("strikes"):
             continue
+        opp = row.get("opp") or {}
         live = await refresh_live(provider, row["symbol"], row["expiration"],
-                                  row["strikes"], row.get("side") or pt.toward_move_side(row["dir"]))
+                                  row["strikes"], row.get("side") or pt.toward_move_side(row["dir"]),
+                                  opp_strikes=opp.get("strikes"), opp_side=opp.get("side"))
         if not live:
             continue
         news_bad = _news_bad(row.get("dir"), (sentiment_by_symbol or {}).get(row["symbol"]))
@@ -327,15 +344,19 @@ async def refresh_analysis(provider, *, sentiment_by_symbol: Optional[dict] = No
             direction=row["dir"], crowd=row.get("crowd"), gap=float(row.get("gap") or 0.0),
             baseline=row["baseline"], latest=live["latest"],
             spot_baseline=float(row.get("spot_baseline") or 0.0),
-            spot_now=live.get("spot_now"), news_bad=news_bad)
+            spot_now=live.get("spot_now"), news_bad=news_bad,
+            opp_baseline=opp.get("baseline"), opp_latest=live.get("opp_latest"))
         # NOTE: this is an INSERT-on-conflict (PostgREST upsert), so the payload
         # must satisfy the table's NOT NULL columns (dir, gap) even though the row
         # already exists — carry them from the row being refreshed. On conflict,
         # only the provided columns update; baseline/strikes/thesis are preserved.
+        # The immutable opp baseline/strikes/side are carried; only opp.latest moves.
         await supabase_admin.upsert_simmer_overnight({
             "symbol": row["symbol"], "expiration": row["expiration"], "session_date": session,
             "dir": row["dir"], "gap": float(row.get("gap") or 0.0),
             "latest": live["latest"], "volume": live["volume"], "verdict": verdict,
+            "opp": {"side": opp.get("side"), "strikes": opp.get("strikes") or [],
+                    "baseline": opp.get("baseline") or {}, "latest": live.get("opp_latest") or {}},
         })
         updated += 1
     return updated

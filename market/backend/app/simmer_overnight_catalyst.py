@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 from . import simmer_config, simmer_premium_tracker as pt, supabase_admin
 from .config import get_settings
-from .simmer_overnight_combiner import combine
+from .simmer_overnight_combiner import combine, reactive_call
 
 log = logging.getLogger("edgelane.simmer.overnight.catalyst")
 _ET = ZoneInfo("America/New_York")
@@ -183,7 +183,51 @@ async def run_catalyst(session: str) -> dict:
     return {"enabled": True, "names": len(rows), "analyzed": done, "skipped": skipped, "gave_up": gave_up}
 
 
-async def refresh_combiner(session: str, *, lock: bool = False) -> int:
+_REACTIVE_HISTORY_CAP = 12       # append-on-change only → a handful of entries/day
+
+
+def _apply_reactive(existing: dict, scored_final: dict, premium: dict,
+                    drift_cfg: dict, *, reactive_lock: bool) -> tuple[dict, list, bool]:
+    """Fold the Phase A reactive overlay into a combiner block. Returns
+    (premium_reactive, premium_reactive_history, changed).
+
+    The SCORED reactive call (`premium_reactive`) freezes at a checkpoint
+    (`reactive_lock`, ~noon ET) and is NEVER re-scored after — so the close grade is
+    made before the outcome window, exactly like llm_only (09:25) and
+    combiner_blended (10:00). Without this freeze the last-tick call would be graded
+    against the 16:00 close and a late flip toward the realized move would be
+    credited as 'right' — lookahead that would flatter the reactive candidate in the
+    very forward test used to decide whether to ship it.
+
+    `premium_reactive_history` is an append-ON-CHANGE log (not per tick) of the live
+    reactive call for observability — bounded, non-predictive; the UI reads its last
+    entry for the always-live call. The scored freeze above is what gets graded."""
+    live = reactive_call(scored_final, premium, drift_cfg=drift_cfg)
+    history = list(existing.get("premium_reactive_history") or [])
+    last = history[-1] if history else {}
+    changed = (last.get("call"), last.get("source")) != (live["call"], live["source"])
+    if changed:
+        history.append({"t": datetime.now(_ET).isoformat(), "call": live["call"],
+                        "source": live["source"], "gap_retraced": premium.get("gap_retraced"),
+                        "skew_shift": premium.get("skew_shift")})
+        history = history[-_REACTIVE_HISTORY_CAP:]
+    prev_scored = existing.get("premium_reactive") or {}
+    if prev_scored.get("decided_at"):
+        scored = prev_scored                 # already frozen at the checkpoint — never re-score
+    else:
+        scored = dict(live)
+        if reactive_lock:
+            scored["decided_at"] = datetime.now(_ET).isoformat()
+            # Spot AT the freeze — the reactive call is graded from here to the close,
+            # not from 09:25, so it isn't credited for the pre-decision morning move.
+            scored["spot_at"] = premium.get("spot_now")
+    scored_changed = (prev_scored.get("call"), prev_scored.get("source"),
+                      prev_scored.get("decided_at")) != (scored.get("call"), scored.get("source"),
+                                                         scored.get("decided_at"))
+    return scored, history, (changed or scored_changed)
+
+
+async def refresh_combiner(session: str, *, lock: bool = False, reactive_lock: bool = False) -> int:
     """Re-combine each analyzed name against the LIVE premium verdict — WITHOUT any
     new LLM call (the catalyst read is frozen at 09:25, one call/day; only the
     premium engine's verdict moves).
@@ -191,9 +235,11 @@ async def refresh_combiner(session: str, *, lock: bool = False) -> int:
     FAIRNESS: the SCORED decision must be made before the outcome window, and at a
     comparable time to `llm_only` (which is fixed at 09:25). So the combiner updates
     live only until a cutoff, then FREEZES: the watcher passes `lock=True` once past
-    ~10:00 ET, which stamps `decided_at` on the combiner block; a row already
-    carrying `decided_at` is skipped (never re-scored from late-session premiums).
-    Pure math; read-only w.r.t. simmer_overnight. Gated by `enabled`."""
+    ~10:00 ET, which stamps `decided_at` on the combiner block; a frozen combiner is
+    never re-scored. The Phase A reactive overlay gets a LATER checkpoint
+    (`reactive_lock`, ~noon ET) so it can react through the morning, then it too
+    freezes for a lookahead-free grade. Pure math; read-only w.r.t.
+    simmer_overnight. Gated by `enabled`."""
     ovn = simmer_config.overnight_llm()
     if not ovn.get("enabled"):
         return 0
@@ -203,19 +249,41 @@ async def refresh_combiner(session: str, *, lock: bool = False) -> int:
     ov_rows = await supabase_admin.list_simmer_overnight(session) or []
     prem_by = {r["symbol"]: (r.get("verdict") or {}) for r in ov_rows}
     mode = ovn.get("decision_mode", "llm_only")
+    drift_cfg = simmer_config.overnight_drift()
     updated = 0
     for a in analyses:
-        if (a.get("combiner") or {}).get("decided_at"):   # decision already frozen
-            continue
         llm = a.get("llm") or {}
         if not llm.get("call"):                # nothing to combine until the LLM read lands
             continue
         v = prem_by.get(a["symbol"]) or {}
+        # Carry the LEADING signals (skew_shift, gap_retraced) through to the reactive
+        # override, not just the toward-side magnitude.
         premium = {"call": v.get("call"), "premium_trend": v.get("premium_trend"),
-                   "underlying_trend": v.get("underlying_trend"), "confidence": v.get("confidence")}
+                   "underlying_trend": v.get("underlying_trend"),
+                   "confidence": v.get("confidence"), "mean_ratio": v.get("mean_ratio"),
+                   "skew_shift": v.get("skew_shift"), "gap_retraced": v.get("gap_retraced"),
+                   "spot_now": v.get("spot_now")}
+        existing = a.get("combiner") or {}
+        frozen = bool(existing.get("decided_at"))
+        if frozen:
+            # The combiner scored call is locked (bake-off fairness), `final` untouched.
+            # Only the reactive overlay keeps moving (until ITS own noon freeze).
+            scored, history, changed = _apply_reactive(
+                existing, existing.get("final") or {}, premium, drift_cfg, reactive_lock=reactive_lock)
+            if not changed:
+                continue                        # no change → skip the write (no churn)
+            comb = {**existing, "premium_reactive": scored, "premium_reactive_history": history}
+            await supabase_admin.upsert_simmer_overnight_analysis({
+                "symbol": a["symbol"], "session_date": str(session)[:10], "combiner": comb})
+            updated += 1
+            continue
         comb = _combiner_block(premium, llm, mode)
         if lock:                               # past the cutoff → this is the scored decision
             comb["decided_at"] = datetime.now(_ET).isoformat()
+        scored, history, _ = _apply_reactive(
+            existing, comb["final"], premium, drift_cfg, reactive_lock=reactive_lock)
+        comb["premium_reactive"] = scored
+        comb["premium_reactive_history"] = history
         await supabase_admin.upsert_simmer_overnight_analysis({
             "symbol": a["symbol"], "session_date": str(session)[:10],
             "premium": premium, "combiner": comb})
@@ -293,6 +361,17 @@ async def capture_reading(provider, label: str, session: str) -> int:
             llm_only_call = (comb.get("llm_only") or {}).get("call")
             blended_call = (comb.get("combiner_blended") or {}).get("call")
             final_call = (comb.get("final") or {}).get("call")
+            # Phase A reactive candidate — the call FROZEN at the noon checkpoint,
+            # graded from the spot AT THAT FREEZE (not 09:25), so it's credited only
+            # for the move AFTER it was made, lookahead-free.
+            reactive_pr = comb.get("premium_reactive") or {}
+            reactive_c = reactive_pr.get("call")
+            reactive_from = reactive_pr.get("spot_at") or pm
+            # The last live reactive call (post-noon). Graded too but LABELLED
+            # non-predictive — a late flip toward the realized move is not a real
+            # pre-outcome call, so this must never be read as the reactive score.
+            hist = comb.get("premium_reactive_history") or []
+            reactive_live_c = hist[-1].get("call") if hist else reactive_c
             patch["close"] = {
                 "spot": spot_f,
                 "intraday_pct": round((spot_f - pm) / pm * 100, 2) if (spot_f and pm) else None,
@@ -300,6 +379,14 @@ async def capture_reading(provider, label: str, session: str) -> int:
                 "llm_only_right": _direction_right(llm_only_call, gap, pm, spot_f),
                 "combiner_blended_call": blended_call,
                 "combiner_blended_right": _direction_right(blended_call, gap, pm, spot_f),
+                # scored (noon-frozen) reactive call — the one the bake-off compares,
+                # graded from its freeze spot (spot_at) to the close.
+                "premium_reactive_call": reactive_c,
+                "premium_reactive_from": reactive_from,
+                "premium_reactive_right": _direction_right(reactive_c, gap, reactive_from, spot_f),
+                # non-predictive: last live reactive call, for observing the path only.
+                "premium_reactive_live_call": reactive_live_c,
+                "premium_reactive_live_right_nonpredictive": _direction_right(reactive_live_c, gap, pm, spot_f),
             }
             patch["outcome"] = _outcome(gap, pm, spot_f)
             patch["direction_right"] = _direction_right(final_call, gap, pm, spot_f)

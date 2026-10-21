@@ -214,15 +214,112 @@ async def test_refresh_combiner_freezes_decision_at_cutoff(wired, monkeypatch):
     frozen = wired["MU"]["combiner"]["final"]["call"]
     assert frozen == "sell_bear_call" and wired["MU"]["combiner"].get("decided_at")
 
-    # the live premium now flips to the opposite committed side…
+    # the live premium now flips HARD to the opposite committed side (big drift)…
     async def _list_ov(session):
         return [{"symbol": "MU", "expiration": "2026-11-13",
                  "verdict": {"call": "sell_bull_put", "premium_trend": "fading",
-                             "underlying_trend": "holding", "confidence": 80}}]
+                             "underlying_trend": "holding", "confidence": 80,
+                             "mean_ratio": 0.85}}]   # toward-side premium down 15% → material
     monkeypatch.setattr(cat.supabase_admin, "list_simmer_overnight", _list_ov)
-    # …but a frozen row is skipped, so the scored call is unchanged.
-    assert await cat.refresh_combiner("2026-10-12", lock=True) == 0
+    # The FROZEN scored call is never re-scored (bake-off integrity preserved)…
+    assert await cat.refresh_combiner("2026-10-12", lock=True) == 1
     assert wired["MU"]["combiner"]["final"]["call"] == frozen
+    assert wired["MU"]["combiner"].get("decided_at")
+    # …but the Phase A reactive overlay DOES flip the user-facing call to the tape.
+    assert wired["MU"]["combiner"]["premium_reactive"]["call"] == "sell_bull_put"
+    assert wired["MU"]["combiner"]["premium_reactive"]["source"] == "premium_override"
+
+
+async def test_premium_drift_simulation_reactive_tracks_the_tape(wired, monkeypatch):
+    """Phase A end-to-end: a down-gap name is scored sell_bear_call and FROZEN at
+    10:00. Then drive the live premium through a realistic intraday path and assert
+    the never-frozen reactive overlay reacts the way a market-maker would — holds
+    while the tape confirms, stands down on mild drift, FLIPS to bull_put when the
+    premium materially cancels the thesis, and re-commits when the tape comes back.
+    Exercises the real refresh_combiner wiring (not just the pure fn)."""
+    _ovn(monkeypatch, decision_mode="combiner_blended")
+    monkeypatch.setattr(cat, "_make_llm",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM in refresh")))
+    # a scored bear-call, already frozen at the cutoff
+    wired["MU"] = {"symbol": "MU", "session_date": "2026-10-12",
+                   "llm": {"call": "sell_bear_call", "sustain": "extend", "confidence": 80},
+                   "combiner": {"mode": "combiner_blended", "decided_at": "2026-10-12T10:00:00-04:00",
+                                "final": {"call": "sell_bear_call", "confidence": 78}}}
+
+    async def _list_an(session):
+        return [wired["MU"]]
+    monkeypatch.setattr(cat.supabase_admin, "list_simmer_overnight_analysis", _list_an)
+
+    async def tick(call, premium_trend, underlying_trend, conf, mean_ratio):
+        async def _list_ov(session):
+            return [{"symbol": "MU", "expiration": "2026-11-13",
+                     "verdict": {"call": call, "premium_trend": premium_trend,
+                                 "underlying_trend": underlying_trend, "confidence": conf,
+                                 "mean_ratio": mean_ratio}}]
+        monkeypatch.setattr(cat.supabase_admin, "list_simmer_overnight", _list_ov)
+        await cat.refresh_combiner("2026-10-12", lock=True)
+        return wired["MU"]["combiner"]["premium_reactive"]
+
+    # t0 — tape CONFIRMS the drop (premium building, still extending down) → hold bear_call
+    r = await tick("sell_bear_call", "building", "extending", 75, 1.18)
+    assert r["call"] == "sell_bear_call" and r["source"] == "frozen_hold"
+
+    # t1 — MILD drift against us (fading, stock holding, only 6% premium decay) → stand down
+    r = await tick("wait", "fading", "holding", 50, 0.94)
+    assert r["call"] == "wait" and r["source"] == "premium_drift_standdown"
+
+    # t2 — MATERIAL flip: premium now names the opposite side, 16% decay, tape retracing
+    #      up, real conviction → premium CANCELS the stale bear_call, flip to bull_put
+    r = await tick("sell_bull_put", "fading", "retracing", 72, 0.84)
+    assert r["call"] == "sell_bull_put" and r["source"] == "premium_override"
+
+    # t3 — the move resumes down, premium rebuilds → the overlay re-commits to bear_call
+    r = await tick("sell_bear_call", "building", "extending", 70, 1.15)
+    assert r["call"] == "sell_bear_call" and r["source"] == "frozen_hold"
+
+    # the FROZEN scored call never moved through any of it (bake-off integrity)
+    assert wired["MU"]["combiner"]["final"]["call"] == "sell_bear_call"
+    assert wired["MU"]["combiner"]["decided_at"] == "2026-10-12T10:00:00-04:00"
+
+
+async def test_reactive_scored_call_freezes_at_noon_no_lookahead(wired, monkeypatch):
+    """The SCORED reactive call freezes at the noon checkpoint. A later flip toward
+    the realized move must NOT become the scored call — otherwise the close grade
+    gets lookahead and flatters the reactive candidate. The late flip is still logged
+    in premium_reactive_history (non-predictive), just never graded as the decision."""
+    _ovn(monkeypatch, decision_mode="combiner_blended")
+    monkeypatch.setattr(cat, "_make_llm",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM in refresh")))
+    wired["MU"] = {"symbol": "MU", "session_date": "2026-10-12",
+                   "llm": {"call": "sell_bear_call", "sustain": "extend", "confidence": 80},
+                   "combiner": {"mode": "combiner_blended", "decided_at": "2026-10-12T10:00:00-04:00",
+                                "final": {"call": "sell_bear_call", "confidence": 78}}}
+
+    async def _list_an(session):
+        return [wired["MU"]]
+    monkeypatch.setattr(cat.supabase_admin, "list_simmer_overnight_analysis", _list_an)
+
+    async def set_live(call, premium_trend, underlying_trend, conf, mean_ratio):
+        async def _list_ov(session):
+            return [{"symbol": "MU", "expiration": "2026-11-13",
+                     "verdict": {"call": call, "premium_trend": premium_trend,
+                                 "underlying_trend": underlying_trend, "confidence": conf,
+                                 "mean_ratio": mean_ratio}}]
+        monkeypatch.setattr(cat.supabase_admin, "list_simmer_overnight", _list_ov)
+
+    # noon checkpoint: tape still backs the scored bear_call → reactive freezes holding it
+    await set_live("sell_bear_call", "building", "extending", 75, 1.15)
+    await cat.refresh_combiner("2026-10-12", lock=True, reactive_lock=True)
+    reactive = wired["MU"]["combiner"]["premium_reactive"]
+    assert reactive["call"] == "sell_bear_call" and reactive.get("decided_at")
+
+    # AFTER noon the tape flips hard to the (realized) opposite side — a late flip
+    await set_live("sell_bull_put", "fading", "holding", 80, 0.82)
+    await cat.refresh_combiner("2026-10-12", lock=True, reactive_lock=True)
+    # scored call is UNCHANGED (frozen at noon) — no lookahead credit for the late flip
+    assert wired["MU"]["combiner"]["premium_reactive"]["call"] == "sell_bear_call"
+    # …but the live flip is captured in the (non-predictive) history
+    assert wired["MU"]["combiner"]["premium_reactive_history"][-1]["call"] == "sell_bull_put"
 
 
 async def test_capture_reading_disabled_is_noop(wired, monkeypatch):
@@ -271,3 +368,35 @@ async def test_capture_reading_appends_and_stamps_outcome(wired, monkeypatch):
     assert row["close"]["combiner_blended_right"] is True
     assert row["close"]["llm_only_call"] == "sell_bull_put"
     assert row["close"]["llm_only_right"] is False   # bull_put wrong: name broke down
+
+
+async def test_reactive_graded_from_freeze_spot_not_premarket(wired, monkeypatch):
+    """A noon flip after a MORNING reversal must not be credited for the morning move.
+    Down-gap name reversed UP to 106 by noon; the reactive call flipped to bull_put and
+    froze there (spot_at=106). It then FELL to 103 into the close. Graded from 09:25
+    (100→103, +3%) bull_put would look RIGHT — lookahead for the pre-noon rip. Graded
+    from the freeze spot (106→103, −2.8%) it is correctly WRONG."""
+    _ovn(monkeypatch)
+
+    class _Prov:
+        async def chain(self, sym, exp):
+            return [{"side": "put", "strike": 100.0, "bid": 1.0, "ask": 1.2, "volume": 50}]
+        async def quote(self, sym):
+            return {"last": 103.0}          # closed at 103, below the noon freeze of 106
+
+    wired["MU"] = {"symbol": "MU", "session_date": "2026-10-12", "gap": -0.05,
+                   "premarket": {"spot": 100.0}, "readings": [],
+                   "combiner": {"final": {"call": "sell_bear_call"},
+                                "llm_only": {"call": "sell_bear_call"},
+                                "combiner_blended": {"call": "sell_bear_call"},
+                                "premium_reactive": {"call": "sell_bull_put",
+                                                     "decided_at": "2026-10-12T12:00:00-04:00",
+                                                     "spot_at": 106.0},
+                                "premium_reactive_history": [{"call": "sell_bull_put"}]}}
+    assert await cat.capture_reading(_Prov(), "16:00", "2026-10-12") == 1
+    close = wired["MU"]["close"]
+    assert close["premium_reactive_from"] == 106.0          # graded from the freeze, not 100
+    assert close["premium_reactive_right"] is False         # 106→103 fell → bull_put wrong
+    # a 09:25-based grade would have (wrongly) called it right:
+    from app.simmer_overnight_catalyst import _direction_right
+    assert _direction_right("sell_bull_put", -0.05, 100.0, 103.0) is True

@@ -80,6 +80,41 @@ def test_reversal_with_collapsing_premium_is_skip():
     assert any("fade" in r for r in v["reasons"])
 
 
+# ── two-sided skew + reclaim (leading reversal signals, on every analysis) ──────
+def test_gap_retraced_measures_the_reclaim():
+    # down gap of 5% off a 100 baseline
+    assert pt.gap_retraced(-0.05, 100.0, 98.0) == 0.0     # extending (fell further) → 0
+    assert pt.gap_retraced(-0.05, 100.0, 103.0) == 0.6    # +3% intraday = 60% of the gap back
+    assert pt.gap_retraced(-0.05, 100.0, 105.0) == 1.0    # full gap erased
+    assert pt.gap_retraced(-0.05, 100.0, None) is None
+
+
+def test_opposite_side_picks_the_reversal_side():
+    assert pt.opposite_move_side("down") == "call" and pt.toward_move_side("down") == "put"
+    assert pt.opposite_move_side("up") == "put"
+
+
+def test_analysis_is_two_sided_on_a_reversal():
+    # down-gap name reversing up: toward (put) premium fading, opposite (call) building,
+    # price reclaiming 60% of the gap → skew_shift strongly positive, gap_retraced 0.6.
+    v = pt.analyze(direction="down", crowd="lone", gap=-0.05,
+                   baseline={"97": 3.0, "95": 2.0}, latest={"97": 1.6, "95": 1.0},   # fading
+                   spot_baseline=100.0, spot_now=103.0,                               # retracing
+                   opp_baseline={"103": 2.0, "105": 1.0}, opp_latest={"103": 3.2, "105": 1.8})
+    assert v["gap_retraced"] == 0.6
+    assert v["opp_mean_ratio"] > 1.4 and v["mean_ratio"] < 0.7
+    assert v["skew_shift"] > 0.5            # opposite building far more than toward
+    assert v["call"] == "skip"              # reversing + collapsing
+
+
+def test_two_sided_fields_present_even_without_opposite_data():
+    v = pt.analyze(direction="down", crowd="lone", gap=-0.05,
+                   baseline={"98.0": 1.0}, latest={"98.0": 0.9},
+                   spot_baseline=100.0, spot_now=99.9)   # still falling (extending)
+    assert v["opp_mean_ratio"] is None and v["skew_shift"] is None
+    assert v["gap_retraced"] == 0.0         # still computed from price alone
+
+
 def test_up_move_holding_sells_bull_put():
     v = pt.analyze(direction="up", crowd="sector_wide", gap=0.05,
                    baseline={"102.0": 1.0, "104.0": 1.0},
