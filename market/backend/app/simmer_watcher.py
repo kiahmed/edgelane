@@ -2228,6 +2228,13 @@ def _combiner_lock(now) -> bool:
     return (now.hour, now.minute) >= (10, 0)
 
 
+def _reactive_lock(now) -> bool:
+    """Past the noon ET checkpoint → freeze the SCORED reactive call. Later than the
+    combiner cutoff so the reactive overlay gets the morning to react, but still well
+    before the close so its grade carries no lookahead."""
+    return (now.hour, now.minute) >= (12, 0)
+
+
 def _should_reset(now, reset_done: bool) -> bool:
     """EOD RQ reset: once per weekday, from 16:00 ET — after the close reading has
     stamped outcomes (it fires at 15:58), so grading is persisted first."""
@@ -2359,7 +2366,8 @@ async def overnight_loop(provider, tz_name: str) -> None:
                 # 10:00 cutoff so the scored call isn't late-session lookahead.
                 try:
                     if simmer_config.overnight_llm().get("enabled"):
-                        await catalyst.refresh_combiner(today, lock=_combiner_lock(now))
+                        await catalyst.refresh_combiner(today, lock=_combiner_lock(now),
+                                                        reactive_lock=_reactive_lock(now))
                         # Fire in-app alerts for plays that reached ≥70 (re-trigger
                         # on a call flip or a conviction rise; per-user opt-out).
                         await overnight_alert_fanout(today)
