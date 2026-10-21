@@ -45,6 +45,7 @@ from ..earnings_engine import build_earnings_analyzer
 from ..entitlements import ensure_tool
 from .. import simmer_config
 from .. import simmer_news
+from .. import simmer_overnight_combiner as combiner
 from .. import simmer_watcher
 from .. import supabase_admin
 from ..simmer_engine import STRUCTURES
@@ -119,10 +120,23 @@ async def _overnight_block(sym: str) -> dict:
     row = await supabase_admin.get_simmer_overnight_by_symbol(sym, session)
     if not row:
         return {"active": False}
+    an = await supabase_admin.get_simmer_overnight_analysis(sym, session)
+    llm = (an or {}).get("llm") or {}
+    comb = (an or {}).get("combiner") or {}
+
+    # ONE user-facing verdict. The premium/price read, the catalyst read, and the
+    # intraday drift override are folded IN SEQUENCE into a single call + ordered
+    # steps (never separate, competing opinions). The bake-off candidates stay in
+    # simmer_overnight_analysis for grading; the card shows only this.
+    premium = dict(row.get("verdict") or {})
+    premium.update(dir=row.get("dir"), gap=float(row.get("gap") or 0.0), crowd=row.get("crowd"))
+    decision = combiner.reconcile(premium, llm, comb, drift_cfg=simmer_config.overnight_drift())
+
     out = {
         "active": True,
         "thesis": row.get("thesis"),
-        "verdict": row.get("verdict") or {},
+        "verdict": {"call": decision["call"], "confidence": decision["confidence"],
+                    "steps": decision["steps"], "source": decision["source"]},
         "dir": row.get("dir"),
         "gap": float(row.get("gap") or 0.0),
         "crowd": row.get("crowd"),
@@ -133,14 +147,10 @@ async def _overnight_block(sym: str) -> dict:
         "spot_baseline": row.get("spot_baseline"),
         "as_of": row.get("updated_at"),
     }
-    # Catalyst read (LLM) + combiner, when the analyzer has run for this name today.
-    # The row is user-agnostic (both llm_only and combiner_blended are computed);
-    # the UI's per-user toggle picks which call to show. Absent → the tab just
-    # shows the premium verdict above (the analyzer may be off or not yet run).
-    an = await supabase_admin.get_simmer_overnight_analysis(sym, session)
-    if an:
-        llm = an.get("llm") or {}
-        comb = an.get("combiner") or {}
+    # Catalyst REASONING (why it moved / sustain / chips) — supporting detail under the
+    # one verdict, NOT its own call. No llm_only/combiner toggle (they resolved to the
+    # same call and read as a second opinion).
+    if an and llm.get("call"):
         out["catalyst"] = {
             "why_moved": llm.get("why_moved"),
             "one_liner": llm.get("one_liner"),
@@ -148,11 +158,7 @@ async def _overnight_block(sym: str) -> dict:
             "deserved": llm.get("deserved"),
             "sentiment": llm.get("web_social_sentiment"),
             "sustain": llm.get("sustain"),
-            "confidence": llm.get("confidence"),
             "provider": llm.get("provider"),
-            "llm_only_call": (comb.get("llm_only") or {}).get("call"),
-            "combiner_call": (comb.get("combiner_blended") or {}).get("call"),
-            "combiner_decided_at": comb.get("decided_at"),
             "outcome": an.get("outcome"),
         }
     return out

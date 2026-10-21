@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from app import simmer_premium_tracker as pt
-from app.simmer_overnight_combiner import combine, reactive_call
+from app.simmer_overnight_combiner import combine, reactive_call, reconcile
 
 _P_WAIT = {"call": "wait", "premium_trend": "holding", "underlying_trend": "holding", "confidence": 50}
 _P_BEAR = {"call": "sell_bear_call", "premium_trend": "fading", "underlying_trend": "holding", "confidence": 80}
@@ -147,3 +147,38 @@ def test_bidirectional_reversal_end_to_end_through_the_real_tracker():
     v, r = step(104.0, {"97": 1.2, "95": 0.7}, {"103": 3.6, "105": 2.2})
     assert v["call"] == "skip" and v["gap_retraced"] >= 0.6
     assert r["call"] == "wait"
+
+
+# ── reconcile: one user-facing verdict, factors in sequence (no second opinion) ─
+def test_reconcile_folds_catalyst_into_one_call_not_two():
+    # the screenshot case: premium says sell_bull_put, catalyst is non-committal (wait).
+    # The card must show ONE call (the premium side, catalyst couldn't corroborate),
+    # with the catalyst as a step — never a competing verdict.
+    premium = {"call": "sell_bull_put", "premium_trend": "building", "underlying_trend": "holding",
+               "confidence": 63, "mean_ratio": 1.1, "dir": "up", "gap": 0.028, "crowd": "lone"}
+    llm = {"call": "wait", "sustain": "fade", "why_moved": "rebound lacks a fresh catalyst",
+           "catalyst_type": "other", "deserved": "overreaction", "web_social_sentiment": "doubt"}
+    comb = {"final": {"call": "sell_bull_put", "confidence": 63},
+            "llm_only": {"call": "wait"}, "combiner_blended": {"call": "sell_bull_put"}}
+    r = reconcile(premium, llm, comb)
+    assert r["call"] == "sell_bull_put"                    # ONE call
+    assert [s["step"] for s in r["steps"]] == ["setup", "premium", "catalyst", "intraday"]
+    assert "rebound lacks a fresh catalyst" in r["steps"][2]["detail"]
+
+
+def test_reconcile_intraday_override_is_the_final_call():
+    # premium/catalyst agreed bear_call, but the tape reversed hard intraday → the
+    # single verdict reflects the override, not the stale agreed call.
+    premium = {"call": "sell_bull_put", "premium_trend": "fading", "underlying_trend": "retracing",
+               "confidence": 72, "mean_ratio": 0.84, "dir": "down", "gap": -0.05, "crowd": "sector_wide"}
+    comb = {"final": {"call": "sell_bear_call", "confidence": 78}}
+    r = reconcile(premium, {"call": "sell_bear_call"}, comb)
+    assert r["call"] == "sell_bull_put" and r["source"] == "premium_override"
+
+
+def test_reconcile_without_catalyst_omits_that_step():
+    premium = {"call": "sell_bear_call", "premium_trend": "building", "underlying_trend": "extending",
+               "confidence": 60, "mean_ratio": 1.2, "dir": "down", "gap": -0.04, "crowd": "lone"}
+    r = reconcile(premium, None, None)
+    assert r["call"] == "sell_bear_call"
+    assert [s["step"] for s in r["steps"]] == ["setup", "premium", "intraday"]

@@ -68,6 +68,7 @@ from . import simmer_events
 from . import simmer_ledger
 from . import simmer_overnight as overnight
 from . import simmer_overnight_catalyst as catalyst
+from . import simmer_overnight_combiner as combiner
 from . import supabase_admin
 from .config import get_settings
 from .dealer_exposures import compute_dealer_exposures
@@ -1406,25 +1407,71 @@ async def fanout_alert(env: dict, regime: dict | None) -> int:
 
 
 # ── Overnight catalyst alerts (docs/simmer_overnight_llm_spec.md) ────────────
-OVERNIGHT_ALERT_MIN = 70        # fire when a play's confidence reaches this
-OVERNIGHT_ALERT_RISE = 5        # re-fire only when conviction rises by at least this
+OVERNIGHT_ALERT_MIN = 70        # fallback; live value from simmer_config.overnight_alert()
+
+# In-memory per-session guards (reset on restart; the fanout runs in one process).
+# Keyed (session, user, symbol). _flip_seen records WHEN the current reconciled call
+# first appeared (consecutively), so a flip only re-alerts once it has HELD for
+# flip_confirm_sec — an oscillating name can't beep. _alert_count caps NEW alerts/day.
+_overnight_flip_seen: dict[tuple, tuple[str, float]] = {}
+_overnight_alert_count: dict[tuple, int] = {}
 
 
-async def _should_fire_overnight(user_id: str, symbol: str, conf: float, call: str) -> bool:
-    """Re-trigger rule: fire if the user has NO open overnight alert for this name,
-    the play FLIPPED (e.g. bear_call → bull_put), or conviction ROSE meaningfully.
-    Otherwise the existing open-alert collapses the repeat."""
+async def _overnight_alert_action(user_id: str, symbol: str, conf: float, call: str,
+                                  session: str, cfg: dict) -> tuple[str | None, str | None]:
+    """Decide what to do with the overnight alert for one user+name this tick, as
+    (action, alert_id):
+
+      * ("insert", None)  — create a new alert (first one today, or a NEW verdict
+                            after the prior one was acknowledged → it beeps).
+      * ("update", id)    — overwrite the existing OPEN (unacknowledged) alert in
+                            place: a verdict change, or a meaningful conviction rise.
+                            Keeps ONE current alert per name; no new beep.
+      * (None, None)      — do nothing: an acknowledged alert of the SAME verdict must
+                            NOT re-pop, an unchanged open alert is already showing, a
+                            flip that hasn't HELD long enough, or a read error.
+
+    One row per user+symbol per session, kept current. Acknowledgements persist, so a
+    dismissed alert stays dismissed until the verdict actually changes."""
+    # When did the current reconciled call first appear (consecutively)? Reset whenever
+    # it changes — so a flip is timed from when the NEW call started, and oscillation
+    # never accumulates a hold.
+    key = (str(session)[:10], user_id, symbol)
+    now = time.time()
+    seen = _overnight_flip_seen.get(key)
+    first_seen = seen[1] if (seen and seen[0] == call) else now
+    _overnight_flip_seen[key] = (call, first_seen)
+    held_sec = now - first_seen
+
+    # The latest alert for this name TODAY — any ack state (so an acknowledged alert is
+    # visible here and can suppress a re-pop). Scoped to today so yesterday's acked
+    # alert doesn't gag a fresh one.
     rows = await supabase_admin.select_many(
-        "simmer_alerts", "score,structure",
-        {"user_id": f"eq.{user_id}", "symbol": f"eq.{symbol}",
-         "state": "eq.overnight", "acknowledged": "eq.false"},
+        "simmer_alerts", "id,score,structure,acknowledged",
+        {"user_id": f"eq.{user_id}", "symbol": f"eq.{symbol}", "state": "eq.overnight",
+         "created_at": f"gte.{str(session)[:10]}"},
         order="created_at.desc", limit=1)
+    if rows is None:
+        return (None, None)              # read ERROR → fail closed, touch nothing this tick
     if not rows:
-        return True
+        return ("insert", None)          # no alert today → first one
     last = rows[0]
-    if str(last.get("structure") or "") != str(call):
-        return True
-    return float(conf) >= float(last.get("score") or 0) + OVERNIGHT_ALERT_RISE
+    acked = bool(last.get("acknowledged"))
+    rise = float(cfg.get("rise", 5))
+    if str(last.get("structure") or "") == str(call):
+        # SAME verdict. Acknowledged → stay dismissed. Unacknowledged → refresh only
+        # on a real conviction rise (no new beep; same row).
+        if acked:
+            return (None, None)
+        if float(conf) >= float(last.get("score") or 0) + rise:
+            return ("update", str(last.get("id")))
+        return (None, None)
+    # VERDICT CHANGED — require the new call to have HELD long enough (not a flicker).
+    if held_sec < float(cfg.get("flip_confirm_sec", 540)):
+        return (None, None)
+    # A genuinely new verdict after the user acked the old one → a new alert (beeps).
+    # Over an unacknowledged alert → overwrite it in place (one current row).
+    return ("insert", None) if acked else ("update", str(last.get("id")))
 
 
 async def overnight_alert_fanout(session: str) -> int:
@@ -1442,14 +1489,29 @@ async def overnight_alert_fanout(session: str) -> int:
         str(r.get("symbol") or "").upper(): r.get("expiration")
         for r in ov_rows if r.get("expiration")
     }
+    # The live premium verdict per symbol — so the alert fires on the SAME reconciled
+    # call the card shows, not the frozen combiner.final (otherwise an alert could say
+    # "sell bear-call" while the card, reacting to intraday drift, now says "wait").
+    prem_by = {}
+    for r in ov_rows:
+        sym = str(r.get("symbol") or "").upper()
+        v = dict(r.get("verdict") or {})
+        v.update(dir=r.get("dir"), gap=float(r.get("gap") or 0.0), crowd=r.get("crowd"))
+        prem_by[sym] = v
+    drift_cfg = simmer_config.overnight_drift()
+    alert_cfg = simmer_config.overnight_alert()
+    min_conf = float(alert_cfg.get("min_conf", OVERNIGHT_ALERT_MIN))
+    cap = int(alert_cfg.get("cap", 3))
     session_day = str(session)[:10]
     written = 0
     for a in analyses:
-        final = (a.get("combiner") or {}).get("final") or {}
-        call, conf = final.get("call"), final.get("confidence")
-        if call in (None, "wait", "skip") or conf is None or float(conf) < OVERNIGHT_ALERT_MIN:
-            continue
         symbol = str(a.get("symbol") or "").upper()
+        # Reconcile exactly as the card does → one call + confidence.
+        decision = combiner.reconcile(prem_by.get(symbol) or {}, a.get("llm") or {},
+                                      a.get("combiner") or {}, drift_cfg=drift_cfg)
+        call, conf = decision.get("call"), decision.get("confidence")
+        if call in (None, "wait", "skip") or conf is None or float(conf) < min_conf:
+            continue
         watchers = await supabase_admin.select_many(
             "simmer_watchlist", "user_id", {"symbol": f"eq.{symbol}", "active": "eq.true"})
         uids = [str(w["user_id"]) for w in (watchers or []) if w.get("user_id")]
@@ -1467,32 +1529,44 @@ async def overnight_alert_fanout(session: str) -> int:
             continue
         opted_out = {str(r["user_id"]) for r in srows
                      if r.get("user_id") and r.get("notify_overnight") is False}
+        llm = a.get("llm") or {}
+        payload = _json_safe({
+            "why_moved": llm.get("why_moved"), "one_liner": llm.get("one_liner"),
+            "catalyst_type": llm.get("catalyst_type"), "deserved": llm.get("deserved"),
+            "sentiment": llm.get("web_social_sentiment"), "sustain": llm.get("sustain"),
+            # the reconciled headline the card renders (not the frozen combiner)
+            "call": call, "confidence": round(float(conf), 2),
+            "source": decision.get("source"),
+            "dir": a.get("dir"), "gap": a.get("gap"),
+        })
         for uid in uids:
             if uid in opted_out:
                 continue
-            if not await _should_fire_overnight(uid, symbol, float(conf), str(call)):
-                continue
-            llm = a.get("llm") or {}
-            cfinal = (a.get("combiner") or {}).get("final") or {}
-            ok = await supabase_admin.insert_row("simmer_alerts", {
-                "user_id": uid, "symbol": symbol,
-                "expiration": exp_by_symbol.get(symbol) or session_day,
-                "score": round(float(conf), 2), "state": "overnight", "structure": call,
-                # SUMMARY only (same fields the Phase 2 route exposes) — never the raw
-                # llm dict (provider/model/queries/tokens/latency/notes are internal).
-                "payload": _json_safe({
-                    "why_moved": llm.get("why_moved"), "one_liner": llm.get("one_liner"),
-                    "catalyst_type": llm.get("catalyst_type"), "deserved": llm.get("deserved"),
-                    "sentiment": llm.get("web_social_sentiment"), "sustain": llm.get("sustain"),
-                    "confidence": llm.get("confidence"), "call": llm.get("call"),
-                    "combiner": {"call": cfinal.get("call"), "confidence": cfinal.get("confidence"),
-                                 "decided_at": (a.get("combiner") or {}).get("decided_at")},
-                    "dir": a.get("dir"), "gap": a.get("gap"),
-                }),
-            })
-            written += 1 if ok else 0
+            ckey = (session_day, uid, symbol)
+            action, alert_id = await _overnight_alert_action(
+                uid, symbol, float(conf), str(call), session_day, alert_cfg)
+            if action == "insert":
+                if _overnight_alert_count.get(ckey, 0) >= cap:
+                    continue                # day's NEW-alert cap for this name reached
+                ok = await supabase_admin.insert_row("simmer_alerts", {
+                    "user_id": uid, "symbol": symbol,
+                    "expiration": exp_by_symbol.get(symbol) or session_day,
+                    # The reconciled call/confidence — the SAME number the card shows.
+                    "score": round(float(conf), 2), "state": "overnight", "structure": call,
+                    "payload": payload,
+                })
+                if ok:
+                    written += 1
+                    _overnight_alert_count[ckey] = _overnight_alert_count.get(ckey, 0) + 1
+            elif action == "update" and alert_id:
+                # Overwrite the open alert in place (one current row per name) — a new
+                # verdict or conviction rise; re-surface it unacknowledged, no new beep.
+                await supabase_admin.update_rows(
+                    "simmer_alerts", {"id": f"eq.{alert_id}"},
+                    {"score": round(float(conf), 2), "structure": call,
+                     "payload": payload, "acknowledged": False})
     if written:
-        log.info("[overnight] fired %d overnight alert(s) (conf>=%d)", written, OVERNIGHT_ALERT_MIN)
+        log.info("[overnight] fired %d NEW overnight alert(s) (conf>=%g)", written, min_conf)
     return written
 
 

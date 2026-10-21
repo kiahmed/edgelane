@@ -161,3 +161,63 @@ def reactive_call(frozen: dict, live_premium: dict, *, drift_cfg: dict | None = 
     return {"call": "wait", "confidence": 30, "source": "premium_drift_standdown",
             "reasons": [f"premium no longer backs the scored {fcall} "
                         f"(now {lcall}, drift {drift:.0%}) — stand down, not yet a flip"]}
+
+
+# ── Single user-facing verdict: every factor folded in sequence, ONE call out ──
+_CALL_WORDS = {"sell_bear_call": "Sell bear-call", "sell_bull_put": "Sell bull-put",
+               "wait": "Wait", "skip": "Skip"}
+
+
+def reconcile(premium: dict, llm: Optional[dict], combiner: Optional[dict], *,
+              drift_cfg: dict | None = None) -> dict[str, Any]:
+    """Fold EVERY overnight factor into ONE call, and emit the ordered steps that
+    produced it — so the card shows a single verdict with its reasoning, never two
+    competing opinions. Pure fn; the bake-off candidates in `combiner` are untouched.
+
+    Sequence (each step feeds the next, nothing branches into its own verdict):
+      1. Gap + peer context  (the setup)
+      2. Premium/price read   (building/holding/fading · extending/holding/retracing)
+      3. Catalyst read        (why it moved / deserved / sustain — confirms or trims)
+      4. Intraday drift        (premium-is-master override: hold / stand down / flip)
+    The step-4 override of the catalyst-gated call IS the final call."""
+    premium = premium or {}
+    base = (combiner or {}).get("final") or {
+        "call": premium.get("call"), "confidence": premium.get("confidence")}
+    final = reactive_call(base, premium, drift_cfg=drift_cfg)
+
+    steps: list[dict] = []
+    # 1) setup
+    dir_ = str(premium.get("dir") or "").lower() or None
+    steps.append({"step": "setup", "label": "Overnight gap",
+                  "detail": _premium_setup_line(premium)})
+    # 2) premium / price read
+    pt_, ut_ = premium.get("premium_trend"), premium.get("underlying_trend")
+    if pt_ or ut_:
+        steps.append({"step": "premium", "label": "Premium & tape",
+                      "detail": f"premiums {pt_ or '—'}, underlying {ut_ or '—'} → "
+                                f"{_CALL_WORDS.get(str(premium.get('call')), premium.get('call') or '—')}"})
+    # 3) catalyst (reasoning only — never its own call)
+    if llm and llm.get("call"):
+        bits = [b for b in (llm.get("catalyst_type"), llm.get("deserved"),
+                            (f"vibe: {llm.get('web_social_sentiment')}" if llm.get("web_social_sentiment") else None),
+                            (f"sustain: {llm.get('sustain')}" if llm.get("sustain") else None)) if b]
+        steps.append({"step": "catalyst", "label": "Catalyst read",
+                      "detail": (llm.get("why_moved") or llm.get("one_liner") or "")
+                                + ((" · " + ", ".join(bits)) if bits else "")})
+    # 4) intraday drift → the override that decides the final call
+    steps.append({"step": "intraday", "label": "Intraday drift",
+                  "detail": (final.get("reasons") or ["premium backs the call — holding"])[0]})
+
+    return {"call": final["call"], "confidence": final["confidence"],
+            "source": final["source"], "steps": steps}
+
+
+def _premium_setup_line(premium: dict) -> str:
+    gap = premium.get("gap")
+    d = str(premium.get("dir") or "").lower()
+    move = f"{'down' if d == 'down' else 'up'} {abs(float(gap)) * 100:.1f}%" if gap not in (None, "") else "overnight"
+    crowd = premium.get("crowd")
+    peer = ("sector-wide (more durable)" if crowd in ("sector_wide", "with_market")
+            else "lone move (revert-prone)" if crowd in ("lone", "against_market")
+            else "mixed peer signal")
+    return f"gapped {move} · {peer}"

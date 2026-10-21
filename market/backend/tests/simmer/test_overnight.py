@@ -421,72 +421,170 @@ async def test_reset_rq_end_of_day_deletes_rq_strips_overlay(monkeypatch):
 
 
 # ── overnight ≥70 alert fan-out (fire / re-trigger / opt-out) ───────────────
-async def test_overnight_alert_fanout_fires_retriggers_and_opts_out(monkeypatch):
+async def test_overnight_alert_action_covers_the_lifecycle(monkeypatch):
+    """One current alert per user+name: acked same-verdict never re-pops (the
+    'alerts reappear after I acknowledge them' bug), an unacked alert is overwritten
+    in place, a new verdict after an ack inserts (beeps)."""
     from app import simmer_watcher as sw
-    final = {"call": "sell_bear_call", "confidence": 88}
-    analyses = [{"symbol": "MU", "dir": "down", "gap": -0.05,
-                 "llm": {"call": "sell_bear_call", "why_moved": "CXMT DRAM competition",
-                         "provider": "openai", "model": "gpt-6-luna",
-                         "tokens": {"in": 30000}, "queries": ["mu stock"]},
-                 "combiner": {"final": final, "decided_at": "2026-10-13T10:00:00-04:00"}}]
-    open_alert: dict = {}            # the user's last open overnight alert for MU
-    settings_mode = {"v": "on"}      # on → no row (default ON) | off → opted out | error → None
+    sw._overnight_flip_seen.clear(); sw._overnight_alert_count.clear()
+    cfg = {"min_conf": 70, "rise": 5, "flip_confirm_sec": 0, "cap": 3}
+    state = {"rows": []}
+
+    async def _sm(table, select="*", filters=None, **kw):
+        return state["rows"]
+    monkeypatch.setattr(sw.supabase_admin, "select_many", _sm)
+
+    async def act(call, conf):
+        return await sw._overnight_alert_action("u1", "MU", conf, call, "2026-10-13", cfg)
+
+    assert await act("sell_bear_call", 80) == ("insert", None)         # none today → insert
+    # open (unacked) alert, same call, conviction rose → overwrite in place
+    state["rows"] = [{"id": "a1", "score": 80, "structure": "sell_bear_call", "acknowledged": False}]
+    assert await act("sell_bear_call", 90) == ("update", "a1")
+    assert await act("sell_bear_call", 82) == (None, None)             # no real rise → nothing
+    # ACKNOWLEDGED + same verdict → must NOT re-pop (the reported bug)
+    state["rows"] = [{"id": "a1", "score": 90, "structure": "sell_bear_call", "acknowledged": True}]
+    assert await act("sell_bear_call", 99) == (None, None)
+    # verdict CHANGES after the ack → a brand-new alert (beeps)
+    assert await act("sell_bull_put", 88) == ("insert", None)
+    # verdict change over an UNACKED alert → overwrite the existing row (one per name)
+    state["rows"] = [{"id": "a2", "score": 88, "structure": "sell_bear_call", "acknowledged": False}]
+    assert await act("sell_bull_put", 88) == ("update", "a2")
+
+
+async def test_overnight_alert_action_flip_must_hold(monkeypatch):
+    """A verdict flip acts only once it has HELD flip_confirm_sec — a flicker is ignored."""
+    from app import simmer_watcher as sw
+    sw._overnight_flip_seen.clear()
+    cfg = {"min_conf": 70, "rise": 5, "flip_confirm_sec": 540, "cap": 3}
+    state = {"rows": [{"id": "a1", "score": 80, "structure": "sell_bear_call", "acknowledged": False}]}
+
+    async def _sm(table, select="*", filters=None, **kw):
+        return state["rows"]
+    monkeypatch.setattr(sw.supabase_admin, "select_many", _sm)
+
+    k = ("2026-10-13", "u1", "MU")
+    # the flip just appeared → not held long enough → nothing
+    assert await sw._overnight_alert_action("u1", "MU", 85, "sell_bull_put", "2026-10-13", cfg) == (None, None)
+    # pretend it has now held past the window → acts (overwrite the unacked row)
+    call, first = sw._overnight_flip_seen[k]
+    sw._overnight_flip_seen[k] = (call, first - 600)
+    assert await sw._overnight_alert_action("u1", "MU", 85, "sell_bull_put", "2026-10-13", cfg) == ("update", "a1")
+
+
+async def test_overnight_alert_action_fails_closed_on_read_error(monkeypatch):
+    """A Supabase hiccup reading alerts (None) must touch nothing — never re-fire."""
+    from app import simmer_watcher as sw
+    sw._overnight_flip_seen.clear()
+    cfg = {"min_conf": 70, "rise": 5, "flip_confirm_sec": 0, "cap": 3}
+
+    async def _none(*a, **k):
+        return None
+    monkeypatch.setattr(sw.supabase_admin, "select_many", _none)
+    assert await sw._overnight_alert_action("u1", "MU", 80, "sell_bear_call", "2026-10-13", cfg) == (None, None)
+
+
+def _alert_cfg(**over):
+    base = {"min_conf": 70, "rise": 5, "flip_confirm_sec": 0, "cap": 3}
+    base.update(over)
+    return base
+
+
+async def test_overnight_alert_fanout_inserts_opts_out_and_fires_reconciled(monkeypatch):
+    """End to end: fires one NEW alert on the reconciled call (payload summary-only),
+    respects per-user opt-out, and fails closed on a settings read error."""
+    from app import simmer_watcher as sw
+    sw._overnight_flip_seen.clear(); sw._overnight_alert_count.clear()
+    monkeypatch.setattr(sw.simmer_config, "overnight_alert", lambda: _alert_cfg())
     inserted = []
+    settings_mode = {"v": "on"}
 
     async def _list_an(session):
-        return analyses
+        return [{"symbol": "MU", "dir": "down", "gap": -0.05,
+                 "llm": {"call": "sell_bear_call", "why_moved": "CXMT", "provider": "openai",
+                         "model": "gpt-6-luna", "tokens": {"in": 30000}, "queries": ["mu"]},
+                 "combiner": {"final": {"call": "sell_bear_call", "confidence": 88}}}]
+
+    async def _list_ov(session):
+        return [{"symbol": "MU", "expiration": "2026-10-16", "dir": "down", "gap": -0.05,
+                 "crowd": "sector_wide",
+                 "verdict": {"call": "sell_bear_call", "confidence": 88, "premium_trend": "building",
+                             "underlying_trend": "holding", "mean_ratio": 1.1}}]
 
     async def _sm(table, select="*", filters=None, **kw):
         if table == "simmer_watchlist":
             return [{"user_id": "u1"}]
         if table == "simmer_settings":
-            m = settings_mode["v"]
-            if m == "error":
-                return None                       # read ERROR (distinct from "no row")
-            if m == "off":
+            if settings_mode["v"] == "off":
                 return [{"user_id": "u1", "notify_overnight": False}]
-            return []                             # no row → default ON
+            if settings_mode["v"] == "error":
+                return None
+            return []
         if table == "simmer_alerts":
-            return [open_alert] if open_alert else []
+            return []                        # no alert today → insert
         return []
 
     async def _ins(table, row):
-        inserted.append(row)
-        open_alert.clear(); open_alert.update(score=row["score"], structure=row["structure"])
-        return True
-    async def _list_ov(session):
-        return [{"symbol": "MU", "expiration": "2026-10-16"}]
+        inserted.append(row); return True
     monkeypatch.setattr(sw.supabase_admin, "list_simmer_overnight_analysis", _list_an)
     monkeypatch.setattr(sw.supabase_admin, "list_simmer_overnight", _list_ov)
     monkeypatch.setattr(sw.supabase_admin, "select_many", _sm)
     monkeypatch.setattr(sw.supabase_admin, "insert_row", _ins)
 
-    assert await sw.overnight_alert_fanout("2026-10-13") == 1      # first fire (88)
-    # expiration is NOT NULL in simmer_alerts — pin it to the overnight play's own
-    # expiry (from the import row), never None.
-    assert inserted[0]["expiration"] == "2026-10-16"
-    # payload is SUMMARY only — no provider/model/tokens/queries leak into the row
-    pay = inserted[0]["payload"]
-    assert pay["why_moved"] == "CXMT DRAM competition" and pay["call"] == "sell_bear_call"
-    assert "provider" not in pay and "model" not in pay and "tokens" not in pay and "queries" not in pay
-    assert pay["combiner"]["decided_at"] == "2026-10-13T10:00:00-04:00"
-    assert await sw.overnight_alert_fanout("2026-10-13") == 0      # same play/conf → no repeat
-    final["confidence"] = 95
-    assert await sw.overnight_alert_fanout("2026-10-13") == 1      # conviction rose → re-fire
-    final["call"] = "sell_bull_put"; final["confidence"] = 72
-    assert await sw.overnight_alert_fanout("2026-10-13") == 1      # play flipped → re-fire
-    final["call"] = "wait"; final["confidence"] = 99
-    assert await sw.overnight_alert_fanout("2026-10-13") == 0      # wait never alerts
-    final["call"] = "sell_bear_call"; final["confidence"] = 60
-    open_alert.clear()
-    assert await sw.overnight_alert_fanout("2026-10-13") == 0      # below 70 → no alert
-    final["confidence"] = 99; settings_mode["v"] = "off"
-    assert await sw.overnight_alert_fanout("2026-10-13") == 0      # user opted out
-
-    # a settings READ ERROR must FAIL CLOSED (skip the fan-out, no alert) — not be
-    # mistaken for "no row → default ON".
-    settings_mode["v"] = "error"; open_alert.clear()
+    assert await sw.overnight_alert_fanout("2026-10-13") == 1
+    row = inserted[0]
+    assert row["structure"] == "sell_bear_call" and row["score"] == 88
+    assert row["expiration"] == "2026-10-16"
+    pay = row["payload"]
+    assert pay["why_moved"] == "CXMT" and pay["call"] == "sell_bear_call"
+    assert "provider" not in pay and "tokens" not in pay and "queries" not in pay
+    # opted out → no fire
+    settings_mode["v"] = "off"; sw._overnight_flip_seen.clear()
     assert await sw.overnight_alert_fanout("2026-10-13") == 0
+    # settings read error → fail closed
+    settings_mode["v"] = "error"
+    assert await sw.overnight_alert_fanout("2026-10-13") == 0
+
+
+async def test_overnight_alert_fanout_fires_on_reconciled_call_not_stale_combiner(monkeypatch):
+    """The alert matches the card. combiner.final sell_bear_call(80) whose tape has
+    reversed intraday reconciles to sell_bull_put — the alert fires that, never the
+    stale frozen call."""
+    from app import simmer_watcher as sw
+    sw._overnight_flip_seen.clear(); sw._overnight_alert_count.clear()
+    monkeypatch.setattr(sw.simmer_config, "overnight_alert", lambda: _alert_cfg())
+    inserted = []
+
+    async def _list_an(session):
+        return [{"symbol": "MU", "dir": "down", "gap": -0.05,
+                 "llm": {"call": "sell_bear_call", "why_moved": "x"},
+                 "combiner": {"final": {"call": "sell_bear_call", "confidence": 80}}}]
+
+    async def _list_ov(session):
+        return [{"symbol": "MU", "expiration": "2026-10-16", "dir": "down", "gap": -0.05,
+                 "crowd": "sector_wide",
+                 "verdict": {"call": "sell_bull_put", "premium_trend": "fading",
+                             "underlying_trend": "retracing", "confidence": 76, "mean_ratio": 0.82}}]
+
+    async def _sm(table, select="*", filters=None, **kw):
+        if table == "simmer_watchlist":
+            return [{"user_id": "u1"}]
+        if table == "simmer_settings":
+            return []
+        if table == "simmer_alerts":
+            return []
+        return []
+
+    async def _ins(table, row):
+        inserted.append(row); return True
+    monkeypatch.setattr(sw.supabase_admin, "list_simmer_overnight_analysis", _list_an)
+    monkeypatch.setattr(sw.supabase_admin, "list_simmer_overnight", _list_ov)
+    monkeypatch.setattr(sw.supabase_admin, "select_many", _sm)
+    monkeypatch.setattr(sw.supabase_admin, "insert_row", _ins)
+
+    assert await sw.overnight_alert_fanout("2026-10-13") == 1
+    assert inserted[0]["structure"] == "sell_bull_put"       # reconciled call, not bear_call
+    assert inserted[0]["payload"]["source"] == "premium_override"
 
 
 # ── /simmer/overnight route ─────────────────────────────────────────────────
@@ -509,7 +607,8 @@ def test_overnight_route_active(monkeypatch):
         return {"symbol": sym, "expiration": "2026-11-13", "dir": "down", "gap": -0.06,
                 "crowd": "sector_wide", "thesis": "guidance cut", "side": "put",
                 "strikes": [98.0], "baseline": {"98.0": 1.0}, "latest": {"98.0": 1.05},
-                "verdict": {"call": "sell_bear_call", "confidence": 70},
+                "verdict": {"call": "sell_bear_call", "confidence": 70,
+                            "premium_trend": "building", "underlying_trend": "extending"},
                 "updated_at": "2026-10-12T14:00:00Z"}
     monkeypatch.setattr(sroute.supabase_admin, "get_simmer_overnight_by_symbol", _row)
 
@@ -525,12 +624,17 @@ def test_overnight_route_active(monkeypatch):
     r = client.get("/simmer/overnight/NVDA")
     assert r.status_code == 200
     data = r.json()["data"]
+    # ONE reconciled verdict (premium + catalyst + intraday folded in sequence)
     assert data["active"] is True and data["verdict"]["call"] == "sell_bear_call"
     assert data["thesis"] == "guidance cut"
-    # catalyst read surfaced for the UI (both calls + sustain/why)
+    # the sequential steps that produced the single call
+    steps = data["verdict"]["steps"]
+    kinds = [s["step"] for s in steps]
+    assert kinds == ["setup", "premium", "catalyst", "intraday"]
+    # catalyst is REASONING only now — no competing call, no toggle
     cat = data["catalyst"]
     assert cat["sustain"] == "extend" and cat["why_moved"] == "CXMT DRAM competition fears"
-    assert cat["llm_only_call"] == "sell_bear_call" and cat["combiner_call"] == "wait"
+    assert "llm_only_call" not in cat and "combiner_call" not in cat
     assert cat["deserved"] == "overreaction" and cat["sentiment"] == "doubt"
 
 

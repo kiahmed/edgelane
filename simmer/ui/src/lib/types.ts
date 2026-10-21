@@ -302,14 +302,21 @@ export interface OutcomesSummary {
 }
 
 /** The "Overnight" card tab (docs/simmer.md → "Overnight movers"). `active`
- *  false = the tab stays dark (no overnight analysis for this name). */
+ *  false = the tab stays dark (no overnight analysis for this name).
+ *
+ *  ONE reconciled verdict: the backend folds the premium/price read, the catalyst
+ *  read, and the intraday drift override into a single `call` plus the ordered
+ *  `steps` that produced it — never two competing opinions. */
+export interface OvernightStep {
+	step: 'setup' | 'premium' | 'catalyst' | 'intraday';
+	label: string;
+	detail: string;
+}
 export interface OvernightVerdict {
 	call: 'sell_bear_call' | 'sell_bull_put' | 'wait' | 'skip';
-	premium_trend: 'building' | 'holding' | 'fading' | null;
-	underlying_trend: 'extending' | 'holding' | 'retracing' | null;
 	confidence: number;
-	reasons: string[];
-	mean_ratio?: number | null;
+	steps: OvernightStep[];
+	source?: string;
 }
 export interface OvernightData {
 	active: boolean;
@@ -327,6 +334,8 @@ export interface OvernightData {
 	catalyst?: OvernightCatalyst | null;
 }
 
+/** Catalyst REASONING surfaced under the one verdict (why it moved / sustain /
+ *  realized outcome) — detail, not its own call. */
 export interface OvernightCatalyst {
 	why_moved?: string | null;
 	one_liner?: string | null;
@@ -334,10 +343,6 @@ export interface OvernightCatalyst {
 	deserved?: 'deserved' | 'overreaction' | 'unclear' | null;
 	sentiment?: 'embrace' | 'doubt' | 'mixed' | null;
 	sustain?: 'fade' | 'hold_to_midday' | 'hold_to_close' | 'extend' | null;
-	confidence?: number | null;
 	provider?: string | null;
-	llm_only_call?: string | null;
-	combiner_call?: string | null;
-	combiner_decided_at?: string | null;
 	outcome?: 'extended' | 'held' | 'faded' | null;
 }

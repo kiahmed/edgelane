@@ -233,6 +233,19 @@ OVERNIGHT_DRIFT: dict[str, Any] = {
     "skew_flip":         0.10,   # opposite side building ≥10% more than the toward side (skew_shift)
 }
 
+# ── Overnight ≥min in-app alert (DB-held, no restart) ───────────────────────
+# The in-app alert on an overnight play. ONE row per user per symbol per session,
+# kept current: a flip must HOLD before it re-alerts (so an oscillating name can't
+# beep every tick), an acknowledged alert never re-pops unless the verdict changes,
+# and an unacknowledged alert is overwritten in place. Thresholds here so "how long
+# to watch a direction change" is tunable from the DB.
+OVERNIGHT_ALERT: dict[str, Any] = {
+    "min_conf":         70,     # fire when the reconciled confidence reaches this
+    "rise":             5,      # refresh an open alert only when conviction rises ≥ this
+    "flip_confirm_sec": 540,    # a flipped call must hold this long (≈9 min) before re-alerting
+    "cap":              3,      # max NEW alerts per user per symbol per session
+}
+
 # ── Regular sweep master switch (engine-level, all users) ───────────────────
 # DB-held in the `sweep` section of simmer_engine_settings (no restart). False =
 # PAUSE the regular readiness sweep for everyone; overnight/RQ-intersected
@@ -484,7 +497,8 @@ _SECTION_DEFAULTS: dict[str, dict] = {
     "vol": VOL, "dte_tiers": DTE_TIERS, "catalyst": CATALYST, "intraday": INTRADAY,
     "cadence": CADENCE, "ttl": TTL, "velocity": VELOCITY, "news": NEWS,
     "sentiment": SENTIMENT, "squeeze": SQUEEZE, "regime": REGIME,
-    "overnight_llm": OVERNIGHT_LLM, "overnight_drift": OVERNIGHT_DRIFT, "sweep": SWEEP,
+    "overnight_llm": OVERNIGHT_LLM, "overnight_drift": OVERNIGHT_DRIFT,
+    "overnight_alert": OVERNIGHT_ALERT, "sweep": SWEEP,
 }
 
 
@@ -641,6 +655,13 @@ def overnight_drift() -> dict[str, Any]:
     in the `overnight_drift` section of simmer_engine_settings; see OVERNIGHT_DRIFT
     for the shape. Thresholds are meant to be calibrated from realized outcomes."""
     return _section("overnight_drift", OVERNIGHT_DRIFT)
+
+
+def overnight_alert() -> dict[str, Any]:
+    """Overnight in-app alert thresholds (min_conf / rise / flip_confirm_sec / cap).
+    Overridable in the `overnight_alert` section of simmer_engine_settings; see
+    OVERNIGHT_ALERT for the shape."""
+    return _section("overnight_alert", OVERNIGHT_ALERT)
 
 
 def sweep_enabled() -> bool:

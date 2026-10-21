@@ -201,6 +201,37 @@ each step while the frozen `final` never moves).
 
 ---
 
+## 5b. One verdict everywhere (card + alert)
+
+The Overnight card shows a SINGLE reconciled call — `simmer_overnight_combiner.reconcile()`
+folds the premium/price read, the catalyst read, and the intraday drift override into
+one `call` + the ordered `steps` that produced it (setup → premium → catalyst →
+intraday; the intraday override is the final call). No second verdict, no llm_only↔
+combiner toggle (they resolved to the same call). The internal bake-off candidates stay
+in `simmer_overnight_analysis` for grading — not user-facing.
+
+The **≥min in-app alert** (`overnight_alert_fanout`) fires on that SAME reconciled call,
+not the frozen `combiner.final`. It keeps **one current alert row per user per symbol per
+session**, kept up to date (`_overnight_alert_action` decides insert / update-in-place /
+nothing):
+
+- **Acknowledged + same verdict → never re-pops.** (Fixes "I ack all my alerts and they
+  come back minutes later" — the fan-out used to read only `acknowledged=false`, so once
+  you cleared them the query was empty and it re-inserted.)
+- **Unacknowledged + new verdict, or a meaningful conviction rise → overwrites the open
+  row in place** (same id; the card shows the current call, no duplicate rows).
+- **New verdict after you acknowledged the old one → a fresh alert** (new id → it beeps).
+- A **flip must HOLD `flip_confirm_sec` (default 540s ≈ 9 min)** before it re-alerts, so a
+  name oscillating around the flip/skew thresholds can't beep every tick. NEW alerts are
+  capped at `cap` (3) per user per symbol per session.
+- The read **fails closed**: a `None`/error tick touches nothing; `[]` (scoped to today)
+  = no alert yet = insert.
+
+All four knobs live in the DB `overnight_alert` section (`min_conf`, `rise`,
+`flip_confirm_sec`, `cap`) — so "how long to watch a direction change" is tunable without
+a redeploy. Guards (`flip_seen` timestamps, per-session NEW-alert count) are in memory and
+reset on restart (acceptable). Per-user opt-out (`notify_overnight`) unchanged.
+
 ## 6. Phase B — premium-triggered LLM recall (PLANNED)
 
 A second, targeted catalyst call — **only when the premiums say the story changed**, so
