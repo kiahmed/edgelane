@@ -123,6 +123,14 @@ async def _overnight_block(sym: str) -> dict:
     an = await supabase_admin.get_simmer_overnight_analysis(sym, session)
     llm = (an or {}).get("llm") or {}
     comb = (an or {}).get("combiner") or {}
+    # Phase B: if the LLM was re-called on an intraday reversal, its updated read
+    # supersedes the stale 09:25 one for the catalyst REASONING (premium stays master).
+    recall = (an or {}).get("llm_recall") or {}
+    if recall.get("call"):
+        llm = {**llm, "why_moved": recall.get("why_moved") or llm.get("why_moved"),
+               "one_liner": recall.get("one_liner") or llm.get("one_liner"),
+               "deserved": recall.get("deserved"), "web_social_sentiment": recall.get("sentiment"),
+               "sustain": recall.get("sustain") or llm.get("sustain")}
 
     # ONE user-facing verdict. The premium/price read, the catalyst read, and the
     # intraday drift override are folded IN SEQUENCE into a single call + ordered
@@ -160,6 +168,8 @@ async def _overnight_block(sym: str) -> dict:
             "sustain": llm.get("sustain"),
             "provider": llm.get("provider"),
             "outcome": an.get("outcome"),
+            # True when the read was refreshed by a Phase B reversal recall.
+            "recalled": bool(recall.get("call")),
         }
     return out
 
@@ -314,6 +324,13 @@ async def simmer_snap(symbol: str):
 
 
 # ── Config / status ─────────────────────────────────────────────────────────
+@router.get("/simmer/version")
+async def simmer_version_endpoint():
+    """The app version for the UI footer. Public (no auth) so the footer shows it on
+    every page; DB-held single source of truth (front + back read the same value)."""
+    return {"version": simmer_config.app_version()}
+
+
 @router.get("/simmer/config", dependencies=_GATE)
 async def simmer_config_endpoint():
     """Public knob defaults + engine version (nothing here is a secret)."""

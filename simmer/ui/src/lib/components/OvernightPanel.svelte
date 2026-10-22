@@ -72,10 +72,11 @@
 		</ol>
 	{/if}
 
-	<!-- Catalyst's realized outcome (today), if graded -->
-	{#if cat?.outcome}
+	<!-- Catalyst's realized outcome (today) + reversal-recall flag -->
+	{#if cat?.outcome || cat?.recalled}
 		<div class="chips">
-			<span class="chip chip--outcome">today: {OUTCOME_LABEL[cat.outcome] ?? cat.outcome}</span>
+			{#if cat?.recalled}<span class="chip chip--recall" title="the read was re-checked after an intraday reversal">↻ re-checked</span>{/if}
+			{#if cat?.outcome}<span class="chip chip--outcome">today: {OUTCOME_LABEL[cat.outcome] ?? cat.outcome}</span>{/if}
 		</div>
 	{/if}
 
@@ -213,6 +214,10 @@
 	.chip--outcome {
 		background: rgba(16, 185, 129, 0.15);
 		color: #a7f3d0;
+	}
+	.chip--recall {
+		background: rgba(129, 140, 248, 0.18);
+		color: #c7d2fe;
 	}
 	.drill {
 		margin-top: 0.6rem;

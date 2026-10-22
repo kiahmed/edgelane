@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 from . import simmer_config, simmer_premium_tracker as pt, supabase_admin
 from .config import get_settings
-from .simmer_overnight_combiner import combine, reactive_call
+from .simmer_overnight_combiner import combine, reactive_call, reconcile
 
 log = logging.getLogger("edgelane.simmer.overnight.catalyst")
 _ET = ZoneInfo("America/New_York")
@@ -88,6 +88,121 @@ def _combiner_block(premium: dict, llm: dict, mode: str) -> dict:
     return {"mode": mode, "final": final, **options}
 
 
+_RECALL_SIDES = ("sell_bear_call", "sell_bull_put")
+
+
+def _recall_target(analysis: dict, reconciled: dict) -> Optional[str]:
+    """Phase B trigger (pure). Return the call to RE-VALIDATE with a fresh LLM read,
+    or None. A recall is worth a paid call only when the intraday tape has MATERIALLY
+    reversed against the 09:25 catalyst read — i.e. premium drove the reconciled call
+    to the OPPOSITE committed side (`premium_override`) of what the LLM originally said.
+    De-duped: never recall twice for the same reversed call (an `llm_recall.for_call`
+    marker), so an override that persists doesn't re-spend."""
+    r_call, r_src = reconciled.get("call"), reconciled.get("source")
+    if r_src != "premium_override" or r_call not in _RECALL_SIDES:
+        return None
+    orig = (analysis.get("llm") or {}).get("call")
+    if r_call == orig:                      # the tape agrees with the 09:25 read — nothing to re-check
+        return None
+    if (analysis.get("llm_recall") or {}).get("for_call") == r_call:
+        return None                          # already re-validated this reversal
+    return r_call
+
+
+def _recall_ctx(analysis: dict, premium: dict, target: str, session: str):
+    """A recall-flavoured grounded-read context: tell the LLM the tape has REVERSED
+    against its 09:25 read and ask it to re-examine (debunk / overreaction / real
+    reversal). No math handed over — just the premium-engine's own words."""
+    from .simmer_llm import CatalystCtx
+    orig = (analysis.get("llm") or {}).get("call") or "wait"
+    gap = float(premium.get("gap") or analysis.get("gap") or 0.0)
+    pt, ut = premium.get("premium_trend"), premium.get("underlying_trend")
+    retr = premium.get("gap_retraced")
+    line = (f"INTRADAY REVERSAL since the open: the 09:25 read was '{orig}' after a "
+            f"{'down' if gap < 0 else 'up'} gap of {abs(gap) * 100:.1f}%. The premium-only "
+            f"engine now reads '{premium.get('call') or 'wait'}' (premiums {pt or 'n/a'}, "
+            f"underlying {ut or 'n/a'}" + (f", {retr:.0%} of the gap retraced" if retr is not None else "")
+            + f"). Re-examine: is the original move being DEBUNKED / was it an overreaction, "
+            f"or is this a genuine reversal? Give the side that makes sense NOW (the tape "
+            f"currently points to '{target}').")
+    return CatalystCtx(symbol=analysis["symbol"], gap=gap,
+                       dir=str(analysis.get("dir") or ("down" if gap < 0 else "up")),
+                       crowd=analysis.get("crowd"), day_label=_day_label(session),
+                       premium_trend_line=line)
+
+
+# Cost guard: a recall whose grounded read keeps FAILING persists nothing (no call →
+# dedup never sets), so without this it would re-call every loop tick while the reversal
+# holds. Count attempts per (session, symbol, target) in memory and stop after a few —
+# mirrors the catalyst retry cap. Resets on restart (rare inside a session).
+_MAX_RECALL_ATTEMPTS = 3
+_recall_attempts: dict[tuple[str, str, str], int] = {}
+
+
+async def run_recall(session: str) -> dict:
+    """Phase B: when the intraday tape has REVERSED against the 09:25 read, re-call the
+    LLM ONCE (per distinct reversal, capped) to re-read the 'why' against the new tape.
+    Premium stays master — this only annotates the catalyst reasoning; it never changes
+    the reconciled call. Gated by overnight_llm.recall_enabled (default OFF). Best-effort."""
+    try:
+        await simmer_config.refresh_setup()
+    except Exception:                          # noqa: BLE001
+        pass
+    ovn = simmer_config.overnight_llm()
+    if not ovn.get("recall_enabled"):
+        return {"enabled": False}
+    analyses = await supabase_admin.list_simmer_overnight_analysis(session) or []
+    if not analyses:
+        return {"enabled": True, "recalled": 0}
+    ov_rows = await supabase_admin.list_simmer_overnight(session) or []
+    prem_by = {}
+    for r in ov_rows:
+        v = dict(r.get("verdict") or {})
+        v.update(dir=r.get("dir"), gap=float(r.get("gap") or 0.0), crowd=r.get("crowd"))
+        prem_by[str(r.get("symbol") or "").upper()] = v
+    drift_cfg = simmer_config.overnight_drift()
+    s = get_settings()
+    cap = int(ovn.get("recall_cap", 2))
+    recalled = 0
+    for a in analyses:
+        sym = str(a.get("symbol") or "").upper()
+        reconciled = reconcile(prem_by.get(sym) or {}, a.get("llm") or {},
+                               a.get("combiner") or {}, drift_cfg=drift_cfg)
+        target = _recall_target(a, reconciled)
+        if not target:
+            continue
+        prior = a.get("llm_recall") or {}
+        if int(prior.get("count", 0)) >= cap:
+            continue
+        akey = (str(session)[:10], sym, target)
+        if _recall_attempts.get(akey, 0) >= _MAX_RECALL_ATTEMPTS:
+            continue                           # cost guard: stop retrying a broken recall
+        ctx = _recall_ctx({**a, "symbol": sym}, prem_by.get(sym) or {}, target, session)
+        try:
+            live = await _run_provider(
+                _make_llm(ovn.get("provider", "openai"), ovn.get("model", ""), s, ovn), ctx)
+        except Exception:                      # noqa: BLE001 — best-effort per name
+            log.exception("[recall] failed for %s", sym)
+            live = {}
+        if not live.get("call"):
+            _recall_attempts[akey] = _recall_attempts.get(akey, 0) + 1   # count the failed try
+            continue
+        _recall_attempts.pop(akey, None)       # success → clear the failure count
+        await supabase_admin.upsert_simmer_overnight_analysis({
+            "symbol": sym, "session_date": str(session)[:10],
+            "llm_recall": {
+                "for_call": target, "call": live.get("call"), "sustain": live.get("sustain"),
+                "deserved": live.get("deserved"), "sentiment": live.get("web_social_sentiment"),
+                "why_moved": live.get("why_moved"), "one_liner": live.get("one_liner"),
+                "confidence": live.get("confidence"), "provider": live.get("provider"),
+                "at": datetime.now(_ET).isoformat(), "count": int(prior.get("count", 0)) + 1,
+            }})
+        recalled += 1
+    if recalled:
+        log.info("[recall] re-validated %d reversal(s)", recalled)
+    return {"enabled": True, "recalled": recalled}
+
+
 async def analyze_one(mv: dict, premium: dict, session: str, s, ovn: dict) -> Optional[dict]:
     """Run live + shadow providers + combiner for one mover. Returns the row to
     persist (llm / llm_shadow / premium / combiner), or None if the live read
@@ -108,6 +223,11 @@ async def analyze_one(mv: dict, premium: dict, session: str, s, ovn: dict) -> Op
     if not live.get("call") and not shadow.get("call"):
         log.info("[catalyst] no usable LLM read for %s", mv["symbol"])
         return None
+    # Stamp WHEN the read was made. On a normal day this is ~09:25; on a LATE START
+    # (backend up mid-session) it's late, and the close grader uses it to mark the
+    # llm_only/combiner calls non-predictive (no pre-open lookahead in the bake-off).
+    if live.get("call"):
+        live["at"] = datetime.now(_ET).isoformat()
     combiner = _combiner_block(premium, live, ovn.get("decision_mode", "llm_only"))
     return {"symbol": mv["symbol"], "session_date": str(session)[:10],
             "dir": ctx.dir, "gap": ctx.gap, "crowd": mv.get("crowd"),
@@ -180,7 +300,12 @@ async def run_catalyst(session: str) -> dict:
              "(provider=%s mode=%s shadow=%s)",
              done, skipped, gave_up, len(rows), ovn.get("provider"), ovn.get("decision_mode"),
              ovn.get("shadow_provider"))
-    return {"enabled": True, "names": len(rows), "analyzed": done, "skipped": skipped, "gave_up": gave_up}
+    # `complete` → nothing left to try: every name is either analyzed (skipped) or has
+    # hit the attempt cap. The loop uses this to stop calling run_catalyst for the day
+    # (no fixed 10:30 window), so a late start still finishes and a normal day winds down.
+    complete = bool(rows) and (skipped + gave_up) >= len(rows)
+    return {"enabled": True, "names": len(rows), "analyzed": done, "skipped": skipped,
+            "gave_up": gave_up, "complete": complete}
 
 
 _REACTIVE_HISTORY_CAP = 12       # append-on-change only → a handful of entries/day
@@ -291,6 +416,26 @@ async def refresh_combiner(session: str, *, lock: bool = False, reactive_lock: b
     return updated
 
 
+# An LLM read after this ET wall-clock time is a LATE-START read (backend came up
+# mid-session), not a genuine pre/at-open prediction — graded but flagged
+# non-predictive so it doesn't flatter the forward-test bake-off with lookahead.
+_PREDICTIVE_CUTOFF = (9, 45)
+
+
+def _read_predictive(at_iso: Optional[str]) -> bool:
+    """True if the catalyst read was made early enough (≤ ~09:45 ET) to count as a
+    pre/at-open prediction. No timestamp (older rows) → assume predictive."""
+    if not at_iso:
+        return True
+    try:
+        t = datetime.fromisoformat(str(at_iso))
+    except (TypeError, ValueError):
+        return True
+    if t.tzinfo is not None:
+        t = t.astimezone(_ET)
+    return (t.hour, t.minute) <= _PREDICTIVE_CUTOFF
+
+
 # ── Readings + realized outcome (the forward test's scoring half) ────────────
 def _outcome(gap: float, spot_premarket: float | None, spot_close: float | None) -> Optional[str]:
     """Map the realized intraday path to extended | held | faded, reusing the
@@ -361,6 +506,11 @@ async def capture_reading(provider, label: str, session: str) -> int:
             llm_only_call = (comb.get("llm_only") or {}).get("call")
             blended_call = (comb.get("combiner_blended") or {}).get("call")
             final_call = (comb.get("final") or {}).get("call")
+            # llm_only / combiner_blended claim to be PRE-OPEN (09:25 / 10:00) calls. If
+            # the LLM actually read late (a late start), grading them from the premarket
+            # spot is lookahead → mark them non-predictive (grade = None) so the bake-off
+            # ignores them. The reactive candidate is already graded from its own spot.
+            predictive = _read_predictive((existing.get("llm") or {}).get("at"))
             # Phase A reactive candidate — the call FROZEN at the noon checkpoint,
             # graded from the spot AT THAT FREEZE (not 09:25), so it's credited only
             # for the move AFTER it was made, lookahead-free.
@@ -376,9 +526,11 @@ async def capture_reading(provider, label: str, session: str) -> int:
                 "spot": spot_f,
                 "intraday_pct": round((spot_f - pm) / pm * 100, 2) if (spot_f and pm) else None,
                 "llm_only_call": llm_only_call,
-                "llm_only_right": _direction_right(llm_only_call, gap, pm, spot_f),
+                "llm_only_right": _direction_right(llm_only_call, gap, pm, spot_f) if predictive else None,
                 "combiner_blended_call": blended_call,
-                "combiner_blended_right": _direction_right(blended_call, gap, pm, spot_f),
+                "combiner_blended_right": (_direction_right(blended_call, gap, pm, spot_f)
+                                           if predictive else None),
+                "late_llm": not predictive,    # read made mid-session → the two above are non-predictive
                 # scored (noon-frozen) reactive call — the one the bake-off compares,
                 # graded from its freeze spot (spot_at) to the close.
                 "premium_reactive_call": reactive_c,

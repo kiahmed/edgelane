@@ -400,3 +400,174 @@ async def test_reactive_graded_from_freeze_spot_not_premarket(wired, monkeypatch
     # a 09:25-based grade would have (wrongly) called it right:
     from app.simmer_overnight_catalyst import _direction_right
     assert _direction_right("sell_bull_put", -0.05, 100.0, 103.0) is True
+
+
+# ── Phase B: _recall_target (premium-triggered LLM recall) ──────────────────────
+def test_recall_target_only_on_reversal_against_the_09_25_read():
+    from app.simmer_overnight_catalyst import _recall_target
+    a = {"llm": {"call": "sell_bear_call"}}
+    # tape overrode to the OPPOSITE side → re-validate that reversal
+    assert _recall_target(a, {"call": "sell_bull_put", "source": "premium_override"}) == "sell_bull_put"
+    # override but SAME side as the 09:25 read → nothing to re-check
+    assert _recall_target(a, {"call": "sell_bear_call", "source": "premium_override"}) is None
+    # not an override (holding / standing down) → no recall
+    assert _recall_target(a, {"call": "sell_bull_put", "source": "frozen_hold"}) is None
+    assert _recall_target(a, {"call": "wait", "source": "premium_drift_standdown"}) is None
+    # already recalled for this reversed call → don't re-spend
+    a2 = {"llm": {"call": "sell_bear_call"}, "llm_recall": {"for_call": "sell_bull_put"}}
+    assert _recall_target(a2, {"call": "sell_bull_put", "source": "premium_override"}) is None
+    # a DIFFERENT reversed call than last time → recall again
+    assert _recall_target({"llm": {"call": "sell_bull_put"}, "llm_recall": {"for_call": "wait"}},
+                          {"call": "sell_bear_call", "source": "premium_override"}) == "sell_bear_call"
+
+
+async def test_run_recall_revalidates_a_reversal_then_dedupes(monkeypatch):
+    """Phase B: an intraday reversal against the 09:25 read triggers ONE grounded
+    recall that annotates the catalyst reasoning; a second pass for the same reversal
+    does not re-spend."""
+    _ovn(monkeypatch, recall_enabled=True)
+    saved: dict = {}
+
+    async def _list_an(session):
+        row = {"symbol": "MU", "session_date": "2026-10-12", "dir": "down", "gap": -0.05,
+               "llm": {"call": "sell_bear_call", "why_moved": "DRAM glut"},
+               "combiner": {"final": {"call": "sell_bear_call", "confidence": 80},
+                            "decided_at": "2026-10-12T10:00:00-04:00"}}
+        if "MU" in saved and saved["MU"].get("llm_recall"):
+            row["llm_recall"] = saved["MU"]["llm_recall"]       # carry the prior recall
+        return [row]
+
+    async def _list_ov(session):
+        return [{"symbol": "MU", "expiration": "2026-11-13", "dir": "down", "gap": -0.05,
+                 "crowd": "sector_wide",
+                 "verdict": {"call": "sell_bull_put", "premium_trend": "fading",
+                             "underlying_trend": "retracing", "confidence": 72, "mean_ratio": 0.84}}]
+
+    async def _upsert(row):
+        saved.setdefault(row["symbol"], {}).update(row); return True
+
+    async def _refresh():
+        return True
+    monkeypatch.setattr(cat.simmer_config, "refresh_setup", _refresh)
+    monkeypatch.setattr(cat.supabase_admin, "list_simmer_overnight_analysis", _list_an)
+    monkeypatch.setattr(cat.supabase_admin, "list_simmer_overnight", _list_ov)
+    monkeypatch.setattr(cat.supabase_admin, "upsert_simmer_overnight_analysis", _upsert)
+    monkeypatch.setattr(cat, "get_settings",
+                        lambda: types.SimpleNamespace(gemini_api_key="g", openai_api_key="o"))
+
+    class _Rec:
+        provider, model = "openai", "gpt-6-luna"
+        async def grounded_read(self, ctx):
+            assert "REVERSAL" in (ctx.premium_trend_line or "")   # recall context reached the LLM
+            return GroundedNote(text="fears overblown", queries=["mu"], latency_ms=1, tokens={})
+        async def structured_read(self, note, ctx):
+            return CatalystVerdict(catalyst_type="other", deserved="overreaction",
+                                   web_social_sentiment="doubt", sustain="hold_to_close",
+                                   confidence=68, call="sell_bull_put", one_liner="overblown")
+    monkeypatch.setattr(cat, "_make_llm", lambda *a, **k: _Rec())
+
+    assert await cat.run_recall("2026-10-12") == {"enabled": True, "recalled": 1}
+    rec = saved["MU"]["llm_recall"]
+    assert rec["for_call"] == "sell_bull_put" and rec["deserved"] == "overreaction" and rec["count"] == 1
+
+    # same reversal still standing → no second paid call
+    monkeypatch.setattr(cat, "_make_llm",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not recall twice")))
+    assert (await cat.run_recall("2026-10-12"))["recalled"] == 0
+
+
+async def test_run_recall_disabled_is_noop(monkeypatch):
+    _ovn(monkeypatch, recall_enabled=False)
+
+    async def _refresh():
+        return True
+    monkeypatch.setattr(cat.simmer_config, "refresh_setup", _refresh)
+    assert await cat.run_recall("2026-10-12") == {"enabled": False}
+
+
+async def test_run_recall_caps_failed_attempts(monkeypatch):
+    """A recall whose grounded read keeps FAILING persists nothing (dedup never sets),
+    so it must be attempt-capped — otherwise it re-calls (pays) every tick while the
+    reversal holds."""
+    _ovn(monkeypatch, recall_enabled=True)
+    cat._recall_attempts.clear()
+    calls = {"n": 0}
+
+    async def _list_an(session):
+        return [{"symbol": "MU", "session_date": "2026-10-12", "dir": "down", "gap": -0.05,
+                 "llm": {"call": "sell_bear_call"},
+                 "combiner": {"final": {"call": "sell_bear_call", "confidence": 80},
+                              "decided_at": "2026-10-12T10:00:00-04:00"}}]
+
+    async def _list_ov(session):
+        return [{"symbol": "MU", "expiration": "2026-11-13", "dir": "down", "gap": -0.05,
+                 "crowd": "sector_wide",
+                 "verdict": {"call": "sell_bull_put", "premium_trend": "fading",
+                             "underlying_trend": "retracing", "confidence": 72, "mean_ratio": 0.84}}]
+
+    async def _refresh():
+        return True
+    monkeypatch.setattr(cat.simmer_config, "refresh_setup", _refresh)
+    monkeypatch.setattr(cat.supabase_admin, "list_simmer_overnight_analysis", _list_an)
+    monkeypatch.setattr(cat.supabase_admin, "list_simmer_overnight", _list_ov)
+    monkeypatch.setattr(cat, "get_settings",
+                        lambda: types.SimpleNamespace(gemini_api_key="g", openai_api_key="o"))
+
+    class _Boom:
+        provider, model = "openai", "gpt-6-luna"
+        async def grounded_read(self, ctx):
+            calls["n"] += 1
+            raise RuntimeError("provider down")
+        async def structured_read(self, note, ctx):
+            return None
+    monkeypatch.setattr(cat, "_make_llm", lambda *a, **k: _Boom())
+
+    res = None
+    for _ in range(6):                     # the loop would retry every tick
+        res = await cat.run_recall("2026-10-12")
+    assert calls["n"] == cat._MAX_RECALL_ATTEMPTS     # tried 3×, then stopped paying
+    assert res["recalled"] == 0
+
+
+async def test_run_catalyst_reports_complete_when_all_resolved(wired, monkeypatch):
+    """`complete` drives the loop's catalyst wind-down (no fixed 10:30 cap): False
+    while a name was just analyzed, True once every name is resolved (skipped/capped)."""
+    _ovn(monkeypatch)
+    res = await cat.run_catalyst("2026-10-12")
+    assert res["analyzed"] == 1 and res["complete"] is False      # just analyzed → one more pass
+    res2 = await cat.run_catalyst("2026-10-12")
+    assert res2["skipped"] == 1 and res2["complete"] is True      # now persisted → done for the day
+
+
+# ── FIX 2: late LLM reads are flagged non-predictive (no bake-off lookahead) ────
+def test_read_predictive_cutoff():
+    from app.simmer_overnight_catalyst import _read_predictive
+    assert _read_predictive("2026-10-12T09:25:00-04:00") is True     # at-open read
+    assert _read_predictive("2026-10-12T09:45:00-04:00") is True     # on the cutoff
+    assert _read_predictive("2026-10-12T13:00:00-04:00") is False    # late start → non-predictive
+    assert _read_predictive(None) is True                            # old rows → assume predictive
+
+
+async def test_close_excludes_late_llm_from_grading(wired, monkeypatch):
+    """A late-start LLM read (llm.at mid-session) must NOT be graded as a pre-open
+    call — llm_only/combiner grades become None and late_llm=True (the reactive
+    candidate, graded from its own spot, is unaffected)."""
+    _ovn(monkeypatch)
+
+    class _Prov:
+        async def chain(self, sym, exp):
+            return [{"side": "put", "strike": 100.0, "bid": 1.0, "ask": 1.2, "volume": 50}]
+        async def quote(self, sym):
+            return {"last": 96.0}
+
+    wired["MU"] = {"symbol": "MU", "session_date": "2026-10-12", "gap": -0.047,
+                   "premarket": {"spot": 100.0}, "readings": [],
+                   "llm": {"call": "sell_bear_call", "at": "2026-10-12T13:00:00-04:00"},  # late read
+                   "combiner": {"final": {"call": "sell_bear_call"},
+                                "llm_only": {"call": "sell_bear_call"},
+                                "combiner_blended": {"call": "sell_bear_call"}}}
+    assert await cat.capture_reading(_Prov(), "16:00", "2026-10-12") == 1
+    close = wired["MU"]["close"]
+    assert close["late_llm"] is True
+    assert close["llm_only_right"] is None and close["combiner_blended_right"] is None
+    assert close["llm_only_call"] == "sell_bear_call"       # the call is still recorded

@@ -11,6 +11,7 @@
 	import { watchlist } from '$lib/stores/watchlist.svelte';
 	import { page } from '$app/state';
 	import { asset, resolve } from '$app/paths';
+	import { getJSON } from '$lib/api';
 
 	let { children }: { children: Snippet } = $props();
 
@@ -19,6 +20,14 @@
 	let aboutOpen = $state(false);
 	// Computed, not hardcoded — Matrix fills its footer year at runtime too.
 	const year = new Date().getFullYear();
+	// App version — DB-held single source of truth, served by the backend so front +
+	// back always show the same number. Best-effort: blank if the backend is down.
+	let version = $state('');
+	$effect(() => {
+		getJSON<{ version: string }>('/simmer/version')
+			.then((r) => (version = r.version ?? ''))
+			.catch(() => {});
+	});
 	const initial = $derived((auth.user?.email ?? 'D')[0]?.toUpperCase() ?? 'D');
 	const path = $derived(page.url.pathname);
 </script>
@@ -106,6 +115,8 @@
 				aria-hidden="true"
 				class="h-4 w-4 opacity-90"
 			/>
+			{#if version}<span class="text-slate-500">version: {version}</span>
+				<span class="text-slate-700">·</span>{/if}
 			<span>&copy; Facades Simmer {year}. All rights reserved.</span>
 		</div>
 		<!-- "paper outcomes" refers to how the engine grades its OWN past calls

@@ -6,8 +6,8 @@ from __future__ import annotations
 from datetime import datetime
 
 from app.simmer_watcher import (_captures_due, _combiner_lock, _import_window_closed,
-                                 _overnight_sleep, _should_catalyst, _should_import,
-                                 _should_reset)
+                                 _new_day_reset_action, _overnight_sleep, _should_catalyst,
+                                 _should_import)
 
 MON, SAT = 12, 17          # 2026-10-12 is a Monday; 2026-10-17 a Saturday
 
@@ -18,24 +18,27 @@ def dt(h, m, day=MON):
 
 # ── import window (one-shot; `imported_today`=full board captured) ───────────
 def test_should_import_window():
-    assert not _should_import(dt(9, 24), False)        # before 09:25
-    assert _should_import(dt(9, 25), False)            # opens at 09:25
+    assert not _should_import(dt(6, 59), False)        # before 07:00
+    assert _should_import(dt(7, 0), False)             # opens at 07:00 (pre-open baseline)
+    assert _should_import(dt(9, 25), False)            # still imports at the open
     assert _should_import(dt(15, 59), False)           # late start still imports
     assert not _should_import(dt(16, 0), False)        # not from 16:00
-    assert not _should_import(dt(9, 30), True)         # full board already captured
-    assert not _should_import(dt(9, 30, SAT), False)   # weekend
+    assert not _should_import(dt(7, 30), True)         # full board already captured
+    assert not _should_import(dt(7, 30, SAT), False)   # weekend
 
 
 def test_should_catalyst():
-    # 2nd arg is "≥1 row captured" (NOT the full-board flag) — a partial board at
-    # 09:30 must still run the catalyst for the names that did land.
-    assert _should_catalyst(dt(9, 30), True, False)        # a row landed, retry window open
-    assert _should_catalyst(dt(9, 25), True, False)        # retry window open
-    assert _should_catalyst(dt(10, 0), True, False)        # re-runs mid-window (retries failures)
-    assert _should_catalyst(dt(10, 30), True, False)       # inclusive window end
-    assert not _should_catalyst(dt(10, 31), True, False)   # past the retry window
+    # Floor at 09:25 (an LLM read before the open is pointless), NOT capped at 10:30 —
+    # a late start must still analyze directly rather than skip the day.
+    assert not _should_catalyst(dt(7, 0), True, False)     # before 09:25 → no LLM yet
+    assert not _should_catalyst(dt(9, 24), True, False)    # one minute before → still no
+    assert _should_catalyst(dt(9, 25), True, False)        # opens at 09:25
+    assert _should_catalyst(dt(10, 0), True, False)        # re-runs (retries failures)
+    assert _should_catalyst(dt(13, 0), True, False)        # a late start past 10:30 still runs
+    assert _should_catalyst(dt(15, 59), True, False)       # right up to the close
+    assert not _should_catalyst(dt(16, 0), True, False)    # not after the close
     assert not _should_catalyst(dt(9, 25), False, False)   # nothing captured yet
-    assert not _should_catalyst(dt(9, 25), True, True)     # window already closed (done)
+    assert not _should_catalyst(dt(9, 25), True, True)     # already complete (done)
 
 
 def test_import_window_closed_caps_retries():
@@ -52,12 +55,14 @@ def test_combiner_lock_at_1000():
     assert _combiner_lock(dt(13, 30))
 
 
-def test_should_reset_eod():
-    assert not _should_reset(dt(15, 59), False)        # before the close
-    assert _should_reset(dt(16, 0), False)             # from 16:00
-    assert _should_reset(dt(18, 0), False)             # later still fine
-    assert not _should_reset(dt(16, 30), True)         # already done today
-    assert not _should_reset(dt(16, 30, SAT), False)   # weekend
+def test_new_day_reset_never_wipes_on_read_error():
+    # None = Supabase read error → MUST NOT reset (would delete a live board), and must
+    # not mark done so it re-checks next tick.
+    assert _new_day_reset_action(None) == (False, False)
+    # [] = confirmed empty → genuine first import → reset + mark done
+    assert _new_day_reset_action([]) == (True, True)
+    # rows present (e.g. mid-day restart) → skip reset, mark done
+    assert _new_day_reset_action([{"symbol": "MU"}]) == (False, True)
 
 
 # ── which readings are due ───────────────────────────────────────────────────

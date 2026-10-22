@@ -345,4 +345,6 @@ export interface OvernightCatalyst {
 	sustain?: 'fade' | 'hold_to_midday' | 'hold_to_close' | 'extend' | null;
 	provider?: string | null;
 	outcome?: 'extended' | 'held' | 'faded' | null;
+	/** Phase B: the read was refreshed by an intraday-reversal LLM recall. */
+	recalled?: boolean;
 }

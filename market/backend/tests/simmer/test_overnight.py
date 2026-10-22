@@ -692,3 +692,21 @@ async def test_run_import_skips_name_without_a_baseline(mock_supabase, monkeypat
     assert res["imported"] == 0
     assert mock_supabase["watchlist"] == []
     assert mock_supabase["overnight"] == {}
+
+
+def test_simmer_version_endpoint_is_public():
+    """The footer version endpoint needs no auth and returns the DB-held version
+    (the pre-seed default when engine settings aren't loaded)."""
+    client, _ = _route_client()
+    r = client.get("/simmer/version")
+    assert r.status_code == 200
+    v = r.json()["version"]
+    assert isinstance(v, str) and v.count(".") == 2       # semver-ish, e.g. 1.0.0
+
+
+def test_app_version_accessor_reads_the_section(monkeypatch):
+    from app import simmer_config
+    monkeypatch.setitem(simmer_config._ENGINE, "version", {"version": "2.3.4"})
+    assert simmer_config.app_version() == "2.3.4"
+    monkeypatch.delitem(simmer_config._ENGINE, "version", raising=False)
+    assert simmer_config.app_version() == simmer_config.VERSION["version"]   # falls back to default

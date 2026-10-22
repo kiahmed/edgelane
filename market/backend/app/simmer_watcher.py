@@ -2267,33 +2267,46 @@ def _seconds_until(now, hh: int, mm: int) -> float:
 # faked clock, independent of the live while-loop. Each is a pure function of the
 # ET `now` + the per-day flags. See tests/simmer/test_overnight_schedule.py.
 def _should_import(now, imported_today: bool) -> bool:
-    """09:25 pre-open import, weekdays, until 16:00 (a late start still imports).
-    `imported_today` is True once the FULL board has landed (all movers captured),
-    so a partial capture keeps retrying instead of stranding the rest."""
+    """07:00 pre-open import, weekdays, until 16:00. Capturing the baseline + RQ
+    crowd early (quotes are the prior close pre-open) front-loads everything so the
+    board is ready well before the open; the LLM is deferred to 09:25 separately.
+    A late start (backend down, comes up after 07:00) still imports. `imported_today`
+    is True once the FULL board has landed, so a partial capture keeps retrying."""
     return (now.weekday() < 5 and not imported_today
-            and (now.hour, now.minute) >= (9, 25) and now.hour < 16)
+            and (now.hour, now.minute) >= (7, 0) and now.hour < 16)
 
 
 def _should_catalyst(now, rows_captured: bool, catalyst_done: bool) -> bool:
-    """Catalyst LLM pass: RE-RUN every tick through the 10:30 window once AT LEAST
-    ONE overnight row has been captured today (run_catalyst skips names already
-    analyzed, so only the ones whose LLM read failed transiently at the open get
-    retried) — NOT a one-shot, which would leave the whole board unanalyzed on a
-    single rate-limited pass.
-
-    Gated on "any row captured", NOT the full-board import flag: on a partial-board
-    day (a mover that never captures — no listed options / a persistently empty
-    chain) the full-board flag only trips at the 10:30 window close, in the same
-    tick that sets catalyst_done, so the pass would never run for ANY name. Keying
-    off the first captured row lets the LLM analyze everything that did land."""
+    """Catalyst LLM pass: runs only from 09:25 (an LLM read before the open is
+    pointless — no market reaction yet) through market hours, once AT LEAST ONE
+    overnight row has been captured. NOT capped at 10:30: a late start (backend up
+    after 09:25, even mid-session) must still analyze directly rather than skip the
+    day. run_catalyst is idempotent (skips analyzed names) and attempt-capped, and
+    the loop stops calling it once run_catalyst reports the board complete."""
     return (rows_captured and not catalyst_done
-            and (now.hour, now.minute) <= (10, 30) and now.hour < 16)
+            and (now.hour, now.minute) >= (9, 25) and now.hour < 16)
+
+
+def _new_day_reset_action(today_rows) -> tuple[bool, bool]:
+    """Decide the new-day RQ reset from the simmer_overnight read for today, as
+    (do_reset, mark_done). `today_rows` is `select_many`'s result:
+      * None  → READ ERROR: do nothing, DON'T mark done (re-check next tick). Never
+                wipe on an error — `not None` would delete a live board.
+      * []    → confirmed empty → genuine first import: reset yesterday's RQ rows + mark done.
+      * rows  → a board already exists today (e.g. a mid-day restart): skip the reset,
+                mark done so we don't re-check."""
+    if today_rows is None:
+        return (False, False)
+    if not today_rows:
+        return (True, True)
+    return (False, True)
 
 
 def _import_window_closed(now) -> bool:
-    """After 10:30 ET, accept whatever imported and stop retrying — so a mover that
-    never captures (no listed options / a persistently empty chain) can't hold the
-    done-flag open and make the loop re-fetch RelativeQs every 60s all day."""
+    """After 10:30 ET, accept whatever imported and stop retrying the IMPORT — so a
+    mover that never captures (no listed options / a persistently empty chain) can't
+    hold the done-flag open and make the loop re-fetch RelativeQs every 60s all day.
+    (The catalyst is NOT closed here; it stops on its own 'complete' signal.)"""
     return (now.hour, now.minute) >= (10, 30)
 
 
@@ -2307,12 +2320,6 @@ def _reactive_lock(now) -> bool:
     combiner cutoff so the reactive overlay gets the morning to react, but still well
     before the close so its grade carries no lookahead."""
     return (now.hour, now.minute) >= (12, 0)
-
-
-def _should_reset(now, reset_done: bool) -> bool:
-    """EOD RQ reset: once per weekday, from 16:00 ET — after the close reading has
-    stamped outcomes (it fires at 15:58), so grading is persisted first."""
-    return now.weekday() < 5 and not reset_done and (now.hour, now.minute) >= (16, 0)
 
 
 def _captures_due(now, *, open_: bool, readings_done) -> list[str]:
@@ -2333,13 +2340,13 @@ def _captures_due(now, *, open_: bool, readings_done) -> list[str]:
 
 def _overnight_sleep(now, open_: bool, import_pending: bool = False) -> float:
     """Loop cadence: 60s in the first 30 min and from 15:45 (so a tick lands in the
-    16:00 window), else 180s while open; pre-09:25 wake near the open; 120s across
-    16:00–16:30 to catch the close reading; otherwise 600s.
+    16:00 window), else 180s while open; pre-07:00 wake near the 07:00 import; 120s
+    across 16:00–16:30 to catch the close reading; otherwise 600s.
 
     `import_pending` (the full board hasn't landed yet though we're in the
-    09:25–16:00 window) forces a brisk 60s retry — so an at-open empty-chain that
+    07:00–16:00 window) forces a brisk 60s retry — so an at-open empty-chain that
     left some movers uncaptured is retried promptly, not stranded behind a 600s
-    pre-open sleep."""
+    sleep."""
     if import_pending:
         return 60.0
     hm = (now.hour, now.minute)
@@ -2347,8 +2354,8 @@ def _overnight_sleep(now, open_: bool, import_pending: bool = False) -> float:
         mins_since_open = (now.hour - 9) * 60 + (now.minute - 30)
         near_close = hm >= (15, 45)
         return 60.0 if (0 <= mins_since_open < 30 or near_close) else 180.0
-    if hm < (9, 25):
-        return min(_seconds_until(now, 9, 25), 600.0)
+    if hm < (7, 0):
+        return min(_seconds_until(now, 7, 0), 600.0)
     if (16, 0) <= hm <= (16, 30):
         return 120.0
     return 600.0
@@ -2357,17 +2364,18 @@ def _overnight_sleep(now, open_: bool, import_pending: bool = False) -> float:
 async def overnight_loop(provider, tz_name: str) -> None:
     """Dedicated overnight scheduler (docs/simmer.md → "Overnight movers").
 
-    Wakes near **09:25 ET** for the one-shot RelativeQs import + frozen baseline,
-    then — once open — refreshes the premium-decision verdicts every ~3 min
-    (tighter, ~1 min, for the first 30 min) until close. Separate from the sweep
-    so the 9:25 capture lands on time regardless of sweep cadence. Best-effort;
-    only cancellation propagates."""
+    Wakes near **07:00 ET** for the RelativeQs import + frozen baseline + RQ crowd
+    (quotes are the prior close pre-open); the LLM catalyst is deferred to 09:25.
+    Once open it refreshes the premium verdicts every ~3 min (tighter, ~1 min, for
+    the first 30 min) until close. The day's first import also clears yesterday's RQ
+    list (analysis preserved). Best-effort; only cancellation propagates."""
     from zoneinfo import ZoneInfo
     tz = ZoneInfo(tz_name) if tz_name else ZoneInfo("America/New_York")
     imported_date: str | None = None     # full board captured for this session
     captured_date: str | None = None     # ≥1 overnight row landed for this session
+    reopen_date: str | None = None       # near-open re-import pass done for this session
     catalyst_date: str | None = None     # catalyst pass done for this session
-    reset_date: str | None = None        # EOD RQ reset done for this session
+    reset_date: str | None = None        # new-day RQ reset done for this session
     readings_done: set[str] = set()      # reading labels captured today (reset per day)
     readings_day: str | None = None
     while True:
@@ -2379,13 +2387,30 @@ async def overnight_loop(provider, tz_name: str) -> None:
             today = now.date().isoformat()
             if readings_day != today:        # new session → reset the per-day reading flags
                 readings_done = set(); readings_day = today
-            # 09:25 import. fetch_movers already retries until it has the COMPLETE
+            # 07:00 import. fetch_movers already retries until it has the COMPLETE
             # RelativeQs board, so a short board is never silently accepted. Mark the
             # session done only when every mover's baseline has landed (rows >=
             # movers) — a partial capture (an at-open empty Tradier chain on some
             # names) leaves the flag unset so a later tick retries just the stragglers
             # (import_pending → 60s). Idempotent: already-captured names are skipped.
             if _should_import(now, imported_date == today):
+                # New-day reset, BEFORE the day's first import: clear yesterday's RQ
+                # watchlist rows + overlays (analysis is preserved), then import today's
+                # board. Gated on "no overnight rows exist for today yet" so a mid-day
+                # RESTART (today's rows already present) never re-deletes a live board.
+                if reset_date != today:
+                    try:
+                        today_rows = await supabase_admin.list_simmer_overnight(today)
+                        do_reset, mark_done = _new_day_reset_action(today_rows)
+                        if do_reset:
+                            rres = await overnight.reset_rq_end_of_day()
+                            log.info("overnight new-day RQ reset: %s", rres)
+                        elif today_rows is None:
+                            log.warning("overnight new-day reset: today-row read failed, skipping")
+                        if mark_done:
+                            reset_date = today
+                    except Exception:
+                        log.exception("overnight new-day RQ reset failed")
                 try:
                     res = await overnight.run_import(provider)
                     log.info("overnight import: %s", res)
@@ -2399,12 +2424,26 @@ async def overnight_loop(provider, tz_name: str) -> None:
                         imported_date = today
                 except Exception:
                     log.exception("overnight import failed")
+            # Catch names RelativeQs ADDS between the 07:00 import and the open: one
+            # idempotent re-import pass near 09:20 (run_import skips already-captured
+            # names; a new name just gets captured + picked up by refresh/catalyst).
+            # The 07:00 "complete" flag otherwise stops imports and would miss them.
+            if (reopen_date != today and now.weekday() < 5
+                    and (9, 20) <= (now.hour, now.minute) < (9, 30)):
+                try:
+                    res = await overnight.run_import(provider)
+                    log.info("overnight near-open re-import: %s", res)
+                    if res.get("rows", 0) > 0:
+                        captured_date = today
+                    reopen_date = today
+                except Exception:
+                    log.exception("overnight near-open re-import failed")
             # Restart-safe: run_import's later passes return rows=0 (nothing new to
             # import), so after a mid-morning restart the in-memory capture flag would
             # stay unset and strand the catalyst. While still in the catalyst window
             # and nothing is confirmed captured yet, probe the DB once.
             if (captured_date != today and catalyst_date != today
-                    and now.weekday() < 5 and (9, 25) <= (now.hour, now.minute) <= (10, 30)):
+                    and now.weekday() < 5 and (9, 25) <= (now.hour, now.minute) and now.hour < 16):
                 try:
                     if await supabase_admin.list_simmer_overnight(today):
                         captured_date = today
@@ -2420,13 +2459,16 @@ async def overnight_loop(provider, tz_name: str) -> None:
                         if "09:25" not in readings_done:
                             await catalyst.capture_reading(provider, "09:25", today)
                             readings_done.add("09:25")
+                        # Stop for the day once every name is analyzed or attempt-capped.
+                        if cres.get("complete"):
+                            catalyst_date = today
                 except Exception:
                     log.exception("overnight catalyst failed")
-            # Close the import + catalyst retry window past 10:30 (accept whatever
-            # landed) so the loop stops re-running them for the rest of the day.
+            # Close the IMPORT retry window past 10:30 (accept whatever landed) so a
+            # mover that never captures can't make the loop re-fetch RelativeQs all day.
+            # The catalyst is NOT closed here — it stops on its own `complete` signal.
             if _import_window_closed(now):
                 imported_date = today
-                catalyst_date = today
             open_, _ = _is_market_open(tz_name)
             if open_:
                 try:
@@ -2445,6 +2487,9 @@ async def overnight_loop(provider, tz_name: str) -> None:
                         # Fire in-app alerts for plays that reached ≥70 (re-trigger
                         # on a call flip or a conviction rise; per-user opt-out).
                         await overnight_alert_fanout(today)
+                        # Phase B: re-call the LLM on a genuine intraday reversal against
+                        # the 09:25 read (no-op unless overnight_llm.recall_enabled).
+                        await catalyst.run_recall(today)
                 except Exception:
                     log.exception("overnight combiner refresh / alerts failed")
             # Forward-test readings (read-only), gated on the analyzer being enabled so
@@ -2457,17 +2502,9 @@ async def overnight_loop(provider, tz_name: str) -> None:
                         readings_done.add(label)
                     except Exception:
                         log.exception("overnight reading %s failed", label)
-            # EOD RQ reset (read-only path aside): delete purely-RQ watchlist rows +
-            # strip overlays once past 16:00, AFTER the close reading stamped
-            # outcomes. The analysis history is preserved. Runs regardless of the
-            # LLM analyzer being enabled (RQ import is a separate feature).
-            if _should_reset(now, reset_date == today):
-                try:
-                    rres = await overnight.reset_rq_end_of_day()
-                    log.info("overnight RQ EOD reset: %s", rres)
-                    reset_date = today
-                except Exception:
-                    log.exception("overnight RQ EOD reset failed")
+            # NOTE: no 16:00 reset. After the close the RQ items STAY on the list
+            # (market closed → refresh_analysis / catalyst don't run, so nothing is
+            # analyzed), and the day's first import next morning clears them (above).
             await asyncio.sleep(_overnight_sleep(
                 now, open_, import_pending=_should_import(now, imported_date == today)))
         except asyncio.CancelledError:

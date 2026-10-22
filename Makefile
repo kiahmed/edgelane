@@ -48,7 +48,8 @@ DATA_DUMP    = deploy/edgelane-data.tar.gz
         deploy-data-dump deploy-data-restore \
         doctor vercel-setup check-tunnel vercel-clean \
         simmer-ui-install simmer-ui-dev simmer-ui-build simmer-ui-check \
-        simmer-ui-test deploy-simmer simmer-postiz-integrate simmer-fire-event gcloud-setup
+        simmer-ui-test deploy-simmer simmer-postiz-integrate simmer-fire-event gcloud-setup \
+        bump-version
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} \
@@ -154,14 +155,19 @@ ui: ## Open market/ui/index.html in a browser
 frontend-setup: ## One-time: create/link the Matrix + Simmer Vercel projects + Edge Config
 	@$(DEPLOY_SH) --frontend-setup $(ARGS)
 
+bump-version: ## Bump the DB-held app version shown in the UI footer (ARGS=minor|major)
+	@python3 tools/bump_version.py $(ARGS)
+
 deploy-be: deploy-builder ## Backend → Docker container + tunnel (DEPLOY=local_container)
-	@BUILDX_BUILDER=$(BUILDER) $(DEPLOY_SH) -b --target $(DEPLOY) $(ARGS)
+	@BUILDX_BUILDER=$(BUILDER) $(DEPLOY_SH) -b --target $(DEPLOY) $(ARGS) \
+		&& { python3 tools/bump_version.py || echo "version bump skipped"; }
 
 deploy-market_matrix: ## Matrix UI (market/ui, the original EdgeLane "market" frontend) → Vercel (CLEAN=1 to wipe first)
 	@$(DEPLOY_SH) -f $(CLEAN_FLAG) $(ARGS)
 
 deploy-prod: deploy-builder ## Backend + frontend together (pushes Supabase migrations first; CLEAN=1 to wipe first)
-	@BUILDX_BUILDER=$(BUILDER) $(DEPLOY_SH) --target $(DEPLOY) $(CLEAN_FLAG) $(ARGS)
+	@BUILDX_BUILDER=$(BUILDER) $(DEPLOY_SH) --target $(DEPLOY) $(CLEAN_FLAG) $(ARGS) \
+		&& { python3 tools/bump_version.py || echo "version bump skipped"; }
 
 deploy-dry: ## Dry-run the full deploy (prints commands, runs nothing)
 	@$(DEPLOY_SH) --target $(DEPLOY) -n $(ARGS)
@@ -189,7 +195,8 @@ deploy-be-down: ## Remove ONLY the backend (cloudflared keeps running)
 
 # Rebuild + recreate ONLY the backend (latest code), without touching cloudflared.
 deploy-be-restart: deploy-builder ## Rebuild + recreate ONLY the backend, latest code
-	@BUILDX_BUILDER=$(BUILDER) $(COMPOSE) up -d --no-deps --build edgelane-backend
+	@BUILDX_BUILDER=$(BUILDER) $(COMPOSE) up -d --no-deps --build edgelane-backend \
+		&& { python3 tools/bump_version.py || echo "version bump skipped"; }
 
 # Ensure the dedicated buildx builder exists AND boots (self-healing). Prereq of
 # every backend build target, so you never run it by hand. On Docker Desktop/WSL2
@@ -316,7 +323,8 @@ simmer-ui-test: ## Vitest unit tests (api pointer resolution, fmt)
 	@cd $(SIMMER_UI) && npm test
 
 deploy-simmer: ## Simmer UI → Vercel project edgelane-simmer (CLEAN=1 to wipe first)
-	@$(DEPLOY_SH) -s $(CLEAN_FLAG) $(ARGS)
+	@$(DEPLOY_SH) -s $(CLEAN_FLAG) $(ARGS) \
+		&& { python3 tools/bump_version.py || echo "version bump skipped"; }
 
 simmer-postiz-integrate: ## Provision the Simmer→postiz Pub/Sub topic/IAM/secret (idempotent; DRY=1 to print)
 	@bash ops/simmer/edgelane_provision.sh

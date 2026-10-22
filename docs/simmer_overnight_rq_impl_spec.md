@@ -232,23 +232,51 @@ All four knobs live in the DB `overnight_alert` section (`min_conf`, `rise`,
 a redeploy. Guards (`flip_seen` timestamps, per-session NEW-alert count) are in memory and
 reset on restart (acceptable). Per-user opt-out (`notify_overnight`) unchanged.
 
-## 6. Phase B — premium-triggered LLM recall (PLANNED)
+## 5c. Daily lifecycle (import / analysis / reset)
+
+- **07:00 ET — import + baseline + RQ crowd.** `_should_import` opens at 07:00 (quotes
+  are the prior close pre-open), front-loading the board so it's ready before the open.
+  The **day's first import first clears yesterday's RQ list** (`reset_rq_end_of_day`,
+  analysis preserved) — gated by `_new_day_reset_action(today_rows)`: `[]` → reset, rows
+  present (restart) → skip, **`None` (read error) → do nothing** (never wipe a live board).
+- **~09:20 — near-open re-import.** RelativeQs grows its board through the morning, so one
+  idempotent pass near 09:20 catches names added after 07:00 (run_import skips the rest).
+- **09:25 — LLM catalyst starts** (`_should_catalyst` floor; an LLM read before the open
+  is pointless). No 10:30 ceiling: a **late start** (backend up mid-session) still imports
+  and analyzes directly; the loop winds the catalyst down on run_catalyst's `complete`.
+- **Late reads are non-predictive.** The LLM read is stamped `llm.at`; a read after ~09:45
+  (late start) has its `llm_only`/`combiner_blended` close grades set to `None` + `late_llm`
+  so it never contaminates the bake-off as a pre-open call (the reactive candidate is
+  already graded from its own `spot_at`).
+- **After 16:00 — items stay.** No EOD reset; RQ items remain on the watchlist (market
+  closed → nothing analyzes them). They're cleared by the next morning's first import.
+
+## 6. Phase B — premium-triggered LLM recall (BUILT, default OFF)
 
 A second, targeted catalyst call — **only when the premiums say the story changed**, so
 the LLM can re-read the "why" (is the market treating it as an overreaction, is social
-turning) against the new tape.
+turning) against the new tape. `simmer_overnight_catalyst.run_recall()`, wired into the
+loop after the combiner/alerts, gated by `overnight_llm.recall_enabled` (default **false**
+— it's a paid call).
 
-- **Trigger is state-change, not a clock or a count cap.** While premium backs the
-  verdict → no call. When Phase A records a genuine flip/stand-down crossing
-  (`premium_reactive.source` transitions support → override/standdown) → one recall.
-  Debounced so a back-and-forth wiggle is one event, not many; re-arms only after the
-  premium settles back to supporting. Calm day = 0 recalls; an LRCX round-trip ≈ 1.
-- **Premium is still master.** Phase A has already moved the call on premium alone; the
-  recall only annotates the "why" and can trim/confirm confidence. If the forward test
-  shows premium-alone is as good, Phase B may not ship — the grades decide.
-- Input to the recall: the premium drift + intraday price/vol move since the open, plus
-  the original 09:25 note. Reuses the existing two-call adapter; no new provider.
-- Cost: ~1 extra call on the minority of names that genuinely flip, never the board.
+- **Trigger (`_recall_target`, pure):** fire a recall only when Phase A drove the
+  reconciled call to the OPPOSITE committed side of the 09:25 read (`premium_reactive`
+  `source == "premium_override"` and the call contradicts `llm.call`). De-duped by an
+  `llm_recall.for_call` marker so a standing override never re-spends; capped at
+  `recall_cap` (2) per name per session. Calm day = 0 recalls.
+- **Premium stays master.** Phase A already moved the call on premium alone; the recall
+  only **annotates** the catalyst reasoning (why_moved / deserved / sentiment / sustain)
+  and is surfaced in the card (route merges `llm_recall` over the stale `llm`; a
+  `↻ re-checked` chip shows it). It never overrides the reconciled call.
+- **Input:** a recall-flavoured grounded-read context stating the tape has reversed
+  against the 09:25 read, with the premium engine's live words + gap-retraced. Reuses the
+  existing two-call adapter; no new provider.
+- **Cost:** ≤ `recall_cap` successful calls on the minority of names that genuinely
+  reverse. A recall that keeps FAILING persists nothing (its dedup never sets), so it is
+  separately **attempt-capped** (`_MAX_RECALL_ATTEMPTS`, 3, in memory per session/name/
+  target) — otherwise a broken provider would re-pay every tick while the reversal holds.
+- Persisted to `simmer_overnight_analysis.llm_recall`. Enable with the DB flag once the
+  forward test shows the reversals are real.
 
 ---
 

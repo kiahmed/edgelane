@@ -214,7 +214,21 @@ OVERNIGHT_LLM: dict[str, Any] = {
                                         #   llm_only | combiner_blended  (both are logged for comparison)
     "shadow_provider":  "gemini",       # parallel model, logged not acted on; "" to disable
     "shadow_model":     "gemini-3.8-flash",
+    # Phase B — premium-triggered LLM recall. When the intraday tape REVERSES against the
+    # 09:25 read (premium_reactive override to the opposite side), re-call the LLM ONCE to
+    # re-read the "why" (debunk / overreaction?) against the new tape. Default OFF (a paid
+    # call); premium stays master either way — the recall only annotates, never overrides.
+    "recall_enabled":   False,          # master switch for the Phase B recall
+    "recall_cap":       2,              # max recalls per name per session
 }
+
+# ── App version (single source of truth, DB-held) ───────────────────────────
+# One version string both the backend and the Simmer UI display (the UI reads it
+# from the backend), bumped by EITHER deployment so front + back always show the
+# same number. Lives in the `version` section of simmer_engine_settings; the deploy
+# script bumps it (tools/bump_version.py). The constant here is only the pre-seed
+# fallback.
+VERSION: dict[str, Any] = {"version": "1.0.0"}
 
 # ── Overnight premium-drift override (Phase A; docs/simmer_overnight_rq_impl_spec.md) ──
 # The scored overnight call freezes at 10:00 for a clean bake-off, which also leaves it
@@ -498,7 +512,7 @@ _SECTION_DEFAULTS: dict[str, dict] = {
     "cadence": CADENCE, "ttl": TTL, "velocity": VELOCITY, "news": NEWS,
     "sentiment": SENTIMENT, "squeeze": SQUEEZE, "regime": REGIME,
     "overnight_llm": OVERNIGHT_LLM, "overnight_drift": OVERNIGHT_DRIFT,
-    "overnight_alert": OVERNIGHT_ALERT, "sweep": SWEEP,
+    "overnight_alert": OVERNIGHT_ALERT, "sweep": SWEEP, "version": VERSION,
 }
 
 
@@ -669,6 +683,12 @@ def sweep_enabled() -> bool:
     `sweep` section). False pauses the sweep for all users; overnight/RQ tickers
     are carved out and keep running. Defaults ON."""
     return bool(_section("sweep", SWEEP).get("enabled", True))
+
+
+def app_version() -> str:
+    """The single app version string shown in the UI footer (DB-held, `version`
+    section). Bumped by either deployment so front + back stay in lockstep."""
+    return str(_section("version", VERSION).get("version") or VERSION["version"])
 
 
 def vol() -> dict[str, Any]:
