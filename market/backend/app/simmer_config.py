@@ -214,6 +214,15 @@ OVERNIGHT_LLM: dict[str, Any] = {
                                         #   llm_only | combiner_blended  (both are logged for comparison)
     "shadow_provider":  "gemini",       # parallel model, logged not acted on; "" to disable
     "shadow_model":     "gemini-3.8-flash",
+    # Space successive grounded reads so a burst of ~30K-token web_search calls doesn't
+    # trip OpenAI's per-minute token limit (the adapter also backs off on a 429, but
+    # spacing avoids most of them). Seconds between per-ticker calls.
+    "call_spacing_sec":  3,
+    # Wall-clock budget for one run_catalyst / run_recall pass. The LLM pass runs INLINE
+    # in overnight_loop before the readings / refresh / alert fan-out, so it must not
+    # starve them: once this many seconds have elapsed, stop STARTING new names and
+    # resume on the next tick (idempotent — already-analyzed names are skipped).
+    "call_budget_sec":   480,
     # Phase B — premium-triggered LLM recall. When the intraday tape REVERSES against the
     # 09:25 read (premium_reactive override to the opposite side), re-call the LLM ONCE to
     # re-read the "why" (debunk / overreaction?) against the new tape. Default OFF (a paid

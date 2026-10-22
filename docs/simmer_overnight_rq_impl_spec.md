@@ -275,8 +275,30 @@ loop after the combiner/alerts, gated by `overnight_llm.recall_enabled` (default
   reverse. A recall that keeps FAILING persists nothing (its dedup never sets), so it is
   separately **attempt-capped** (`_MAX_RECALL_ATTEMPTS`, 3, in memory per session/name/
   target) — otherwise a broken provider would re-pay every tick while the reversal holds.
-- Persisted to `simmer_overnight_analysis.llm_recall`. Enable with the DB flag once the
-  forward test shows the reversals are real.
+- Persisted to `simmer_overnight_analysis.llm_recall` (migration **0031** — required, or
+  the upsert fails PGRST204 and silently drops).
+
+## 6b. Provider reliability (OpenAI rate limits)
+
+Grounded `web_search` reads are ~30K input tokens each and take ~26–30s. A burst of 9
+names tripped OpenAI's per-minute **token** limit — the old adapter didn't check the HTTP
+status, so a 429/402 was parsed as an empty read and **silently swallowed** (no log, no
+retry), leaving 2/9 names analyzed on 2026-10-22. Fixes:
+- **`openai._post`** now checks status: retries **429/5xx** up to `_MAX_RETRIES` (3) with
+  exponential backoff + jitter, honoring **`Retry-After`** (OpenAI's guidance); a **402**
+  (quota/credit) or 401/403 is logged loudly and **not** retried; timeout raised to 90s.
+- **Loop-safety** (the LLM pass runs INLINE in `overnight_loop` before readings/refresh/
+  alerts): a single backoff/`Retry-After` is capped at `_MAX_RETRY_WAIT` (30s) — anything
+  longer gives up this tick (the per-name attempt cap retries next tick); only
+  **connect-type** errors are retried, a **read timeout** returns None (it may already be
+  billed, and retrying would block); and `run_catalyst`/`run_recall` carry a wall-clock
+  budget `overnight_llm.call_budget_sec` (480s) — once elapsed they stop starting new
+  names and resume next tick, so worst-case retries can't starve the 10:00/16:00 readings
+  or the alert fan-out.
+- **`overnight_llm.call_spacing_sec`** (3) spaces successive grounded reads in
+  `run_catalyst`/`run_recall` so the burst stays under the token-per-minute limit.
+Separately, the Gemini **news** path is out of prepaid credit (HTTP 402) — a billing
+top-up, unrelated to the overnight catalyst (which is OpenAI).
 
 ---
 

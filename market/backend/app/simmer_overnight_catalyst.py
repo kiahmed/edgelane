@@ -11,7 +11,9 @@ Best-effort like the rest of the off-hours path: every failure logs and degrades
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from datetime import datetime
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -163,6 +165,8 @@ async def run_recall(session: str) -> dict:
     drift_cfg = simmer_config.overnight_drift()
     s = get_settings()
     cap = int(ovn.get("recall_cap", 2))
+    budget = float(ovn.get("call_budget_sec", 480) or 0)
+    deadline = time.monotonic() + budget
     recalled = 0
     for a in analyses:
         sym = str(a.get("symbol") or "").upper()
@@ -177,6 +181,9 @@ async def run_recall(session: str) -> dict:
         akey = (str(session)[:10], sym, target)
         if _recall_attempts.get(akey, 0) >= _MAX_RECALL_ATTEMPTS:
             continue                           # cost guard: stop retrying a broken recall
+        if budget > 0 and time.monotonic() > deadline:
+            log.info("[recall] time budget reached — resuming next tick")
+            break                              # don't starve the inline loop; resume next tick
         ctx = _recall_ctx({**a, "symbol": sym}, prem_by.get(sym) or {}, target, session)
         try:
             live = await _run_provider(
@@ -184,10 +191,15 @@ async def run_recall(session: str) -> dict:
         except Exception:                      # noqa: BLE001 — best-effort per name
             log.exception("[recall] failed for %s", sym)
             live = {}
+        spacing = float(ovn.get("call_spacing_sec", 0) or 0)   # space the grounded reads
         if not live.get("call"):
             _recall_attempts[akey] = _recall_attempts.get(akey, 0) + 1   # count the failed try
+            if spacing > 0:
+                await asyncio.sleep(spacing)
             continue
         _recall_attempts.pop(akey, None)       # success → clear the failure count
+        if spacing > 0:
+            await asyncio.sleep(spacing)
         await supabase_admin.upsert_simmer_overnight_analysis({
             "symbol": sym, "session_date": str(session)[:10],
             "llm_recall": {
@@ -262,6 +274,7 @@ async def run_catalyst(session: str) -> dict:
         return {"enabled": True, "names": 0}
     s = get_settings()
     day = str(session)[:10]
+    deadline = time.monotonic() + float(ovn.get("call_budget_sec", 480) or 0)
     done = skipped = gave_up = 0
     for row in rows:
         # Restart-safe idempotency: if this name already has a PERSISTED llm read
@@ -279,6 +292,12 @@ async def run_catalyst(session: str) -> dict:
         if _catalyst_attempts.get(akey, 0) >= _MAX_CATALYST_ATTEMPTS:
             gave_up += 1
             continue
+        # Wall-clock budget: stop STARTING new paid reads once we've used the budget, so
+        # the inline pass can't starve the 10:00/16:00 readings + alert fan-out. Resume
+        # next tick (idempotent). Pending names keep `complete` False → the loop retries.
+        if float(ovn.get("call_budget_sec", 480) or 0) > 0 and time.monotonic() > deadline:
+            log.info("[catalyst] time budget reached — resuming next tick")
+            break
         verdict = row.get("verdict") or {}
         premium = {"call": verdict.get("call"), "premium_trend": verdict.get("premium_trend"),
                    "underlying_trend": verdict.get("underlying_trend"),
@@ -296,6 +315,10 @@ async def run_catalyst(session: str) -> dict:
             done += 1
         else:
             _catalyst_attempts[akey] = _catalyst_attempts.get(akey, 0) + 1
+        # Space successive grounded reads to stay under the per-minute token limit.
+        spacing = float(ovn.get("call_spacing_sec", 0) or 0)
+        if spacing > 0:
+            await asyncio.sleep(spacing)
     log.info("[catalyst] analyzed %d, skipped %d (already done), gave up %d (retry cap) of %d names "
              "(provider=%s mode=%s shadow=%s)",
              done, skipped, gave_up, len(rows), ovn.get("provider"), ovn.get("decision_mode"),

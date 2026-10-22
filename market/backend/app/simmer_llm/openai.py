@@ -8,8 +8,10 @@ method is build-body -> _post -> parse and a None short-circuits to None.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
 import time
 
 import httpx
@@ -20,6 +22,20 @@ from .prompts import step1, step2
 log = logging.getLogger("edgelane.simmer.llm.openai")
 
 _ENDPOINT = "https://api.openai.com/v1/responses"
+
+# Rate-limit handling per OpenAI's guidance (developers.openai.com/api/docs/guides/
+# rate-limits): a 429/5xx is retried with exponential backoff + jitter, honoring the
+# Retry-After header when present. web_search calls are ~30K input tokens each, so a
+# burst trips the per-minute token limit — the backoff spaces them out. A 402
+# (quota/credit depleted) or 401/403 is NOT retried (it won't recover) and is logged
+# loudly instead of being silently swallowed as an empty read.
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+_MAX_RETRIES = 3
+_TIMEOUT_SEC = 90.0          # a grounded read takes ~26–30s; 60s was clipping the slow ones
+_MAX_RETRY_WAIT = 30.0       # cap any single backoff/Retry-After — the catalyst runs INLINE
+                            # in overnight_loop, so a 60–3600s Retry-After would stall the
+                            # whole loop (readings / refresh / alerts). Longer than this →
+                            # give up this tick; the per-name attempt cap retries next tick.
 
 # Call-2 strict json_schema: the 7 model fields of CatalystVerdict. Meta fields
 # are stamped by the adapter, never sent to the model.
@@ -61,15 +77,57 @@ class OpenAIOvernightLLM:
                 "Content-Type": "application/json"}
 
     async def _post(self, url: str, headers: dict, body: dict) -> dict | None:
-        """Single network seam. POST JSON; return parsed dict or None on ANY
-        network/parse failure (logged). Never raises."""
-        try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(url, headers=headers, json=body)
-            return resp.json()
-        except Exception as e:
-            log.warning("openai _post failed: %s", e)
+        """Single network seam. POST JSON; return parsed dict, or None on failure.
+        Retries 429/5xx up to _MAX_RETRIES with exponential backoff + jitter,
+        honoring Retry-After. A 402/401/403 is logged and NOT retried. Never raises."""
+        delay = 2.0
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(timeout=_TIMEOUT_SEC) as client:
+                    resp = await client.post(url, headers=headers, json=body)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                # The request never reached the server → safe to retry.
+                log.warning("openai _post connect error (attempt %d/%d): %s",
+                            attempt + 1, _MAX_RETRIES + 1, e)
+                if attempt < _MAX_RETRIES:
+                    await asyncio.sleep(min(delay, _MAX_RETRY_WAIT) + random.uniform(0, 1.0))
+                    delay *= 2
+                    continue
+                return None
+            except Exception as e:
+                # Read timeout / transport error AFTER sending: the request may already
+                # be processing (and billed), and retrying inline would both re-pay and
+                # block the loop. Give up — the per-name attempt cap retries next tick.
+                log.warning("openai _post read/transport error (no inline retry): %s", e)
+                return None
+            if resp.status_code < 300:
+                try:
+                    return resp.json()
+                except Exception as e:
+                    log.warning("openai _post: 2xx but unparseable body: %s", e)
+                    return None
+            detail = resp.text[:300]
+            if resp.status_code in _RETRY_STATUS and attempt < _MAX_RETRIES:
+                ra = (resp.headers.get("retry-after") or "").strip()
+                if ra.replace(".", "", 1).isdigit():
+                    ra_f = float(ra)
+                    if ra_f > _MAX_RETRY_WAIT:
+                        # too long to wait inline → give up this tick (attempt cap retries later)
+                        log.warning("openai %s Retry-After %.0fs exceeds the %.0fs cap — giving "
+                                    "up this tick: %s", resp.status_code, ra_f, _MAX_RETRY_WAIT, detail)
+                        return None
+                    wait = ra_f
+                else:
+                    wait = min(delay, _MAX_RETRY_WAIT)
+                wait += random.uniform(0, 1.0)          # jitter — don't retry in lockstep
+                log.warning("openai %s (attempt %d/%d) — retrying in %.1fs: %s",
+                            resp.status_code, attempt + 1, _MAX_RETRIES + 1, wait, detail)
+                await asyncio.sleep(wait); delay *= 2
+                continue
+            # 402/401/403/400, or retries exhausted → give up loudly (was silently empty)
+            log.warning("openai _post failed HTTP %s (no retry): %s", resp.status_code, detail)
             return None
+        return None
 
     @staticmethod
     def _output_text(j: dict) -> str:

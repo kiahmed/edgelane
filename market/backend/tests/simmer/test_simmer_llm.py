@@ -306,3 +306,100 @@ async def test_real_post_returns_none_on_network_error(monkeypatch):
     assert await g._post("http://x", {}, {}) is None
     o = OpenAIOvernightLLM("k")
     assert await o._post("http://x", {}, {}) is None
+
+
+# ── openai _post: status handling + 429 backoff/retry (OpenAI rate-limit guidance) ──
+class _Resp:
+    def __init__(self, status, body, headers=None):
+        self.status_code = status
+        self._body = body
+        self.headers = headers or {}
+        self.text = str(body)
+    def json(self):
+        return self._body
+
+
+def _fake_client_factory(responses):
+    seq = list(responses)
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, headers=None, json=None):
+            item = seq.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+    return _Client
+
+
+async def _noop_sleep(*a, **k):
+    return None
+
+
+async def test_openai_post_retries_429_then_succeeds(monkeypatch):
+    from app.simmer_llm import openai as oa
+    monkeypatch.setattr(oa.httpx, "AsyncClient",
+                        _fake_client_factory([_Resp(429, {"error": "rate"}, {"retry-after": "0"}),
+                                              _Resp(200, {"ok": True})]))
+    monkeypatch.setattr(oa.asyncio, "sleep", _noop_sleep)
+    out = await oa.OpenAIOvernightLLM(api_key="x")._post("u", {}, {})
+    assert out == {"ok": True}       # retried past the 429 and got the body
+
+
+async def test_openai_post_402_quota_not_retried(monkeypatch):
+    from app.simmer_llm import openai as oa
+    # a second response would be used only if it retried — it must NOT.
+    monkeypatch.setattr(oa.httpx, "AsyncClient",
+                        _fake_client_factory([_Resp(402, {"error": "insufficient_quota"}),
+                                              _Resp(200, {"ok": True})]))
+    monkeypatch.setattr(oa.asyncio, "sleep", _noop_sleep)
+    out = await oa.OpenAIOvernightLLM(api_key="x")._post("u", {}, {})
+    assert out is None               # credit/quota → give up loudly, no retry
+
+
+async def test_openai_post_gives_up_after_max_retries(monkeypatch):
+    from app.simmer_llm import openai as oa
+    monkeypatch.setattr(oa.httpx, "AsyncClient",
+                        _fake_client_factory([_Resp(429, {"e": 1})] * (oa._MAX_RETRIES + 1)))
+    monkeypatch.setattr(oa.asyncio, "sleep", _noop_sleep)
+    out = await oa.OpenAIOvernightLLM(api_key="x")._post("u", {}, {})
+    assert out is None               # exhausted retries → None (not an empty dict swallowed)
+
+
+async def test_openai_post_long_retry_after_gives_up_this_tick(monkeypatch):
+    from app.simmer_llm import openai as oa
+    # Retry-After far beyond the cap would stall the inline loop → give up this tick
+    # (the 2nd response must NOT be consumed).
+    monkeypatch.setattr(oa.httpx, "AsyncClient",
+                        _fake_client_factory([_Resp(429, {"e": 1}, {"retry-after": "600"}),
+                                              _Resp(200, {"ok": True})]))
+    monkeypatch.setattr(oa.asyncio, "sleep", _noop_sleep)
+    out = await oa.OpenAIOvernightLLM(api_key="x")._post("u", {}, {})
+    assert out is None
+
+
+async def test_openai_post_read_timeout_not_retried(monkeypatch):
+    from app.simmer_llm import openai as oa
+    # A read timeout may already be processing/billed → no inline retry.
+    monkeypatch.setattr(oa.httpx, "AsyncClient",
+                        _fake_client_factory([oa.httpx.ReadTimeout("slow"),
+                                              _Resp(200, {"ok": True})]))
+    monkeypatch.setattr(oa.asyncio, "sleep", _noop_sleep)
+    out = await oa.OpenAIOvernightLLM(api_key="x")._post("u", {}, {})
+    assert out is None
+
+
+async def test_openai_post_connect_error_is_retried(monkeypatch):
+    from app.simmer_llm import openai as oa
+    # A connect error never reached the server → safe to retry.
+    monkeypatch.setattr(oa.httpx, "AsyncClient",
+                        _fake_client_factory([oa.httpx.ConnectError("refused"),
+                                              _Resp(200, {"ok": True})]))
+    monkeypatch.setattr(oa.asyncio, "sleep", _noop_sleep)
+    out = await oa.OpenAIOvernightLLM(api_key="x")._post("u", {}, {})
+    assert out == {"ok": True}
