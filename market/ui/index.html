@@ -2111,6 +2111,15 @@
   $('gateTabSignUp').addEventListener('click', () => _setGateMode('signup'));
   $('gateSwitchLink').addEventListener('click', () => _setGateMode(AUTH.mode === 'signup' ? 'signin' : 'signup'));
 
+  // GA4 sign-up funnel (tracking only): sign_up_start once per page on the
+  // first keystroke in sign-up mode, sign_up when signUp succeeds.
+  // Abandoned = starts - sign-ups. Nothing personal is sent.
+  const _ga = (name) => { try { if (typeof gtag === 'function') gtag('event', name, { product: 'matrix', method: 'email' }); } catch (_) {} };
+  let _gaSignupStarted = false;
+  $('gateForm').addEventListener('input', () => {
+    if (AUTH.mode === 'signup' && !_gaSignupStarted) { _gaSignupStarted = true; _ga('sign_up_start'); }
+  });
+
   const _emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   $('gateForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -2127,6 +2136,9 @@
       await withBusy(async () => {
         if (AUTH.mode === 'signup') {
           const { data, error } = await supa.auth.signUp({ email, password, options: { data: { full_name: name, signup_product: MATRIX_TOOL }, emailRedirectTo: location.origin + location.pathname } });
+          // An already-registered email also returns no error (Supabase hides
+          // it from enumeration) but with no identities, so don't count it.
+          if (!error && data.user && (data.user.identities || []).length) _ga('sign_up');
           if (error) { $('gateError').textContent = error.message; }
           else if (!data.session) {
             AUTH._pendingEmail = email;

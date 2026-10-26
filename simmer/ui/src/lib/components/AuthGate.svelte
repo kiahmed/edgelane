@@ -71,6 +71,25 @@
 		showResend = false;
 	}
 
+	// GA4 sign-up funnel (tracking only): sign_up_start once per page on the
+	// first keystroke in sign-up mode, sign_up when signUp succeeds.
+	// Abandoned = starts - sign-ups. Nothing personal is sent.
+	function ga(name: string) {
+		const g = (window as unknown as { gtag?: (...a: unknown[]) => void }).gtag;
+		try {
+			if (typeof g === 'function') g('event', name, { product: 'simmer', method: 'email' });
+		} catch {
+			// analytics must never affect sign-up
+		}
+	}
+	let gaSignupStarted = false;
+	function onFormInput() {
+		if (auth.mode === 'signup' && !gaSignupStarted) {
+			gaSignupStarted = true;
+			ga('sign_up_start');
+		}
+	}
+
 	async function submit(e: SubmitEvent) {
 		e.preventDefault();
 		if (busy) return;
@@ -84,6 +103,7 @@
 		try {
 			if (auth.mode === 'signup') {
 				const res = await auth.signUp(email.trim(), password, turnstileToken);
+				if (!res.error) ga('sign_up');
 				if (res.error) error = res.error;
 				else if (res.needsConfirmation) {
 					notice = 'Check your inbox — a confirmation link is on its way.';
@@ -144,7 +164,7 @@
 			>
 		</div>
 
-		<form onsubmit={submit}>
+		<form onsubmit={submit} oninput={onFormInput}>
 			<label for="gate-email">Email</label>
 			<input
 				id="gate-email"
