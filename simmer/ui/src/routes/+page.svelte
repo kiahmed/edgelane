@@ -8,6 +8,7 @@
 	import { watchlist } from '$lib/stores/watchlist.svelte';
 	import { settingsStore } from '$lib/stores/settings.svelte';
 	import type { WatchlistRow } from '$lib/types';
+	import { cardConf, passesMinConf } from '$lib/watchlistFilter';
 	import { readSnap, snapOgImage, snapHref } from '$lib/snap';
 	import { page } from '$app/state';
 
@@ -49,9 +50,9 @@
 	let rqOnly = $state(false);
 	const ovnGap = (r: WatchlistRow) =>
 		Math.abs(Number((r.overrides?.overnight as { gap?: number } | undefined)?.gap ?? 0));
-	// Best confidence across the two tabs, on a 0–100 scale, for sorting.
-	const confVal = (r: WatchlistRow) =>
-		Math.max((r.readiness?.confidence ?? 0) * 100, r.overnight_conf ?? 0);
+	// Confidence the card shows (overnight reconciled read, else readiness) — the min-conf
+	// filter and the sort both judge a row on this. See $lib/watchlistFilter.
+	const confVal = cardConf;
 
 	// Nearest expiry first; rows without an evaluated expiry sink to the bottom.
 	// Expirations are ISO YYYY-MM-DD, so a string compare is chronological.
@@ -65,15 +66,10 @@
 				if (q && !r.symbol.toUpperCase().includes(q)) return false;
 				const env = r.readiness;
 				if (statusFilter !== 'all' && env?.decision !== statusFilter) return false;
-				// Min confidence (percent). Pass if EITHER confidence clears it: the
-				// readiness confidence (0–1 fraction, shown ×100%) or the overnight
-				// catalyst confidence (already 0–100). A row with both passes on
-				// whichever matches; a row with only one is judged on that one.
-				if (minConf > 0) {
-					const rc = (env?.confidence ?? -1) * 100; // −100 ⇒ no readiness conf
-					const oc = r.overnight_conf ?? -1; // −1 ⇒ no overnight conf
-					if (rc < minConf && oc < minConf) return false;
-				}
+				// Min confidence (percent), judged on the number the card SHOWS — a name
+				// flipped to 'wait' at ~30% is dropped at min 80 even if its frozen
+				// combiner was 82. See $lib/watchlistFilter.
+				if (!passesMinConf(r, minConf)) return false;
 				if (rqOnly && !r.overrides?.overnight) return false;
 				return true;
 			});

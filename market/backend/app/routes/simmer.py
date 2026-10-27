@@ -405,19 +405,28 @@ async def get_watchlist(request: Request,
         {"user_id": f"eq.{user['id']}", "active": "eq.true"},
         order="position.asc,symbol.asc")
     supabase_ok = rows is not None
-    # Latest overnight catalyst confidence (0–100) per symbol today — ONE batch
-    # read — so the dashboard filter can rank RQ names by it alongside readiness
-    # confidence. Best-effort; absent → the row just has no overnight_conf.
+    # Overnight confidence per symbol today — the SAME reconciled number the card
+    # shows (reconcile() folds premium + catalyst + intraday drift). NOT combiner.final
+    # (frozen): if the tape flipped a name to 'wait', the card shows ~30% while the
+    # frozen combiner still reads ~82%, and the filter must match the card. ONE batch
+    # read; best-effort; absent → the row just has no overnight_conf.
     ovn_conf: dict[str, Any] = {}
     try:
         from zoneinfo import ZoneInfo
         session = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
-        for a in (await supabase_admin.list_simmer_overnight_analysis(session) or []):
-            c = ((a.get("combiner") or {}).get("final") or {}).get("confidence")
-            if c is None:
-                c = (a.get("llm") or {}).get("confidence")
-            if c is not None:
-                ovn_conf[str(a.get("symbol") or "").upper()] = c
+        analyses = await supabase_admin.list_simmer_overnight_analysis(session) or []
+        prem_by = {}
+        for ro in (await supabase_admin.list_simmer_overnight(session) or []):
+            v = dict(ro.get("verdict") or {})
+            v.update(dir=ro.get("dir"), gap=float(ro.get("gap") or 0.0), crowd=ro.get("crowd"))
+            prem_by[str(ro.get("symbol") or "").upper()] = v
+        drift_cfg = simmer_config.overnight_drift()
+        for a in analyses:
+            sym = str(a.get("symbol") or "").upper()
+            decision = combiner.reconcile(prem_by.get(sym) or {}, a.get("llm") or {},
+                                          a.get("combiner") or {}, drift_cfg=drift_cfg)
+            if decision.get("confidence") is not None:
+                ovn_conf[sym] = decision["confidence"]
     except Exception:
         ovn_conf = {}
     out = []

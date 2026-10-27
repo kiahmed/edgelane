@@ -1417,61 +1417,56 @@ _overnight_flip_seen: dict[tuple, tuple[str, float]] = {}
 _overnight_alert_count: dict[tuple, int] = {}
 
 
-async def _overnight_alert_action(user_id: str, symbol: str, conf: float, call: str,
-                                  session: str, cfg: dict) -> tuple[str | None, str | None]:
+def _overnight_alert_action(user_id: str, symbol: str, call: str, conf: float,
+                            qualifies: bool, last: dict | None, session: str,
+                            cfg: dict) -> tuple[str | None, str | None]:
     """Decide what to do with the overnight alert for one user+name this tick, as
     (action, alert_id):
 
-      * ("insert", None)  — create a new alert (first one today, or a NEW verdict
-                            after the prior one was acknowledged → it beeps).
-      * ("update", id)    — overwrite the existing OPEN (unacknowledged) alert in
-                            place: a verdict change, or a meaningful conviction rise.
-                            Keeps ONE current alert per name; no new beep.
-      * (None, None)      — do nothing: an acknowledged alert of the SAME verdict must
-                            NOT re-pop, an unchanged open alert is already showing, a
-                            flip that hasn't HELD long enough, or a read error.
+      * ("insert", None)      — place a new alert (beeps). First qualifying alert of the
+                                day, once the call has HELD flip_confirm_sec.
+      * ("update", id)        — refresh an OPEN (unacked) alert of the SAME call in place
+                                on a conviction rise (no new beep).
+      * ("delete", id)        — the OPEN (unacked) alert no longer matches the tape (the
+                                direction changed, or it's no longer a qualifying setup):
+                                remove it so the user never sees a stale call.
+      * ("delete_insert", id) — the OPEN (unacked) alert's direction changed to a DIFFERENT
+                                qualifying call that has held: drop the stale + place a fresh
+                                one (beeps).
+      * (None, None)          — nothing: an ACKNOWLEDGED alert (dismissed for the day — it
+                                never re-pops), an unchanged open alert, or a not-yet-held
+                                qualifying call with no alert to clean up.
 
-    One row per user+symbol per session, kept current. Acknowledgements persist, so a
-    dismissed alert stays dismissed until the verdict actually changes."""
-    # When did the current reconciled call first appear (consecutively)? Reset whenever
-    # it changes — so a flip is timed from when the NEW call started, and oscillation
-    # never accumulates a hold.
+    `qualifies` = the reconciled call is a sell side AND conf ≥ min_conf. `last` is the
+    user's latest overnight alert for this name today (any ack state), or None — the caller
+    fetches it in one batch. Pure except for the in-memory flip-hold timer."""
+    # When did the current reconciled call first appear (consecutively)? Reset whenever it
+    # changes, so a flip is timed from when the NEW call started and oscillation can't
+    # accumulate a hold.
     key = (str(session)[:10], user_id, symbol)
     now = time.time()
     seen = _overnight_flip_seen.get(key)
     first_seen = seen[1] if (seen and seen[0] == call) else now
     _overnight_flip_seen[key] = (call, first_seen)
-    held_sec = now - first_seen
+    stable = (now - first_seen) >= float(cfg.get("flip_confirm_sec", 540))
 
-    # The latest alert for this name TODAY — any ack state (so an acknowledged alert is
-    # visible here and can suppress a re-pop). Scoped to today so yesterday's acked
-    # alert doesn't gag a fresh one.
-    rows = await supabase_admin.select_many(
-        "simmer_alerts", "id,score,structure,acknowledged",
-        {"user_id": f"eq.{user_id}", "symbol": f"eq.{symbol}", "state": "eq.overnight",
-         "created_at": f"gte.{str(session)[:10]}"},
-        order="created_at.desc", limit=1)
-    if rows is None:
-        return (None, None)              # read ERROR → fail closed, touch nothing this tick
-    if not rows:
-        return ("insert", None)          # no alert today → first one
-    last = rows[0]
-    acked = bool(last.get("acknowledged"))
-    rise = float(cfg.get("rise", 5))
-    if str(last.get("structure") or "") == str(call):
-        # SAME verdict. Acknowledged → stay dismissed. Unacknowledged → refresh only
-        # on a real conviction rise (no new beep; same row).
-        if acked:
-            return (None, None)
-        if float(conf) >= float(last.get("score") or 0) + rise:
-            return ("update", str(last.get("id")))
+    if not last:
+        # No alert today. A brand-new qualifying call beeps once it's held (debounce).
+        return ("insert", None) if (qualifies and stable) else (None, None)
+    if bool(last.get("acknowledged")):
+        return (None, None)              # dismissed for the day — never re-pop
+    aid = str(last.get("id"))
+    if str(last.get("structure") or "") == str(call) and qualifies:
+        # same open call → refresh only on a real conviction rise (no new beep)
+        if float(conf) >= float(last.get("score") or 0) + float(cfg.get("rise", 5)):
+            return ("update", aid)
         return (None, None)
-    # VERDICT CHANGED — require the new call to have HELD long enough (not a flicker).
-    if held_sec < float(cfg.get("flip_confirm_sec", 540)):
-        return (None, None)
-    # A genuinely new verdict after the user acked the old one → a new alert (beeps).
-    # Over an unacknowledged alert → overwrite it in place (one current row).
-    return ("insert", None) if acked else ("update", str(last.get("id")))
+    # The open (unacked) alert no longer matches the tape (direction changed, or the name
+    # is no longer a qualifying setup). Drop the stale one immediately; replace it only
+    # once a DIFFERENT qualifying call has held (else just remove the stale).
+    if qualifies and stable:
+        return ("delete_insert", aid)
+    return ("delete", aid)
 
 
 async def overnight_alert_fanout(session: str) -> int:
@@ -1503,6 +1498,26 @@ async def overnight_alert_fanout(session: str) -> int:
     min_conf = float(alert_cfg.get("min_conf", OVERNIGHT_ALERT_MIN))
     cap = int(alert_cfg.get("cap", 3))
     session_day = str(session)[:10]
+
+    # Batch-read today's overnight alerts ONCE → the latest per (user, symbol) and the
+    # users holding one per symbol — so we also process names that fell back to 'wait'
+    # and must have their now-stale alert cleared.
+    open_alerts = await supabase_admin.select_many(
+        "simmer_alerts", "id,user_id,symbol,score,structure,acknowledged",
+        {"state": "eq.overnight", "created_at": f"gte.{session_day}"},
+        order="created_at.desc")
+    if open_alerts is None:
+        log.warning("[overnight] alert read failed — skipping fan-out this tick")
+        return 0
+    latest_by: dict[tuple[str, str], dict] = {}
+    alert_uids_by_sym: dict[str, set] = {}
+    for al in open_alerts:
+        uid, sym = str(al.get("user_id") or ""), str(al.get("symbol") or "").upper()
+        if not uid or not sym:
+            continue
+        latest_by.setdefault((uid, sym), al)      # desc order → first seen is the latest
+        alert_uids_by_sym.setdefault(sym, set()).add(uid)
+
     written = 0
     for a in analyses:
         symbol = str(a.get("symbol") or "").upper()
@@ -1510,48 +1525,53 @@ async def overnight_alert_fanout(session: str) -> int:
         decision = combiner.reconcile(prem_by.get(symbol) or {}, a.get("llm") or {},
                                       a.get("combiner") or {}, drift_cfg=drift_cfg)
         call, conf = decision.get("call"), decision.get("confidence")
-        if call in (None, "wait", "skip") or conf is None or float(conf) < min_conf:
-            continue
-        watchers = await supabase_admin.select_many(
-            "simmer_watchlist", "user_id", {"symbol": f"eq.{symbol}", "active": "eq.true"})
-        uids = [str(w["user_id"]) for w in (watchers or []) if w.get("user_id")]
+        qualifies = (call in ("sell_bear_call", "sell_bull_put")
+                     and conf is not None and float(conf) >= min_conf)
+
+        # Who to process: active watchers (to place a new alert) when it qualifies, PLUS
+        # anyone already holding an alert for this name (to refresh or clear it).
+        uids: set[str] = set(alert_uids_by_sym.get(symbol, set()))
+        if qualifies:
+            watchers = await supabase_admin.select_many(
+                "simmer_watchlist", "user_id", {"symbol": f"eq.{symbol}", "active": "eq.true"})
+            uids |= {str(w["user_id"]) for w in (watchers or []) if w.get("user_id")}
         if not uids:
             continue
-        # Read every watcher's opt-out in ONE call. select_many returns None on a
-        # read ERROR (vs [] / rows when it succeeds) — unlike _select_one, which
-        # swallows errors into None. So a hiccup is distinguishable from "no row":
-        # None → FAIL CLOSED (skip the fan-out this run); a missing row → default ON.
+
+        # Per-user opt-out, ONE read. None → fail closed (skip this name this tick).
         srows = await supabase_admin.select_many(
             "simmer_settings", "user_id,notify_overnight",
             {"user_id": f"in.({','.join(uids)})"})
         if srows is None:
-            log.warning("[overnight] notify_overnight read failed for %s — skipping fan-out", symbol)
+            log.warning("[overnight] notify_overnight read failed for %s — skipping", symbol)
             continue
         opted_out = {str(r["user_id"]) for r in srows
                      if r.get("user_id") and r.get("notify_overnight") is False}
+
         llm = a.get("llm") or {}
         payload = _json_safe({
             "why_moved": llm.get("why_moved"), "one_liner": llm.get("one_liner"),
             "catalyst_type": llm.get("catalyst_type"), "deserved": llm.get("deserved"),
             "sentiment": llm.get("web_social_sentiment"), "sustain": llm.get("sustain"),
-            # the reconciled headline the card renders (not the frozen combiner)
-            "call": call, "confidence": round(float(conf), 2),
-            "source": decision.get("source"),
-            "dir": a.get("dir"), "gap": a.get("gap"),
-        })
+            "call": call, "confidence": round(float(conf or 0), 2),
+            "source": decision.get("source"), "dir": a.get("dir"), "gap": a.get("gap"),
+        }) if qualifies else None
+
         for uid in uids:
             if uid in opted_out:
                 continue
             ckey = (session_day, uid, symbol)
-            action, alert_id = await _overnight_alert_action(
-                uid, symbol, float(conf), str(call), session_day, alert_cfg)
-            if action == "insert":
+            action, alert_id = _overnight_alert_action(
+                uid, symbol, str(call), float(conf or 0), qualifies,
+                latest_by.get((uid, symbol)), session_day, alert_cfg)
+            if action in ("insert", "delete_insert"):
+                if action == "delete_insert" and alert_id:
+                    await supabase_admin.delete_rows("simmer_alerts", {"id": f"eq.{alert_id}"})
                 if _overnight_alert_count.get(ckey, 0) >= cap:
-                    continue                # day's NEW-alert cap for this name reached
+                    continue                # NEW-alert cap reached (any stale was removed)
                 ok = await supabase_admin.insert_row("simmer_alerts", {
                     "user_id": uid, "symbol": symbol,
                     "expiration": exp_by_symbol.get(symbol) or session_day,
-                    # The reconciled call/confidence — the SAME number the card shows.
                     "score": round(float(conf), 2), "state": "overnight", "structure": call,
                     "payload": payload,
                 })
@@ -1559,14 +1579,15 @@ async def overnight_alert_fanout(session: str) -> int:
                     written += 1
                     _overnight_alert_count[ckey] = _overnight_alert_count.get(ckey, 0) + 1
             elif action == "update" and alert_id:
-                # Overwrite the open alert in place (one current row per name) — a new
-                # verdict or conviction rise; re-surface it unacknowledged, no new beep.
                 await supabase_admin.update_rows(
                     "simmer_alerts", {"id": f"eq.{alert_id}"},
-                    {"score": round(float(conf), 2), "structure": call,
-                     "payload": payload, "acknowledged": False})
+                    {"score": round(float(conf), 2), "payload": payload})
+            elif action == "delete" and alert_id:
+                # Stale open alert — the direction changed / no longer qualifies. Remove it
+                # so the user never sees a call the tape has abandoned.
+                await supabase_admin.delete_rows("simmer_alerts", {"id": f"eq.{alert_id}"})
     if written:
-        log.info("[overnight] fired %d NEW overnight alert(s) (conf>=%g)", written, min_conf)
+        log.info("[overnight] placed %d NEW overnight alert(s) (conf>=%g)", written, min_conf)
     return written
 
 
@@ -2405,6 +2426,14 @@ async def overnight_loop(provider, tz_name: str) -> None:
                         if do_reset:
                             rres = await overnight.reset_rq_end_of_day()
                             log.info("overnight new-day RQ reset: %s", rres)
+                            # Clear every user's PRIOR-day overnight alerts so they don't
+                            # linger / bloat the table — the new day re-fires its own. The
+                            # created_at < today bound is defence-in-depth: today's gate
+                            # already guarantees no rows yet, but this makes it impossible
+                            # to ever delete a live alert created today.
+                            await supabase_admin.delete_rows(
+                                "simmer_alerts",
+                                {"state": "eq.overnight", "created_at": f"lt.{today}"})
                         elif today_rows is None:
                             log.warning("overnight new-day reset: today-row read failed, skipping")
                         if mark_done:

@@ -420,68 +420,56 @@ async def test_reset_rq_end_of_day_deletes_rq_strips_overlay(monkeypatch):
     assert "overnight" not in stripped[0]["overrides"] and stripped[0]["overrides"]["note"] == "keep"
 
 
-# ── overnight ≥70 alert fan-out (fire / re-trigger / opt-out) ───────────────
-async def test_overnight_alert_action_covers_the_lifecycle(monkeypatch):
-    """One current alert per user+name: acked same-verdict never re-pops (the
-    'alerts reappear after I acknowledge them' bug), an unacked alert is overwritten
-    in place, a new verdict after an ack inserts (beeps)."""
+# ── overnight alert lifecycle (place / refresh / delete stale / don't re-pop) ──
+_UNACK = {"id": "a1", "score": 80, "structure": "sell_bear_call", "acknowledged": False}
+_ACK = {"id": "a1", "score": 80, "structure": "sell_bear_call", "acknowledged": True}
+
+
+def _act(sw, call, conf, qualifies, last, cfg):
+    return sw._overnight_alert_action("u1", "MU", call, conf, qualifies, last, "2026-10-13", cfg)
+
+
+def test_overnight_alert_action_covers_the_lifecycle():
     from app import simmer_watcher as sw
-    sw._overnight_flip_seen.clear(); sw._overnight_alert_count.clear()
+    sw._overnight_flip_seen.clear()
     cfg = {"min_conf": 70, "rise": 5, "flip_confirm_sec": 0, "cap": 3}
-    state = {"rows": []}
-
-    async def _sm(table, select="*", filters=None, **kw):
-        return state["rows"]
-    monkeypatch.setattr(sw.supabase_admin, "select_many", _sm)
-
-    async def act(call, conf):
-        return await sw._overnight_alert_action("u1", "MU", conf, call, "2026-10-13", cfg)
-
-    assert await act("sell_bear_call", 80) == ("insert", None)         # none today → insert
-    # open (unacked) alert, same call, conviction rose → overwrite in place
-    state["rows"] = [{"id": "a1", "score": 80, "structure": "sell_bear_call", "acknowledged": False}]
-    assert await act("sell_bear_call", 90) == ("update", "a1")
-    assert await act("sell_bear_call", 82) == (None, None)             # no real rise → nothing
-    # ACKNOWLEDGED + same verdict → must NOT re-pop (the reported bug)
-    state["rows"] = [{"id": "a1", "score": 90, "structure": "sell_bear_call", "acknowledged": True}]
-    assert await act("sell_bear_call", 99) == (None, None)
-    # verdict CHANGES after the ack → a brand-new alert (beeps)
-    assert await act("sell_bull_put", 88) == ("insert", None)
-    # verdict change over an UNACKED alert → overwrite the existing row (one per name)
-    state["rows"] = [{"id": "a2", "score": 88, "structure": "sell_bear_call", "acknowledged": False}]
-    assert await act("sell_bull_put", 88) == ("update", "a2")
+    # no alert + a qualifying sell → place one (beeps)
+    assert _act(sw, "sell_bear_call", 80, True, None, cfg) == ("insert", None)
+    # open same call, conviction rose → refresh in place (no beep)
+    assert _act(sw, "sell_bear_call", 90, True, _UNACK, cfg) == ("update", "a1")
+    assert _act(sw, "sell_bear_call", 82, True, _UNACK, cfg) == (None, None)   # no real rise
+    # ACKNOWLEDGED + same verdict → never re-pop (the reported bug)
+    assert _act(sw, "sell_bear_call", 99, True, _ACK, cfg) == (None, None)
+    # ACKNOWLEDGED + verdict change → still dismissed for the day (don't pop)
+    assert _act(sw, "sell_bull_put", 88, True, _ACK, cfg) == (None, None)
+    # UNACKED + direction change to a different qualifying call → drop stale + place fresh
+    assert _act(sw, "sell_bull_put", 88, True, _UNACK, cfg) == ("delete_insert", "a1")
+    # UNACKED + now NON-qualifying (flipped to 'wait' at 30%) → just remove the stale
+    assert _act(sw, "wait", 30, False, _UNACK, cfg) == ("delete", "a1")
 
 
-async def test_overnight_alert_action_flip_must_hold(monkeypatch):
-    """A verdict flip acts only once it has HELD flip_confirm_sec — a flicker is ignored."""
+def test_overnight_alert_action_flip_must_hold():
     from app import simmer_watcher as sw
     sw._overnight_flip_seen.clear()
     cfg = {"min_conf": 70, "rise": 5, "flip_confirm_sec": 540, "cap": 3}
-    state = {"rows": [{"id": "a1", "score": 80, "structure": "sell_bear_call", "acknowledged": False}]}
-
-    async def _sm(table, select="*", filters=None, **kw):
-        return state["rows"]
-    monkeypatch.setattr(sw.supabase_admin, "select_many", _sm)
-
     k = ("2026-10-13", "u1", "MU")
-    # the flip just appeared → not held long enough → nothing
-    assert await sw._overnight_alert_action("u1", "MU", 85, "sell_bull_put", "2026-10-13", cfg) == (None, None)
-    # pretend it has now held past the window → acts (overwrite the unacked row)
+    # flip just appeared → the stale alert is removed NOW, but the replacement waits for the hold
+    assert _act(sw, "sell_bull_put", 85, True, _UNACK, cfg) == ("delete", "a1")
     call, first = sw._overnight_flip_seen[k]
-    sw._overnight_flip_seen[k] = (call, first - 600)
-    assert await sw._overnight_alert_action("u1", "MU", 85, "sell_bull_put", "2026-10-13", cfg) == ("update", "a1")
+    sw._overnight_flip_seen[k] = (call, first - 600)           # pretend it has now held
+    assert _act(sw, "sell_bull_put", 85, True, _UNACK, cfg) == ("delete_insert", "a1")
 
 
-async def test_overnight_alert_action_fails_closed_on_read_error(monkeypatch):
-    """A Supabase hiccup reading alerts (None) must touch nothing — never re-fire."""
+def test_overnight_alert_action_first_alert_needs_the_hold():
     from app import simmer_watcher as sw
     sw._overnight_flip_seen.clear()
-    cfg = {"min_conf": 70, "rise": 5, "flip_confirm_sec": 0, "cap": 3}
-
-    async def _none(*a, **k):
-        return None
-    monkeypatch.setattr(sw.supabase_admin, "select_many", _none)
-    assert await sw._overnight_alert_action("u1", "MU", 80, "sell_bear_call", "2026-10-13", cfg) == (None, None)
+    cfg = {"min_conf": 70, "rise": 5, "flip_confirm_sec": 540, "cap": 3}
+    # a brand-new qualifying call must hold before it beeps (debounce)
+    assert _act(sw, "sell_bear_call", 80, True, None, cfg) == (None, None)
+    k = ("2026-10-13", "u1", "MU")
+    call, first = sw._overnight_flip_seen[k]
+    sw._overnight_flip_seen[k] = (call, first - 600)
+    assert _act(sw, "sell_bear_call", 80, True, None, cfg) == ("insert", None)
 
 
 def _alert_cfg(**over):
@@ -585,6 +573,79 @@ async def test_overnight_alert_fanout_fires_on_reconciled_call_not_stale_combine
     assert await sw.overnight_alert_fanout("2026-10-13") == 1
     assert inserted[0]["structure"] == "sell_bull_put"       # reconciled call, not bear_call
     assert inserted[0]["payload"]["source"] == "premium_override"
+
+
+async def test_overnight_alert_fanout_deletes_stale_on_flip_to_wait(monkeypatch):
+    """A name that reconciles to 'wait' (premium pulled it off the sell) must have its
+    stale unacked alert DELETED — not left showing a call the tape has abandoned."""
+    from app import simmer_watcher as sw
+    sw._overnight_flip_seen.clear(); sw._overnight_alert_count.clear()
+    monkeypatch.setattr(sw.simmer_config, "overnight_alert", lambda: _alert_cfg())
+    deleted, inserted = [], []
+
+    async def _list_an(session):
+        return [{"symbol": "MU", "dir": "up", "gap": 0.03, "llm": {"call": "sell_bull_put"},
+                 "combiner": {"final": {"call": "sell_bull_put", "confidence": 82}}}]
+
+    async def _list_ov(session):
+        return [{"symbol": "MU", "expiration": "2026-10-16", "dir": "up", "gap": 0.03,
+                 "verdict": {"call": "wait", "premium_trend": "holding",
+                             "underlying_trend": "retracing", "confidence": 30, "mean_ratio": 1.0}}]
+
+    async def _sm(table, select="*", filters=None, **kw):
+        if table == "simmer_alerts":   # a stale UNACKED bull_put alert exists for u1
+            return [{"id": "A1", "user_id": "u1", "symbol": "MU", "score": 82,
+                     "structure": "sell_bull_put", "acknowledged": False}]
+        if table == "simmer_settings":
+            return []
+        if table == "simmer_watchlist":
+            return [{"user_id": "u1"}]
+        return []
+
+    async def _del(table, filters):
+        deleted.append(filters); return True
+
+    async def _ins(table, row):
+        inserted.append(row); return True
+    monkeypatch.setattr(sw.supabase_admin, "list_simmer_overnight_analysis", _list_an)
+    monkeypatch.setattr(sw.supabase_admin, "list_simmer_overnight", _list_ov)
+    monkeypatch.setattr(sw.supabase_admin, "select_many", _sm)
+    monkeypatch.setattr(sw.supabase_admin, "delete_rows", _del)
+    monkeypatch.setattr(sw.supabase_admin, "insert_row", _ins)
+
+    assert await sw.overnight_alert_fanout("2026-10-13") == 0   # no NEW alert (it's 'wait')
+    assert deleted == [{"id": "eq.A1"}] and inserted == []       # stale one removed
+
+
+async def test_overnight_alert_fanout_fails_closed_on_alert_read_error(monkeypatch):
+    """A None read of the alerts table skips the whole fan-out — never insert/delete blind."""
+    from app import simmer_watcher as sw
+    touched = []
+
+    async def _list_an(session):
+        return [{"symbol": "MU", "dir": "down", "gap": -0.05, "llm": {"call": "sell_bear_call"},
+                 "combiner": {"final": {"call": "sell_bear_call", "confidence": 88}}}]
+
+    async def _list_ov(session):
+        return [{"symbol": "MU", "expiration": "2026-10-16", "dir": "down", "gap": -0.05,
+                 "verdict": {"call": "sell_bear_call", "confidence": 88, "premium_trend": "building",
+                             "underlying_trend": "holding", "mean_ratio": 1.1}}]
+
+    async def _sm(table, select="*", filters=None, **kw):
+        if table == "simmer_alerts":
+            return None                 # read error
+        return []
+
+    async def _touch(*a, **k):
+        touched.append(a); return True
+    monkeypatch.setattr(sw.supabase_admin, "list_simmer_overnight_analysis", _list_an)
+    monkeypatch.setattr(sw.supabase_admin, "list_simmer_overnight", _list_ov)
+    monkeypatch.setattr(sw.supabase_admin, "select_many", _sm)
+    monkeypatch.setattr(sw.supabase_admin, "insert_row", _touch)
+    monkeypatch.setattr(sw.supabase_admin, "delete_rows", _touch)
+
+    assert await sw.overnight_alert_fanout("2026-10-13") == 0
+    assert touched == []                # nothing written
 
 
 # ── /simmer/overnight route ─────────────────────────────────────────────────
