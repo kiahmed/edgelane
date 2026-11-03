@@ -660,6 +660,34 @@
     <p class="small muted">There is no DuckDB mirror of settings — the watcher reads Supabase live, so nothing
     caches to go stale.</p>
 
+    <h3 id="sweep-switch">Sweep master switch — pause / resume all regular sweeps</h3>
+    <p>A single engine-level switch pauses the <strong>regular readiness sweep for every user</strong> without
+    touching anyone's watchlist. It lives in the <code>sweep</code> section of <code>simmer_engine_settings</code>
+    (read via <code>simmer_config.sweep_enabled()</code>). <strong>Overnight / RQ-intersected tickers are carved
+    out and keep running</strong> — only the regular sweep stops.</p>
+    <ul class="small">
+      <li><strong>Default is ON.</strong> The code default is <code>{"enabled": true}</code> and there is
+      <em>no DB row until you create one</em> — so the <code>sweep</code> section won't appear in the settings
+      table until you first disable it.</li>
+      <li><strong>No restart.</strong> Picked up in-memory within <code>SIMMER_SETUP_REFRESH_SEC</code> (default
+      <strong>~60&nbsp;s</strong>); the next sweep after the refresh honours it.</li>
+    </ul>
+    <pre><code># PAUSE the regular sweep (upsert — the row may not exist yet, so a bare `update` would no-op)
+python3 tools/supabase_admin.py sql \
+  "insert into simmer_engine_settings (section, settings, notes)
+   values ('sweep', '{\"enabled\": false}'::jsonb, 'pause regular sweep; overnight/RQ still run')
+   on conflict (section) do update set settings = excluded.settings, updated_at = now()"
+
+# RESUME the regular sweep
+python3 tools/supabase_admin.py sql \
+  "update simmer_engine_settings set settings = '{\"enabled\": true}'::jsonb, updated_at = now()
+   where section = 'sweep'"
+
+# …or just delete the row to fall back to the default-ON code value
+python3 tools/supabase_admin.py delete simmer_engine_settings --where section=sweep -y</code></pre>
+    <p class="small muted">Add <code>-y</code> / <code>--yes</code> to any write if a non-interactive shell
+    prompts for confirmation. The same <code>sweep</code> section is how you'd script a maintenance window.</p>
+
     <div class="callout warn">
       <p class="h">DEVMODE — check before any prod backend deploy</p>
       <p style="margin:0" class="small"><code>DEVMODE=true</code> flips the Tradier token/base/account
