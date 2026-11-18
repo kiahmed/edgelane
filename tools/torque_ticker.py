@@ -8,6 +8,7 @@ TORQUE_TICKERS_REFRESH_SEC (default 60s) — no restart, no redeploy.
   python3 tools/torque_ticker.py show QQQ                   # one row, every column
   python3 tools/torque_ticker.py set QQQ stop_loss_default=50 close_target_default=40
   python3 tools/torque_ticker.py set QQQ stop_loss_default=null      # back to the code default
+  python3 tools/torque_ticker.py set XLE tp=15 sl=40                 # aliases of the two columns above
   python3 tools/torque_ticker.py set NVDA --create tick=0.05 yahoo_symbol=NVDA sort_order=110
   add -n / --dry-run to preview the SQL, -y / --yes to skip the confirmation.
 
@@ -80,8 +81,16 @@ def _columns(ctx) -> dict[str, tuple[str, bool]]:
                                r["is_nullable"] == "YES") for r in rows}
 
 
+# The names `show` prints for the ticker's default stop-loss / take-profit,
+# accepted on `set` too (used wherever an account has no saved setting).
+ALIASES = {"sl": "stop_loss_default", "tp": "close_target_default",
+           "reflex_sl": "stop_loss_default", "reflex_stop": "stop_loss_default",
+           "reflex_tp": "close_target_default", "reflex_target": "close_target_default"}
+
+
 def to_sql(col: str, raw: str, cols: dict[str, tuple[str, bool]]) -> str:
     """One CLI value -> a SQL literal typed by the column. Raises SystemExit."""
+    col = ALIASES.get(col, col)
     if col not in cols:
         raise SystemExit(f"ERROR unknown column {col!r}; columns: {', '.join(sorted(cols))}")
     if col in _LOCKED:
@@ -93,6 +102,7 @@ def to_sql(col: str, raw: str, cols: dict[str, tuple[str, bool]]) -> str:
             raise SystemExit(f"ERROR {col} cannot be null")
         return "null"
     if typ in ("numeric", "integer", "bigint", "smallint", "double precision", "real"):
+        v = v.rstrip("*").rstrip("%").strip()      # accept what `show` prints: 15%, 30%*
         try:
             num = float(v)
         except ValueError:
@@ -135,7 +145,7 @@ def parse_pairs(pairs: list[str]) -> list[tuple[str, str]]:
         if "=" not in p:
             raise SystemExit(f"ERROR expected col=value, got {p!r}")
         col, _, val = p.partition("=")
-        col = col.strip()
+        col = ALIASES.get(col.strip(), col.strip())
         if col in seen:
             raise SystemExit(f"ERROR {col} given twice")
         seen.add(col)
@@ -150,17 +160,53 @@ def _row(ctx, t: str) -> dict | None:
     return rows[0] if rows else None
 
 
+# Code defaults the backend falls back to (app/torque_config.py) — shown so the
+# "effective" Reflex columns match what an order would actually use.
+_DEFAULT_STOP, _DEFAULT_TARGET = 30.0, 30.0
+
+
+def _hours(ctx) -> tuple[str, set[str]]:
+    rows = sa.run_sql(*ctx, ("select key, value from public.app_config where key in "
+                             "('torque_trading_hours', 'torque_extended_hours_tickers');"))
+    kv = {r["key"]: r["value"] for r in rows}
+    ext = {t.strip().upper() for t in str(kv.get("torque_extended_hours_tickers") or "").split(",") if t.strip()}
+    return kv.get("torque_trading_hours") or "(unset — backend uses edgelane_market.config)", ext
+
+
+def _effective(r: dict, ext: set[str]) -> dict:
+    def pct(v, d):
+        try:
+            return f"{float(v):g}%" if v is not None else f"{d:g}% (default)"
+        except (TypeError, ValueError):
+            return f"{d:g}% (default)"
+    return {"extended_hours": "yes" if r.get("ticker") in ext else "no",
+            "sl": pct(r.get("stop_loss_default"), _DEFAULT_STOP),
+            "tp": pct(r.get("close_target_default"), _DEFAULT_TARGET)}
+
+
 def cmd_show(ctx, a) -> int:
+    hours, ext = _hours(ctx)
+    print(f"trading window (ET): {hours}   regular session 09:30-16:00")
+    print(f"extended-hours tickers ({len(ext)}): {', '.join(sorted(ext)) or '(none)'}")
     if a.ticker:
         r = _row(ctx, _ticker(a.ticker))
         if not r:
-            print(f"no row for {a.ticker.upper()}")
+            print(f"no row for {a.ticker.upper()} — not a Torque ticker")
             return 1
-        print(sa.render([r], expanded=True))
+        print(sa.render([{**r, **_effective(r, ext)}], expanded=True))
         return 0
     rows = sa.run_sql(*ctx, f"select {', '.join(_SHOW_COLS)} from {TABLE} order by sort_order, ticker;")
-    print(sa.render(rows))
-    print("null = the code default (30% stop / 30% target, global tick). `show <T>` for every column.")
+    out = []
+    for r in rows:
+        e = _effective(r, ext)
+        out.append({"ticker": r["ticker"], "on": "yes" if r.get("enabled") else "no",
+                    "ext_hrs": e["extended_hours"],
+                    "sl": e["sl"].replace(" (default)", "*"),
+                    "tp": e["tp"].replace(" (default)", "*"),
+                    "tick": r.get("tick"), "max_spread": r.get("max_spread_pct")})
+    print(sa.render(out))
+    print("sl / tp = the ticker's default stop-loss / take-profit, used wherever an account has no\n"
+          "saved setting for it; * = code default (no value on the row). `T=<ticker>` = every column.")
     return 0
 
 

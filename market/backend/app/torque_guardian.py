@@ -337,6 +337,14 @@ async def _close(client) -> None:
 
 
 # ── per-account inputs ──────────────────────────────────────────────────────
+def sl_saved_row(row: dict) -> bool:
+    """Whether a torque_sl_settings row holds a real stop-loss save. False only
+    for a TP-only row (sl_saved false AND take-profit data present). A row with
+    no TP data can only have come from a stop-loss save — this also covers a
+    row saved by a backend that predates the sl_saved column."""
+    return row.get("sl_saved", True) is not False or row.get("tp_enabled") is None
+
+
 async def _sl_settings(key: str) -> dict[str, tuple[bool, float]] | None:
     """ticker -> (enabled, pct) for the account; last good copy on a failed
     read; None if it has never loaded (non-Reflex units are then skipped)."""
@@ -346,7 +354,7 @@ async def _sl_settings(key: str) -> dict[str, tuple[bool, float]] | None:
             str(r.get("ticker") or "").upper(): (
                 bool(r.get("enabled")),
                 float(r["pct"]) if r.get("pct") is not None else default_stop_pct(str(r.get("ticker") or "")))
-            for r in rows}
+            for r in rows if sl_saved_row(r)}   # a TP-only row: SL never saved
     return _SETTINGS_CACHE.get(key)
 
 

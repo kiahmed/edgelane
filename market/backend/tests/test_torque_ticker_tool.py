@@ -46,3 +46,20 @@ def test_ticker_and_pairs_validation():
         tt.parse_pairs(["tick=1", "tick=2"])
     with pytest.raises(SystemExit):
         tt.parse_pairs([])
+
+
+def test_effective_reflex_exits_and_extended_flag():
+    e = tt._effective({"ticker": "DJX", "stop_loss_default": 50, "close_target_default": 60}, {"SPY"})
+    assert e == {"extended_hours": "no", "sl": "50%", "tp": "60%"}
+    e = tt._effective({"ticker": "SPY", "stop_loss_default": None, "close_target_default": None}, {"SPY"})
+    assert e == {"extended_hours": "yes", "sl": "30% (default)", "tp": "30% (default)"}
+
+
+def test_reflex_aliases_and_percent_values():
+    assert tt.parse_pairs(["reflex_tp=15%*", "reflex_sl=40%"]) == [
+        ("close_target_default", "15%*"), ("stop_loss_default", "40%")]
+    assert tt.to_sql("reflex_tp", "15%*", COLS) == "15.0"
+    assert tt.parse_pairs(["tp=15", "sl=40"]) == [("close_target_default", "15"), ("stop_loss_default", "40")]
+    assert tt.to_sql("close_target_default", "30%", COLS) == "30.0"
+    with pytest.raises(SystemExit):
+        tt.parse_pairs(["reflex_tp=15", "close_target_default=20"])   # same column twice

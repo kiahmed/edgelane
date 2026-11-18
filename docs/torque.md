@@ -313,7 +313,7 @@ backend container reads the same data:
 | `yahoo_symbol` | Primary live spot quote (null = Tradier put-call parity). |
 | `allowed_roots` | Option roots allowed (null = any; DJX trades `DJXW` only). |
 | `commission_per_contract`, `extra_fee_per_contract` | Per contract per leg, one way (null = global default). |
-| `stop_loss_default`, `close_target_default`, `close_target_min`, `close_target_spread_scaled`, `close_target_required` | Exit defaults / floors (null = global default, 30% / 30%). `stop_loss_default` + `close_target_default` are also the **Reflex (news-signal) entry's** stop and profit target, and the guardian's stop for Reflex positions — Reflex never uses the page's saved per-account stop setting. Out-of-range values fall back to the defaults. |
+| `stop_loss_default`, `close_target_default`, `close_target_min`, `close_target_spread_scaled`, `close_target_required` | Exit defaults / floors (null = global default, 30% / 30%): the starting stop-loss / take-profit wherever an account has no saved setting (`torque_sl_settings`: stop-loss `enabled`/`pct`, take-profit `tp_enabled`/`tp_pct`, migration `0032`), and the stop / target of news-signal entries. Out-of-range values fall back to the defaults. |
 | `market_orders_allowed` | False forces limits (DJX). |
 | `max_spread_pct` | Widest package bid/ask, as % of mid, the ticker trades, arms a profit target on, or calls tradeable (null = global 100; XLE/XLF 150 — their 0DTE books routinely run 50–120%). Entries are priced at mid either way; this only decides whether to trade at all. Migration `0023`. |
 | `richness_floor` | Counter Read noise floor in $ (null = global default 0.03) — see [Counter Read](torque_operating_manual.html#counter). |
@@ -324,10 +324,12 @@ sets any column of one row, typed and range-checked by column (no raw SQL), with
 before/after view and a confirmation:
 
 ```bash
-make torque-ticker                                    # all tickers, key columns
-make torque-ticker T=QQQ                              # every column of QQQ
+make torque-ticker              # header: trading window + extended list; per ticker: ext_hrs,
+                                # sl/tp defaults for every Torque trade (* = code default), tick, max spread
+make torque-ticker T=QQQ        # every column of QQQ + the same effective values
 make torque-ticker T=QQQ SET="stop_loss_default=50 close_target_default=40"
 make torque-ticker T=QQQ SET="stop_loss_default=null"          # back to the default
+make torque-ticker T=XLE SET="tp=15 sl=40"                    # aliases: tp = close_target_default, sl = stop_loss_default; 15% accepted
 make torque-ticker T=NVDA CREATE=1 SET="tick=0.05 yahoo_symbol=NVDA sort_order=110"
 # ARGS=-n previews the SQL, ARGS=-y skips the prompt; JSON values without spaces
 ```

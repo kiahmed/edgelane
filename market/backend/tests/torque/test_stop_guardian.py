@@ -491,7 +491,7 @@ DEV = {"id": "dev-local", "email": "dev@local", "auth": "dev"}
 
 async def test_unsaved_setting_defaults_on_at_the_ticker_default(monkeypatch):
     r = await troute.torque_sl_setting_get("DJX", FakeRequest(FakeTradier()), account_id="T", user=DEV)
-    assert r == {"symbol": "DJX", "enabled": True, "pct": 50.0, "saved": False}
+    assert {k: r[k] for k in ("symbol", "enabled", "pct", "saved")} == {"symbol": "DJX", "enabled": True, "pct": 50.0, "saved": False}
 
 
 async def test_setting_is_saved_and_read_back_per_account_and_ticker(monkeypatch):
@@ -508,7 +508,7 @@ async def test_setting_is_saved_and_read_back_per_account_and_ticker(monkeypatch
     req = troute.SLSettingRequest(symbol="spy", enabled=False, pct=25, account_id="T")
     await troute.torque_sl_setting_set(req, FakeRequest(FakeTradier()), user=DEV)
     r = await troute.torque_sl_setting_get("SPY", FakeRequest(FakeTradier()), account_id="T", user=DEV)
-    assert r == {"symbol": "SPY", "enabled": False, "pct": 25.0, "saved": True}
+    assert {k: r[k] for k in ("symbol", "enabled", "pct", "saved")} == {"symbol": "SPY", "enabled": False, "pct": 25.0, "saved": True}
 
 
 async def test_setting_for_an_unconfigured_ticker_is_refused():

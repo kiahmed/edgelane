@@ -2638,7 +2638,8 @@ async def _guardian_view(akey: str) -> tuple[dict, dict]:
         for sym in r.get("symbols") or []:
             by_sym[str(sym).upper()] = r
     settings = {str(r.get("ticker") or "").upper(): bool(r.get("enabled"))
-                for r in await supabase_admin.get_sl_settings(akey) or []}
+                for r in await supabase_admin.get_sl_settings(akey) or []
+                if guardian.sl_saved_row(r)}
     _GUARD_VIEW[akey] = (time.time(), by_sym, settings)
     return by_sym, settings
 
@@ -2749,20 +2750,27 @@ async def _sl_account_key(request: Request, user: dict, account_id: str | None) 
 @router.get("/torque/sl-setting", dependencies=_GATE)
 async def torque_sl_setting_get(symbol: str, request: Request, account_id: str | None = None,
                                 user: dict = Depends(get_current_user)):
-    """The page's stop-loss toggle + % for this ticker on the caller's broker
-    account. The stop guardian applies the same setting to every non-Reflex
-    position in the ticker, including ones opened outside Torque. Never
-    saved = on, at the ticker's default."""
+    """The page's saved exit settings for this ticker on the caller's broker
+    account: stop-loss (enabled / pct / saved) and take-profit (tp_enabled /
+    tp_pct / tp_saved). The stop guardian applies the stop-loss half to every
+    non-Reflex position in the ticker, including ones opened outside Torque.
+    Never saved = on, at the ticker's default (torque_tickers_setup)."""
     sym = symbol.upper()
     key = await _sl_account_key(request, user, account_id)
     rows = await supabase_admin.get_sl_settings(key)
-    row = next((r for r in (rows or []) if str(r.get("ticker") or "").upper() == sym), None)
+    row = next((r for r in (rows or []) if str(r.get("ticker") or "").upper() == sym), None) or {}
     default_pct = guardian.default_stop_pct(sym)
-    if row:
+    out = {"symbol": sym, "enabled": True, "pct": default_pct, "saved": False,
+           "tp_enabled": True, "tp_pct": tcfg.close_target_default(sym), "tp_saved": False}
+    if row and guardian.sl_saved_row(row):
         pct = row.get("pct")
-        return {"symbol": sym, "enabled": bool(row.get("enabled")), "saved": True,
-                "pct": float(pct) if pct is not None else default_pct}
-    return {"symbol": sym, "enabled": True, "pct": default_pct, "saved": False}
+        out.update(enabled=bool(row.get("enabled")), saved=True,
+                   pct=float(pct) if pct is not None else default_pct)
+    if row.get("tp_enabled") is not None:
+        tp = row.get("tp_pct")
+        out.update(tp_enabled=bool(row["tp_enabled"]), tp_saved=True,
+                   tp_pct=float(tp) if tp is not None else out["tp_pct"])
+    return out
 
 
 @router.post("/torque/sl-setting", dependencies=_GATE)
@@ -2774,13 +2782,43 @@ async def torque_sl_setting_set(req: SLSettingRequest, request: Request,
     key = await _sl_account_key(request, user, req.account_id)
     ok = await supabase_admin.upsert_sl_setting({
         "account_key": key, "ticker": sym, "enabled": bool(req.enabled),
-        "pct": req.pct, "updated_by": str(user.get("id") or ""),
+        "pct": req.pct, "sl_saved": True, "updated_by": str(user.get("id") or ""),
     })
     if not ok:
         raise HTTPException(502, "could not save the stop-loss setting")
     txn("stop-loss setting saved", account=key, ticker=sym, enabled=req.enabled, pct=req.pct,
         user=user.get("id"))
     return {"symbol": sym, "enabled": bool(req.enabled), "pct": req.pct, "saved": True}
+
+
+class TPSettingRequest(BaseModel):
+    symbol: str
+    enabled: bool
+    pct: float | None = Field(default=None, ge=1, le=500)
+    account_id: str | None = None
+
+
+@router.post("/torque/tp-setting", dependencies=_GATE)
+async def torque_tp_setting_set(req: TPSettingRequest, request: Request,
+                                user: dict = Depends(get_current_user)):
+    """Save the page's take-profit (auto-close) toggle + % for this ticker on
+    the caller's broker account — same row as the stop-loss setting, only the
+    tp_* columns are written (a TP save never marks stop-loss as saved)."""
+    sym = req.symbol.upper()
+    if sym not in tcfg.known_tickers():
+        raise HTTPException(400, f"{sym} is not a configured Torque ticker")
+    if not req.enabled and tcfg.close_target_required(sym):
+        raise HTTPException(400, f"auto-close is required for {sym} and can't be turned off")
+    key = await _sl_account_key(request, user, req.account_id)
+    ok = await supabase_admin.upsert_sl_setting({
+        "account_key": key, "ticker": sym, "tp_enabled": bool(req.enabled),
+        "tp_pct": req.pct, "updated_by": str(user.get("id") or ""),
+    })
+    if not ok:
+        raise HTTPException(502, "could not save the take-profit setting")
+    txn("take-profit setting saved", account=key, ticker=sym, enabled=req.enabled, pct=req.pct,
+        user=user.get("id"))
+    return {"symbol": sym, "tp_enabled": bool(req.enabled), "tp_pct": req.pct, "tp_saved": True}
 
 
 @router.get("/torque/orders", dependencies=_GATE)

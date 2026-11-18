@@ -365,9 +365,22 @@ function App(){
   // guardian applies it to Torque-placed positions in the ticker (never saved =
   // on, at the default) and — only once SAVED with stop-loss on — to positions
   // opened outside Torque (Tradier's site, tp CLI). Reflex: always on.
-  useEffect(()=>{if(!ticker)return;setStopPct(slDefault);setSlSaved(false);
-    j('/torque/sl-setting?symbol='+encodeURIComponent(ticker))
-      .then(r=>{setStopLoss(!!r.enabled);setStopPct(r.pct);setSlSaved(!!r.saved);}).catch(()=>{});},[ticker]);   // eslint-disable-line
+  // Guarded: a response that lands after the user switched tickers is dropped,
+  // so one ticker's saved values can never be shown (and re-saved) on another.
+  // The response's tp_pct is the saved value OR the ticker default, so it is
+  // applied unconditionally here — after the synchronous prefill above.
+  useEffect(()=>{if(!ticker)return;let live=true;const sym=ticker;setStopPct(slDefault);setSlSaved(false);
+    j('/torque/sl-setting?symbol='+encodeURIComponent(sym))
+      .then(r=>{if(!live||!r||String(r.symbol||'').toUpperCase()!==sym.toUpperCase())return;
+        setStopLoss(!!r.enabled);setStopPct(r.pct);setSlSaved(!!r.saved);
+        // take-profit: the saved per-ticker toggle + %, else on at the ticker default
+        setAutoClose(r.tp_saved?!!r.tp_enabled:true);if(r.tp_pct!=null)setTargetPct(r.tp_pct);}).catch(()=>{});
+    return()=>{live=false};},[ticker]);   // eslint-disable-line
+  // Take-profit (auto-close) toggle + % — saved per ticker per account, like stop-loss.
+  const saveTakeProfit=(enabled,pct)=>{if(!ticker)return;const p=Number(pct);
+    j('/torque/tp-setting',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbol:ticker,enabled,pct:(p>=1&&p<=500)?p:null})})
+      .catch(e=>setErr('take-profit setting not saved: '+e.message));};
   const saveStopLoss=(enabled,pct)=>{if(!ticker)return;const p=Number(pct);
     j('/torque/sl-setting',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({symbol:ticker,enabled,pct:(p>=1&&p<100)?p:null})})
@@ -754,14 +767,15 @@ function App(){
                   (floored), but the exit can never be disarmed. The server rejects
                   auto_close=false for these tickers, so the UI must not offer it. */}
               <div className={"toggle"+((autoClose||acRequired)?' on':'')}
-                onClick={()=>{if(!acRequired)setAutoClose(v=>!v);}}
+                onClick={()=>{if(!acRequired){const n=!autoClose;setAutoClose(n);saveTakeProfit(n,targetPct);}}}
                 title={acRequired?ticker+': auto-close is required — its spread is too wide to hold a position without a resting exit':undefined}
                 style={{alignSelf:'center',marginBottom:4,cursor:acRequired?'not-allowed':'pointer'}}>
                 <span className="sw"></span> auto-close +
                 <input type="number" min={tgtMin} max="500" value={targetPct}
                   onClick={e=>e.stopPropagation()}
                   onChange={e=>setTargetPct(e.target.value)}
-                  onBlur={e=>{const v=Number(e.target.value);if(!(v>=tgtMin))setTargetPct(tgtMin);}}
+                  onBlur={e=>{let v=Number(e.target.value);if(!(v>=tgtMin)){v=tgtMin;setTargetPct(tgtMin);}
+                    saveTakeProfit(autoClose||acRequired,v);}}
                   style={{width:54,padding:'4px 6px',fontSize:12}}/>%
                 {tgtMin>1&&<span className="muted" style={{fontSize:11,marginLeft:6}}>min {fmt0(tgtMin)}%</span>}
                 {acRequired&&<span className="muted" style={{fontSize:11,marginLeft:6,fontWeight:700}}>required</span>}
