@@ -319,6 +319,7 @@ function App(){
   const [stopLoss,setStopLoss]=useState(true);
   const [slSaved,setSlSaved]=useState(false);   // a saved row exists for this ticker
   const [stopPct,setStopPct]=useState(30);
+  const [extExit,setExtExit]=useState(null);   // {sl,tp} — extended-hours exits for the ticker (server-enforced)
   const [confirm,setConfirm]=useState(null);    // {order_type}
   const [placing,setPlacing]=useState(false);
   const [result,setResult]=useState(null);
@@ -369,10 +370,11 @@ function App(){
   // so one ticker's saved values can never be shown (and re-saved) on another.
   // The response's tp_pct is the saved value OR the ticker default, so it is
   // applied unconditionally here — after the synchronous prefill above.
-  useEffect(()=>{if(!ticker)return;let live=true;const sym=ticker;setStopPct(slDefault);setSlSaved(false);
+  useEffect(()=>{if(!ticker)return;let live=true;const sym=ticker;setStopPct(slDefault);setSlSaved(false);setExtExit(null);
     j('/torque/sl-setting?symbol='+encodeURIComponent(sym))
       .then(r=>{if(!live||!r||String(r.symbol||'').toUpperCase()!==sym.toUpperCase())return;
         setStopLoss(!!r.enabled);setStopPct(r.pct);setSlSaved(!!r.saved);
+        setExtExit(r.ext_sl_pct!=null&&r.ext_tp_pct!=null?{sl:r.ext_sl_pct,tp:r.ext_tp_pct}:null);
         // take-profit: the saved per-ticker toggle + %, else on at the ticker default
         setAutoClose(r.tp_saved?!!r.tp_enabled:true);if(r.tp_pct!=null)setTargetPct(r.tp_pct);}).catch(()=>{});
     return()=>{live=false};},[ticker]);   // eslint-disable-line
@@ -403,6 +405,10 @@ function App(){
   const regOpen=(mktClock&&mktClock.open!=null)?mktClock.open:isMarketOpen();
   const sessionLive=!liveGate?true:(regOpen||extSession);
   const mktOpen=!liveGate?true:(regOpen||(extSession&&extTicker));
+  // Extended session + an extended-hours ticker: the server arms its own
+  // extended stop / target on every entry (not the page's values) — show
+  // those, locked, and send them.
+  const extArm=!!(extSession&&extTicker&&extExit);
 
   // build (on ticker/strategy/adj change)
   const doBuild=useCallback(()=>{
@@ -625,12 +631,12 @@ function App(){
     const body={symbol:ticker,strategy,legs,order_type,
       limit_price:order_type==='limit'?Number(snapPx(tkInfo,limit)):null,duration,quantity:Number(qty),
       // DJX-class tickers: auto-close is mandatory, so always request it.
-      auto_close:(price&&price.auto_close_required)?true:(autoClose&&!(price&&price.untradeable)),
-      close_target_pct:Number(targetPct),
+      auto_close:extArm?true:((price&&price.auto_close_required)?true:(autoClose&&!(price&&price.untradeable))),
+      close_target_pct:extArm?Number(extExit.tp):Number(targetPct),
       // 0 explicitly disables server-side (PlaceRequest.stop_loss_pct ge=0) —
       // toggled off must send a real 0, not omit the field, since omitting it
       // (null) means "use the ticker's own default" instead of "off".
-      stop_loss_pct:stopLoss?Number(stopPct):0,
+      stop_loss_pct:extArm?Number(extExit.sl):(stopLoss?Number(stopPct):0),
       spread_type:build.type,confirm:!dry,dry_run:dry};
     j('/torque/place',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
       .then(r=>{setResult(r);if(!dry)refreshOrders();})   // pull the new order into the account-wide lists
@@ -766,12 +772,12 @@ function App(){
               {/* acRequired (DJX): the toggle is locked ON — the target % stays editable
                   (floored), but the exit can never be disarmed. The server rejects
                   auto_close=false for these tickers, so the UI must not offer it. */}
-              <div className={"toggle"+((autoClose||acRequired)?' on':'')}
-                onClick={()=>{if(!acRequired){const n=!autoClose;setAutoClose(n);saveTakeProfit(n,targetPct);}}}
+              <div className={"toggle"+((autoClose||acRequired||extArm)?' on':'')}
+                onClick={()=>{if(!acRequired&&!extArm){const n=!autoClose;setAutoClose(n);saveTakeProfit(n,targetPct);}}}
                 title={acRequired?ticker+': auto-close is required — its spread is too wide to hold a position without a resting exit':undefined}
                 style={{alignSelf:'center',marginBottom:4,cursor:acRequired?'not-allowed':'pointer'}}>
                 <span className="sw"></span> auto-close +
-                <input type="number" min={tgtMin} max="500" value={targetPct}
+                <input type="number" min={tgtMin} max="500" value={extArm?extExit.tp:targetPct} disabled={extArm}
                   onClick={e=>e.stopPropagation()}
                   onChange={e=>setTargetPct(e.target.value)}
                   onBlur={e=>{let v=Number(e.target.value);if(!(v>=tgtMin)){v=tgtMin;setTargetPct(tgtMin);}
@@ -779,21 +785,25 @@ function App(){
                   style={{width:54,padding:'4px 6px',fontSize:12}}/>%
                 {tgtMin>1&&<span className="muted" style={{fontSize:11,marginLeft:6}}>min {fmt0(tgtMin)}%</span>}
                 {acRequired&&<span className="muted" style={{fontSize:11,marginLeft:6,fontWeight:700}}>required</span>}
+                {extArm&&<span className="muted" style={{fontSize:11,marginLeft:6,fontWeight:700}}
+                  title="Extended session: Torque arms its extended-hours target on every entry (set in the database, not on this page)">ext-hrs</span>}
               </div>
               <div style={{position:'relative',alignSelf:'center',marginBottom:4}}>
-              {stopLoss&&!slSaved&&<span className="tglhint"
+              {stopLoss&&!slSaved&&!extArm&&<span className="tglhint"
                 title="Using the default. Positions opened outside Torque in this ticker are NOT guarded until it's saved on. Click to save."
                 onClick={()=>saveStopLoss(true,stopPct)}>default · click to save</span>}
-              <div className={"toggle"+(stopLoss?' on':'')}
-                onClick={()=>{const n=!stopLoss;setStopLoss(n);saveStopLoss(n,stopPct);}}
+              <div className={"toggle"+((stopLoss||extArm)?' on':'')}
+                onClick={()=>{if(extArm)return;const n=!stopLoss;setStopLoss(n);saveStopLoss(n,stopPct);}}
                 title="Stop-loss for this ticker (saved). Applies to this order and, through Torque's stop guardian, to every Torque-placed position in this ticker (on by default). Positions opened on Tradier's site or the tp CLI are guarded only once this is SAVED on for the ticker. Reflex orders are always protected regardless."
                 style={{cursor:'pointer'}}>
                 <span className="sw"></span> stop-loss −
-                <input type="number" min="1" max="99" value={stopPct}
+                <input type="number" min="1" max="99" value={extArm?extExit.sl:stopPct} disabled={extArm}
                   onClick={e=>e.stopPropagation()}
                   onChange={e=>setStopPct(e.target.value)}
                   onBlur={e=>{let v=Number(e.target.value);if(!(v>=1)){v=1;setStopPct(1);}saveStopLoss(stopLoss,v);}}
                   style={{width:54,padding:'4px 6px',fontSize:12}}/>%
+                {extArm&&<span className="muted" style={{fontSize:11,marginLeft:6,fontWeight:700}}
+                  title="Extended session: Torque arms its extended-hours stop on every entry (set in the database, not on this page)">ext-hrs</span>}
               </div>
               </div>
             </div>

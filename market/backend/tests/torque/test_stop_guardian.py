@@ -383,8 +383,8 @@ async def test_run_once_skips_while_the_market_is_closed(monkeypatch):
     monkeypatch.setattr("app.config.get_settings", lambda: s)
 
     async def _closed(client):
-        return "closed", False
-    monkeypatch.setattr(troute, "_tradier_market_state", _closed)
+        return "CLOSED", False, "closed"
+    monkeypatch.setattr(troute, "_torque_session", _closed)   # not the wall clock
     called = []
 
     async def _accts(app, **kw):
@@ -618,3 +618,172 @@ async def test_extended_session_no_quote_at_exit_cancels_nothing(db, cfg, monkey
     await _ext_pass(book, cfg)
     assert book.cancels == [] and db.ladders == []
     assert db.rows[SPY_C]["state"] == "needs_attention"
+
+
+# ── extended session: clock-based exits on extended-hours tickers ───────────
+async def _ext_pass2(book, cfg, ext=frozenset({"SPY"}), session="extended"):
+    acct = {"key": AKEY, "client": book, "account_id": "ACC", "uids": ["u1"], "owned": False}
+    n = await g.guard_account(acct, settings_obj=cfg, watcher_syms=set(), now=time.time(),
+                              session=session, ext_tickers=ext)
+    for t in list(g._ACTIVE_EXITS.values()):
+        await t
+    return n
+
+
+@pytest.fixture
+def ext_pcts(monkeypatch):
+    async def _pcts(sym):
+        return 10.0, 15.0
+    monkeypatch.setattr(troute, "ext_exit_pcts", _pcts)
+
+
+async def test_extended_session_uses_the_extended_stop(db, cfg, ext_pcts):
+    db.rows[SPY_C] = {"unit_key": SPY_C, "state": "watching", "source": "torque"}
+    book = Book([pos(SPY_C, 1, 300.0)], {SPY_C: (2.60, 2.64)})       # -12.7%: past 10%, inside 30%
+    await _ext_pass2(book, cfg)
+    assert len(db.ladders) == 1 and db.rows[SPY_C]["state"] in ("exiting", "exited")
+
+
+async def test_regular_session_keeps_the_regular_stop(db, cfg, ext_pcts):
+    db.rows[SPY_C] = {"unit_key": SPY_C, "state": "watching", "source": "torque"}
+    book = Book([pos(SPY_C, 1, 300.0)], {SPY_C: (2.60, 2.64)})
+    await _ext_pass2(book, cfg, session="regular")
+    assert db.ladders == [] and db.rows[SPY_C]["state"] == "watching"
+
+
+async def test_extended_take_profit_places_a_limit_at_the_target_not_a_ladder(db, cfg, ext_pcts):
+    db.rows[SPY_C] = {"unit_key": SPY_C, "state": "watching", "source": "torque"}
+    book = Book([pos(SPY_C, 1, 300.0)], {SPY_C: (3.64, 3.68)})       # bid +21%: past the 15% target
+    await _ext_pass2(book, cfg)
+    assert db.ladders == [] and book.cancels == []
+    tgt = g.exit_targets(g.build_units([pos(SPY_C, 1, 300.0)], [])[0][0], 10, 15)["limit"]["price"]
+    closes = [p for p in book.placed if str(p.get("tag") or "").startswith("torqueCloseGuard")]
+    assert len(closes) == 1 and float(closes[0]["price"]) == tgt and closes[0]["duration"] == "gtc"
+
+
+async def test_extended_take_profit_judged_on_the_bid_not_the_mid(db, cfg, ext_pcts):
+    """Wide pre-market book: mid well past +15% but the bid is below entry —
+    nothing is sold, and a resting target isn't touched."""
+    db.rows[SPY_C] = {"unit_key": SPY_C, "state": "watching", "source": "torque"}
+    tp = {"id": 77, "class": "option", "status": "open", "option_symbol": SPY_C,
+          "side": "sell_to_close", "type": "limit", "price": 3.45, "tag": "torqueClose"}
+    book = Book([pos(SPY_C, 1, 300.0)], {SPY_C: (2.90, 4.90)}, orders=[tp])   # mid 3.90, bid 2.90
+    await _ext_pass2(book, cfg)
+    assert db.ladders == [] and book.cancels == []
+    assert not [p for p in book.placed if str(p.get("tag") or "").startswith("torqueCloseGuard")]
+
+
+async def test_extended_take_profit_leaves_a_resting_target_alone(db, cfg, ext_pcts):
+    db.rows[SPY_C] = {"unit_key": SPY_C, "state": "watching", "source": "torque"}
+    tp = {"id": 77, "class": "option", "status": "open", "option_symbol": SPY_C,
+          "side": "sell_to_close", "type": "limit", "price": 3.45, "tag": "torqueClose"}
+    book = Book([pos(SPY_C, 1, 300.0)], {SPY_C: (3.64, 3.68)}, orders=[tp])
+    await _ext_pass2(book, cfg)
+    assert db.ladders == [] and book.cancels == []
+    assert not [p for p in book.placed if str(p.get("tag") or "").startswith("torqueCloseGuard")]
+
+
+async def test_outside_position_gets_no_take_profit_unless_saved(db, cfg, ext_pcts):
+    db.rows[SPY_C] = {"unit_key": SPY_C, "state": "watching", "source": "outside"}
+    db.settings = [{"ticker": "SPY", "enabled": True, "pct": 30, "sl_saved": True}]
+    book = Book([pos(SPY_C, 1, 300.0)], {SPY_C: (3.64, 3.68)})
+    await _ext_pass2(book, cfg)
+    assert db.ladders == []
+    assert not [p for p in book.placed if str(p.get("tag") or "").startswith("torqueCloseGuard")]
+
+
+class ModBook(Book):
+    def __init__(self, *a, fail_modify=False, reject_place=False, **kw):
+        super().__init__(*a, **kw)
+        self.mods, self.fail_modify, self.reject_place = [], fail_modify, reject_place
+
+    async def modify_order(self, account_id, order_id, price=None, order_type=None, duration=None, stop=None):
+        if self.fail_modify:
+            raise RuntimeError("modify refused")
+        self.mods.append((str(order_id), order_type, price, stop))
+        return {"order": {"id": order_id, "status": "ok"}}
+
+    async def place_order(self, account_id, payload):
+        self.placed.append(payload)
+        if self.reject_place:
+            return {"errors": {"error": ["Sell order exceeds available quantity"]}}
+        return {"order": {"id": 999, "status": "ok"}}
+
+
+def _stop_order(tag="torqueStopguard"):
+    return {"id": 55, "class": "option", "status": "open", "option_symbol": SPY_C,
+            "side": "sell_to_close", "type": "stop_limit", "stop_price": 2.70, "price": 2.65, "tag": tag}
+
+
+async def test_extended_tp_cancels_the_resting_stop_then_places_the_target(db, cfg, ext_pcts):
+    g._TP_FAIL.clear()
+    db.rows[SPY_C] = {"unit_key": SPY_C, "state": "watching", "source": "torque"}
+    book = ModBook([pos(SPY_C, 1, 300.0)], {SPY_C: (3.64, 3.68)}, orders=[_stop_order()])
+    book._order_status_by_id = {"55": {"status": "canceled"}}
+    await _ext_pass2(book, cfg)
+    tgt = g.exit_targets(g.build_units([pos(SPY_C, 1, 300.0)], [])[0][0], 10, 15)["limit"]["price"]
+    assert book.cancels == ["55"]
+    closes = [p for p in book.placed if str(p.get("tag") or "").startswith("torqueCloseGuard")]
+    assert len(closes) == 1 and float(closes[0]["price"]) == tgt
+    assert db.ladders == []
+
+
+async def test_extended_tp_never_places_while_the_stop_cancel_is_unconfirmed(db, cfg, ext_pcts, monkeypatch):
+    g._TP_FAIL.clear()
+    monkeypatch.setattr(g, "_CANCEL_CONFIRM_TRIES", 1)
+    db.rows[SPY_C] = {"unit_key": SPY_C, "state": "watching", "source": "torque"}
+    book = ModBook([pos(SPY_C, 1, 300.0)], {SPY_C: (3.64, 3.68)}, orders=[_stop_order()])
+    book._order_status_by_id = {"55": {"status": "open"}}            # cancel not confirmed
+    await _ext_pass2(book, cfg)
+    assert not [p for p in book.placed if str(p.get("tag") or "").startswith("torqueCloseGuard")]
+    assert db.rows[SPY_C]["state"] == "needs_attention"
+    g._TP_FAIL.clear()
+
+
+async def test_extended_tp_nothing_placed_when_the_stop_filled_first(db, cfg, ext_pcts):
+    g._TP_FAIL.clear()
+    db.rows[SPY_C] = {"unit_key": SPY_C, "state": "watching", "source": "torque"}
+    book = ModBook([pos(SPY_C, 1, 300.0)], {SPY_C: (3.64, 3.68)}, orders=[_stop_order()])
+    book._order_status_by_id = {"55": {"status": "filled"}}
+    await _ext_pass2(book, cfg)
+    assert not [p for p in book.placed if str(p.get("tag") or "").startswith("torqueCloseGuard")]
+    g._TP_FAIL.clear()
+
+
+async def test_extended_tp_never_touches_a_stop_torque_did_not_place(db, cfg, ext_pcts):
+    g._TP_FAIL.clear()
+    db.rows[SPY_C] = {"unit_key": SPY_C, "state": "watching", "source": "torque"}
+    book = ModBook([pos(SPY_C, 1, 300.0)], {SPY_C: (3.64, 3.68)}, orders=[_stop_order(tag="mine")])
+    await _ext_pass2(book, cfg)
+    assert book.cancels == [] and not book.placed
+    assert db.rows[SPY_C]["state"] == "needs_attention"
+
+
+async def test_extended_tp_refused_close_flags_needs_attention(db, cfg, ext_pcts):
+    g._TP_FAIL.clear()
+    db.rows[SPY_C] = {"unit_key": SPY_C, "state": "watching", "source": "torque"}
+    book = ModBook([pos(SPY_C, 1, 300.0)], {SPY_C: (3.64, 3.68)}, reject_place=True)
+    await _ext_pass2(book, cfg)
+    assert db.rows[SPY_C]["state"] == "needs_attention" and "refused" in db.rows[SPY_C]["note"]
+    n = len(book.placed)
+    await _ext_pass2(book, cfg)
+    assert len(book.placed) == n                      # backed off, not retried every pass
+    g._TP_FAIL.clear()
+
+
+async def test_extended_tp_after_cancel_sizes_to_what_is_still_held(db, cfg, ext_pcts):
+    """2 held at the start; the stop filled 1 before its cancel landed → the
+    take-profit is placed for the 1 still held."""
+    g._TP_FAIL.clear()
+    db.rows[SPY_C] = {"unit_key": SPY_C, "state": "watching", "source": "torque"}
+    book = ModBook([pos(SPY_C, 2, 600.0)], {SPY_C: (3.64, 3.68)}, orders=[_stop_order()])
+    book._order_status_by_id = {"55": {"status": "canceled"}}
+    real_cancel = book.cancel_order
+    async def _cancel(account_id, order_id):
+        await real_cancel(account_id, order_id)
+        book._positions = [pos(SPY_C, 1, 300.0)]
+    book.cancel_order = _cancel
+    await _ext_pass2(book, cfg)
+    closes = [p for p in book.placed if str(p.get("tag") or "").startswith("torqueCloseGuard")]
+    assert len(closes) == 1 and str(closes[0].get("quantity")) == "1"
+    g._TP_FAIL.clear()

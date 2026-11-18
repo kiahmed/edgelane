@@ -316,6 +316,13 @@ class Settings(BaseModel):
     # window ends the same distance after the close (13:00 -> 13:15). Pushed to
     # public.app_config by `make db-push`; the backend reads them from there and
     # falls back to these values (see routes/torque.py torque_hours).
+    # Stop-loss / take-profit % for entries placed in the extended session
+    # (global; a ticker's ext_stop_loss_pct / ext_close_target_pct row values
+    # win). Blank = the regular-hours default for the ticker. Pushed to
+    # public.app_config by `make db-push`; read from there first. Seeded at
+    # 10% stop / 15% target.
+    torque_ext_stop_loss_pct: str = Field(default="10")
+    torque_ext_close_target_pct: str = Field(default="15")
     torque_trading_hours: str = Field(default="07:30-16:15")
     torque_extended_hours_tickers: str = Field(default=(
         "AAPL,AMD,AMZN,AVGO,BABA,BAC,F,GOOG,GOOGL,HOOD,INTC,META,MRVL,MSFT,MU,NFLX,"
@@ -571,7 +578,8 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
         out["news_signal_entry_step_sec"] = float(raw["NEWS_SIGNAL_ENTRY_STEP_SEC"])
     if "TORQUE_TICKERS_REFRESH_SEC" in raw:
         out["torque_tickers_refresh_sec"] = int(raw["TORQUE_TICKERS_REFRESH_SEC"])
-    for _k in ("TORQUE_TRADING_HOURS", "TORQUE_EXTENDED_HOURS_TICKERS"):
+    for _k in ("TORQUE_TRADING_HOURS", "TORQUE_EXTENDED_HOURS_TICKERS",
+               "TORQUE_EXT_STOP_LOSS_PCT", "TORQUE_EXT_CLOSE_TARGET_PCT"):
         if raw.get(_k, "").strip():
             out[_k.lower()] = raw[_k].strip()
     if "GUARDIAN_ENABLED" in raw:

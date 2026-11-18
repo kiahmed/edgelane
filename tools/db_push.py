@@ -38,6 +38,8 @@ APP_CONFIG_SYNC = {
                              r"^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$"),
     "TORQUE_EXTENDED_HOURS_TICKERS": ("torque_extended_hours_tickers",
                                       r"^[A-Z][A-Z0-9.]{0,9}(,[A-Z][A-Z0-9.]{0,9})*$"),
+    "TORQUE_EXT_STOP_LOSS_PCT": ("torque_ext_stop_loss_pct", r"^\d{1,2}(\.\d{1,2})?$"),
+    "TORQUE_EXT_CLOSE_TARGET_PCT": ("torque_ext_close_target_pct", r"^\d{1,3}(\.\d{1,2})?$"),
 }
 MIGRATIONS_DIR = ROOT / "supabase" / "migrations"
 # A browser-ish UA — the default urllib UA gets Cloudflare-1010 blocked.

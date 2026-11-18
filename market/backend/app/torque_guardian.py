@@ -72,6 +72,88 @@ def ticker_of(option_symbol: str) -> str | None:
     return None
 
 
+# ── trade direction (one open trade per ticker per direction) ──────────────
+def structure_dir(legs: list[dict]) -> str | None:
+    """'bull' | 'bear' | None for a structure given as legs
+    [{symbol: OCC, action: buy_to_open|sell_to_open|...}]. Singles and
+    verticals by their payoff; same-type butterflies follow Torque's own
+    convention (call fly bull, put fly bear); anything mixing calls and puts
+    (condor, iron fly, strangle) has no single direction → None."""
+    parts = []
+    for lg in legs or []:
+        m = _OCC.match(str(lg.get("symbol") or lg.get("option_symbol") or "").upper())
+        if not m:
+            return None
+        act = str(lg.get("action") or lg.get("side") or "").lower()
+        parts.append((m.group(3), int(m.group(4)) / 1000.0, act.startswith("buy")))
+    if not parts:
+        return None
+    if len(parts) == 1:
+        cp, _k, long_ = parts[0]
+        return "bull" if (cp == "C") == long_ else "bear"
+    types = {cp for cp, _k, _l in parts}
+    if len(types) != 1:
+        return None
+    cp = types.pop()
+    longs = [k for _c, k, l in parts if l]
+    shorts = [k for _c, k, l in parts if not l]
+    if len(parts) == 2 and len(longs) == 1 and len(shorts) == 1:
+        if cp == "C":
+            return "bull" if longs[0] < shorts[0] else "bear"
+        return "bear" if longs[0] > shorts[0] else "bull"
+    if len(parts) == 3:
+        return "bull" if cp == "C" else "bear"
+    if not shorts:
+        return "bull" if cp == "C" else "bear"
+    if not longs:
+        return "bear" if cp == "C" else "bull"
+    return None
+
+
+def order_entry_dir(order: dict) -> str | None:
+    """Direction of a WORKING opening order: from the strategy in its Torque
+    tag when present, else from its *_to_open legs. None if it isn't a
+    working entry or has no single direction."""
+    if str(order.get("status") or "").lower() not in _WORKING:
+        return None
+    legs = [{"symbol": lg.get("option_symbol"), "action": lg.get("side")} for lg in _legs_of(order)
+            if str(lg.get("side") or "").lower().endswith("to_open") and lg.get("option_symbol")]
+    if not legs and order.get("option_symbol") and str(order.get("side") or "").lower().endswith("to_open"):
+        legs = [{"symbol": order.get("option_symbol"), "action": order.get("side")}]
+    if not legs:
+        return None
+    tag = str(order.get("tag") or "").lower().replace("_", "").replace("-", "")
+    if tag.startswith("torque"):
+        for key in sorted(tcfg.STRATEGY_DEFS, key=len, reverse=True):
+            if key.replace("_", "") in tag:
+                return tcfg.STRATEGY_DEFS[key].get("dir")
+    return structure_dir(legs)
+
+
+def open_directions(positions: list[dict], orders: list[dict], ticker: str) -> set[str]:
+    """Directions ('bull'/'bear') the account already has on `ticker`: open
+    option positions (grouped into structures like the guardian does) plus
+    working opening orders."""
+    t = ticker.upper()
+    dirs: set[str] = set()
+    units, flagged = build_units(positions, orders)
+    for u in units:
+        if u["ticker"] == t and (d := structure_dir(u["legs"])):
+            dirs.add(d)
+    qty = {str(p.get("symbol") or "").upper(): _qty(p) for p in positions}
+    for f in flagged:
+        if f.get("ticker") != t:
+            continue
+        for sym in f.get("symbols") or []:
+            q = qty.get(str(sym).upper()) or 0.0
+            if q and (d := structure_dir([{"symbol": sym, "action": "buy" if q > 0 else "sell"}])):
+                dirs.add(d)
+    for o in orders:
+        if any(ticker_of(sym) == t for sym in _order_symbols(o)) and (d := order_entry_dir(o)):
+            dirs.add(d)
+    return dirs
+
+
 def default_stop_pct(ticker: str) -> float:
     return float(tcfg.stop_loss_default(ticker) or tcfg.DEFAULT_STOP_LOSS_PCT)
 
@@ -336,6 +418,205 @@ async def _close(client) -> None:
         pass
 
 
+# ── session-based exits (extended-hours tickers) ───────────────────────────
+_TP_CACHE: dict[str, dict[str, tuple[bool, float | None]]] = {}
+_REPRICE_FAIL: dict[tuple[str, str], float] = {}
+_TP_FAIL: dict[tuple[str, str], float] = {}
+_GAP_LOGGED: set[tuple[str, str]] = set()
+_REPRICE_RETRY_SEC = 60.0
+
+
+def tp_reached_at(exec_px: float | None, target_px: float, entry_type: str) -> bool:
+    """Is the executable exit price at or beyond the take-profit price?
+    debit → can sell for >= target; credit → can buy back for <= target."""
+    if exec_px is None or target_px is None:
+        return False
+    return abs(exec_px) <= abs(target_px) if entry_type == "credit" else abs(exec_px) >= abs(target_px)
+
+
+def _working_stop_legs(closes: list[dict]) -> list[tuple[dict, str]]:
+    """(parent order, order tag) for every working stop / stop_limit close
+    among `closes` — the parent is what gets cancelled (an OCO's legs go
+    together)."""
+    out = []
+    for o in closes:
+        tag = str(o.get("tag") or "").lower()
+        legs = _legs_of(o) if str(o.get("class") or "").lower() in ("oto", "otoco", "oco") else [o]
+        for lg in legs:
+            if str(lg.get("type") or "").lower() in _STOP_TYPES and "to_close" in str(lg.get("side") or "") \
+                    and str(lg.get("status") or "").lower() in _WORKING:
+                out.append((o, tag))
+    return out
+
+
+_CANCEL_CONFIRM_TRIES = 3
+
+
+async def _replace_stop_with_take_profit(client, account_id: str, akey: str, unit: dict,
+                                         order: dict, price: float) -> tuple[bool, str]:
+    """Cancel the resting stop order, confirm it is cancelled, then place the
+    take-profit limit. Never places while the stop might still be live; if the
+    stop filled instead, there's nothing left to close."""
+    oid = order.get("id")
+    try:
+        await client.cancel_order(account_id, oid)
+    except Exception as e:
+        log.warning("guardian: cancel of stop %s failed: %s", oid, e)
+    status = ""
+    for i in range(_CANCEL_CONFIRM_TRIES):
+        try:
+            status = str((await client.get_order(account_id, oid)).get("status") or "").lower()
+        except Exception:
+            status = ""
+        if status in ("canceled", "filled", "rejected", "expired"):
+            break
+        await asyncio.sleep(0.5 * (i + 1))
+    txn("guardian take-profit: stop cancel", account=akey, unit=unit["key"], order_id=oid, status=status)
+    if status == "filled":
+        return False, "the stop filled first — position closed by the stop"
+    if status not in ("canceled", "rejected", "expired"):
+        return False, f"couldn't confirm the stop {oid} was cancelled ({status or 'unknown'}) — not placing a second close"
+    # Size the take-profit to what is still held — the stop may have partly
+    # filled before its cancel landed.
+    try:
+        held = {str(p.get("symbol") or "").upper(): p for p in await client.get_positions(account_id)}
+    except Exception as e:
+        return False, f"couldn't re-read the position after cancelling the stop: {str(e)[:120]}"
+    if not set(unit["symbols"]) & set(held):
+        return False, "the position closed while the stop was being cancelled"
+    k = held_multiple(unit, held)
+    if not k:
+        return False, "the position changed while the stop was being cancelled — review"
+    return await _place_take_profit(client, account_id, akey, {**unit, "qty": k}, price)
+
+
+async def _place_take_profit(client, account_id: str, akey: str, unit: dict,
+                             price: float) -> tuple[bool, str]:
+    """A GTC limit close for `unit` at its take-profit price."""
+    from .routes import torque as troute
+    try:
+        payload = troute._build_close_payload(
+            account_id=account_id, symbol=unit["ticker"], strategy="guard", legs=unit["legs"],
+            is_single=unit["single"], entry_type=unit["entry_type"], close_px=price,
+            quantity=unit["qty"], entry_order_id=None, duration="gtc",
+            tag_prefix="torqueCloseGuard", market=False)
+        res = await troute._submit(client, account_id, payload)
+        rej, why = troute._is_rejected(res)
+    except Exception as e:
+        rej, why = True, str(e)[:200]
+    txn("guardian take-profit close", account=akey, unit=unit["key"], price=price,
+        rejected=rej, reason=why or None)
+    return (not rej), why
+
+
+def regular_exit_pcts(unit: dict, source: str, settings: dict | None,
+                      tp_saved: dict) -> tuple[float, float]:
+    """(stop %, target %) a Torque / Reflex position uses in the regular
+    session: Reflex → the ticker's defaults; Torque-placed → the account's
+    saved setting, else the ticker's defaults."""
+    t = unit["ticker"]
+    sl = default_stop_pct(t)
+    tp = float(tcfg.close_target_default(t))
+    if source == "torque":
+        sl = float((settings or {}).get(t, (True, sl))[1])
+        saved = tp_saved.get(t)
+        if saved and saved[1] is not None:
+            tp = float(saved[1])
+    return sl, max(tp, float(tcfg.close_target_min(t)))
+
+
+def _is_limit_close(o: dict) -> bool:
+    legs = _legs_of(o) if str(o.get("class") or "").lower() in ("oto", "otoco", "oco") else [o]
+    return any(str(lg.get("type") or "").lower() == "limit" and "to_close" in str(lg.get("side") or "")
+               and str(lg.get("status") or "").lower() in _WORKING for lg in legs)
+
+
+def _profit_side(price: float | None, unit: dict) -> bool:
+    """A close limit priced on the profit side of entry (a take-profit), as
+    opposed to a stop leg that has triggered into a plain limit."""
+    if price is None or not unit.get("entry"):
+        return False
+    e = abs(float(unit["entry"]))
+    return abs(price) < e if unit["entry_type"] == "credit" else abs(price) > e
+
+
+def exit_targets(unit: dict, sl_pct: float, tp_pct: float) -> dict[str, dict[str, float]]:
+    """Prices Torque's resting exits should carry for `unit` at these %:
+    {'limit': {price}, 'stop_limit': {stop, price}, 'stop': {stop}}."""
+    from .routes import torque as troute
+    t, et = unit["ticker"], unit["entry_type"]
+    tick = tcfg.structure_tick(t, single=unit["single"])
+    tp_px = teng.close_target_price(unit["entry"], et, float(tp_pct), tick,
+                                    **troute._fee_kw(t, unit["legs"]))
+    trig, lim = teng.stop_limit_leg_prices(unit["entry"], et, float(sl_pct), tick,
+                                           tcfg.STOP_LIMIT_BUFFER_TICKS)
+    return {"limit": {"price": tp_px}, "stop_limit": {"stop": trig, "price": lim},
+            "stop": {"stop": trig}, "_tick": {"price": tick}}
+
+
+async def reprice_exits(client, account_id: str, akey: str, unit: dict, orders: list[dict], *,
+                        now: float, want: tuple[float, float],
+                        only_from: tuple[float, float] | None = None) -> int:
+    """Move Torque's own resting exits on `unit` (orders tagged torque*: the
+    bracket's profit limit / stop-limit legs, a watcher's close) to the prices
+    for `want` = (stop %, target %). With `only_from`, a leg is moved only if it
+    currently sits at the `only_from` prices — so returning to regular values
+    at the open never touches an exit Torque didn't move (floors, clamps and
+    hand-set prices stay). A failed modify is retried after
+    _REPRICE_RETRY_SEC; the guardian's own SL / TP enforcement still applies.
+    Returns the number of legs modified."""
+    new = exit_targets(unit, *want)
+    tick = new.pop("_tick")["price"]
+    old = exit_targets(unit, *only_from) if only_from else None
+    if old:
+        old.pop("_tick", None)
+    tol = tick / 2.0
+    n = 0
+    gap = abs(new["limit"]["price"] - new["stop_limit"]["stop"])
+    for o in closing_orders(orders, set(unit["symbols"]))[0]:
+        if not str(o.get("tag") or "").lower().startswith("torque"):
+            continue
+        cls = str(o.get("class") or "").lower()
+        if cls in ("otoco", "oco") and gap < tcfg.OCO_MIN_PRICE_GAP:
+            # Tradier refuses an OCO whose two prices are under $0.10 apart.
+            gkey = (akey, str(o.get("id")))
+            if gkey not in _GAP_LOGGED:
+                _GAP_LOGGED.add(gkey)
+                txn("exit reprice skipped", account=akey, unit=unit["key"], order_id=o.get("id"),
+                    reason=f"target and stop would be {gap:.2f} apart — under the broker's "
+                           f"{tcfg.OCO_MIN_PRICE_GAP:.2f} OCO minimum", stop_pct=want[0], target_pct=want[1])
+            continue
+        legs = _legs_of(o) if cls in ("oto", "otoco", "oco") else [o]
+        for lg in legs:
+            typ = str(lg.get("type") or "").lower()
+            if typ not in new or "to_close" not in str(lg.get("side") or "") \
+                    or str(lg.get("status") or "").lower() not in _WORKING or not lg.get("id"):
+                continue
+            cur = {"price": teng._f(lg.get("price")), "stop": teng._f(lg.get("stop_price") or lg.get("stop"))}
+            if typ == "limit" and not _profit_side(cur["price"], unit):
+                continue        # a triggered stop leg now working as a limit — never move it up
+            target = new[typ]
+            if all(cur.get(k) is not None and abs(cur[k] - v) < tol for k, v in target.items()):
+                continue                                    # already there
+            if old and not all(cur.get(k) is not None and abs(cur[k] - v) < tol
+                               for k, v in old[typ].items()):
+                continue                                    # not one Torque moved — leave it
+            key = (akey, str(lg["id"]))
+            if key in _REPRICE_FAIL and now - _REPRICE_FAIL[key] < _REPRICE_RETRY_SEC:
+                continue
+            try:
+                await client.modify_order(account_id, lg["id"], price=target.get("price"),
+                                          stop=target.get("stop"))
+                _REPRICE_FAIL.pop(key, None)
+                n += 1
+                txn("exit repriced", account=akey, unit=unit["key"], order_id=lg["id"], type=typ,
+                    **{k: v for k, v in target.items()}, stop_pct=want[0], target_pct=want[1])
+            except Exception as e:
+                _REPRICE_FAIL[key] = now
+                log.warning("guardian: reprice of %s on %s failed: %s", lg.get("id"), unit["key"], e)
+    return n
+
+
 # ── per-account inputs ──────────────────────────────────────────────────────
 def sl_saved_row(row: dict) -> bool:
     """Whether a torque_sl_settings row holds a real stop-loss save. False only
@@ -350,6 +631,9 @@ async def _sl_settings(key: str) -> dict[str, tuple[bool, float]] | None:
     read; None if it has never loaded (non-Reflex units are then skipped)."""
     rows = await supabase_admin.get_sl_settings(key)
     if rows is not None:
+        _TP_CACHE[key] = {str(r.get("ticker") or "").upper(): (
+            bool(r.get("tp_enabled")), float(r["tp_pct"]) if r.get("tp_pct") is not None else None)
+            for r in rows if r.get("tp_enabled") is not None}
         _SETTINGS_CACHE[key] = {
             str(r.get("ticker") or "").upper(): (
                 bool(r.get("enabled")),
@@ -389,7 +673,8 @@ async def _watcher_symbols() -> set[str]:
 # ── the decision for one unit ───────────────────────────────────────────────
 def decide(unit: dict, *, row: dict | None, source: str, settings: dict | None,
            watcher_syms: set[str], px: dict | None, has_stop: bool, now: float,
-           akey: str, takeover_sec: float) -> tuple[str, str | None, float | None]:
+           akey: str, takeover_sec: float,
+           ext_stop: float | None = None) -> tuple[str, str | None, float | None]:
     """(action, note, stop_pct) for one unit. Actions:
     'watcher_managed' | 'sl_off' | 'no_settings' | 'no_quote' | 'past_stop_alert'
     | 'watching' | 'broker_stop' | 'wide_book' | 'exit'.
@@ -397,12 +682,18 @@ def decide(unit: dict, *, row: dict | None, source: str, settings: dict | None,
     Stop-loss by source: Reflex → always on at the ticker default; Torque →
     the page's saved per-ticker setting, on at the default when none is
     saved; outside (Tradier's site, tp CLI, …) → only when stop-loss has been
-    switched ON for that ticker on the Torque page (no saved setting = off)."""
+    switched ON for that ticker on the Torque page (no saved setting = off).
+    In the extended session (`ext_stop` set, extended-hours tickers only) the
+    extended stop applies: always on for Reflex and Torque-placed positions
+    (not tied to the page), and the % for an outside position whose stop-loss
+    is switched on."""
     ukey = (akey, unit["key"])
     if set(unit["symbols"]) & watcher_syms:
         return "watcher_managed", "managed by Torque's own watcher", None
     t = unit["ticker"]
-    if source == "reflex":
+    if ext_stop is not None and source in ("reflex", "torque"):
+        enabled, pct = True, float(ext_stop)
+    elif source == "reflex":
         enabled, pct = True, default_stop_pct(t)
     elif settings is None:
         return "no_settings", "stop-loss settings not loaded yet", None
@@ -413,6 +704,8 @@ def decide(unit: dict, *, row: dict | None, source: str, settings: dict | None,
             return "sl_off", (f"stop-loss off — opened outside Torque; switch stop-loss on for {t} "
                               f"on the Torque page to guard it"), None
         enabled, pct = settings[t]
+        if ext_stop is not None:
+            pct = float(ext_stop)
     if not enabled:
         return "sl_off", f"stop-loss turned off for {t}", None
     if not px or not px.get("complete"):
@@ -563,6 +856,8 @@ async def guard_account(acct: dict, *, settings_obj, watcher_syms: set[str], now
             await supabase_admin.upsert_guarded_position({
                 "account_key": akey, "unit_key": f["key"], "ticker": f["ticker"], "symbols": f["symbols"],
                 "source": "outside", "state": "unconfirmed", "note": f["note"]})
+    from .routes import torque as troute
+    tp_saved = _TP_CACHE.get(akey) or {}
     for u in units:
         ukey = (akey, u["key"])
         if ukey in _ACTIVE_EXITS:
@@ -571,9 +866,59 @@ async def guard_account(acct: dict, *, settings_obj, watcher_syms: set[str], now
         source = unit_source(u, row, reflex, torque_syms)
         px = teng.price_structure(u["legs"], quotes) if quotes else None
         _, has_stop = closing_orders(orders, set(u["symbols"]))
+        # Exit values follow the CLOCK for the broker's extended-hours tickers:
+        # the extended stop / target inside the extended session, the regular
+        # ones in the regular session — whenever the position was opened.
+        ext_vals = None
+        if u["ticker"] in ext_tickers:
+            ext_vals = await troute.ext_exit_pcts(u["ticker"])
+            if source != "outside":
+                reg = regular_exit_pcts(u, source, settings, tp_saved)
+                await reprice_exits(acct["client"], aid, akey, u, orders, now=now,
+                                    want=(ext_vals if session == "extended" else reg),
+                                    only_from=(None if session == "extended" else ext_vals))
+        ext_stop = ext_vals[0] if (ext_vals and session == "extended") else None
         action, note, pct = decide(u, row=row, source=source, settings=settings,
                                    watcher_syms=watcher_syms, px=px, has_stop=has_stop, now=now,
-                                   akey=akey, takeover_sec=takeover)
+                                   akey=akey, takeover_sec=takeover, ext_stop=ext_stop)
+        # Extended-session take-profit: judged on the EXECUTABLE side (what the
+        # position could actually be closed for), never the mid and never on a
+        # wide book. A resting limit close is left to fill at its own price;
+        # with none resting, a GTC limit is placed AT the target price — never
+        # the stop ladder, which would cross the spread.
+        if session == "extended" and ext_vals and action in ("watching", "broker_stop"):
+            tp_on = source != "outside" or bool((tp_saved.get(u["ticker"]) or (False, None))[0])
+            if tp_on and px and px.get("complete"):
+                tgt = exit_targets(u, *ext_vals)["limit"]["price"]
+                tick = tcfg.structure_tick(u["ticker"], single=u["single"])
+                exec_px = teng.stop_exit_price(px, u["entry_type"], tick)
+                closes = closing_orders(orders, set(u["symbols"]))[0]
+                if tp_reached_at(exec_px, tgt, u["entry_type"]) and not any(_is_limit_close(o) for o in closes) \
+                        and not (ukey in _TP_FAIL and now - _TP_FAIL[ukey] < _REPRICE_RETRY_SEC):
+                    head = f"take-profit {ext_vals[1]:g}% reached in the extended session — "
+                    stops = _working_stop_legs(closes)
+                    if stops:
+                        # Never add a second close next to a resting stop (Tradier
+                        # reserves the quantity, or the stop is orphaned). The
+                        # position is past its target, so: cancel that stop, confirm
+                        # the cancel, THEN place the take-profit limit. (A modify
+                        # that changes the order type is silently ignored by the
+                        # broker — verified in sandbox — so it isn't used.)
+                        order, tag = stops[0]
+                        if len({str(o.get("id")) for o, _t in stops}) != 1 or not tag.startswith("torque"):
+                            ok, why = False, "a stop order Torque didn't place is resting — not touched"
+                        else:
+                            ok, why = await _replace_stop_with_take_profit(acct["client"], aid, akey, u, order, tgt)
+                        msg = f"resting stop cancelled, limit close placed at {tgt}" if ok else f"not closed: {why}"
+                    else:
+                        ok, why = await _place_take_profit(acct["client"], aid, akey, u, tgt)
+                        msg = f"limit close placed at {tgt}" if ok else f"limit close refused: {why}"
+                    note = head + msg
+                    if ok:
+                        _TP_FAIL.pop(ukey, None)
+                    else:
+                        _TP_FAIL[ukey] = now
+                        action = "needs_attention"
         if action == "past_stop_alert" and (row or {}).get("state") != "past_stop_alert":
             txn("stop guardian alert", account=akey, unit=u["key"], note=note)
         if action == "exit" and session == "extended" and u["ticker"] not in ext_tickers:
@@ -623,7 +968,7 @@ async def run_once(app) -> None:
         if session not in ("regular", "extended"):
             STATUS.update(skipped_closed=True, last_run=time.time())
             return
-    ext_tickers = (await troute.torque_hours())[1] if session == "extended" else frozenset()
+    ext_tickers = (await troute.torque_hours())[1]
     if not tcfg.ticker_setup_loaded():
         return
     sandbox_only = bool(s.devmode or s.tradier_env == "sandbox")

@@ -786,3 +786,12 @@ async def test_extended_session_refuses_a_market_entry_even_on_an_extended_ticke
     with pytest.raises(HTTPException) as ei:
         await torque_place(req, FakeRequest(FakeTradier()), user=DEV)
     assert ei.value.status_code == 400 and "extended session" in str(ei.value.detail)
+
+
+@pytest.mark.parametrize("ot", ["MARKET", "Market"])
+async def test_extended_session_market_refusal_is_case_insensitive(monkeypatch, ot):
+    _extended(monkeypatch, tickers=("DJX",))
+    req = _place_req(order_type=ot, limit_price=None)
+    with pytest.raises(HTTPException) as ei:
+        await torque_place(req, FakeRequest(FakeTradier()), user=DEV)
+    assert ei.value.status_code == 400 and "extended session" in str(ei.value.detail)

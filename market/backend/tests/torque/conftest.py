@@ -281,3 +281,16 @@ def _hermetic_torque_hours(monkeypatch):
     _troute._HOURS_CACHE.update(t=0.0, hours=None, tickers=None)
     yield
     _troute._HOURS_CACHE.update(t=0.0, hours=None, tickers=None)
+
+
+@pytest.fixture(autouse=True)
+def _not_extended_by_default(monkeypatch):
+    """Tests must not depend on the wall clock: the fake calendar opens every
+    day, so a run between 07:30-09:30 / 16:00-16:15 ET would otherwise put
+    every test in the extended session. Tests that need it patch
+    _in_extended_session themselves (after this fixture, so theirs wins)."""
+    from app.routes import torque as _troute
+    async def _no(client):
+        return False
+    monkeypatch.setattr(_troute, "_in_extended_session", _no)
+    _troute._EXT_CACHE.update(t=0.0, vals=None)

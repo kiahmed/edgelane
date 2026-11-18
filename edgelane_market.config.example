@@ -211,6 +211,12 @@ TORQUE_TICKERS_REFRESH_SEC=60
 # reads (these values are its fallback).
 TORQUE_TRADING_HOURS=07:30-16:15
 TORQUE_EXTENDED_HOURS_TICKERS=AAPL,AMD,AMZN,AVGO,BABA,BAC,F,GOOG,GOOGL,HOOD,INTC,META,MRVL,MSFT,MU,NFLX,NOK,NVDA,ORCL,PFE,PLTR,SNDK,TSLA,TSM,GLD,IWM,QQQ,SPY
+# Stop-loss / take-profit % for entries placed in the extended session (outside
+# 09:30-16:00). A ticker's ext_stop_loss_pct / ext_close_target_pct on its
+# torque_tickers_setup row wins; blank = that ticker's regular default. Seeded 10 / 15.
+# Pushed to public.app_config by `make db-push`.
+TORQUE_EXT_STOP_LOSS_PCT=10
+TORQUE_EXT_CLOSE_TARGET_PCT=15
 # Stop guardian: enforces stop-loss on EVERY open position in Torque tickers,
 # whoever placed it (Torque, Reflex, Tradier's site, the tp CLI). Reflex
 # positions always; others per the Torque page's saved per-ticker stop-loss

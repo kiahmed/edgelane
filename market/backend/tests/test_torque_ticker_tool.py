@@ -50,9 +50,9 @@ def test_ticker_and_pairs_validation():
 
 def test_effective_reflex_exits_and_extended_flag():
     e = tt._effective({"ticker": "DJX", "stop_loss_default": 50, "close_target_default": 60}, {"SPY"})
-    assert e == {"extended_hours": "no", "sl": "50%", "tp": "60%"}
+    assert {k: e[k] for k in ("extended_hours", "sl", "tp")} == {"extended_hours": "no", "sl": "50%", "tp": "60%"}
     e = tt._effective({"ticker": "SPY", "stop_loss_default": None, "close_target_default": None}, {"SPY"})
-    assert e == {"extended_hours": "yes", "sl": "30% (default)", "tp": "30% (default)"}
+    assert {k: e[k] for k in ("extended_hours", "sl", "tp")} == {"extended_hours": "yes", "sl": "30% (default)", "tp": "30% (default)"}
 
 
 def test_reflex_aliases_and_percent_values():
@@ -63,3 +63,27 @@ def test_reflex_aliases_and_percent_values():
     assert tt.to_sql("close_target_default", "30%", COLS) == "30.0"
     with pytest.raises(SystemExit):
         tt.parse_pairs(["reflex_tp=15", "close_target_default=20"])   # same column twice
+
+
+def test_saved_rows_show_sl_and_tp_per_account(monkeypatch):
+    rows = [{"account_key": "live:A", "ticker": "XLE", "enabled": True, "pct": 15, "sl_saved": True,
+             "tp_enabled": None, "tp_pct": None},
+            {"account_key": "live:A", "ticker": "SPY", "enabled": True, "pct": None, "sl_saved": False,
+             "tp_enabled": False, "tp_pct": 20}]
+    monkeypatch.setattr(tt.sa, "run_sql", lambda *a: rows)
+    out = {r["ticker"]: r for r in tt._saved(("ref", "tok"))}
+    assert out["XLE"]["saved_sl"] == "on  15%" and out["XLE"]["saved_tp"] == "—"
+    assert out["SPY"]["saved_sl"] == "—" and out["SPY"]["saved_tp"] == "off 20%"   # TP-only row
+
+
+def test_ext_columns_aliases_and_effective(monkeypatch):
+    cols = {**COLS, "ext_stop_loss_pct": ("numeric", True), "ext_close_target_pct": ("numeric", True)}
+    assert tt.parse_pairs(["ext_sl=10", "ext_tp=15%"]) == [("ext_stop_loss_pct", "10"), ("ext_close_target_pct", "15%")]
+    assert tt.to_sql("ext_tp", "15%", cols) == "15.0"
+    with pytest.raises(SystemExit):
+        tt.to_sql("ext_sl", "120", cols)
+    tt._EXT_GLOBAL.update(sl="10", tp="15")
+    e = tt._effective({"ticker": "SPY", "stop_loss_default": None, "close_target_default": None,
+                       "ext_stop_loss_pct": 8, "ext_close_target_pct": None}, {"SPY"})
+    assert e["ext_sl"] == "8%" and e["ext_tp"] == "15% (global)"
+    tt._EXT_GLOBAL.clear()

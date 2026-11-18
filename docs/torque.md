@@ -414,6 +414,37 @@ the extended session it only acts where the broker can fill:
 - `/torque/place` refuses a non-extended ticker and any market entry, and a
   cancel-signal unwind crosses with a limit instead of a market close.
 
+**Extended-hours exits follow the clock** (migration `0033`). For tickers in
+`TORQUE_EXTENDED_HOURS_TICKERS`, exit values depend on the current session, not
+on when the position was opened. Extended values: `ext_exit_pcts` —
+`torque_tickers_setup.ext_stop_loss_pct` / `ext_close_target_pct`, else the
+global `app_config` `torque_ext_stop_loss_pct` / `torque_ext_close_target_pct`
+(`TORQUE_EXT_STOP_LOSS_PCT=10` / `TORQUE_EXT_CLOSE_TARGET_PCT=15`, pushed by
+`make db-push`), else the ticker's regular default.
+
+- Entries placed in the extended session are always armed (auto-close + stop) at
+  the extended values — `/torque/place` overrides the page; the page shows them
+  locked (`ext-hrs`).
+- The guardian (`guard_account`): in the extended session `reprice_exits` moves
+  Torque's own resting exits (tag `torque*`: bracket profit-limit / stop-limit
+  legs, a watcher's close) to the extended prices via modify; `decide` uses the
+  extended stop; `tp_reached` exits a position past the extended target — at
+  once with no resting target, else after `GUARDIAN_TAKEOVER_SEC`. In the
+  regular session it moves back to the regular values (`regular_exit_pcts`)
+  only the legs that sit at the extended prices. Outside positions: never
+  re-priced; extended stop when stop-loss is on, extended TP only when TP is
+  saved on. A failed modify retries after 60s.
+- App watchers (`_monitor_stop`) switch their stop % with the session
+  (`_session_stop_pct`).
+- After 16:15 nothing runs; exits rest at the extended prices overnight.
+
+**One trade per ticker per direction** (`_same_direction_block`, every hour).
+`/torque/place` (page and news signals alike) refuses — 409 — an entry when the
+account already holds a position or a working entry on the ticker in the same
+direction (`torque_guardian.structure_dir`: singles, verticals, same-type flies;
+mixed call/put structures are neutral and not limited). Read failure refuses.
+Not applied to Webull connections (no positions API in the client).
+
 DAY and GTC orders are live in Tradier's extended sessions without any PRE/POST
 duration (Tradier's own notice, 2026-10-29), so entries keep `duration=day`.
 

@@ -725,6 +725,33 @@ database by <code>make db-push</code>. Outside the regular session market orders
 (use a limit), and the stop guardian never cancels a position's exits unless it can send a
 replacement: a ticker that can't trade yet shows <em>SL deferred to the open</em> and is
 re-checked at 09:30. If the broker itself refuses an order, its reason is shown as-is.</p>
+<p><strong>Extended-hours exits follow the clock.</strong> For the extended-hours tickers above,
+every open position is managed with the <em>current session's</em> stop-loss / take-profit,
+whenever it was opened:</p>
+<ul>
+  <li><strong>07:30–09:30 and 16:00–16:15</strong> — the extended values, <strong>10% stop / 15%
+  target</strong> by default (a ticker can have its own, see
+  <a href="#ticker-settings">ticker settings</a>). New entries are armed with them (the page shows
+  both toggles on, locked, marked <em>ext-hrs</em>), and the stop guardian moves Torque's resting
+  exits on open positions to the extended prices. A position already past its target — say +22%
+  at 16:00 against a 15% target — is closed straight away (its re-priced target fills; if it
+  doesn't within a few seconds, the guardian exits with a limit order). The guardian enforces the
+  extended stop too.</li>
+  <li><strong>After 16:15</strong> — positions still open keep their exits resting at the extended
+  prices overnight, so they're live at those levels from 07:30.</li>
+  <li><strong>09:30–16:00</strong> — the regular values (your saved setting, else the ticker
+  default). At the open the guardian moves the exits it re-priced back to the regular prices;
+  exits it never touched are left exactly as placed.</li>
+</ul>
+<p>Only Torque's own exit orders are re-priced — never orders you placed yourself on Tradier. An
+outside position you guard with stop-loss on gets the extended stop in the extended session, and
+an extended take-profit only if you saved take-profit on for the ticker. Tickers without
+extended-hours options keep their regular values all day.</p>
+<p><strong>One trade per ticker per direction.</strong> At any hour, a new entry is refused when
+the account already has an open trade — or a working entry order — on the same ticker in the
+same direction (bullish: long call, bull call/put, call fly; bearish: long put, bear put/call,
+put fly). The opposite direction is allowed; iron condors / iron flies have no direction and
+aren't limited. If Torque can't read the account's positions it refuses rather than guess.</p>
 <h3 id="ticker-settings">Checking and changing ticker settings</h3>
 <p>One command shows the live database settings — run it from the repo root:</p>
 <pre><code>make torque-ticker              # every ticker
@@ -732,7 +759,14 @@ make torque-ticker T=QQQ        # one ticker, every column</code></pre>
 <p>The header shows the trading window and the extended-hours ticker list exactly as the backend
 reads them. Each ticker row shows whether it trades in extended hours (<code>ext_hrs</code>) and
 its default stop-loss / take-profit (<code>sl</code> / <code>tp</code>; <code>*</code> = no
-value on the row, so the 30% default) — used wherever an account hasn't saved its own. <code>T=&lt;ticker&gt;</code> adds every
+value on the row, so the 30% default) — used wherever an account hasn't saved its own. Below the table it lists what each broker account has <strong>saved</strong> on this
+page (<code>saved_sl</code> / <code>saved_tp</code>; <code>—</code> = not saved, so the default
+applies) — those win for that account. The <code>ext_sl</code> / <code>ext_tp</code> columns are what an entry placed in
+extended hours is armed with (<code>g</code> = the global 10% / 15%, <code>r</code> = the regular
+default); set a ticker's own with <code>make torque-ticker T=SPY SET="ext_sl=8 ext_tp=12"</code>.
+The global values live in <code>edgelane_market.config</code>
+(<code>TORQUE_EXT_STOP_LOSS_PCT</code> / <code>TORQUE_EXT_CLOSE_TARGET_PCT</code>), pushed by
+<code>make db-push</code>. <code>T=&lt;ticker&gt;</code> adds every
 other column (price steps, offsets, fees, floors, notes).</p>
 <p>To give one ticker its own numbers (an outlier), set them on its row; to put it back on the
 defaults, set them to <code>null</code>. Changes are live within about a minute, no restart:</p>

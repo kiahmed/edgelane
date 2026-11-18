@@ -372,6 +372,82 @@ async def _torque_session(client) -> tuple[str | None, bool | None, str | None]:
     return st, is_open, "closed"
 
 
+# ── extended-hours exits (stop / target for entries placed outside 09:30-16:00)
+_EXT_KEYS = ("torque_ext_stop_loss_pct", "torque_ext_close_target_pct")
+_EXT_CACHE: dict = {"t": 0.0, "vals": None}
+
+
+def _pct_or_none(v, lo: float, hi: float) -> float | None:
+    try:
+        f = float(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return f if lo <= f <= hi else None
+
+
+async def _ext_globals() -> tuple[float | None, float | None]:
+    """Global extended-hours (stop, target) %: public.app_config first, else
+    the TORQUE_EXT_* settings; None where neither has a valid value. 60s cache."""
+    now = time.time()
+    if _EXT_CACHE["vals"] is not None and now - _EXT_CACHE["t"] < _HOURS_TTL:
+        return _EXT_CACHE["vals"]
+    s = get_settings()
+    sl = _pct_or_none(s.torque_ext_stop_loss_pct, 1, 99)
+    tp = _pct_or_none(s.torque_ext_close_target_pct, 1, 500)
+    try:
+        sl = _pct_or_none(await supabase_admin.get_app_config(_EXT_KEYS[0]), 1, 99) or sl
+        tp = _pct_or_none(await supabase_admin.get_app_config(_EXT_KEYS[1]), 1, 500) or tp
+    except Exception as e:
+        log.warning("extended exits: app_config read failed, using config values: %s", e)
+    _EXT_CACHE.update(t=now, vals=(sl, tp))
+    return sl, tp
+
+
+async def ext_exit_pcts(symbol: str) -> tuple[float, float]:
+    """(stop_loss_pct, close_target_pct) for an entry on `symbol` placed in the
+    extended session: the ticker row's ext_stop_loss_pct / ext_close_target_pct,
+    else the global extended values, else the ticker's regular defaults."""
+    row = tcfg._row(symbol)
+    g_sl, g_tp = await _ext_globals()
+    sl = _pct_or_none(row.get("ext_stop_loss_pct"), 1, 99) or g_sl \
+        or float(tcfg.stop_loss_default(symbol) or tcfg.DEFAULT_STOP_LOSS_PCT)
+    tp = _pct_or_none(row.get("ext_close_target_pct"), 1, 500) or g_tp \
+        or float(tcfg.close_target_default(symbol))
+    return float(sl), float(tp)
+
+
+async def _session_stop_pct(client, symbol: str, base_pct: float) -> float:
+    """The stop % a watcher enforces right now: the extended stop for an
+    extended-hours ticker inside the extended session, else `base_pct`."""
+    try:
+        if await _in_extended_session(client) and symbol.upper() in (await torque_hours())[1]:
+            return (await ext_exit_pcts(symbol))[0]
+    except Exception as e:
+        log.warning("session stop for %s: %s — keeping %s%%", symbol, e, base_pct)
+    return base_pct
+
+
+async def _same_direction_block(client, account_id: str, symbol: str, strategy: str) -> str | None:
+    """Refusal reason when the account already has an open position or a
+    working entry on `symbol` in the same direction as `strategy`; None when
+    clear. Neutral strategies (condor / iron fly) aren't directional. Fails
+    closed: positions/orders that can't be read refuse the order."""
+    d = (tcfg.STRATEGY_DEFS.get(strategy) or {}).get("dir")
+    if not d:
+        return None
+    try:
+        positions = await client.get_positions(account_id)
+        orders = await client.get_orders(account_id)
+    except Exception as e:
+        log.warning("same-direction check: could not read %s: %s", account_id, e)
+        return "couldn't verify open positions on the account — order not placed, try again"
+    if d in guardian.open_directions(positions, orders, symbol):
+        word = "bullish" if d == "bull" else "bearish"
+        return (f"already have an open {word} trade (or a working {word} entry) on "
+                f"{symbol.upper()} — one trade per ticker per direction")
+    return None
+
+
 async def _in_extended_session(client) -> bool:
     """True only when Torque's session is confirmed `extended` — the broker
     refuses market orders then, and only the extended-hours tickers trade.
@@ -937,11 +1013,18 @@ async def torque_place(req: PlaceRequest, request: Request,
     otype = req.order_type.lower()
     if otype not in ("market", "limit"):
         raise HTTPException(400, "order_type must be 'market' or 'limit'")
-    if await _in_extended_session(_client(request)):
+    in_ext = await _in_extended_session(_client(request))
+    ext_exits = None
+    if in_ext:
         if req.symbol.upper() not in (await torque_hours())[1]:
             raise HTTPException(400, f"{req.symbol.upper()} options don't trade in extended hours")
-        if req.order_type == "market":
+        if otype == "market":
             raise HTTPException(400, "market orders aren't accepted in the extended session — use a limit")
+        # Extended-hours exits are Torque's, not the page's: always armed, at
+        # the extended stop / target (ticker row, else global, else default).
+        ext_exits = await ext_exit_pcts(req.symbol)
+        req.stop_loss_pct, req.close_target_pct = ext_exits
+        req.auto_close = True
     if otype == "limit" and req.limit_price is None:
         raise HTTPException(400, "limit order needs limit_price")
     if otype == "market" and not tcfg.market_orders_allowed(req.symbol):
@@ -1035,6 +1118,13 @@ async def torque_place(req: PlaceRequest, request: Request,
                 await client.close()
 
     try:
+        if req.confirm and not req.dry_run:
+            block = await _same_direction_block(client, account_id, req.symbol, req.strategy)
+            if block:
+                raise HTTPException(409, block)
+        if ext_exits:
+            txn("extended-hours exits armed", symbol=req.symbol, strategy=req.strategy,
+                stop_pct=ext_exits[0], target_pct=ext_exits[1])
         tick = tcfg.ticker_rule(req.symbol, req.strategy)["tick"]
         # Authoritative: a bull_call is a debit and a long fly is a debit
         # regardless of what a wide live bid/ask momentarily nets to — use the
@@ -2060,6 +2150,8 @@ async def _news_signal_after_claim(payload: NewsSignalPayload, request: Request,
     # else the code defaults (30% / 30%). Never the Torque page's saved per-
     # account stop setting — Reflex keeps its own rules.
     stop_pct, target_pct = _news_signal_exit_pcts(symbol)
+    if await _in_extended_session(_client(request)):
+        stop_pct, target_pct = await ext_exit_pcts(symbol)   # place() arms these anyway
     common = dict(request=request, source_event_id=payload.source_event_id, symbol=symbol,
                   strategy=strategy, is_single=True, entry_type="debit", stop_pct=stop_pct,
                   target_pct=target_pct,
@@ -2467,7 +2559,11 @@ async def _monitor_stop(client, account_id, w, *, legs, symbol, strategy, is_sin
             continue
         mark = px.get("abs_mid")
         w["mark"] = mark
-        if not teng.stop_breached(mark, entry_fill, entry_type, stop_pct):
+        # Exit values follow the clock for extended-hours tickers: the extended
+        # stop inside the extended session, the order's own stop otherwise.
+        live_pct = await _session_stop_pct(client, symbol, stop_pct)
+        w["stop_pct_live"] = live_pct
+        if not teng.stop_breached(mark, entry_fill, entry_type, live_pct):
             continue
 
         sp = teng.package_spread_pct(px)
@@ -2760,8 +2856,10 @@ async def torque_sl_setting_get(symbol: str, request: Request, account_id: str |
     rows = await supabase_admin.get_sl_settings(key)
     row = next((r for r in (rows or []) if str(r.get("ticker") or "").upper() == sym), None) or {}
     default_pct = guardian.default_stop_pct(sym)
+    ext_sl, ext_tp = await ext_exit_pcts(sym)
     out = {"symbol": sym, "enabled": True, "pct": default_pct, "saved": False,
-           "tp_enabled": True, "tp_pct": tcfg.close_target_default(sym), "tp_saved": False}
+           "tp_enabled": True, "tp_pct": tcfg.close_target_default(sym), "tp_saved": False,
+           "ext_sl_pct": ext_sl, "ext_tp_pct": ext_tp}
     if row and guardian.sl_saved_row(row):
         pct = row.get("pct")
         out.update(enabled=bool(row.get("enabled")), saved=True,

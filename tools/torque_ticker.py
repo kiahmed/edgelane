@@ -42,13 +42,15 @@ _LOCKED = {"ticker", "created_at", "updated_at"}
 # this just stops an obvious typo from landing in the live table.
 _RANGES = {
     "stop_loss_default": (1, 99), "close_target_default": (1, 500), "close_target_min": (1, 500),
+    "ext_stop_loss_pct": (1, 99), "ext_close_target_pct": (1, 500),
     "max_spread_pct": (1, 1000), "richness_floor": (0, 10),
     "tick": (0.001, 100), "tick_above_3": (0.001, 100),
     "commission_per_contract": (0, 50), "extra_fee_per_contract": (0, 50),
     "sort_order": (-100000, 100000),
 }
 _SHOW_COLS = ("ticker", "enabled", "sort_order", "tick", "tick_above_3", "stop_loss_default",
-              "close_target_default", "close_target_min", "max_spread_pct", "market_orders_allowed")
+              "close_target_default", "close_target_min", "max_spread_pct", "market_orders_allowed",
+              "ext_stop_loss_pct", "ext_close_target_pct")
 
 
 def _ctx():
@@ -84,6 +86,7 @@ def _columns(ctx) -> dict[str, tuple[str, bool]]:
 # The names `show` prints for the ticker's default stop-loss / take-profit,
 # accepted on `set` too (used wherever an account has no saved setting).
 ALIASES = {"sl": "stop_loss_default", "tp": "close_target_default",
+           "ext_sl": "ext_stop_loss_pct", "ext_tp": "ext_close_target_pct",
            "reflex_sl": "stop_loss_default", "reflex_stop": "stop_loss_default",
            "reflex_tp": "close_target_default", "reflex_target": "close_target_default"}
 
@@ -165,10 +168,15 @@ def _row(ctx, t: str) -> dict | None:
 _DEFAULT_STOP, _DEFAULT_TARGET = 30.0, 30.0
 
 
+_EXT_GLOBAL: dict = {}
+
+
 def _hours(ctx) -> tuple[str, set[str]]:
     rows = sa.run_sql(*ctx, ("select key, value from public.app_config where key in "
-                             "('torque_trading_hours', 'torque_extended_hours_tickers');"))
+                             "('torque_trading_hours', 'torque_extended_hours_tickers', "
+                             "'torque_ext_stop_loss_pct', 'torque_ext_close_target_pct');"))
     kv = {r["key"]: r["value"] for r in rows}
+    _EXT_GLOBAL.update(sl=kv.get("torque_ext_stop_loss_pct"), tp=kv.get("torque_ext_close_target_pct"))
     ext = {t.strip().upper() for t in str(kv.get("torque_extended_hours_tickers") or "").split(",") if t.strip()}
     return kv.get("torque_trading_hours") or "(unset — backend uses edgelane_market.config)", ext
 
@@ -179,21 +187,60 @@ def _effective(r: dict, ext: set[str]) -> dict:
             return f"{float(v):g}%" if v is not None else f"{d:g}% (default)"
         except (TypeError, ValueError):
             return f"{d:g}% (default)"
-    return {"extended_hours": "yes" if r.get("ticker") in ext else "no",
-            "sl": pct(r.get("stop_loss_default"), _DEFAULT_STOP),
-            "tp": pct(r.get("close_target_default"), _DEFAULT_TARGET)}
+    def ext_pct(v, glob, regular):
+        try:
+            if v is not None:
+                return f"{float(v):g}%"
+            if glob not in (None, ""):
+                return f"{float(glob):g}% (global)"
+        except (TypeError, ValueError):
+            pass
+        return regular + " (regular)"
+    sl = pct(r.get("stop_loss_default"), _DEFAULT_STOP)
+    tp = pct(r.get("close_target_default"), _DEFAULT_TARGET)
+    return {"extended_hours": "yes" if r.get("ticker") in ext else "no", "sl": sl, "tp": tp,
+            "ext_sl": ext_pct(r.get("ext_stop_loss_pct"), _EXT_GLOBAL.get("sl"), sl.split(" ")[0]),
+            "ext_tp": ext_pct(r.get("ext_close_target_pct"), _EXT_GLOBAL.get("tp"), tp.split(" ")[0])}
+
+
+def _saved(ctx, ticker: str | None = None) -> list[dict]:
+    """Per-account saved exit settings (torque_sl_settings), as display rows.
+    They win over the ticker defaults for that account's page orders."""
+    where = f" where ticker = {_q(ticker)}" if ticker else ""
+    rows = sa.run_sql(*ctx, ("select account_key, ticker, enabled, pct, sl_saved, tp_enabled, tp_pct "
+                             f"from public.torque_sl_settings{where} order by ticker, account_key;"))
+    out = []
+    for r in rows:
+        sl_saved = r.get("sl_saved") is not False or r.get("tp_enabled") is None
+        def onoff(on, pct):
+            return ("on " if on else "off") + (f" {float(pct):g}%" if pct is not None else " (default %)")
+        out.append({"account": r["account_key"], "ticker": r["ticker"],
+                    "saved_sl": onoff(r.get("enabled"), r.get("pct")) if sl_saved else "—",
+                    "saved_tp": onoff(r.get("tp_enabled"), r.get("tp_pct"))
+                    if r.get("tp_enabled") is not None else "—"})
+    return out
+
+
+def _print_saved(ctx, ticker: str | None = None) -> None:
+    rows = _saved(ctx, ticker)
+    print("\nsaved per account (torque_sl_settings) — wins over the defaults above for that account:")
+    print(sa.render(rows) if rows else "  (none saved)")
+    print("— = not saved for that account (the default above applies).")
 
 
 def cmd_show(ctx, a) -> int:
     hours, ext = _hours(ctx)
     print(f"trading window (ET): {hours}   regular session 09:30-16:00")
     print(f"extended-hours tickers ({len(ext)}): {', '.join(sorted(ext)) or '(none)'}")
+    print(f"extended-hours entries: stop {_EXT_GLOBAL.get('sl') or '—'}% / target {_EXT_GLOBAL.get('tp') or '—'}% "
+          "(global; a ticker's ext_sl / ext_tp wins)")
     if a.ticker:
         r = _row(ctx, _ticker(a.ticker))
         if not r:
             print(f"no row for {a.ticker.upper()} — not a Torque ticker")
             return 1
         print(sa.render([{**r, **_effective(r, ext)}], expanded=True))
+        _print_saved(ctx, r["ticker"])
         return 0
     rows = sa.run_sql(*ctx, f"select {', '.join(_SHOW_COLS)} from {TABLE} order by sort_order, ticker;")
     out = []
@@ -203,10 +250,15 @@ def cmd_show(ctx, a) -> int:
                     "ext_hrs": e["extended_hours"],
                     "sl": e["sl"].replace(" (default)", "*"),
                     "tp": e["tp"].replace(" (default)", "*"),
+                    "ext_sl": e["ext_sl"].replace(" (global)", "g").replace(" (regular)", "r"),
+                    "ext_tp": e["ext_tp"].replace(" (global)", "g").replace(" (regular)", "r"),
                     "tick": r.get("tick"), "max_spread": r.get("max_spread_pct")})
     print(sa.render(out))
     print("sl / tp = the ticker's default stop-loss / take-profit, used wherever an account has no\n"
-          "saved setting for it; * = code default (no value on the row). `T=<ticker>` = every column.")
+          "saved setting for it; * = code default (no value on the row). ext_sl / ext_tp = what an\n"
+          "entry placed in extended hours is armed with (g = global value, r = regular default).\n"
+          "`T=<ticker>` = every column.")
+    _print_saved(ctx)
     return 0
 
 
