@@ -261,7 +261,7 @@ async def _yahoo_spot(ticker: str) -> float | None:
         return None
 
 
-_MKT_CACHE: dict = {"t": 0.0, "state": None, "open": None}
+_MKT_CACHE: dict = {"t": 0.0, "state": None, "open": None, "session": None}
 _MKT_OK_TTL = 30.0     # serve a good read this long
 _MKT_FAIL_TTL = 8.0    # serve a FAILED read briefly too, so an outage doesn't
                        # re-hit every poll — still recovers within seconds
@@ -294,6 +294,92 @@ async def _tradier_calendar_days(client) -> dict[str, dict]:
 def _hhmm_today(hhmm: str, now_ny: datetime) -> datetime:
     h, m = (int(x) for x in hhmm.split(":"))
     return now_ny.replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+# ── Torque trading window (incl. the broker's extended options sessions) ──
+# public.app_config keys, written by `make db-push` from edgelane_market.config
+# (TORQUE_TRADING_HOURS / TORQUE_EXTENDED_HOURS_TICKERS). A missing or
+# malformed DB value falls back to the config value. Cached for _HOURS_TTL.
+_HOURS_KEY, _EXT_TICKERS_KEY = "torque_trading_hours", "torque_extended_hours_tickers"
+_HOURS_TTL = 60.0
+_HOURS_CACHE: dict = {"t": 0.0, "hours": None, "tickers": None}
+_HOURS_RE = re.compile(r"^\s*([01]\d|2[0-3]):([0-5]\d)\s*-\s*([01]\d|2[0-3]):([0-5]\d)\s*$")
+
+
+def _parse_hours(v: str | None) -> tuple[str, str] | None:
+    m = _HOURS_RE.match(str(v or ""))
+    if not m:
+        return None
+    start, end = f"{m.group(1)}:{m.group(2)}", f"{m.group(3)}:{m.group(4)}"
+    return (start, end) if start < end else None
+
+
+def _parse_tickers(v: str | None) -> frozenset[str] | None:
+    out = frozenset(t.strip().upper() for t in str(v or "").split(",") if t.strip())
+    return out or None
+
+
+async def torque_hours() -> tuple[tuple[str, str], frozenset[str]]:
+    """Torque's trading window ("HH:MM", "HH:MM" ET) and the tickers allowed to
+    trade inside it but outside the regular session."""
+    now = time.time()
+    if _HOURS_CACHE["hours"] and now - _HOURS_CACHE["t"] < _HOURS_TTL:
+        return _HOURS_CACHE["hours"], _HOURS_CACHE["tickers"]
+    s = get_settings()
+    hours = _parse_hours(s.torque_trading_hours) or ("09:30", "16:00")
+    tickers = _parse_tickers(s.torque_extended_hours_tickers) or frozenset()
+    try:
+        hours = _parse_hours(await supabase_admin.get_app_config(_HOURS_KEY)) or hours
+        tickers = _parse_tickers(await supabase_admin.get_app_config(_EXT_TICKERS_KEY)) or tickers
+    except Exception as e:
+        log.warning("torque hours: app_config read failed, using config values: %s", e)
+    _HOURS_CACHE.update(t=now, hours=hours, tickers=tickers)
+    return hours, tickers
+
+
+def _minutes(hhmm: str) -> int:
+    h, m = (int(x) for x in hhmm.split(":"))
+    return h * 60 + m
+
+
+async def _torque_session(client) -> tuple[str | None, bool | None, str | None]:
+    """(market_state, open, session). `open` is the regular session (Tradier's
+    calendar, unchanged). `session` is Torque's own view:
+      "regular"  — the regular session;
+      "extended" — inside TORQUE_TRADING_HOURS but outside the regular session
+                   (only the extended-hours tickers trade). After the close the
+                   window runs as long past the day's actual close as the
+                   configured end is past 16:00, so an early close is honoured;
+      "closed"   — anything else, incl. a non-trading day;
+      None       — unknown (calendar never fetched)."""
+    st, is_open = await _tradier_market_state(client)
+    if is_open is True:
+        return st, True, "regular"
+    if st is None:
+        return st, is_open, None
+    now_ny = datetime.now(_NY_TZ)
+    day = (await _tradier_calendar_days(client)).get(now_ny.strftime("%Y-%m-%d")) or {}
+    reg = day.get("open") or {}
+    if str(day.get("status") or "").lower() != "open" or not (reg.get("start") and reg.get("end")):
+        return st, is_open, "closed"
+    (h_start, h_end), _ = await torque_hours()
+    now_m = now_ny.hour * 60 + now_ny.minute
+    if _minutes(h_start) <= now_m < _minutes(reg["start"]):
+        return st, is_open, "extended"
+    post = max(0, _minutes(h_end) - 16 * 60)
+    if _minutes(reg["end"]) <= now_m < _minutes(reg["end"]) + post:
+        return st, is_open, "extended"
+    return st, is_open, "closed"
+
+
+async def _in_extended_session(client) -> bool:
+    """True only when Torque's session is confirmed `extended` — the broker
+    refuses market orders then, and only the extended-hours tickers trade.
+    Any read failure is False: callers then keep their regular behaviour."""
+    try:
+        return (await _torque_session(client))[2] == "extended"
+    except Exception:
+        return False
 
 
 async def _tradier_market_state(client) -> tuple[str | None, bool | None]:
@@ -487,11 +573,13 @@ async def torque_clock(request: Request):
     # still None) for the shorter _MKT_FAIL_TTL so a sustained outage is
     # shielded, not spammed.
     ttl = _MKT_OK_TTL if _MKT_CACHE["open"] is not None else _MKT_FAIL_TTL
-    if _MKT_CACHE["t"] and now - _MKT_CACHE["t"] < ttl:
-        return {"market_state": _MKT_CACHE["state"], "open": _MKT_CACHE["open"]}
-    st, is_open = await _tradier_market_state(_client(request))
-    _MKT_CACHE.update(t=now, state=st, open=is_open)
-    return {"market_state": st, "open": is_open}
+    if not (_MKT_CACHE["t"] and now - _MKT_CACHE["t"] < ttl):
+        st, is_open, session = await _torque_session(_client(request))
+        _MKT_CACHE.update(t=now, state=st, open=is_open, session=session)
+    (h_start, h_end), ext = await torque_hours()
+    return {"market_state": _MKT_CACHE["state"], "open": _MKT_CACHE["open"],
+            "session": _MKT_CACHE.get("session"), "trading_hours": f"{h_start}-{h_end}",
+            "extended_tickers": sorted(ext)}
 
 
 # ── analysis ───────────────────────────────────────────────────────────────
@@ -849,6 +937,11 @@ async def torque_place(req: PlaceRequest, request: Request,
     otype = req.order_type.lower()
     if otype not in ("market", "limit"):
         raise HTTPException(400, "order_type must be 'market' or 'limit'")
+    if await _in_extended_session(_client(request)):
+        if req.symbol.upper() not in (await torque_hours())[1]:
+            raise HTTPException(400, f"{req.symbol.upper()} options don't trade in extended hours")
+        if req.order_type == "market":
+            raise HTTPException(400, "market orders aren't accepted in the extended session — use a limit")
     if otype == "limit" and req.limit_price is None:
         raise HTTPException(400, "limit order needs limit_price")
     if otype == "market" and not tcfg.market_orders_allowed(req.symbol):
@@ -1256,9 +1349,28 @@ async def _is_sandbox_account(uid) -> bool:
             and (cfg.get("tradier_env") or "").lower() == "sandbox")
 
 
+def _news_signal_exit_pcts(symbol: str) -> tuple[float, float]:
+    """(stop_loss_pct, close_target_pct) for a news-signal entry on `symbol`:
+    the ticker's torque_tickers_setup values, else the code defaults. A value
+    outside what PlaceRequest accepts (stop 1-99, target 1-500) falls back to
+    the default with a warning instead of failing the signal."""
+    stop = tcfg.stop_loss_default(symbol)
+    if stop is None or not (1 <= float(stop) <= 99):
+        if stop is not None:
+            log.warning("news_signal: %s stop_loss_default=%s out of range — using %s",
+                        symbol, stop, tcfg.DEFAULT_STOP_LOSS_PCT)
+        stop = tcfg.DEFAULT_STOP_LOSS_PCT
+    target = tcfg.close_target_default(symbol)
+    if not (1 <= float(target) <= 500):
+        log.warning("news_signal: %s close_target_default=%s out of range — using %s",
+                    symbol, target, tcfg.DEFAULT_CLOSE_TARGET_PCT)
+        target = tcfg.DEFAULT_CLOSE_TARGET_PCT
+    return float(stop), float(target)
+
+
 async def _place_news_signal_for_uid(uid, *, request, source_event_id, symbol, strategy,
                                      legs, is_single, entry_type, tick,
-                                     limit_price, stop_pct, quantity,
+                                     limit_price, stop_pct, quantity, target_pct=None,
                                      sandbox_only: bool = False, expiration=None,
                                      attempt: int = 1, entry_ask: float | None = None) -> dict:
     """One qualified account's attempt: entitlement + broker checks, then a
@@ -1285,6 +1397,7 @@ async def _place_news_signal_for_uid(uid, *, request, source_event_id, symbol, s
         symbol=symbol, strategy=strategy, legs=legs, order_type="limit",
         limit_price=limit_price, quantity=quantity,
         auto_close=True, stop_loss_pct=stop_pct, confirm=True, tag_prefix="torqueNews",
+        close_target_pct=(target_pct if target_pct is not None else _news_signal_exit_pcts(symbol)[1]),
     )
     try:
         result = await torque_place(place_req, request, user=user)
@@ -1653,7 +1766,9 @@ async def _close_one_signal_order(row: dict, *, sandbox_only: bool = False) -> d
             client, account_id, entry_order_id, float(row.get("quantity") or 1))
         result = {"uid": uid, "entry_order_id": entry_order_id, "action": outcome}
         if outcome == "close_market":
-            use_market = tcfg.market_orders_allowed(row["symbol"])
+            # No market order in the extended session (the broker refuses it):
+            # cross at the live bid/ask instead, exactly like a no-market ticker.
+            use_market = tcfg.market_orders_allowed(row["symbol"]) and not await _in_extended_session(client)
             close_px = None
             if not use_market:
                 # A market order on this ticker pays ~2x fair — cross at the
@@ -1699,9 +1814,9 @@ async def _handle_cancel_signal(payload: "NewsSignalPayload", request: Request) 
     if not payload.cancels_event_id:
         return {"ok": True, "accepted": False, "reason": "cancel signal missing cancels_event_id"}
     _CANCELLED_SIGNALS.add(str(payload.cancels_event_id))   # stops a step-up still running here
-    sandbox_only = await _market_gate_sandbox_only(request)
+    sandbox_only, gate_reason = await _market_gate_sandbox_only(request, (payload.symbol or "").upper())
     if sandbox_only is None:
-        return {"ok": True, "accepted": False, "reason": "market is closed or its state is unknown"}
+        return {"ok": True, "accepted": False, "reason": gate_reason}
     rows = await supabase_admin.get_torque_orders_by_event(payload.cancels_event_id)
     if not rows:
         return {"ok": True, "accepted": False,
@@ -1731,24 +1846,33 @@ async def _handle_cancel_signal(payload: "NewsSignalPayload", request: Request) 
     return out
 
 
-async def _market_gate_sandbox_only(request: Request) -> bool | None:
-    """The shared market-hours gate for entry and cancel signals.
-      False → market confirmed open: act normally on every account.
-      True  → market closed/unknown BUT the backend runs in DEVMODE / sandbox
-              (the same switch that lifts the Torque UI's own market gate):
-              proceed, restricted to Tradier sandbox accounts — DEVMODE only
-              flips the house client, never a user's own connection, so a
-              production account must still be skipped out of hours.
-      None  → market closed/unknown in production mode: drop the signal.
+async def _market_gate_sandbox_only(request: Request, symbol: str | None = None
+                                   ) -> tuple[bool | None, str | None]:
+    """The shared market-hours gate for entry and cancel signals, as
+    (sandbox_only, reason):
+      False → Torque's trading session is live for `symbol` (the regular
+              session, or the extended session for an extended-hours ticker):
+              act normally on every account.
+      True  → not live BUT the backend runs in DEVMODE / sandbox (the same
+              switch that lifts the Torque UI's own market gate): proceed,
+              restricted to Tradier sandbox accounts — DEVMODE only flips the
+              house client, never a user's own connection, so a production
+              account must still be skipped out of hours.
+      None  → not live in production mode: drop, with `reason`.
     Fails closed — an unreadable clock counts as closed."""
     try:
         clock = await torque_clock(request)
     except Exception:
         clock = {"open": None}
     if clock.get("open") is True:
-        return False
+        return False, None
+    reason = "market is closed or its state is unknown"
+    if clock.get("session") == "extended":
+        if symbol and symbol.upper() in set(clock.get("extended_tickers") or []):
+            return False, None
+        reason = f"{symbol} options don't trade in extended hours"
     s = get_settings()
-    return True if (s.devmode or s.tradier_env == "sandbox") else None
+    return (True, reason) if (s.devmode or s.tradier_env == "sandbox") else (None, reason)
 
 
 @router.post("/webhook/news_signal", dependencies=[Depends(require_news_signal_auth)])
@@ -1894,15 +2018,16 @@ async def _news_signal_after_claim(payload: NewsSignalPayload, request: Request,
         return {"ok": True, "accepted": False, "reason": f"{symbol} is not a configured Torque ticker"}
 
     # Defensive belt-and-suspenders — facades-news-reactor already enforces
-    # trading_hours on the sending side. Fails CLOSED here: an unattended
+    # trading_hours on the sending side. Torque's own trading window applies
+    # (the extended session for extended-hours tickers). Fails CLOSED here: an unattended
     # trader should never act on an uncertain market-open read, so anything
     # other than a confirmed `open is True` (including a calendar-fetch
     # failure) drops the signal rather than trading blind — except in
     # DEVMODE, where only Tradier sandbox accounts are acted on out of hours
     # (see _market_gate_sandbox_only).
-    sandbox_only = await _market_gate_sandbox_only(request)
+    sandbox_only, gate_reason = await _market_gate_sandbox_only(request, symbol)
     if sandbox_only is None:
-        return {"ok": True, "accepted": False, "reason": "market is closed or its state is unknown"}
+        return {"ok": True, "accepted": False, "reason": gate_reason}
 
     # Live query, not a static allowlist — see the docstring above. Whoever
     # currently has news-reactor entitled gets this signal; no separate
@@ -1930,9 +2055,14 @@ async def _news_signal_after_claim(payload: NewsSignalPayload, request: Request,
     if not limit_price:
         return {"ok": True, "accepted": False, "reason": "no live quote available at execution time"}
 
-    stop_pct = tcfg.stop_loss_default(symbol) or tcfg.DEFAULT_STOP_LOSS_PCT
+    # Exit levels are OURS, not the sender's: the ticker's row in
+    # torque_tickers_setup (stop_loss_default / close_target_default) when set,
+    # else the code defaults (30% / 30%). Never the Torque page's saved per-
+    # account stop setting — Reflex keeps its own rules.
+    stop_pct, target_pct = _news_signal_exit_pcts(symbol)
     common = dict(request=request, source_event_id=payload.source_event_id, symbol=symbol,
                   strategy=strategy, is_single=True, entry_type="debit", stop_pct=stop_pct,
+                  target_pct=target_pct,
                   quantity=settings.news_signal_quantity, sandbox_only=sandbox_only)
     results = [
         await _place_news_signal_for_uid(
@@ -1995,7 +2125,8 @@ async def _news_signal_after_claim(payload: NewsSignalPayload, request: Request,
     TXN.info("news_signal %s %s %s @ %.2f: %d/%d accounts placed",
              payload.source_event_id, symbol, strategy, limit_price, len(placed), len(results))
     out = {"ok": True, "accepted": len(placed) > 0, "symbol": symbol, "strategy": strategy,
-           "limit_price": limit_price, "stop_loss_pct": stop_pct, "results": results}
+           "limit_price": limit_price, "stop_loss_pct": stop_pct, "close_target_pct": target_pct,
+           "results": results}
     if not placed:
         # No account got a live order — say why on the signal log, and mark
         # broker rejections distinctly from a gate dropping it.
@@ -2275,6 +2406,16 @@ async def _run_stop_exit_ladder(client, account_id, w, *, symbol, strategy, legs
                           f"fallback — refusing to submit and risk an over-close; needs manual review")
         _checkpoint_watcher(w)
         return
+    if await _in_extended_session(client):
+        # The broker refuses market orders outside the regular session: no
+        # fallback — flag it; the next guardian pass (or a human) retries
+        # with a fresh limit.
+        w["state"] = "stop_needs_attention"
+        w["stop_note"] = (f"no bounded fill after {tcfg.STOP_MAX_REQUOTES} re-quotes in the extended "
+                          f"session — market orders aren't accepted until 09:30; close it manually "
+                          f"or it is retried with a fresh limit")
+        _checkpoint_watcher(w)
+        return
     market_id, rej, why = await _submit_stop_exit(
         client, account_id, symbol=symbol, strategy=strategy, legs=legs,
         is_single=is_single, entry_type=entry_type, quantity=remaining,
@@ -2482,6 +2623,7 @@ _GUARD_LABEL = {
     "sl_off": "no SL (turned off)", "past_stop_alert": "past stop — alert only",
     "unconfirmed": "no SL (unconfirmed spread)", "watcher_managed": "SL by watcher",
     "no_settings": "SL pending", "needs_attention": "guardian needs attention",
+    "outside_session": "SL deferred to the open",
 }
 
 

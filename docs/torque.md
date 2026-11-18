@@ -313,11 +313,24 @@ backend container reads the same data:
 | `yahoo_symbol` | Primary live spot quote (null = Tradier put-call parity). |
 | `allowed_roots` | Option roots allowed (null = any; DJX trades `DJXW` only). |
 | `commission_per_contract`, `extra_fee_per_contract` | Per contract per leg, one way (null = global default). |
-| `stop_loss_default`, `close_target_default`, `close_target_min`, `close_target_spread_scaled`, `close_target_required` | Exit defaults / floors (null = global default). |
+| `stop_loss_default`, `close_target_default`, `close_target_min`, `close_target_spread_scaled`, `close_target_required` | Exit defaults / floors (null = global default, 30% / 30%). `stop_loss_default` + `close_target_default` are also the **Reflex (news-signal) entry's** stop and profit target, and the guardian's stop for Reflex positions — Reflex never uses the page's saved per-account stop setting. Out-of-range values fall back to the defaults. |
 | `market_orders_allowed` | False forces limits (DJX). |
 | `max_spread_pct` | Widest package bid/ask, as % of mid, the ticker trades, arms a profit target on, or calls tradeable (null = global 100; XLE/XLF 150 — their 0DTE books routinely run 50–120%). Entries are priced at mid either way; this only decides whether to trade at all. Migration `0023`. |
 | `richness_floor` | Counter Read noise floor in $ (null = global default 0.03) — see [Counter Read](torque_operating_manual.html#counter). |
 | `daily_min_range`, `daily_max_range` | Reserved for later use; not read by Torque yet. |
+
+**Editing a row.** `make torque-ticker` (tools/torque_ticker.py) shows the table or
+sets any column of one row, typed and range-checked by column (no raw SQL), with a
+before/after view and a confirmation:
+
+```bash
+make torque-ticker                                    # all tickers, key columns
+make torque-ticker T=QQQ                              # every column of QQQ
+make torque-ticker T=QQQ SET="stop_loss_default=50 close_target_default=40"
+make torque-ticker T=QQQ SET="stop_loss_default=null"          # back to the default
+make torque-ticker T=NVDA CREATE=1 SET="tick=0.05 yahoo_symbol=NVDA sort_order=110"
+# ARGS=-n previews the SQL, ARGS=-y skips the prompt; JSON values without spaces
+```
 
 **How it's read.** Each container loads the table into memory before it serves
 (`torque_config.refresh_ticker_setup`, from `main.py`), then re-reads it every
@@ -370,6 +383,37 @@ Anchoring model (points from spot, snapped to the chain grid):
 - `condor` — short put/call `short_offset` from spot, `width` wings.
 - `iron_fly` — short put+call ATM, `width` wings.
 - `butterfly` — body at spot+`body_offset`, `wing` each side (buy 1 / sell 2 / buy 1).
+
+## Trading window and extended hours
+
+Torque trades inside `TORQUE_TRADING_HOURS` (ET, default `07:30-16:15`) on
+Tradier trading days (holidays skipped). The regular session is still Tradier's
+09:30-16:00; the rest of the window is the **extended session**, where only
+`TORQUE_EXTENDED_HOURS_TICKERS` trade (the broker's extended-hours option
+names; any other ticker is rejected with "options don't trade in extended
+hours"). On an early-close day the window ends as far past the actual close as
+the configured end is past 16:00 (13:00 close → 13:15).
+
+Both keys live in `edgelane_market.config`; `make db-push` copies them into
+`public.app_config` (`torque_trading_hours`, `torque_extended_hours_tickers`),
+which the backend reads (60 s cache) and falls back to the config values when
+missing or malformed. One gate drives everything: `/torque/clock` returns
+`session` (`regular` | `extended` | `closed`) plus `extended_tickers`; the
+Torque page, the `/webhook/news_signal` entry/cancel gate and the stop guardian
+all follow it. The guardian watches every guarded position in either session; in
+the extended session it only acts where the broker can fill:
+
+- a ticker **not** on the extended list that breaches is set `outside_session` —
+  nothing is cancelled and nothing is sent (its quotes are stale and the broker
+  would refuse the exit); it is re-checked at 09:30;
+- an extended ticker exits with the limit ladder only — **no market fallback**
+  (`stop_needs_attention` instead), and with no live quote nothing is cancelled
+  (`needs_attention`);
+- `/torque/place` refuses a non-extended ticker and any market entry, and a
+  cancel-signal unwind crosses with a limit instead of a market close.
+
+DAY and GTC orders are live in Tradier's extended sessions without any PRE/POST
+duration (Tradier's own notice, 2026-10-29), so entries keep `duration=day`.
 
 ## API (all under the market backend)
 

@@ -435,7 +435,7 @@ def decide(unit: dict, *, row: dict | None, source: str, settings: dict | None,
 
 # ── exit ────────────────────────────────────────────────────────────────────
 async def _exit_unit(akey: str, client, account_id: str, unit: dict, orders: list[dict],
-                     pct: float, owned: bool) -> None:
+                     pct: float, owned: bool, extended: bool = False) -> None:
     """Close a unit whose stop is breached. First cancel every working order
     that would close it (a bracket whose stop didn't fill, a resting profit
     target, a stale exit) so the exit isn't rejected as over-closing, then
@@ -446,6 +446,17 @@ async def _exit_unit(akey: str, client, account_id: str, unit: dict, orders: lis
     syms = set(unit["symbols"])
     state, note = "exiting", None
     try:
+        if extended:
+            # Extended session: the only exit the broker accepts is a limit, so
+            # without a live quote there is nothing to send — check BEFORE
+            # cancelling anything, so the position never loses its exits.
+            pre = await troute._package_price(client, unit["ticker"], unit["legs"])
+            tick0 = tcfg.structure_tick(unit["ticker"], single=unit["single"])
+            if not pre or teng.stop_exit_price(pre, unit["entry_type"], tick0) is None:
+                state = "needs_attention"
+                note = ("stop breached in the extended session with no live quote — market orders "
+                        "aren't accepted until 09:30; existing exits left in place")
+                return
         for o in closing_orders(orders, syms)[0]:
             try:
                 await client.cancel_order(account_id, o.get("id"))
@@ -472,6 +483,10 @@ async def _exit_unit(akey: str, client, account_id: str, unit: dict, orders: lis
             state = "needs_attention"
             note = (f"stop breached but no live quote, and market orders are off for {unit['ticker']} "
                     f"— close it manually")
+            return
+        if first is None and extended:
+            state = "needs_attention"
+            note = "stop breached in the extended session and the quote vanished — close it manually"
             return
         if first is None:
             mid, rej, why = await troute._submit_stop_exit(
@@ -517,7 +532,8 @@ async def _persist(akey: str, unit: dict, *, state: str, note: str | None, pct: 
 
 
 # ── one pass over one account ───────────────────────────────────────────────
-async def guard_account(acct: dict, *, settings_obj, watcher_syms: set[str], now: float) -> int:
+async def guard_account(acct: dict, *, settings_obj, watcher_syms: set[str], now: float,
+                        session: str = "regular", ext_tickers: frozenset = frozenset()) -> int:
     akey, client, aid = acct["key"], acct["client"], acct["account_id"]
     positions = await client.get_positions(aid)
     rows = {r["unit_key"]: r for r in (await supabase_admin.get_guarded_positions(akey) or [])}
@@ -552,6 +568,13 @@ async def guard_account(acct: dict, *, settings_obj, watcher_syms: set[str], now
                                    akey=akey, takeover_sec=takeover)
         if action == "past_stop_alert" and (row or {}).get("state") != "past_stop_alert":
             txn("stop guardian alert", account=akey, unit=u["key"], note=note)
+        if action == "exit" and session == "extended" and u["ticker"] not in ext_tickers:
+            # Its options don't trade until 09:30: an exit would be refused,
+            # and the quotes it breached on are stale. Keep every existing
+            # broker order (bracket stop/target) and re-check at the open.
+            action, note = "outside_session", (
+                f"stop {pct:g}% breached on an extended-session quote, but {u['ticker']} options "
+                f"don't trade until 09:30 — exits left in place, re-checked at the open")
         if action == "exit":
             exit_client, owned = acct["client"], False
             if acct["owned"]:
@@ -563,7 +586,8 @@ async def guard_account(acct: dict, *, settings_obj, watcher_syms: set[str], now
             await _persist(akey, u, state="exiting", note=note, pct=pct,
                            source=source, mark=(px or {}).get("abs_mid"))
             _ACTIVE_EXITS[ukey] = asyncio.create_task(
-                _exit_unit(akey, exit_client, aid, u, orders, pct, owned))
+                _exit_unit(akey, exit_client, aid, u, orders, pct, owned,
+                           extended=(session == "extended")))
             continue
         state = action
         if row is None or row.get("state") != state or row.get("note") != note \
@@ -579,14 +603,19 @@ async def run_once(app) -> None:
     from .routes import torque as troute
     s = get_settings()
     house = getattr(app.state, "tradier", None)
+    session = "regular"
     if not (s.devmode or s.tradier_env == "sandbox"):
+        # Torque's trading window (regular or extended session). Every guarded
+        # position is watched in both; in the extended session an exit is only
+        # sent where the broker can fill it (see guard_account / _exit_unit).
         try:
-            _st, is_open = await troute._tradier_market_state(house)
+            _st, _open, session = await troute._torque_session(house)
         except Exception:
-            is_open = None
-        if is_open is not True:
+            session = None
+        if session not in ("regular", "extended"):
             STATUS.update(skipped_closed=True, last_run=time.time())
             return
+    ext_tickers = (await troute.torque_hours())[1] if session == "extended" else frozenset()
     if not tcfg.ticker_setup_loaded():
         return
     sandbox_only = bool(s.devmode or s.tradier_env == "sandbox")
@@ -608,7 +637,8 @@ async def run_once(app) -> None:
     try:
         for acct in accounts:
             try:
-                total += await guard_account(acct, settings_obj=s, watcher_syms=watcher_syms, now=now)
+                total += await guard_account(acct, settings_obj=s, watcher_syms=watcher_syms, now=now,
+                                              session=session, ext_tickers=ext_tickers)
             except Exception as e:
                 log.warning("guardian: pass over %s failed: %s", acct["key"], e)
     finally:

@@ -37,7 +37,7 @@ DATA_VOLUME  = edgelane_edgelane-data
 DATA_DUMP    = deploy/edgelane-data.tar.gz
 
 .PHONY: help \
-        setup db-setup run run-dev run-prod run-bg stop logs clean \
+        setup db-setup torque-ticker run run-dev run-prod run-bg stop logs clean \
         diag status snapshot accuracy \
         test test-e2e test-all \
         webhook-debug webhook-post ext-version ext-policy \
@@ -230,6 +230,20 @@ db-push: ## Apply Supabase migrations (idempotent)
 
 db-push-dry: ## List the migrations that would be applied
 	@$(PY) tools/db_push.py --dry-run
+
+# Torque per-ticker setup (public.torque_tickers_setup): show or edit any column
+# of a row — stop/TP overrides, ticks, offsets, enable/disable, add a ticker.
+#   make torque-ticker                                   all tickers
+#   make torque-ticker T=QQQ                             every column of QQQ
+#   make torque-ticker T=QQQ SET="stop_loss_default=50 close_target_default=40"
+#   make torque-ticker T=QQQ SET="stop_loss_default=null"        (back to default)
+#   make torque-ticker T=NVDA CREATE=1 SET="tick=0.05 yahoo_symbol=NVDA sort_order=110"
+#   ARGS=-n previews the SQL, ARGS=-y skips the confirmation. JSON: no spaces.
+torque-ticker: export TORQUE_SET := $(SET)
+torque-ticker: ## Show/edit a torque_tickers_setup row: [T=QQQ] [SET="col=val …"] [CREATE=1] [ARGS=-y|-n]
+	@if [ -z "$(SET)" ]; then $(PY) tools/torque_ticker.py show $(T); \
+	else [ -n "$(T)" ] || { echo "T=<ticker> is required with SET"; exit 2; }; \
+	  $(PY) tools/torque_ticker.py set $(T) $(if $(CREATE),--create) $(ARGS); fi
 
 # Fires a genuinely signed POST /webhook/news_signal — real auth, real
 # idempotency/rate-cap/market-hours gates, real fan-out to whoever is

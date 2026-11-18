@@ -309,6 +309,17 @@ class Settings(BaseModel):
     # How often each backend container re-reads public.torque_tickers_setup (s).
     # An edit in the table reaches every container within this window.
     torque_tickers_refresh_sec: int = Field(default=60)
+    # Torque's trading window (ET, "HH:MM-HH:MM") and the tickers whose options
+    # the broker trades outside the regular 09:30-16:00 session (Tradier: 07:30
+    # pre, to 16:15 post). Inside the window but outside the regular session
+    # only TORQUE_EXTENDED_HOURS_TICKERS can trade. On an early-close day the
+    # window ends the same distance after the close (13:00 -> 13:15). Pushed to
+    # public.app_config by `make db-push`; the backend reads them from there and
+    # falls back to these values (see routes/torque.py torque_hours).
+    torque_trading_hours: str = Field(default="07:30-16:15")
+    torque_extended_hours_tickers: str = Field(default=(
+        "AAPL,AMD,AMZN,AVGO,BABA,BAC,F,GOOG,GOOGL,HOOD,INTC,META,MRVL,MSFT,MU,NFLX,"
+        "NOK,NVDA,ORCL,PFE,PLTR,SNDK,TSLA,TSM,GLD,IWM,QQQ,SPY"))
     # Stop guardian (app/torque_guardian.py): enforces stop-loss on every open
     # position in Torque tickers, whoever placed it. OFF by default: the
     # production compose file turns it on with the GUARDIAN_ENABLED env var
@@ -560,6 +571,9 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
         out["news_signal_entry_step_sec"] = float(raw["NEWS_SIGNAL_ENTRY_STEP_SEC"])
     if "TORQUE_TICKERS_REFRESH_SEC" in raw:
         out["torque_tickers_refresh_sec"] = int(raw["TORQUE_TICKERS_REFRESH_SEC"])
+    for _k in ("TORQUE_TRADING_HOURS", "TORQUE_EXTENDED_HOURS_TICKERS"):
+        if raw.get(_k, "").strip():
+            out[_k.lower()] = raw[_k].strip()
     if "GUARDIAN_ENABLED" in raw:
         out["guardian_enabled"] = raw["GUARDIAN_ENABLED"].strip().lower() in ("true", "1", "yes", "on")
     if "GUARDIAN_INTERVAL_SEC" in raw:

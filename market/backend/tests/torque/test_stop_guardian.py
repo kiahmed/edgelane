@@ -396,6 +396,31 @@ async def test_run_once_skips_while_the_market_is_closed(monkeypatch):
     assert called == [] and g.STATUS["skipped_closed"] is True
 
 
+async def test_run_once_runs_in_the_extended_session(monkeypatch):
+    s = troute.get_settings().model_copy(update={"devmode": False, "tradier_env": "production"})
+    monkeypatch.setattr("app.config.get_settings", lambda: s)
+
+    async def _ext(client):
+        return "PRE", False, "extended"
+    monkeypatch.setattr(troute, "_torque_session", _ext)
+    monkeypatch.setattr(g.tcfg, "ticker_setup_loaded", lambda: True)
+    async def _lease(*a, **k):
+        return True
+    monkeypatch.setattr(g.supabase_admin, "acquire_guardian_lease", _lease)
+    async def _watch():
+        return set()
+    monkeypatch.setattr(g, "_watcher_symbols", _watch)
+    called = []
+
+    async def _accts(app, **kw):
+        called.append(1)
+        return []
+    monkeypatch.setattr(g, "_accounts", _accts)
+    app = type("A", (), {"state": type("S", (), {"tradier": FakeTradier()})()})()
+    await g.run_once(app)
+    assert called == [1] and g.STATUS["skipped_closed"] is False
+
+
 async def test_outside_position_with_no_saved_setting_is_left_alone(db, cfg):
     book = Book([pos(SPY_C, 1, 300.0)], {SPY_C: (1.98, 2.02)})         # past a 30% stop
     db.rows[SPY_C] = {"unit_key": SPY_C, "state": "watching", "source": "outside"}
@@ -548,3 +573,48 @@ async def test_guardian_no_quote_exit_never_goes_to_market_where_market_orders_a
     await g._exit_unit(AKEY, book, "ACC", u, [], 30.0, False)
     assert book.placed == [] and db.rows[SPY_C]["state"] == "needs_attention"
     assert "market orders are off" in db.rows[SPY_C]["note"]
+
+
+# ── extended session (Torque window outside 09:30-16:00) ─────────────────────
+NDX_C = "NDXP261012C22000000"
+
+
+async def _ext_pass(book, cfg, ext=frozenset({"SPY"})):
+    acct = {"key": AKEY, "client": book, "account_id": "ACC", "uids": ["u1"], "owned": False}
+    n = await g.guard_account(acct, settings_obj=cfg, watcher_syms=set(), now=time.time(),
+                              session="extended", ext_tickers=ext)
+    for t in list(g._ACTIVE_EXITS.values()):
+        await t
+    return n
+
+
+async def test_extended_session_non_extended_ticker_breach_keeps_its_exits(db, cfg):
+    db.rows[NDX_C] = {"unit_key": NDX_C, "state": "watching", "source": "torque"}
+    tp = {"id": 77, "class": "option", "status": "open", "option_symbol": NDX_C,
+          "side": "sell_to_close", "type": "limit"}
+    book = Book([pos(NDX_C, 1, 300.0)], {NDX_C: (1.98, 2.02)}, orders=[tp])   # past a 30% stop
+    await _ext_pass(book, cfg)
+    assert book.cancels == [] and db.ladders == []          # nothing cancelled, nothing sent
+    assert db.rows[NDX_C]["state"] == "outside_session"
+
+
+async def test_extended_session_extended_ticker_breach_still_exits(db, cfg):
+    db.rows[SPY_C] = {"unit_key": SPY_C, "state": "watching", "source": "torque"}
+    tp = {"id": 77, "class": "option", "status": "open", "option_symbol": SPY_C,
+          "side": "sell_to_close", "type": "limit"}
+    book = Book([pos(SPY_C, 1, 300.0)], {SPY_C: (1.98, 2.02)}, orders=[tp])
+    await _ext_pass(book, cfg)
+    assert book.cancels == ["77"] and len(db.ladders) == 1
+
+
+async def test_extended_session_no_quote_at_exit_cancels_nothing(db, cfg, monkeypatch):
+    db.rows[SPY_C] = {"unit_key": SPY_C, "state": "watching", "source": "torque"}
+    tp = {"id": 77, "class": "option", "status": "open", "option_symbol": SPY_C,
+          "side": "sell_to_close", "type": "limit"}
+    book = Book([pos(SPY_C, 1, 300.0)], {SPY_C: (1.98, 2.02)}, orders=[tp])
+    async def _no_px(client, symbol, legs):
+        return None
+    monkeypatch.setattr(troute, "_package_price", _no_px)
+    await _ext_pass(book, cfg)
+    assert book.cancels == [] and db.ladders == []
+    assert db.rows[SPY_C]["state"] == "needs_attention"

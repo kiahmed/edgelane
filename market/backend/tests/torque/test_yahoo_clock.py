@@ -44,7 +44,7 @@ async def test_regular_session_reports_open(monkeypatch):
         "postmarket": {"start": "16:00", "end": "19:55"},
     }})
     r = await torque_clock(FakeRequest(client))
-    assert r == {"market_state": "REGULAR", "open": True}
+    assert {k: r[k] for k in ("market_state", "open")} == {"market_state": "REGULAR", "open": True}
 
 
 async def test_holiday_reports_closed_with_no_session_times(monkeypatch):
@@ -54,7 +54,7 @@ async def test_holiday_reports_closed_with_no_session_times(monkeypatch):
         "date": _today_str(), "status": "closed", "description": "Market is closed for Thanksgiving Day",
     }})
     r = await torque_clock(FakeRequest(client))
-    assert r == {"market_state": "CLOSED", "open": False}
+    assert {k: r[k] for k in ("market_state", "open")} == {"market_state": "CLOSED", "open": False}
 
 
 async def test_early_close_day_is_closed_after_the_shortened_end(monkeypatch):
@@ -82,7 +82,7 @@ async def test_before_premarket_reports_closed(monkeypatch):
         "postmarket": {"start": "16:00", "end": "19:55"},
     }})
     r = await torque_clock(FakeRequest(client))
-    assert r == {"market_state": "CLOSED", "open": False}
+    assert {k: r[k] for k in ("market_state", "open")} == {"market_state": "CLOSED", "open": False}
 
 
 async def test_calendar_fetch_failure_with_nothing_cached_reports_open_none(monkeypatch):
@@ -93,7 +93,7 @@ async def test_calendar_fetch_failure_with_nothing_cached_reports_open_none(monk
     monkeypatch.setattr(client, "market_calendar", _boom)
 
     r = await torque_clock(FakeRequest(client))
-    assert r == {"market_state": None, "open": None}
+    assert {k: r[k] for k in ("market_state", "open")} == {"market_state": None, "open": None}
 
 
 async def test_calendar_is_cached_for_the_whole_month(monkeypatch):

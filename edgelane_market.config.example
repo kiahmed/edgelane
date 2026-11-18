@@ -203,6 +203,14 @@ NEWS_SIGNAL_ENTRY_STEP_SEC=5
 # How often each backend container re-reads Torque's ticker setup
 # (Supabase public.torque_tickers_setup). Edits there apply within this window.
 TORQUE_TICKERS_REFRESH_SEC=60
+
+# Torque trading window (ET). Inside it but outside the regular 09:30-16:00
+# session, only TORQUE_EXTENDED_HOURS_TICKERS trade (the broker's extended
+# options sessions); on an early-close day it ends the same 15 min after the
+# close. `make db-push` copies both into public.app_config, which the backend
+# reads (these values are its fallback).
+TORQUE_TRADING_HOURS=07:30-16:15
+TORQUE_EXTENDED_HOURS_TICKERS=AAPL,AMD,AMZN,AVGO,BABA,BAC,F,GOOG,GOOGL,HOOD,INTC,META,MRVL,MSFT,MU,NFLX,NOK,NVDA,ORCL,PFE,PLTR,SNDK,TSLA,TSM,GLD,IWM,QQQ,SPY
 # Stop guardian: enforces stop-loss on EVERY open position in Torque tickers,
 # whoever placed it (Torque, Reflex, Tradier's site, the tp CLI). Reflex
 # positions always; others per the Torque page's saved per-ticker stop-loss

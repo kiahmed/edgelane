@@ -279,3 +279,29 @@ async def test_cancel_close_never_sends_market_where_market_orders_are_off(enabl
         assert real_orders[-1]["type"] == "limit" and real_orders[-1]["tag"].startswith("torqueCancelLmt")
     else:
         assert len(real_orders) == 1 and "manually" in result["reason"]
+
+
+async def test_cancel_close_in_the_extended_session_crosses_with_a_limit(enabled, monkeypatch):
+    """The broker refuses market orders outside the regular session, so the
+    cancel-signal unwind crosses at the live bid/ask instead."""
+    client = FakeTradier(place_responses=[{"order": {"id": 1, "status": "ok"}}],
+                         order_status={"status": "filled", "exec_quantity": 2.0})
+    await _place_entry(monkeypatch, client)
+
+    async def _resolve_uid(uid):
+        return "tradier", client, "TEST123"
+
+    async def _price(client, symbol, legs):
+        return {"complete": True, "net_bid": 1.00, "net_ask": 1.10, "abs_mid": 1.05}
+
+    async def _ext(client):
+        return True
+    monkeypatch.setattr(troute, "resolve_client_for_uid", _resolve_uid)
+    monkeypatch.setattr(troute, "_package_price", _price)
+    monkeypatch.setattr(troute, "_in_extended_session", _ext)
+
+    r = await news_signal(_cancel_payload(), FakeRequest(client))
+    real_orders = [p for p in client.placed if "_modify" not in p]
+    assert all(p.get("type") != "market" for p in real_orders)
+    assert real_orders[-1]["type"] == "limit" and real_orders[-1]["tag"].startswith("torqueCancelLmt")
+    assert r["results"][0]["action"] != "needs_attention"

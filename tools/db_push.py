@@ -11,6 +11,9 @@ Config comes from deploy/.env:
   SUPABASE_PROJECT_REF   project ref (e.g. wfezpfswpywsmbnjrbri)
   SUPABASE_ACCESS_TOKEN  Management API token (sbp_…)
 
+Then mirrors the APP_CONFIG_SYNC keys of edgelane_market.config (Torque's
+trading window + extended-hours tickers) into public.app_config.
+
 Usage:
   python3 tools/db_push.py            apply all migrations
   python3 tools/db_push.py --dry-run  list what would run, apply nothing
@@ -25,6 +28,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = ROOT / "deploy" / ".env"
+MARKET_CONFIG = ROOT / "edgelane_market.config"
+
+# edgelane_market.config keys mirrored into public.app_config on every push, so
+# the backend reads them from the DB (it falls back to the same config keys).
+# Each value is validated before it is written: key -> (app_config key, regex).
+APP_CONFIG_SYNC = {
+    "TORQUE_TRADING_HOURS": ("torque_trading_hours",
+                             r"^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$"),
+    "TORQUE_EXTENDED_HOURS_TICKERS": ("torque_extended_hours_tickers",
+                                      r"^[A-Z][A-Z0-9.]{0,9}(,[A-Z][A-Z0-9.]{0,9})*$"),
+}
 MIGRATIONS_DIR = ROOT / "supabase" / "migrations"
 # A browser-ish UA — the default urllib UA gets Cloudflare-1010 blocked.
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -52,6 +66,32 @@ def _run_sql(ref: str, token: str, sql: str) -> tuple[int, str]:
                  "User-Agent": _UA, "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=60) as r:
         return r.status, r.read().decode()[:400]
+
+
+def _sync_app_config(ref: str, token: str) -> int:
+    """Upsert the APP_CONFIG_SYNC keys from edgelane_market.config into
+    public.app_config. A key absent from the config is left as it is in the
+    DB; a malformed value fails the push rather than writing garbage."""
+    import re
+    cfg = _load_env(MARKET_CONFIG)
+    for cfg_key, (db_key, rx) in APP_CONFIG_SYNC.items():
+        raw = cfg.get(cfg_key, "").split("#", 1)[0].strip()
+        if not raw:
+            continue
+        val = re.sub(r"\s+", "", raw).upper() if cfg_key.endswith("TICKERS") else re.sub(r"\s+", "", raw)
+        if not re.match(rx, val):
+            print(f"FAILED app_config {db_key}: {cfg_key}={raw!r} is malformed", file=sys.stderr)
+            return 1
+        sql = ("insert into public.app_config (key, value) values ('%s', '%s') "
+               "on conflict (key) do update set value = excluded.value, updated_at = now();"
+               % (db_key, val))          # both validated above: no quotes possible
+        try:
+            st, _ = _run_sql(ref, token, sql)
+            print(f"app_config {db_key} = {val} -> HTTP {st}")
+        except Exception as exc:
+            print(f"FAILED app_config {db_key} -> {exc}", file=sys.stderr)
+            return 1
+    return 0
 
 
 def main() -> int:
@@ -86,6 +126,10 @@ def main() -> int:
         except Exception as exc:
             print(f"FAILED {f.name} -> {exc}", file=sys.stderr)
             return 1
+
+    rc = _sync_app_config(ref, token)
+    if rc:
+        return rc
 
     try:
         _, body = _run_sql(ref, token,

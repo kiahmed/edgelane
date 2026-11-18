@@ -267,3 +267,17 @@ def _no_background_entry_chase(monkeypatch):
     troute._CANCELLED_SIGNALS.clear()
     yield
     troute._CANCELLED_SIGNALS.clear()
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_torque_hours(monkeypatch):
+    """Torque's trading window reads public.app_config; never touch a real
+    project from tests — return no DB value (→ the config fallback) and start
+    every test with an empty cache."""
+    from app.routes import torque as _troute
+    async def _no_value(key):
+        return None
+    monkeypatch.setattr(_troute.supabase_admin, "get_app_config", _no_value)
+    _troute._HOURS_CACHE.update(t=0.0, hours=None, tickers=None)
+    yield
+    _troute._HOURS_CACHE.update(t=0.0, hours=None, tickers=None)

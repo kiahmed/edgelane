@@ -602,3 +602,161 @@ async def test_cancel_override_on_market_closed_unwinds_sandbox_only(sandbox_ove
     assert by["prod"]["action"] == "skipped" and "sandbox" in by["prod"]["reason"]
     assert prod._order_status_by_id == {}         # never cancelled
     troute._SUPERSEDED.clear()
+
+
+# ── Torque trading window: regular + extended session ────────────────────────
+def _ext_clock(monkeypatch, *, session, tickers=("NDX",)):
+    async def _clock(request):
+        return {"market_state": "PRE", "open": False, "session": session,
+                "extended_tickers": list(tickers)}
+    monkeypatch.setattr(troute, "torque_clock", _clock)
+
+
+async def test_extended_session_listed_ticker_trades_in_production(enabled, monkeypatch):
+    _ext_clock(monkeypatch, session="extended")
+    async def _tools(uid):
+        return ["torque", "news-reactor"]
+    monkeypatch.setattr(troute.supabase_admin, "get_user_tools", _tools)
+    client = FakeTradier(place_responses=[{"order": {"id": 1, "status": "ok"}}])
+    async def _resolve(request, user):
+        return "tradier", client, "TEST123", True
+    monkeypatch.setattr(troute, "resolve_broker", _resolve)
+    r = await news_signal(_payload(), FakeRequest(client))
+    assert r["accepted"] is True and "test_mode" not in r
+    assert len(client.placed) == 1              # production account, real order
+
+
+async def test_extended_session_unlisted_ticker_is_rejected(enabled, monkeypatch):
+    _ext_clock(monkeypatch, session="extended", tickers=("SPY",))
+    client = FakeTradier()
+    r = await news_signal(_payload(), FakeRequest(client))
+    assert r["accepted"] is False and "extended hours" in r["reason"]
+    assert client.placed == []
+
+
+async def test_outside_trading_window_drops(enabled, monkeypatch):
+    _ext_clock(monkeypatch, session="closed")
+    client = FakeTradier()
+    r = await news_signal(_payload(), FakeRequest(client))
+    assert r["accepted"] is False and "market is closed" in r["reason"]
+    assert client.placed == []
+
+
+def _fix_now(monkeypatch, hhmm):
+    from datetime import datetime as _dt
+    h, m = (int(x) for x in hhmm.split(":"))
+    fixed = _dt(2026, 11, 17, h, m, tzinfo=troute._NY_TZ)
+
+    class _FixedDT(_dt):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed if tz is None else fixed.astimezone(tz)
+    monkeypatch.setattr(troute, "datetime", _FixedDT)
+
+
+@pytest.mark.parametrize("hhmm,close,expected", [
+    ("07:29", "16:00", "closed"), ("07:30", "16:00", "extended"),
+    ("09:27", "16:00", "extended"),            # the broker's 09:25-09:30 pause is inside the window
+    ("12:00", "16:00", "regular"),
+    ("16:00", "16:00", "extended"), ("16:14", "16:00", "extended"), ("16:15", "16:00", "closed"),
+    ("13:14", "13:00", "extended"), ("13:15", "13:00", "closed"),    # early close -> 13:15
+    ("16:05", "13:00", "closed"),
+])
+async def test_torque_session_windows(monkeypatch, hhmm, close, expected):
+    _fix_now(monkeypatch, hhmm)
+    async def _state(client):
+        return ("REGULAR", True) if expected == "regular" else ("PRE", False)
+    monkeypatch.setattr(troute, "_tradier_market_state", _state)
+    async def _days(client):
+        return {"2026-11-17": {"date": "2026-11-17", "status": "open",
+                               "open": {"start": "09:30", "end": close}}}
+    monkeypatch.setattr(troute, "_tradier_calendar_days", _days)
+    async def _hours():
+        return ("07:30", "16:15"), frozenset({"SPY"})
+    monkeypatch.setattr(troute, "torque_hours", _hours)
+    assert (await troute._torque_session(None))[2] == expected
+
+
+async def test_torque_session_holiday_is_closed(monkeypatch):
+    _fix_now(monkeypatch, "08:00")
+    async def _state(client):
+        return "CLOSED", False
+    monkeypatch.setattr(troute, "_tradier_market_state", _state)
+    async def _days(client):
+        return {"2026-11-17": {"date": "2026-11-17", "status": "closed"}}
+    monkeypatch.setattr(troute, "_tradier_calendar_days", _days)
+    assert (await troute._torque_session(None))[2] == "closed"
+
+
+@pytest.mark.parametrize("db_hours,db_tickers,want_hours,want_has", [
+    ("08:00-16:10", "TSLA,NVDA", ("08:00", "16:10"), "TSLA"),     # DB wins
+    ("garbage", None, ("07:30", "16:15"), "SPY"),                 # malformed/missing -> config
+])
+async def test_torque_hours_db_then_config(monkeypatch, db_hours, db_tickers, want_hours, want_has):
+    troute._HOURS_CACHE.update(t=0.0, hours=None, tickers=None)
+    s = troute.get_settings().model_copy(update={
+        "torque_trading_hours": "07:30-16:15", "torque_extended_hours_tickers": "SPY,QQQ"})
+    monkeypatch.setattr(troute, "get_settings", lambda: s)
+    async def _cfg(key):
+        return {"torque_trading_hours": db_hours, "torque_extended_hours_tickers": db_tickers}[key]
+    monkeypatch.setattr(troute.supabase_admin, "get_app_config", _cfg)
+    hours, tickers = await troute.torque_hours()
+    troute._HOURS_CACHE.update(t=0.0, hours=None, tickers=None)
+    assert hours == want_hours and want_has in tickers
+
+
+async def test_torque_hours_db_error_falls_back_to_config(monkeypatch):
+    troute._HOURS_CACHE.update(t=0.0, hours=None, tickers=None)
+    async def _boom(key):
+        raise RuntimeError("supabase down")
+    monkeypatch.setattr(troute.supabase_admin, "get_app_config", _boom)
+    hours, tickers = await troute.torque_hours()
+    troute._HOURS_CACHE.update(t=0.0, hours=None, tickers=None)
+    assert hours == troute._parse_hours(troute.get_settings().torque_trading_hours)
+    assert tickers
+
+
+# ── Reflex exit levels come from torque_tickers_setup, else code defaults ────
+def _place_one(monkeypatch):
+    async def _tools(uid):
+        return ["torque", "news-reactor"]
+    monkeypatch.setattr(troute.supabase_admin, "get_user_tools", _tools)
+    client = FakeTradier(place_responses=[{"order": {"id": 1, "status": "ok"}}])
+    async def _resolve(request, user):
+        return "tradier", client, "TEST123", True
+    monkeypatch.setattr(troute, "resolve_broker", _resolve)
+    return client
+
+
+async def test_reflex_tp_and_sl_come_from_the_ticker_row(enabled, monkeypatch):
+    tcfg._SETUP["NDX"] = {**tcfg._SETUP["NDX"], "stop_loss_default": 40, "close_target_default": 55}
+    _place_one(monkeypatch)
+    r = await news_signal(_payload(), FakeRequest(FakeTradier()))
+    assert r["accepted"] is True
+    assert r["stop_loss_pct"] == 40 and r["close_target_pct"] == 55
+
+
+async def test_reflex_tp_and_sl_default_when_the_row_has_none(enabled, monkeypatch):
+    tcfg._SETUP["NDX"] = {**tcfg._SETUP["NDX"], "stop_loss_default": None, "close_target_default": None}
+    _place_one(monkeypatch)
+    r = await news_signal(_payload(), FakeRequest(FakeTradier()))
+    assert r["stop_loss_pct"] == tcfg.DEFAULT_STOP_LOSS_PCT
+    assert r["close_target_pct"] == tcfg.DEFAULT_CLOSE_TARGET_PCT
+
+
+@pytest.mark.parametrize("stop,target", [(150, 900), (0, 0), (-5, -1)])
+def test_reflex_exit_pcts_out_of_range_fall_back(stop, target):
+    tcfg._SETUP["NDX"] = {**tcfg._SETUP["NDX"], "stop_loss_default": stop, "close_target_default": target}
+    assert troute._news_signal_exit_pcts("NDX") == (tcfg.DEFAULT_STOP_LOSS_PCT, tcfg.DEFAULT_CLOSE_TARGET_PCT)
+
+
+async def test_reflex_ignores_the_pages_saved_stop_setting(enabled, monkeypatch):
+    """The Torque page's per-account stop toggle/% (torque_sl_settings) never
+    reaches a Reflex entry — only the ticker row does."""
+    tcfg._SETUP["NDX"] = {**tcfg._SETUP["NDX"], "stop_loss_default": 40, "close_target_default": 55}
+    async def _saved(key):
+        return [{"ticker": "NDX", "enabled": False, "pct": 10}]
+    monkeypatch.setattr(troute.supabase_admin, "get_sl_settings", _saved)
+    _place_one(monkeypatch)
+    r = await news_signal(_payload(), FakeRequest(FakeTradier()))
+    assert r["stop_loss_pct"] == 40 and r["close_target_pct"] == 55

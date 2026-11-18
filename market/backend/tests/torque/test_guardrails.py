@@ -737,3 +737,52 @@ async def test_checkpoint_watcher_failure_is_swallowed_not_raised(monkeypatch):
         "strategy": "long_call", "state": "stop_placed", "done": False}
     tq._checkpoint_watcher(w)   # must not raise synchronously
     await asyncio.sleep(0)      # let the task run and swallow its own exception
+
+
+async def test_extended_session_stop_ladder_never_falls_back_to_market(monkeypatch):
+    """Outside the regular session the broker refuses market orders: once the
+    bounded re-quotes are spent the ladder flags it instead of sending one."""
+    monkeypatch.setattr(tq, "_STOP_INTERVAL", 0.01)
+
+    async def _fake_price(client, symbol, legs):
+        return {"complete": True, "net_bid": 0.60, "net_ask": 0.64, "abs_mid": 0.62}
+    monkeypatch.setattr(tq, "_package_price", _fake_price)
+    async def _ext(client):
+        return True
+    monkeypatch.setattr(tq, "_in_extended_session", _ext)
+
+    client = FakeTradier(order_status={"status": "open"})
+    w = {}
+    legs = [{"symbol": "SPY261012C00700000", "action": "buy_to_open", "quantity": 1}]
+    await tq._monitor_stop(
+        client, "T", w, legs=legs, symbol="SPY", strategy="long_call", is_single=True,
+        entry_type="debit", entry_fill=1.00, stop_pct=30.0, tick=0.01, quantity=1,
+        close_order_id=None)
+    assert w["state"] == "stop_needs_attention"
+    assert w["stop_market_fallback"] is False
+    assert not any(str(p.get("type")) == "market" for p in client.placed if isinstance(p, dict))
+
+
+# ── extended session: place() refuses what the broker can't trade ───────────
+def _extended(monkeypatch, tickers=("SPY",)):
+    async def _ext(client):
+        return True
+    monkeypatch.setattr(tq, "_in_extended_session", _ext)
+    async def _hours():
+        return ("07:30", "16:15"), frozenset(tickers)
+    monkeypatch.setattr(tq, "torque_hours", _hours)
+
+
+async def test_extended_session_refuses_a_non_extended_ticker(monkeypatch):
+    _extended(monkeypatch)
+    with pytest.raises(HTTPException) as ei:
+        await torque_place(_place_req(), FakeRequest(FakeTradier()), user=DEV)
+    assert ei.value.status_code == 400 and "don't trade in extended hours" in str(ei.value.detail)
+
+
+async def test_extended_session_refuses_a_market_entry_even_on_an_extended_ticker(monkeypatch):
+    _extended(monkeypatch, tickers=("DJX",))
+    req = _place_req(order_type="market", limit_price=None)
+    with pytest.raises(HTTPException) as ei:
+        await torque_place(req, FakeRequest(FakeTradier()), user=DEV)
+    assert ei.value.status_code == 400 and "extended session" in str(ei.value.detail)

@@ -135,7 +135,9 @@ native Tradier OTO bracket, spreads/market entries place→confirm-fill→close 
 rejected/unfilled entry never leaves a naked close). Per-ticker settings (tickers,
 price steps, strike offsets, fees, exit defaults) live in the Supabase table
 `torque_tickers_setup` (seeded by `make db-setup`, refreshed into every
-container), never hardcoded in code or the page. Run via `make run-dev` (sandbox) and open `:8789/torque`. Full doc:
+container; edit a row with `make torque-ticker`), never hardcoded in code or the page.
+Reflex entries take their stop/TP from the same row. Trading window + extended-hours
+tickers: `TORQUE_TRADING_HOURS` / `TORQUE_EXTENDED_HOURS_TICKERS`, pushed to `app_config` by `make db-push`. Run via `make run-dev` (sandbox) and open `:8789/torque`. Full doc:
 `docs/torque.md`.
 
 ### Data Providers

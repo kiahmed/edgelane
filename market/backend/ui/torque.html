@@ -324,16 +324,17 @@ function App(){
   const [result,setResult]=useState(null);
   const [err,setErr]=useState(null);
   const [now,setNow]=useState('');
-  const [mktClock,setMktClock]=useState(null);   // {market_state, open} from Tradier's calendar (holiday-aware)
+  const [mktClock,setMktClock]=useState(null);   // {market_state, open, session, extended_tickers} — Tradier calendar + Torque's trading window
   // Past Orders is now account-wide: it comes from the /torque/orders `history`
   // list (every Torque-tagged order on the broker account), so it's identical from
   // any tab and shows the broker's own live status. No per-tab tracking here.
 
   useEffect(()=>{const t=setInterval(()=>setNow(new Date().toLocaleTimeString()),1000);return()=>clearInterval(t)},[]);
 
-  // market clock: Yahoo marketState, polled slowly and ALWAYS (even when closed, so
-  // we notice the reopen). Authoritative over the local weekday+time gate — it knows
-  // holidays and early closes. On failure (open==null) we fall back to isMarketOpen().
+  // market clock: backend /torque/clock (Tradier's calendar + Torque's trading
+  // window), polled slowly and ALWAYS (even when closed, so we notice the reopen).
+  // Authoritative over the local weekday+time gate — it knows holidays and early
+  // closes. On failure (open==null) we fall back to isMarketOpen().
   useEffect(()=>{let live=true;
     const run=()=>j('/torque/clock').then(c=>{if(live)setMktClock(c)}).catch(()=>{if(live)setMktClock(null)});
     run();const t=setInterval(run,45000);return()=>{live=false;clearInterval(t)};
@@ -380,7 +381,15 @@ function App(){
   // to the local weekday+time gate only if the clock is unavailable. Recomputes
   // every render — the 1s clock keeps it fresh.
   const liveGate=cfg&&!cfg.devmode&&cfg.env!=='sandbox';
-  const mktOpen=!liveGate?true:(mktClock&&mktClock.open!=null)?mktClock.open:isMarketOpen();
+  // Torque's own session (backend /torque/clock): regular, or extended
+  // (TORQUE_TRADING_HOURS outside 09:30-16:00) where only the broker's
+  // extended-hours tickers trade. sessionLive = any session is live (orders
+  // keep polling); mktOpen = the SELECTED ticker can trade right now.
+  const extSession=!!(mktClock&&mktClock.session==='extended');
+  const extTicker=!!(mktClock&&ticker&&(mktClock.extended_tickers||[]).includes(ticker));
+  const regOpen=(mktClock&&mktClock.open!=null)?mktClock.open:isMarketOpen();
+  const sessionLive=!liveGate?true:(regOpen||extSession);
+  const mktOpen=!liveGate?true:(regOpen||(extSession&&extTicker));
 
   // build (on ticker/strategy/adj change)
   const doBuild=useCallback(()=>{
@@ -582,9 +591,9 @@ function App(){
       setOrders(o);
     }).catch(()=>{});
     run();
-    if(!mktOpen)return()=>{live=false};
+    if(!sessionLive)return()=>{live=false};
     const t=setInterval(run,4000);return()=>{live=false;clearInterval(t)};
-  },[mktOpen,focusTick]);
+  },[sessionLive,focusTick]);
   const refreshOrders=()=>j('/torque/orders').then(setOrders).catch(()=>{});
 
   const cancelOrder=(id)=>{setPlacing(true);
@@ -644,7 +653,8 @@ function App(){
       </div>
       <span className={"tag "+(cfg.env==='sandbox'||cfg.devmode?'sandbox':'production')}>
         {cfg.devmode||cfg.env==='sandbox'?'SANDBOX':'PRODUCTION'} · {cfg.mode}</span>
-      {!mktOpen&&<span className="tag closed" title="Polling pauses whenever the market isn't in its regular session — from Tradier's own market calendar, so holidays and early closes are handled automatically. Positioning/flow freeze; orders shown as of the pause (cancel/modify still work). Resumes automatically at the next regular session.">MARKET {mktLabel(mktClock)} · PAUSED</span>}
+      {liveGate&&mktOpen&&extSession&&<span className="tag closed" title="Extended options session (Torque trading window outside 09:30-16:00) — this ticker trades now.">EXTENDED HOURS · LIVE</span>}
+      {!mktOpen&&<span className="tag closed" title="Polling pauses whenever this ticker can't trade — outside Torque's trading window (Tradier's calendar, so holidays and early closes are handled), or in the extended session for a ticker the broker doesn't trade in extended hours. Positioning/flow freeze; orders shown as of the pause (cancel/modify still work). Resumes automatically.">MARKET {mktLabel(mktClock)}{extSession&&!extTicker?' · '+ticker+' NO EXT-HOURS':''} · PAUSED</span>}
       <div className="grow"></div>
       <div className="clock">{now}</div>
     </header>
@@ -984,7 +994,8 @@ function OrdersPanel({data,onCancel,onModify,busy,ticks}){
   const G_LABEL={watching:'protected',broker_stop:'protected (broker stop live)',wide_book:'past stop — book too wide, re-checking',
     no_quote:'protected (no quote yet)',exiting:'EXITING',exited:'closed by guardian',sl_off:'SL turned off',
     past_stop_alert:'ALERT — already past stop when first seen (not auto-closed)',unconfirmed:'not guarded — unconfirmed spread',
-    watcher_managed:'managed by Torque watcher',no_settings:'waiting for settings',needs_attention:'NEEDS ATTENTION'};
+    watcher_managed:'managed by Torque watcher',no_settings:'waiting for settings',needs_attention:'NEEDS ATTENTION',
+    outside_session:'breached pre/post — deferred to the open'};
   const gAlert=guarded.filter(g=>['past_stop_alert','needs_attention','exiting'].includes(g.state)).length;
   const arming=watchers.length-needsAttn;
   return <div className="panel orders">
@@ -1116,7 +1127,7 @@ function isMarketOpen(){
 }
 // short label for the closed banner from the backend's market_state (falls back to CLOSED).
 const MKT_STATE_LABEL={REGULAR:'OPEN',PRE:'PRE-MARKET',PREPRE:'PRE-MARKET',POST:'AFTER-HOURS',POSTPOST:'AFTER-HOURS',CLOSED:'CLOSED'};
-const mktLabel=c=>(c&&MKT_STATE_LABEL[c.market_state])||'CLOSED';
+const mktLabel=c=>(c&&c.session==='extended')?'EXTENDED HOURS':((c&&MKT_STATE_LABEL[c.market_state])||'CLOSED');
 // Positioning is a snapshot of where premium/OI/volume cluster — NOT a price
 // forecast. Label reads as call-/put-leaning, never bullish/bearish.
 const LEAN_LAB={bullish:'call-leaning',bearish:'put-leaning',neutral:'balanced'};
