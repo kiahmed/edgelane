@@ -861,8 +861,19 @@ needed — on every account opted into news signals. These are always a single a
 long call (bullish) or long put (bearish) on the nearest listed expiry, with the profit target
 and stop-loss attached — as one broker-held bracket whenever the two exit prices are at least
 $0.10 apart, otherwise watched by Torque (see <a href="#autoclose">Auto-close</a>). They show up in <strong>Working</strong>
-like any other order, play a <strong>short tone</strong> when they first appear (so an unattended
-fire still gets noticed), and are labelled <strong>news signal</strong> in Past Orders.</p>
+like any other order and are labelled <strong>news signal</strong> in Past Orders.</p>
+<p><strong>Arrival alert.</strong> Every signal Reflex sends plays a loud alert the moment Torque has
+decided what to do with it: a <em>rising</em> tune when an order is being placed, a
+<em>falling</em> one when it was refused (e.g. already have an open trade in that direction,
+market closed), and a buzzing one for a cancel. The header shows <code>🔔 REFLEX SOUND ON</code>
+(click to switch it off in this browser), a <code>test</code> button that plays all three, and the
+last signal's outcome. Browsers block sound until you click the page once — if that happens a
+<code>🔇 SOUND BLOCKED — CLICK TO ENABLE</code> pill appears; any click or key fixes it. Turning the
+sound on also asks to allow desktop notifications, shown when the Torque tab is in the background
+(switching the sound off silences those too).
+The sound style and volume are set in <code>edgelane_market.config</code>
+(<code>TORQUE_REFLEX_ALERT</code> = fanfare, siren, chime, klaxon, arcade or off;
+<code>TORQUE_REFLEX_ALERT_VOLUME</code> 0–1) and need a backend restart.</p>
 <ul>
   <li><strong>Exit levels are Torque's, per ticker.</strong> The stop and profit target come from
   the ticker's row in <code>torque_tickers_setup</code> — <code>stop_loss_default</code> and

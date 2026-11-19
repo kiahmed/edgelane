@@ -616,6 +616,7 @@ async def torque_cfg():
         # closed at the global 30% default) — the UI should prefill `default`
         # and refuse to submit below `min`.
         "close_targets": tcfg.close_targets_map(),
+        "reflex_alert": {"style": _alert_style(), "volume": get_settings().torque_reflex_alert_volume},
         # Per-ticker stop-loss default — DJX 50%, everyone else 30% globally.
         # See stop_loss_defaults_map()'s docstring for why the UI needs this
         # rather than just always sending a flat 30%.
@@ -2841,6 +2842,24 @@ async def _sl_account_key(request: Request, user: dict, account_id: str | None) 
     finally:
         if per_user:
             await client.close()
+
+
+_ALERT_STYLES = ("fanfare", "siren", "chime", "klaxon", "arcade", "off")
+
+
+def _alert_style() -> str:
+    st = (get_settings().torque_reflex_alert or "fanfare").strip().lower()
+    return st if st in _ALERT_STYLES else "fanfare"
+
+
+@router.get("/torque/signals", dependencies=_GATE)
+async def torque_signals(limit: int = 20):
+    """Latest Reflex (news-reactor) signals Torque received, newest first, with
+    the outcome it reached (placed / dropped / cancel_processed; null while
+    still being processed). The page polls this to play its arrival alert —
+    a refusal never creates an order, so the orders feed can't show it."""
+    rows = await supabase_admin.get_recent_news_signals(max(1, min(int(limit), 50)))
+    return {"signals": rows or [], "ok": rows is not None}
 
 
 @router.get("/torque/sl-setting", dependencies=_GATE)

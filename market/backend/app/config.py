@@ -323,6 +323,12 @@ class Settings(BaseModel):
     # 10% stop / 15% target.
     torque_ext_stop_loss_pct: str = Field(default="10")
     torque_ext_close_target_pct: str = Field(default="15")
+    # Torque page alert when a Reflex (news-reactor) signal arrives — one per
+    # signal, a different tone for accepted / refused / cancel. Style: fanfare
+    # (rising four-note), siren (two-tone sweep), chime (bright bell triad),
+    # klaxon (square-wave horn), arcade (fast 8-bit arpeggio), off. Volume 0-1.
+    torque_reflex_alert: str = Field(default="fanfare")
+    torque_reflex_alert_volume: float = Field(default=0.8)
     torque_trading_hours: str = Field(default="07:30-16:15")
     torque_extended_hours_tickers: str = Field(default=(
         "AAPL,AMD,AMZN,AVGO,BABA,BAC,F,GOOG,GOOGL,HOOD,INTC,META,MRVL,MSFT,MU,NFLX,"
@@ -578,6 +584,10 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
         out["news_signal_entry_step_sec"] = float(raw["NEWS_SIGNAL_ENTRY_STEP_SEC"])
     if "TORQUE_TICKERS_REFRESH_SEC" in raw:
         out["torque_tickers_refresh_sec"] = int(raw["TORQUE_TICKERS_REFRESH_SEC"])
+    if raw.get("TORQUE_REFLEX_ALERT", "").strip():
+        out["torque_reflex_alert"] = raw["TORQUE_REFLEX_ALERT"].strip().lower()
+    if raw.get("TORQUE_REFLEX_ALERT_VOLUME", "").strip():
+        out["torque_reflex_alert_volume"] = max(0.0, min(1.0, float(raw["TORQUE_REFLEX_ALERT_VOLUME"])))
     for _k in ("TORQUE_TRADING_HOURS", "TORQUE_EXTENDED_HOURS_TICKERS",
                "TORQUE_EXT_STOP_LOSS_PCT", "TORQUE_EXT_CLOSE_TARGET_PCT"):
         if raw.get(_k, "").strip():

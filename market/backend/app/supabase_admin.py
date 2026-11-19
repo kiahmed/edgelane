@@ -424,6 +424,15 @@ async def record_news_signal_outcome(source_event_id: str, outcome: str, reason:
                              {"outcome": outcome, "reason": reason})
 
 
+async def get_recent_news_signals(limit: int = 20) -> Optional[list[dict]]:
+    """The latest received news-reactor signals with Torque's outcome, newest
+    first — feeds the Torque page's arrival alert."""
+    return await select_many(
+        "news_reactor_signals",
+        select="source_event_id,received_at,symbol,state,direction,outcome,reason",
+        order="received_at.desc", limit=int(limit))
+
+
 async def insert_torque_order(row: dict) -> bool:
     """Record which order, on which account, resulted from which news-signal
     event — one row per (signal, qualified account). Correlation index for a

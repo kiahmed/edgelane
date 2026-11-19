@@ -580,19 +580,90 @@ function App(){
   // than "any unrecognized order", which
   // would also false-fire for orders placed via `tp` or by hand on the broker.
   const seenOrderIds=useRef(null);   // null until first fetch primes it — no beep for pre-existing orders
-  const beepNewsOrder=()=>{
-    try{
-      const Ctx=window.AudioContext||window.webkitAudioContext;
-      const ctx=new Ctx();
-      const osc=ctx.createOscillator(),gain=ctx.createGain();
-      osc.type='sine';osc.frequency.value=880;
-      gain.gain.setValueAtTime(0.0001,ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.3,ctx.currentTime+0.01);
-      gain.gain.exponentialRampToValueAtTime(0.0001,ctx.currentTime+0.4);
-      osc.connect(gain);gain.connect(ctx.destination);
-      osc.start();osc.stop(ctx.currentTime+0.42);
-    }catch(e){}
+  // ── Reflex arrival alert ────────────────────────────────────────────────
+  // One alert per signal received from facades-news-reactor, a distinct tone
+  // for accepted (an order is being placed) / refused / cancel. Style + volume
+  // come from the backend config (TORQUE_REFLEX_ALERT, _VOLUME); on/off is per
+  // browser. Browsers block audio until a click: a visible pill says so and
+  // any click / key unlocks it. A desktop notification backs it up when the
+  // tab is in the background.
+  const lsGet=(k,d)=>{try{const v=localStorage.getItem(k);return v==null?d:v;}catch(e){return d;}};
+  const lsSet=(k,v)=>{try{localStorage.setItem(k,v);}catch(e){}};
+  const [soundOn,setSoundOn]=useState(()=>lsGet('torque.reflexSound','on')!=='off');
+  const [soundBlocked,setSoundBlocked]=useState(false);
+  const [lastSignal,setLastSignal]=useState(null);
+  const audioRef=useRef(null);
+  const getCtx=()=>{const Ctx=window.AudioContext||window.webkitAudioContext;if(!Ctx)return null;
+    if(!audioRef.current)audioRef.current=new Ctx();return audioRef.current;};
+  useEffect(()=>{const unlock=()=>{const c=audioRef.current;
+      if(c&&c.state==='suspended')c.resume().then(()=>setSoundBlocked(false)).catch(()=>{});
+      else setSoundBlocked(false);};
+    window.addEventListener('pointerdown',unlock);window.addEventListener('keydown',unlock);
+    return()=>{window.removeEventListener('pointerdown',unlock);window.removeEventListener('keydown',unlock);};},[]);
+  // [freq, start s, dur s, wave, endFreq?]
+  const ALERTS={
+    fanfare:{accepted:[[523,0,.16,'triangle'],[659,.16,.16,'triangle'],[784,.32,.16,'triangle'],[1047,.48,.45,'square']],
+             refused:[[784,0,.18,'triangle'],[659,.18,.18,'triangle'],[523,.36,.18,'triangle'],[392,.54,.5,'square']],
+             cancel:[[440,0,.22,'sawtooth'],[330,.28,.22,'sawtooth'],[440,.56,.22,'sawtooth'],[330,.84,.4,'sawtooth']]},
+    siren:{accepted:[[600,0,.45,'sawtooth',1400],[600,.5,.45,'sawtooth',1400]],
+           refused:[[1300,0,.5,'sawtooth',500],[1300,.55,.5,'sawtooth',500]],
+           cancel:[[700,0,.2,'square'],[500,.22,.2,'square'],[700,.44,.2,'square'],[500,.66,.2,'square'],[700,.88,.2,'square']]},
+    chime:{accepted:[[1047,0,.7,'sine'],[1319,.14,.7,'sine'],[1568,.28,.9,'sine']],
+           refused:[[1568,0,.6,'sine'],[1245,.16,.6,'sine'],[1047,.32,.9,'sine']],
+           cancel:[[659,0,.6,'sine'],[659,.5,.9,'sine']]},
+    klaxon:{accepted:[[300,0,.18,'square'],[400,.24,.18,'square'],[500,.48,.4,'square']],
+            refused:[[260,0,.45,'square'],[200,.55,.6,'square']],
+            cancel:[[350,0,.1,'square'],[350,.16,.1,'square'],[350,.32,.1,'square'],[350,.48,.1,'square']]},
+    arcade:{accepted:[523,659,784,1047,1319,1568,2093].map((f,k)=>[f,k*.07,.08,'square']),
+            refused:[1568,1319,1047,784,659,523,392].map((f,k)=>[f,k*.07,.08,'square']),
+            cancel:[[880,0,.06,'square'],[660,.08,.06,'square'],[880,.16,.06,'square'],[660,.24,.06,'square'],[880,.32,.06,'square'],[660,.4,.2,'square']]}};
+  const playAlert=(kind,styleOverride)=>{
+    const conf=(cfg&&cfg.reflex_alert)||{style:'fanfare',volume:.8};
+    const style=styleOverride||conf.style;
+    if(style==='off')return;
+    const notes=(ALERTS[style]||ALERTS.fanfare)[kind]||ALERTS.fanfare.accepted;
+    const vol=Math.max(.05,Math.min(1,Number(conf.volume)||.8));
+    try{const ctx=getCtx();if(!ctx)return;
+      const go=()=>{const t0=ctx.currentTime+.02;
+        notes.forEach(([f,st,du,wave,f2])=>{const o=ctx.createOscillator(),g=ctx.createGain();
+          o.type=wave||'square';o.frequency.setValueAtTime(f,t0+st);
+          if(f2)o.frequency.linearRampToValueAtTime(f2,t0+st+du);
+          g.gain.setValueAtTime(.0001,t0+st);g.gain.exponentialRampToValueAtTime(vol*.5,t0+st+.015);
+          g.gain.exponentialRampToValueAtTime(.0001,t0+st+du);o.connect(g);g.connect(ctx.destination);
+          o.start(t0+st);o.stop(t0+st+du+.02);});};
+      if(ctx.state==='suspended')ctx.resume().then(()=>{setSoundBlocked(false);go();}).catch(()=>setSoundBlocked(true));
+      else go();
+      setTimeout(()=>{if(ctx.state!=='running')setSoundBlocked(true);},300);
+    }catch(e){setSoundBlocked(true);}
   };
+  const notifySignal=(sig,kind)=>{
+    try{if(typeof Notification==='undefined'||Notification.permission!=='granted'||!document.hidden)return;
+      const what=kind==='accepted'?'order placed':kind==='cancel'?'cancel':'refused';
+      new Notification('Reflex '+(sig.symbol||'')+' '+(sig.direction||sig.state||'')+' — '+what,
+        {body:sig.reason||'',tag:'reflex-'+sig.source_event_id});}catch(e){}
+  };
+  const toggleSound=()=>{const n=!soundOn;setSoundOn(n);lsSet('torque.reflexSound',n?'on':'off');
+    if(n){playAlert('accepted');
+      try{if(typeof Notification!=='undefined'&&Notification.permission==='default')Notification.requestPermission();}catch(e){}}};
+  const seenSignals=useRef(null);   // null until primed — no alert for signals already there at load
+  useEffect(()=>{let live=true;
+    const run=()=>j('/torque/signals').then(r=>{
+      if(!live||!r||!r.ok)return;
+      const sigs=r.signals||[];
+      if(seenSignals.current===null){seenSignals.current=new Set(sigs.filter(x=>x.outcome).map(x=>x.source_event_id));
+        if(sigs[0])setLastSignal(sigs[0]);return;}
+      // Oldest first, once Torque has decided (outcome set) — so the tone says what happened.
+      sigs.slice().reverse().forEach(x=>{
+        if(!x.outcome||seenSignals.current.has(x.source_event_id))return;
+        seenSignals.current.add(x.source_event_id);
+        const kind=String(x.state||'').toLowerCase()==='cancel'||x.outcome==='cancel_processed'?'cancel'
+          :x.outcome==='placed'?'accepted':'refused';
+        setLastSignal({...x,kind});
+        if(soundOn){playAlert(kind);notifySignal(x,kind);}   // the switch silences both
+      });
+    }).catch(()=>{});
+    run();const t=setInterval(run,4000);return()=>{live=false;clearInterval(t)};
+  },[soundOn,cfg]);   // eslint-disable-line
   useEffect(()=>{let live=true;
     const run=()=>j('/torque/orders').then(o=>{
       if(!live)return;
@@ -604,7 +675,6 @@ function App(){
         // Tradier drops the tag on OTOCO brackets, so the backend also flags
         // signal orders by id (news_signal) — the tag alone can't be relied on.
         const isNews=x=>x.news_signal||String(x.tag||'').startsWith('torqueNews');
-        if(all.some(x=>isNews(x)&&!seenOrderIds.current.has(String(x.id))))beepNewsOrder();
         seenOrderIds.current=ids;
       }
       setOrders(o);
@@ -672,6 +742,17 @@ function App(){
       </div>
       <span className={"tag "+(cfg.env==='sandbox'||cfg.devmode?'sandbox':'production')}>
         {cfg.devmode||cfg.env==='sandbox'?'SANDBOX':'PRODUCTION'} · {cfg.mode}</span>
+      <span className={"tag "+(soundOn?'sandbox':'closed')} style={{cursor:'pointer'}} onClick={toggleSound}
+        title={'Reflex arrival alert ('+((cfg.reflex_alert||{}).style||'fanfare')+', set by TORQUE_REFLEX_ALERT) — click to turn '+(soundOn?'off':'on')+' in this browser'}>
+        {soundOn?'🔔 REFLEX SOUND ON':'🔕 REFLEX SOUND OFF'}</span>
+      {soundOn&&<span className="tag" style={{cursor:'pointer'}} title="Play the three alerts: accepted, refused, cancel"
+        onClick={()=>{playAlert('accepted');setTimeout(()=>playAlert('refused'),1300);setTimeout(()=>playAlert('cancel'),2600);}}>test</span>}
+      {soundOn&&soundBlocked&&<span className="tag closed" style={{cursor:'pointer'}}
+        title="The browser blocked audio until you interact with the page — Reflex alerts would be silent"
+        onClick={()=>{const c=getCtx();if(c)c.resume().then(()=>{setSoundBlocked(false);playAlert('accepted');}).catch(()=>{});}}>
+        🔇 SOUND BLOCKED — CLICK TO ENABLE</span>}
+      {lastSignal&&lastSignal.kind&&<span className="tag" title={(lastSignal.reason||'')+' · '+(lastSignal.received_at||'')}>
+        Reflex {lastSignal.symbol} {lastSignal.direction||''} · {lastSignal.kind==='accepted'?'placed':lastSignal.kind}</span>}
       {liveGate&&mktOpen&&extSession&&<span className="tag closed" title="Extended options session (Torque trading window outside 09:30-16:00) — this ticker trades now.">EXTENDED HOURS · LIVE</span>}
       {!mktOpen&&<span className="tag closed" title="Polling pauses whenever this ticker can't trade — outside Torque's trading window (Tradier's calendar, so holidays and early closes are handled), or in the extended session for a ticker the broker doesn't trade in extended hours. Positioning/flow freeze; orders shown as of the pause (cancel/modify still work). Resumes automatically.">MARKET {mktLabel(mktClock)}{extSession&&!extTicker?' · '+ticker+' NO EXT-HOURS':''} · PAUSED</span>}
       <div className="grow"></div>

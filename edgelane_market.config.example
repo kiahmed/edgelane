@@ -217,6 +217,13 @@ TORQUE_EXTENDED_HOURS_TICKERS=AAPL,AMD,AMZN,AVGO,BABA,BAC,F,GOOG,GOOGL,HOOD,INTC
 # Pushed to public.app_config by `make db-push`.
 TORQUE_EXT_STOP_LOSS_PCT=10
 TORQUE_EXT_CLOSE_TARGET_PCT=15
+# Torque page alert when a Reflex signal arrives (one per signal; tones differ for
+# accepted / refused / cancel). Try them with the page's "test" button:
+#   fanfare  rising four-note (default)      siren   two-tone sweep
+#   chime    bright bell triad               klaxon  square-wave horn
+#   arcade   fast 8-bit arpeggio             off     no sound
+TORQUE_REFLEX_ALERT=fanfare
+TORQUE_REFLEX_ALERT_VOLUME=0.8
 # Stop guardian: enforces stop-loss on EVERY open position in Torque tickers,
 # whoever placed it (Torque, Reflex, Tradier's site, the tp CLI). Reflex
 # positions always; others per the Torque page's saved per-ticker stop-loss
