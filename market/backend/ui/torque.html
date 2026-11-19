@@ -745,8 +745,6 @@ function App(){
       <span className={"tag "+(soundOn?'sandbox':'closed')} style={{cursor:'pointer'}} onClick={toggleSound}
         title={'Reflex arrival alert ('+((cfg.reflex_alert||{}).style||'fanfare')+', set by TORQUE_REFLEX_ALERT) — click to turn '+(soundOn?'off':'on')+' in this browser'}>
         {soundOn?'🔔 REFLEX SOUND ON':'🔕 REFLEX SOUND OFF'}</span>
-      {soundOn&&<span className="tag" style={{cursor:'pointer'}} title="Play the three alerts: accepted, refused, cancel"
-        onClick={()=>{playAlert('accepted');setTimeout(()=>playAlert('refused'),1300);setTimeout(()=>playAlert('cancel'),2600);}}>test</span>}
       {soundOn&&soundBlocked&&<span className="tag closed" style={{cursor:'pointer'}}
         title="The browser blocked audio until you interact with the page — Reflex alerts would be silent"
         onClick={()=>{const c=getCtx();if(c)c.resume().then(()=>{setSoundBlocked(false);playAlert('accepted');}).catch(()=>{});}}>
