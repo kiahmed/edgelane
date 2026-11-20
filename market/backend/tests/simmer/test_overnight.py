@@ -5,9 +5,27 @@ from __future__ import annotations
 
 import pytest
 
+from datetime import date, timedelta
+
 from app import simmer_overnight as ov
 from app import simmer_relativeqs as rq
 from app import supabase_admin
+
+
+def _future_expiries(n: int = 2) -> list[str]:
+    """The next `n` Fridays STRICTLY AFTER today's session, so the fake provider's
+    expiries — and the expected RQ pin (`_next_expiry` takes the nearest future one) —
+    track the clock and never rot the way a hardcoded date does."""
+    d = date.fromisoformat(ov.session_date())
+    cur = d + timedelta(days=((4 - d.weekday()) % 7) or 7)   # next Friday, strictly after
+    out = []
+    for _ in range(n):
+        out.append(cur.isoformat())
+        cur += timedelta(days=7)
+    return out
+
+
+_PIN = _future_expiries(1)[0]        # the expiry run_import will pin (nearest future Friday)
 
 
 # ── RelativeQs client parse ─────────────────────────────────────────────────
@@ -91,7 +109,7 @@ class _FakeProvider:
         return {"last": self._spot}
 
     async def expirations(self, symbol):
-        return ["2026-11-20", "2026-12-18"]
+        return _future_expiries(2)       # clock-relative, so _next_expiry's pin is stable
 
 
 async def test_capture_baseline_freezes_strikes_and_premiums():
@@ -191,7 +209,7 @@ async def test_run_import_filters_imports_and_freezes_baseline(mock_supabase, mo
     assert all(r["overrides"]["overnight"]["dir"] == "down" for r in nvda_rows)
 
     # overnight analysis row exists with a FROZEN baseline + thesis
-    key = ("NVDA", "2026-11-20", ov.session_date())
+    key = ("NVDA", _PIN, ov.session_date())
     row = mock_supabase["overnight"][key]
     assert row["baseline"] and row["side"] == "put" and row["thesis"]
     assert row["verdict"]["call"] == "wait"            # baseline only, pre-open
@@ -217,7 +235,7 @@ async def test_run_import_is_nondestructive_on_an_existing_user_row(mock_supabas
     assert u1["overrides"]["overnight"]["gap"] == -0.06   # overlay merged in
     # user-2 did NOT already watch NVDA → inserted fresh as an RQ pick
     u2 = next(r for r in mock_supabase["watchlist"] if r["user_id"] == "user-2" and r["symbol"] == "NVDA")
-    assert u2["source"] == "rq" and u2["expiration"] == "2026-11-20"
+    assert u2["source"] == "rq" and u2["expiration"] == _PIN
 
 
 async def test_run_import_pins_expiry_on_a_pending_row_without_one(mock_supabase, monkeypatch):
@@ -233,7 +251,7 @@ async def test_run_import_pins_expiry_on_a_pending_row_without_one(mock_supabase
 
     await ov.run_import(_FakeProvider(100.0))
     u1 = next(r for r in mock_supabase["watchlist"] if r["user_id"] == "user-1" and r["symbol"] == "NVDA")
-    assert u1["expiration"] == "2026-11-20"      # auto-pinned (was None)
+    assert u1["expiration"] == _PIN               # auto-pinned (was None)
     assert u1["source"] == "user"                # still not flipped to rq
     assert u1["overrides"]["overnight"]["gap"] == -0.06
 
@@ -280,8 +298,8 @@ async def test_toggle2_analyzes_only_intersection_never_imports(mock_supabase, m
     assert nvda["overrides"]["overnight"]["dir"] == "down"
     assert not any(r["user_id"] == "user-9" and r["symbol"] == "AMD" for r in wl)
     # the shared analysis row exists for BOTH movers regardless of users
-    assert ("NVDA", "2026-11-20", ov.session_date()) in mock_supabase["overnight"]
-    assert ("AMD", "2026-11-20", ov.session_date()) in mock_supabase["overnight"]
+    assert ("NVDA", _PIN, ov.session_date()) in mock_supabase["overnight"]
+    assert ("AMD", _PIN, ov.session_date()) in mock_supabase["overnight"]
 
 
 async def test_refresh_analysis_updates_verdict_from_live(mock_supabase, monkeypatch):
