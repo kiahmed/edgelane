@@ -2097,9 +2097,8 @@ async def _news_signal_after_claim(payload: NewsSignalPayload, request: Request,
         # close still open.
         return await _handle_cancel_signal(payload, request)
 
-    if not _news_signal_rate_ok(settings):
-        return {"ok": True, "accepted": False, "reason": "signal rate cap exceeded"}
-
+    # Pure in-memory refusals first, so a signal refused for its direction or
+    # ticker never uses up the rate cap meant for signals that can trade.
     strategy = _NEWS_DIRECTION_STRATEGY.get((payload.direction or "").lower())
     if not strategy:
         return {"ok": True, "accepted": False, "reason": f"unrecognized direction {payload.direction!r}"}
@@ -2107,6 +2106,11 @@ async def _news_signal_after_claim(payload: NewsSignalPayload, request: Request,
     symbol = payload.symbol.upper()
     if symbol not in tcfg.tickers():
         return {"ok": True, "accepted": False, "reason": f"{symbol} is not a configured Torque ticker"}
+    if not tcfg.reflex_enabled(symbol):
+        return {"ok": True, "accepted": False, "reason": f"Reflex signals are off for {symbol}"}
+
+    if not _news_signal_rate_ok(settings):
+        return {"ok": True, "accepted": False, "reason": "signal rate cap exceeded"}
 
     # Defensive belt-and-suspenders — facades-news-reactor already enforces
     # trading_hours on the sending side. Torque's own trading window applies

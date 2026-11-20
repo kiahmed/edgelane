@@ -305,3 +305,19 @@ async def test_cancel_close_in_the_extended_session_crosses_with_a_limit(enabled
     assert all(p.get("type") != "market" for p in real_orders)
     assert real_orders[-1]["type"] == "limit" and real_orders[-1]["tag"].startswith("torqueCancelLmt")
     assert r["results"][0]["action"] != "needs_attention"
+
+
+async def test_cancel_still_processed_when_reflex_is_off_for_the_ticker(enabled, monkeypatch):
+    """Switching a ticker's Reflex off must never block unwinding an order a
+    signal already placed."""
+    client = FakeTradier(place_responses=[{"order": {"id": 1, "status": "ok"}}],
+                         order_status={"status": "open"})
+    await _place_entry(monkeypatch, client)
+    async def _resolve_uid(uid):
+        return "tradier", client, "TEST123"
+    monkeypatch.setattr(troute, "resolve_client_for_uid", _resolve_uid)
+    for t in list(troute.tcfg._SETUP):
+        troute.tcfg._SETUP[t] = {**troute.tcfg._SETUP[t], "reflex_enabled": False}
+    r = await news_signal(_cancel_payload(), FakeRequest(client))
+    assert "Reflex signals are off" not in str(r.get("reason"))
+    assert r.get("results"), r                   # the cancel reached the accounts it fanned out to

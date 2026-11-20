@@ -882,6 +882,13 @@ The sound style and volume are set in <code>edgelane_market.config</code>
   ticker with <code>make torque-ticker T=QQQ SET="stop_loss_default=40 close_target_default=35"</code>
   (live within ~60s, no restart) — see <a href="#ticker-settings">Checking and changing ticker
   settings</a>.</li>
+  <li><strong>Switching Reflex off for one ticker.</strong>
+  <code>make torque-ticker T=XLE SET="reflex=off"</code> refuses Reflex entries on that ticker
+  (the alert plays the <em>refused</em> tune, reason "Reflex signals are off for XLE") while it stays
+  tradeable on this page; <code>reflex=on</code> turns it back on. Live within ~60s, no restart.
+  Cancels for orders Reflex already placed still go through. To stop Reflex everywhere, set
+  <code>ACCEPT_NEWS_REACTOR_SIGNALS=false</code> in <code>edgelane_market.config</code> and restart
+  the backend.</li>
   <li><strong>Unwound automatically.</strong> If later news invalidates the call, a cancel arrives
   and Torque closes it out on its own: a still-unfilled entry is simply cancelled; a filled one is
   closed at market for exactly the filled quantity, whatever its P/L.</li>

@@ -119,7 +119,7 @@ _SETUP_STATE: dict[str, Any] = {"loaded": False, "loaded_at": 0.0}
 
 _ROW_DEFAULTS: dict[str, Any] = {
     "enabled": True, "offsets": {}, "close_target_spread_scaled": False,
-    "close_target_required": False, "market_orders_allowed": True,
+    "close_target_required": False, "market_orders_allowed": True, "reflex_enabled": True,
 }
 
 
@@ -341,6 +341,13 @@ STOP_LIMIT_BUFFER_TICKS = 3
 # costs a cent; on DJX the ask can be 10.00 against a 5.22 mid, so a market
 # entry silently pays ~2x fair value. There is no legitimate reason to send a
 # market order into that book — force a limit and let the user see the price.
+def reflex_enabled(ticker: str) -> bool:
+    """Whether Reflex (news-reactor) entry signals are accepted for this ticker
+    (reflex_enabled in torque_tickers_setup, default true). Page trading and
+    Reflex cancels don't depend on it."""
+    return bool(_row(ticker).get("reflex_enabled", True))
+
+
 def market_orders_allowed(ticker: str) -> bool:
     """A market order crosses to whatever the book shows — on DJX that silently
     pays ~2x fair value, so such tickers force a limit (market_orders_allowed

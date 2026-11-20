@@ -760,3 +760,45 @@ async def test_reflex_ignores_the_pages_saved_stop_setting(enabled, monkeypatch)
     _place_one(monkeypatch)
     r = await news_signal(_payload(), FakeRequest(FakeTradier()))
     assert r["stop_loss_pct"] == 40 and r["close_target_pct"] == 55
+
+
+# ── per-ticker Reflex on/off (torque_tickers_setup.reflex_enabled) ──────────
+async def test_reflex_off_for_the_ticker_drops_the_entry(enabled, monkeypatch):
+    tcfg._SETUP["NDX"] = {**tcfg._SETUP["NDX"], "reflex_enabled": False}
+    client = _place_one(monkeypatch)
+    r = await news_signal(_payload(), FakeRequest(client))
+    assert r["accepted"] is False and r["reason"] == "Reflex signals are off for NDX"
+    assert client.placed == []
+
+
+async def test_reflex_on_by_default_and_other_tickers_unaffected(enabled, monkeypatch):
+    tcfg._SETUP["SPY"] = {**tcfg._SETUP["SPY"], "reflex_enabled": False}
+    row = dict(tcfg._SETUP["NDX"]); row.pop("reflex_enabled", None)
+    tcfg._SETUP["NDX"] = row
+    assert tcfg.reflex_enabled("NDX") is True
+    _place_one(monkeypatch)
+    r = await news_signal(_payload(), FakeRequest(FakeTradier()))
+    assert r["accepted"] is True
+
+
+async def test_global_switch_wins_over_reflex_enabled(monkeypatch):
+    s = troute.get_settings().model_copy(update={"accept_news_reactor_signals": False})
+    monkeypatch.setattr(troute, "get_settings", lambda: s)
+    r = await news_signal(_payload(), FakeRequest(FakeTradier()))
+    assert r["accepted"] is False and "ACCEPT_NEWS_REACTOR_SIGNALS" in r["reason"]
+
+
+def test_reflex_enabled_seed_rows_default_true():
+    assert all(tcfg.reflex_enabled(t) for t in tcfg.tickers())
+
+
+async def test_refused_ticker_does_not_use_up_the_rate_cap(enabled, monkeypatch):
+    s = enabled.model_copy(update={"news_signal_max_per_window": 1})
+    monkeypatch.setattr(troute, "get_settings", lambda: s)
+    tcfg._SETUP["SPY"] = {**tcfg._SETUP["SPY"], "reflex_enabled": False}
+    for i in range(3):
+        r = await news_signal(_payload(source_event_id=f"off-{i}", symbol="SPY"), FakeRequest(FakeTradier()))
+        assert r["reason"] == "Reflex signals are off for SPY"
+    _place_one(monkeypatch)
+    r = await news_signal(_payload(source_event_id="on-1"), FakeRequest(FakeTradier()))
+    assert r["accepted"] is True                 # the cap is still available for NDX

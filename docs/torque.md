@@ -591,7 +591,7 @@ log instead (`GET /torque/signals`, `news_reactor_signals`), so refusals —
 which never create an order — sound too: rising for placed, falling for
 refused, buzzing for cancel (`TORQUE_REFLEX_ALERT`, `_VOLUME`).
 
-### Planned: per-ticker Reflex on/off (spec — not built)
+### Per-ticker Reflex on/off (`reflex_enabled`, migration 0034)
 
 **Need.** Today Reflex can be stopped only globally
 (`ACCEPT_NEWS_REACTOR_SIGNALS`, needs a restart), per account (`news-reactor`

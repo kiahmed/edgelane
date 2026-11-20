@@ -9,6 +9,7 @@ TORQUE_TICKERS_REFRESH_SEC (default 60s) — no restart, no redeploy.
   python3 tools/torque_ticker.py set QQQ stop_loss_default=50 close_target_default=40
   python3 tools/torque_ticker.py set QQQ stop_loss_default=null      # back to the code default
   python3 tools/torque_ticker.py set XLE tp=15 sl=40                 # aliases of the two columns above
+  python3 tools/torque_ticker.py set XLE reflex=off                  # refuse Reflex entries on XLE
   python3 tools/torque_ticker.py set NVDA --create tick=0.05 yahoo_symbol=NVDA sort_order=110
   add -n / --dry-run to preview the SQL, -y / --yes to skip the confirmation.
 
@@ -50,7 +51,7 @@ _RANGES = {
 }
 _SHOW_COLS = ("ticker", "enabled", "sort_order", "tick", "tick_above_3", "stop_loss_default",
               "close_target_default", "close_target_min", "max_spread_pct", "market_orders_allowed",
-              "ext_stop_loss_pct", "ext_close_target_pct")
+              "ext_stop_loss_pct", "ext_close_target_pct", "reflex_enabled")
 
 
 def _ctx():
@@ -87,6 +88,7 @@ def _columns(ctx) -> dict[str, tuple[str, bool]]:
 # accepted on `set` too (used wherever an account has no saved setting).
 ALIASES = {"sl": "stop_loss_default", "tp": "close_target_default",
            "ext_sl": "ext_stop_loss_pct", "ext_tp": "ext_close_target_pct",
+           "reflex": "reflex_enabled",
            "reflex_sl": "stop_loss_default", "reflex_stop": "stop_loss_default",
            "reflex_tp": "close_target_default", "reflex_target": "close_target_default"}
 
@@ -121,9 +123,10 @@ def to_sql(col: str, raw: str, cols: dict[str, tuple[str, bool]]) -> str:
             raise SystemExit(f"ERROR {col}={num} is outside {lo}..{hi}")
         return repr(num) if isinstance(num, float) else str(num)
     if typ == "boolean":
-        if v.lower() not in ("true", "false"):
-            raise SystemExit(f"ERROR {col} needs true or false, got {raw!r}")
-        return v.lower()
+        b = {"true": "true", "on": "true", "yes": "true", "false": "false", "off": "false", "no": "false"}.get(v.lower())
+        if b is None:
+            raise SystemExit(f"ERROR {col} needs true/false (or on/off), got {raw!r}")
+        return b
     if typ == "jsonb":
         try:
             obj = json.loads(v)
@@ -242,11 +245,13 @@ def cmd_show(ctx, a) -> int:
         print(sa.render([{**r, **_effective(r, ext)}], expanded=True))
         _print_saved(ctx, r["ticker"])
         return 0
-    rows = sa.run_sql(*ctx, f"select {', '.join(_SHOW_COLS)} from {TABLE} order by sort_order, ticker;")
+    # select * — works before and after a migration adds a column.
+    rows = sa.run_sql(*ctx, f"select * from {TABLE} order by sort_order, ticker;")
     out = []
     for r in rows:
         e = _effective(r, ext)
         out.append({"ticker": r["ticker"], "on": "yes" if r.get("enabled") else "no",
+                    "reflex": "off" if r.get("reflex_enabled") is False else "on",
                     "ext_hrs": e["extended_hours"],
                     "sl": e["sl"].replace(" (default)", "*"),
                     "tp": e["tp"].replace(" (default)", "*"),
@@ -257,6 +262,7 @@ def cmd_show(ctx, a) -> int:
     print("sl / tp = the ticker's default stop-loss / take-profit, used wherever an account has no\n"
           "saved setting for it; * = code default (no value on the row). ext_sl / ext_tp = what an\n"
           "entry placed in extended hours is armed with (g = global value, r = regular default).\n"
+          "reflex = whether Reflex entry signals are accepted for the ticker (SET=\"reflex=off\").\n"
           "`T=<ticker>` = every column.")
     _print_saved(ctx)
     return 0

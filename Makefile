@@ -237,6 +237,7 @@ db-push-dry: ## List the migrations that would be applied
 #   make torque-ticker T=QQQ                             every column of QQQ
 #   make torque-ticker T=QQQ SET="stop_loss_default=50 close_target_default=40"
 #   make torque-ticker T=QQQ SET="stop_loss_default=null"        (back to default)
+#   make torque-ticker T=XLE SET="reflex=off"           (refuse Reflex entries on XLE)
 #   make torque-ticker T=NVDA CREATE=1 SET="tick=0.05 yahoo_symbol=NVDA sort_order=110"
 #   ARGS=-n previews the SQL, ARGS=-y skips the confirmation. JSON: no spaces.
 torque-ticker: export TORQUE_SET := $(SET)

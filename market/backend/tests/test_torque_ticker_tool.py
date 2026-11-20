@@ -28,7 +28,7 @@ def test_to_sql_types_values(col, val, sql):
 
 @pytest.mark.parametrize("col,val", [
     ("stop_loss_default", "150"), ("stop_loss_default", "0"), ("close_target_default", "abc"),
-    ("close_target_default", "nan"), ("sort_order", "1.5"), ("enabled", "yes"), ("tick", "null"),
+    ("close_target_default", "nan"), ("sort_order", "1.5"), ("enabled", "maybe"), ("tick", "null"),
     ("ticker", "ZZZ"), ("updated_at", "r:now()"), ("bogus", "1"), ("offsets", "[1,2]"),
     ("offsets", "{bad"), ("allowed_roots", "x y;z"),
 ])
@@ -87,3 +87,11 @@ def test_ext_columns_aliases_and_effective(monkeypatch):
                        "ext_stop_loss_pct": 8, "ext_close_target_pct": None}, {"SPY"})
     assert e["ext_sl"] == "8%" and e["ext_tp"] == "15% (global)"
     tt._EXT_GLOBAL.clear()
+
+
+def test_reflex_alias_and_on_off_booleans():
+    cols = {**COLS, "reflex_enabled": ("boolean", False)}
+    assert tt.parse_pairs(["reflex=off"]) == [("reflex_enabled", "off")]
+    assert tt.to_sql("reflex", "off", cols) == "false" and tt.to_sql("reflex", "ON", cols) == "true"
+    with pytest.raises(SystemExit):
+        tt.to_sql("reflex", "maybe", cols)
