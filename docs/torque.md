@@ -586,12 +586,66 @@ armed at the ticker's own configured default, same as any other order.
 
 Every resulting order carries the `torqueNews…` tag (vs. the normal
 `torque…`/`torqueClose…`) — visible in the Orders/Past-Orders table like any
-other order (no separate panel), and it's what the page's sound alert keys
-off: a short tone plays the first time a `torqueNews…`-tagged order appears in
-a poll that wasn't there in the previous one, so an unattended fire still gets
-noticed. Detection is tag-based specifically so it doesn't also fire for
-orders placed via `tp` or by hand on the broker's own site, which show up in
-the same account-wide orders list but aren't news-signal-driven.
+other order (no separate panel). The page's arrival alert keys off the signal
+log instead (`GET /torque/signals`, `news_reactor_signals`), so refusals —
+which never create an order — sound too: rising for placed, falling for
+refused, buzzing for cancel (`TORQUE_REFLEX_ALERT`, `_VOLUME`).
+
+### Planned: per-ticker Reflex on/off (spec — not built)
+
+**Need.** Today Reflex can be stopped only globally
+(`ACCEPT_NEWS_REACTOR_SIGNALS`, needs a restart), per account (`news-reactor`
+in `profiles.tools_enabled`), or by disabling a ticker outright
+(`torque_tickers_setup.enabled=false`), which also removes it from the Torque
+page. There is no way to keep a ticker tradeable on the page while refusing
+Reflex signals for it.
+
+**Where.** A column on `torque_tickers_setup` — the table that already holds
+the Reflex-relevant per-ticker settings (the stop / take-profit Reflex entries
+use, the extended-hours values) — not a new schema:
+
+| Column | Type | Default | Meaning |
+|---|---|---|---|
+| `reflex_enabled` | `boolean not null` | `true` | `false` = Reflex entry signals for this ticker are refused; the page and everything else are unaffected. |
+
+Migration `0034_torque_reflex_per_ticker.sql`: `add column if not exists`,
+default `true`, so every existing ticker keeps today's behaviour. No seed.
+
+**Behaviour.**
+
+- Gate order in `news_signal` (entry): global switch → … → **ticker configured**
+  → **`reflex_enabled`** → market gate → fan-out. Refusal is a normal
+  log-and-drop: `accepted:false`, outcome `dropped`, reason
+  `"Reflex signals are off for XLE"` — so it lands in `news_reactor_signals`,
+  news-reactor records it, and the page plays the *refused* tone.
+- **Cancels are never blocked** by it: unwinding an order a signal already
+  placed is always allowed, even after the ticker is switched off.
+- Precedence: the global `ACCEPT_NEWS_REACTOR_SIGNALS=false` wins; a ticker
+  with `enabled=false` is refused as "not a configured Torque ticker" as today;
+  `reflex_enabled` only matters for an enabled ticker.
+- Takes effect within `TORQUE_TICKERS_REFRESH_SEC` (60 s) — no restart, no
+  deploy. Applies to every account (it's a ticker setting, not per account).
+- Positions Reflex already opened on the ticker keep their exits and guardian
+  protection unchanged.
+
+**Code.** `torque_config.reflex_enabled(ticker)` (row value, default `True`);
+one check in `routes/torque.py` `news_signal` right after the configured-ticker
+check. Nothing in `place()`, the guardian or the page changes.
+
+**Operating it** (`make torque-ticker`):
+
+```bash
+make torque-ticker                                  # new column: reflex on/off per ticker
+make torque-ticker T=XLE SET="reflex_enabled=false" # stop Reflex on XLE (alias: reflex=false)
+make torque-ticker T=XLE SET="reflex_enabled=true"  # back on
+```
+
+**Tests.** Off → entry dropped with the reason, no order, outcome `dropped`;
+cancel still processed when off; default true for rows without the column;
+global switch still wins; the tool shows and sets it (alias `reflex`).
+
+**Docs.** Operating manual: one line in *News-signal orders* on switching a
+ticker off for Reflex.
 
 ### After submission: confirmation, same-contract retry, status
 
