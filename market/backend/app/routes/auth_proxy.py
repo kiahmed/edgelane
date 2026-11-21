@@ -147,6 +147,35 @@ class Credentials(BaseModel):
         return _norm_product(v)
 
 
+# The ONLY origins a confirmation link may return to. Exact hosts, never a
+# pattern: vercel.app names are first-come, so a wildcard like
+# edgelane-matrix-*.vercel.app lets anyone register a matching project and
+# receive a victim's confirm-link tokens. Localhost only in DEVMODE.
+_EMAIL_REDIRECT_ORIGINS = frozenset({
+    "https://matrix.facades.trade",
+    "https://simmer.facades.trade",
+    "https://edgelane-matrix.vercel.app",
+    "https://edgelane-simmer.vercel.app",
+})
+_DEV_EMAIL_REDIRECT_ORIGINS = frozenset({
+    "http://localhost:5173", "http://localhost:8080", "http://localhost:8789",
+})
+
+
+def _email_redirect(request: Request) -> dict:
+    """`redirect_to` for the confirmation link: the calling app's own origin.
+
+    Without it GoTrue falls back to the project-wide Site URL — formerly Matrix
+    — so a Simmer signup's confirm button landed on Matrix and hit "Matrix
+    isn't enabled for this account". Only an origin in the exact allow-set is
+    forwarded (no open redirect); GoTrue re-checks its own uri_allow_list."""
+    origin = (request.headers.get("origin") or "").rstrip("/")
+    allowed = _EMAIL_REDIRECT_ORIGINS
+    if getattr(get_settings(), "devmode", False):
+        allowed = allowed | _DEV_EMAIL_REDIRECT_ORIGINS
+    return {"redirect_to": origin + "/"} if origin in allowed else {}
+
+
 class RefreshBody(BaseModel):
     refresh_token: str = Field(min_length=8, max_length=2000)
     product: str = Field(default=_DEFAULT_PRODUCT, max_length=32)
@@ -222,6 +251,7 @@ async def signup(body: Credentials, request: Request):
     data = await _post("/signup",
                        {"email": body.email, "password": body.password,
                         "data": {"signup_product": body.product}},
+                       params=_email_redirect(request),
                        client_ip=_client_ip(request))
     sess = _session(data)
     # With email confirmation ON, GoTrue returns a user but no session.
@@ -272,5 +302,6 @@ async def logout(body: RefreshBody | None = None):
 @router.post("/auth/resend")
 async def resend(body: EmailBody, request: Request):
     await _post("/resend", {"type": "signup", "email": body.email},
+                params=_email_redirect(request),
                 client_ip=_client_ip(request))
     return {"ok": True}

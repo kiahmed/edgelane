@@ -236,3 +236,56 @@ def test_refresh_403_when_tool_revoked_midsession(gotrue, monkeypatch, auth_on):
     r = _client(None).post("/auth/refresh", json={"refresh_token": "r" * 20})
     assert r.status_code == 403
     assert auth_on["revoked"] == ["jwt.x.y"]
+
+
+# ── Confirmation link lands on the app that signed up, not the Site URL ──────
+def test_signup_confirm_link_redirects_to_the_calling_app(gotrue, monkeypatch):
+    """Regression: with no redirect_to GoTrue used the Site URL (Matrix), so a
+    Simmer signup's confirm button opened Matrix → "not enabled"."""
+    calls, install = gotrue
+    monkeypatch.setattr(auth_proxy, "_post", install(200, {"id": "u-1"}))
+    r = _client(None).post("/auth/signup", json={"email": "a@b.co", "password": "secret1"},
+                           headers={"Origin": "https://simmer.facades.trade"})
+    assert r.status_code == 200
+    assert calls[0][2] == {"redirect_to": "https://simmer.facades.trade/"}
+
+
+def test_resend_confirm_link_redirects_to_the_calling_app(gotrue, monkeypatch):
+    calls, install = gotrue
+    monkeypatch.setattr(auth_proxy, "_post", install(200, {}))
+    _client(None).post("/auth/resend", json={"email": "a@b.co"},
+                       headers={"Origin": "https://simmer.facades.trade"})
+    assert calls[0][0] == "/resend"
+    assert calls[0][2] == {"redirect_to": "https://simmer.facades.trade/"}
+
+
+def test_untrusted_origin_is_never_forwarded_as_redirect(gotrue, monkeypatch):
+    calls, install = gotrue
+    monkeypatch.setattr(auth_proxy, "_post", install(200, {"id": "u-1"}))
+    _client(None).post("/auth/signup", json={"email": "a@b.co", "password": "secret1"},
+                       headers={"Origin": "https://evil.example"})
+    assert not calls[0][2]
+
+
+@pytest.mark.parametrize("origin", ["https://edgelane-matrix-x.vercel.app",
+                                    "https://edgelane-simmer-git-evil.vercel.app",
+                                    "https://edgelaneevil.vercel.app",
+                                    "http://localhost:5173"])
+def test_lookalike_or_dev_origin_gets_no_redirect_in_prod(gotrue, monkeypatch, origin):
+    """vercel.app names are first-come: a look-alike project must never receive
+    a confirm link (its fragment carries the victim's tokens)."""
+    calls, install = gotrue
+    monkeypatch.setattr(auth_proxy, "_post", install(200, {}))
+    _client(None).post("/auth/resend", json={"email": "a@b.co"}, headers={"Origin": origin})
+    assert not calls[0][2]
+
+
+def test_cors_regex_is_exact_hosts_only():
+    import re
+    from app.config import Settings
+    rx = Settings().cors_allow_origin_regex
+    for ok in ("https://edgelane-matrix.vercel.app", "https://simmer.facades.trade"):
+        assert re.match(rx, ok)
+    for bad in ("https://edgelane-matrix-x.vercel.app", "https://edgelane-hazel.vercel.app",
+                "https://matrix.facades.trade.evil.com"):
+        assert not re.match(rx, bad)

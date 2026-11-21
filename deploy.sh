@@ -37,8 +37,8 @@ fi
 # behind a Cloudflare tunnel. 'cloud' is reserved for a future hosted target.
 DEPLOY_TARGET="${DEPLOY_TARGET:-local_container}"
 VERCEL_PROJECT="${VERCEL_PROJECT:-edgelane-matrix}"
-# ⚠ Simmer's hostname must keep matching the backend CORS regex
-# ^https://edgelane[a-z0-9-]*\.vercel\.app$ — see docs/simmer.md "Deployment".
+# ⚠ Both Vercel hostnames are listed EXACTLY in the backend CORS regex
+# (config.py cors_allow_origin_regex) — renaming a project means updating it.
 SIMMER_VERCEL_PROJECT="${SIMMER_VERCEL_PROJECT:-edgelane-simmer}"
 # Parent portal domain. Matrix and Simmer are also served from
 # matrix./simmer.<FACADES_DOMAIN>, so those origins must be in the Supabase Auth
@@ -345,9 +345,23 @@ frontend_setup() {
 
 # Redirect patterns for the facades.trade product subdomains, as a comma-prefixed
 # fragment ready to append to an allow-list (empty when FACADES_DOMAIN is unset).
+# Reflex (facades-news-reactor) shares this Supabase project: without its origin
+# here GoTrue drops its emailRedirectTo and the confirm link falls back to the
+# Site URL (Matrix) → "Matrix isn't enabled for this account".
 _facades_allow_fragment() {
   [ -n "$FACADES_DOMAIN" ] || return 0
-  printf ',https://matrix.%s/**,https://simmer.%s/**' "$FACADES_DOMAIN" "$FACADES_DOMAIN"
+  printf ',https://matrix.%s/**,https://simmer.%s/**,https://reflex.%s/**' "$FACADES_DOMAIN" "$FACADES_DOMAIN" "$FACADES_DOMAIN"
+}
+
+# Supabase Auth redirect allow-list: EXACT production origins only. No `-*`
+# preview wildcards (vercel.app names are first-come — a wildcard lets anyone
+# register a matching project and receive confirm-link tokens) and no localhost
+# in the shared production project; set AUTH_ALLOW_LOCALHOST=1 for a temporary
+# local-dev deploy. $1 = the live Matrix production origin.
+_auth_allow_list() {
+  local list="$1/**,https://$VERCEL_PROJECT.vercel.app/**,https://$SIMMER_VERCEL_PROJECT.vercel.app/**$(_facades_allow_fragment)"
+  [ "${AUTH_ALLOW_LOCALHOST:-0}" = "1" ] && list="$list,http://localhost:8080/**,http://localhost:8789/**,http://localhost:5173/**"
+  printf '%s' "$list"
 }
 
 # PATCH the Supabase Auth uri_allow_list so confirmation / reset emails may
@@ -359,7 +373,7 @@ _sync_auth_allow_list() {
     warn "  SUPABASE_ACCESS_TOKEN/PROJECT_REF unset — skipping Auth allow-list sync"
     return 0
   fi
-  local allow="https://${VERCEL_PROJECT}.vercel.app/**,https://${VERCEL_PROJECT}-*.vercel.app/**,https://${SIMMER_VERCEL_PROJECT}.vercel.app/**,https://${SIMMER_VERCEL_PROJECT}-*.vercel.app/**,http://localhost:8080/**,http://localhost:8789/**,http://localhost:5173/**$(_facades_allow_fragment)"
+  local allow; allow=$(_auth_allow_list "https://${VERCEL_PROJECT}.vercel.app")
   if $DRY_RUN; then
     info "  [dry-run] PATCH Supabase Auth uri_allow_list (adds ${SIMMER_VERCEL_PROJECT} origins)"
     return 0
@@ -622,10 +636,14 @@ deploy_simmer() {
   warn "reminders: Supabase uri_allow_list picks up the Simmer origin on the next Matrix deploy (or PATCH manually); Turnstile allowed-domains is a manual dashboard step if the teaser is ever enabled"
 }
 
-# Point Supabase Auth at the *current* Vercel production URL so confirmation /
-# magic-link emails redirect back to the live site (default Site URL is
-# localhost:3000 → the link is dead). Never hardcoded: derived from PROD_URL on
-# every deploy. site_url + uri_allow_list are editable on the free tier (unlike
+# Keep the Supabase Auth redirect allow-list current with the live Matrix
+# production URL, and set the Site URL (GoTrue's FALLBACK when a signup's own
+# redirect is missing or not allow-listed) to the neutral portal
+# https://<FACADES_DOMAIN> — never a product. This project is shared by Matrix,
+# Simmer and Reflex logins; a Matrix fallback sent other products' confirm
+# links to Matrix ("not enabled for this account"). Each product passes its own
+# redirect; the portal is only the safety net. With FACADES_DOMAIN empty the
+# Matrix URL is the fallback, as before. site_url + uri_allow_list are editable on the free tier (unlike
 # the email *templates*, which need custom SMTP). Uses curl — Supabase's WAF
 # 403s the Python-urllib user-agent (error 1010).
 sync_supabase_site_url() {
@@ -638,21 +656,23 @@ sync_supabase_site_url() {
   fi
   # Simmer origins ride along so magic-link/confirmation emails can redirect to
   # either app (docs/simmer.md "Deployment" item 2).
-  local allow="$origin/**,https://$VERCEL_PROJECT-*.vercel.app/**,https://$SIMMER_VERCEL_PROJECT.vercel.app/**,https://$SIMMER_VERCEL_PROJECT-*.vercel.app/**,http://localhost:8080/**,http://localhost:8789/**,http://localhost:5173/**$(_facades_allow_fragment)"
+  local allow; allow=$(_auth_allow_list "$origin")
+  local site="$origin"
+  [ -n "$FACADES_DOMAIN" ] && site="https://$FACADES_DOMAIN"
   if $DRY_RUN; then
-    info "would PATCH Supabase Auth site_url=$origin (dry-run)"
+    info "would PATCH Supabase Auth site_url=$site (dry-run)"
     return 0
   fi
-  info "Syncing Supabase Auth site_url -> $origin"
+  info "Syncing Supabase Auth site_url -> $site"
   local body code
-  body=$(printf '{"site_url":"%s","uri_allow_list":"%s"}' "$origin" "$allow")
+  body=$(printf '{"site_url":"%s","uri_allow_list":"%s"}' "$site" "$allow")
   code=$(curl -s -o /dev/null -w '%{http_code}' -X PATCH \
     -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
     -H "Content-Type: application/json" -d "$body" \
     "https://api.supabase.com/v1/projects/$SUPABASE_PROJECT_REF/config/auth")
   [ "$code" = "200" ] \
     && ok "Supabase Auth site_url + redirect allow-list synced" \
-    || warn "Supabase Auth sync got HTTP $code — set Site URL to $origin manually in the dashboard"
+    || warn "Supabase Auth sync got HTTP $code — set Site URL to $site manually in the dashboard"
 }
 
 # ----------------------------------------------------------------------------

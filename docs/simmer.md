@@ -2221,7 +2221,7 @@ Three guards now exist, because any one of them alone can be defeated:
    in `config.py` (and `edgelane_market.config.example`) is now:
 
    ```
-   ^https://(edgelane[a-z0-9-]*\.vercel\.app|(matrix|simmer)\.facades\.trade)$
+   ^https://(edgelane-matrix|edgelane-simmer)\.vercel\.app$|^https://(matrix|simmer)\.facades\.trade$  (exact hosts — no wildcards)
    ```
 
    The first branch covers the raw Vercel origin `edgelane-simmer.vercel.app`;

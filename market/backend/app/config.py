@@ -123,16 +123,17 @@ class Settings(BaseModel):
         # The private GEX provider's page origin (where the extension direct-POSTs
         # from) is added via the local config file, not hardcoded here.
     ])
-    # Regex fallback so the deployed Vercel frontend works across renamed projects
-    # and rotating preview URLs (edgelane-hazel, edgelane-matrix, *-git-* previews)
-    # without re-listing each one. Matched in addition to cors_allow_origins.
+    # Regex for the deployed frontends' EXACT production hosts. Matched in
+    # addition to cors_allow_origins. No `edgelane[a-z0-9-]*` / preview
+    # wildcards: vercel.app names are first-come, so a pattern lets anyone
+    # register a matching project and call the API as a trusted origin.
     # The facades.trade alternation covers the parent portal's product
     # subdomains, which serve the same Vercel deployments under a custom domain.
     # Torque is absent on purpose: it has no public subdomain yet — add it here
     # at the same time as its DNS record.
     # Override/disable via CORS_ALLOW_ORIGIN_REGEX in the config (blank = off).
     cors_allow_origin_regex: str | None = Field(
-        default=r"^https://(edgelane[a-z0-9-]*\.vercel\.app|(matrix|simmer)\.facades\.trade)$")
+        default=r"^https://(edgelane-matrix|edgelane-simmer)\.vercel\.app$|^https://(matrix|simmer)\.facades\.trade$")
 
     # WebSocket
     ws_heartbeat_sec: int = Field(default=30)
