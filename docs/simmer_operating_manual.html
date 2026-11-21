@@ -165,6 +165,7 @@
     <li><a href="#config">Configuration</a></li>
     <li><a href="#overnight-llm">Overnight analyzer settings</a></li>
     <li><a href="#deploy">Deploy &amp; update</a></li>
+    <li><a href="#users">Inviting or resetting a user</a></li>
     <li><a href="#trouble">Troubleshooting</a></li>
   </ol>
 </nav>
@@ -764,6 +765,43 @@ python3 tools/supabase_admin.py update simmer_engine_settings \
     tunnel once (Zero Trust → Networks → Tunnels), route <code>edge.facades.trade</code> to
     <code>http://edgelane-backend:8789</code>, and put its <code>CF_TUNNEL_TOKEN</code> plus
     <code>EDGELANE_API_BASE=https://edge.facades.trade</code> in <code>deploy/.env</code>.</p>
+  </section>
+
+  <section id="users">
+    <h2>Inviting or resetting a user</h2>
+<p><strong>Rule:</strong> every auth email you send by hand must carry the product's redirect. Without one,
+Supabase sends the user to the portal (<code>facades.trade</code>, the project's Site URL), which throws the link
+away, and the user has to ask for a new one. The product's own sign-up and "Forgot password" already do this —
+the rule is only for emails you trigger yourself.</p>
+<p>Use these commands, run from the <strong>EdgeLane</strong> repo (all three products — Matrix, Simmer,
+Reflex — sign in against the same Supabase project, so every invite is sent from there):</p>
+<pre><code>make invite EMAIL=jane@example.com PRODUCT=simmer            # invite with the Simmer redirect
+make reset-password EMAIL=jane@example.com PRODUCT=simmer    # password reset → Simmer
+make grant-product EMAIL=jane@example.com PRODUCT=simmer   # existing user: grant only
+# add ARGS=-n to preview without sending</code></pre>
+<p><code>make invite</code> sends the invite with <code>redirect_to=https://simmer.facades.trade/</code>. It also adds <code>simmer</code> to the user's <code>profiles.tools_enabled</code> — without it Simmer refuses the login.
+Before sending, it checks the product URL is on Supabase → Authentication → URL Configuration → Redirect URLs
+(if it isn't, Supabase would fall back to the portal) and refuses if not. If the address already has an account,
+no invite is sent — it grants access and tells you to send a reset instead.</p>
+<p><strong>Avoid the Supabase dashboard's Invite user / Send password recovery buttons</strong> for this: they send
+the project's default link, which is the portal.</p>
+<table>
+  <tr><th>Product</th><th>Redirect URL</th><th>Tool it needs</th></tr>
+  <tr><td>Matrix</td><td><code>https://matrix.facades.trade/</code></td><td><code>market</code></td></tr>
+  <tr><td>Simmer</td><td><code>https://simmer.facades.trade/</code></td><td><code>simmer</code></td></tr>
+  <tr><td>Reflex</td><td><code>https://reflex.facades.trade/</code></td><td>none</td></tr>
+</table>
+<p><strong>Check it once:</strong> invite a test address of your own; the link in the email should carry
+<code>redirect_to=https://simmer.facades.trade/</code>, not <code>facades.trade</code>. (The email templates use
+<code>{{ .ConfirmationURL }}</code>, which carries the redirect — keep them that way.)</p>
+<p><strong>If a link already went to the portal:</strong> nothing breaks — the portal discards the tokens and shows
+the user their product links. Send a fresh email with the commands above.</p>
+<p>Without the EdgeLane repo, the same calls by hand:</p>
+<pre><code>curl -X POST "$SUPABASE_URL/auth/v1/invite?redirect_to=https://simmer.facades.trade/" \
+  -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+  -H "Content-Type: application/json" -d '{"email": "jane@example.com"}'
+curl -X POST "$SUPABASE_URL/auth/v1/recover?redirect_to=https://simmer.facades.trade/" \
+  -H "apikey: $SUPABASE_ANON_KEY" -H "Content-Type: application/json" -d '{"email": "jane@example.com"}'</code></pre>
   </section>
 
   <section id="trouble">

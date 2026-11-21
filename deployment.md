@@ -126,7 +126,7 @@ same trade pick, and no LLM is in the decision path. Torque itself does
 | `docs/` | Implementation notes (`torque.md`, `torque_operating_manual.html`, `tradier_implementation.md`, etc.). | ✓ |
 | `docs/matrix_operating_manual.html` | Matrix: onboarding, badges, scores, decision rules. | ✓ |
 | `docs/torque_operating_manual.html` | Torque: controls, readings, labels. | ✓ |
-| `simmer/simmer_operating_manual.html` | Simmer: readiness scoring + operations. | ✓ |
+| `docs/simmer_operating_manual.html` | Simmer: readiness scoring + operations. | ✓ |
 | `deployment.md` | This file. | ✓ |
 
 ### Deploy / production

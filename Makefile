@@ -37,7 +37,7 @@ DATA_VOLUME  = edgelane_edgelane-data
 DATA_DUMP    = deploy/edgelane-data.tar.gz
 
 .PHONY: help \
-        setup db-setup torque-ticker run run-dev run-prod run-bg stop logs clean \
+        setup db-setup torque-ticker invite reset-password grant-product run run-dev run-prod run-bg stop logs clean \
         diag status snapshot accuracy \
         test test-e2e test-all \
         webhook-debug webhook-post ext-version ext-policy \
@@ -230,6 +230,22 @@ db-push: ## Apply Supabase migrations (idempotent)
 
 db-push-dry: ## List the migrations that would be applied
 	@$(PY) tools/db_push.py --dry-run
+
+# Auth emails sent by hand (Matrix / Simmer / Reflex share one Supabase project).
+# Always with the product's redirect — without one the email lands on the portal
+# (facades.trade), which throws the link away. Invite also grants the product's
+# tool (market / simmer; Reflex has no tool gate). ARGS=-n previews only.
+invite: ## Invite a user with the product's redirect + grant it: EMAIL=… PRODUCT=matrix|simmer|reflex
+	@test -n "$(EMAIL)" -a -n "$(PRODUCT)" || { echo "usage: make invite EMAIL=jane@example.com PRODUCT=matrix|simmer|reflex"; exit 2; }
+	@$(PY) tools/auth_email.py invite "$(EMAIL)" "$(PRODUCT)" $(ARGS)
+
+reset-password: ## Send a password reset with the product's redirect: EMAIL=… PRODUCT=matrix|simmer|reflex
+	@test -n "$(EMAIL)" -a -n "$(PRODUCT)" || { echo "usage: make reset-password EMAIL=jane@example.com PRODUCT=matrix|simmer|reflex"; exit 2; }
+	@$(PY) tools/auth_email.py reset "$(EMAIL)" "$(PRODUCT)" $(ARGS)
+
+grant-product: ## Grant an existing user a product's tool: EMAIL=… PRODUCT=matrix|simmer
+	@test -n "$(EMAIL)" -a -n "$(PRODUCT)" || { echo "usage: make grant-product EMAIL=jane@example.com PRODUCT=matrix|simmer"; exit 2; }
+	@$(PY) tools/auth_email.py grant "$(EMAIL)" "$(PRODUCT)" $(ARGS)
 
 # Torque per-ticker setup (public.torque_tickers_setup): show or edit any column
 # of a row — stop/TP overrides, ticks, offsets, enable/disable, add a ticker.
