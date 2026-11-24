@@ -15,6 +15,8 @@ The house client is reachable for execution ONLY via the server-owner bypasses
 """
 from __future__ import annotations
 
+import logging
+
 from typing import Any, Optional
 
 from fastapi import HTTPException, Request
@@ -25,6 +27,9 @@ from .webull_client import WebullClient
 
 # Socket timeout for a per-user *execution* client (see resolve_broker below).
 EXECUTION_HTTP_TIMEOUT_SEC = 15.0
+
+
+log = logging.getLogger("edgelane.market.broker_resolver")
 
 
 def _clean_account_id(raw: Any) -> Optional[str]:
@@ -120,4 +125,20 @@ async def resolve_client_for_uid(uid: str) -> Optional[tuple[str, Any, Optional[
     if not resolved:
         return None
     broker, client, account, _is_per_user = resolved
+    if not account:
+        # Same as the place path (_resolve_torque_broker): a connection saved
+        # without an account id uses the broker's first account. Without this,
+        # every uid-resolved call (entry step-up, entry confirmation, cancel
+        # unwinds, watcher recovery) hit `accounts/None/...` and failed.
+        try:
+            account = await (client.first_account_id() if broker == "webull" else client.resolve_account_id())
+        except Exception as e:
+            log.warning("resolve_client_for_uid: could not resolve the account for %s: %s", uid, e)
+            account = None
+        if not account:
+            try:
+                await client.close()
+            except Exception:
+                pass
+            return None
     return broker, client, account

@@ -107,7 +107,13 @@ class FakeTradier:
         return {"calendar": {"month": month, "year": year, "days": {"day": days}}}
 
     async def stock_quote(self, symbol):
-        return {"symbol": symbol.upper(), "last": self._spot, "close": self._spot}
+        # A live quote: fresh bid/ask around spot (what the independent price
+        # check for Reflex strikes reads), like a real Tradier quote.
+        import time as _t
+        now_ms = _t.time() * 1000
+        return {"symbol": symbol.upper(), "last": self._spot, "close": self._spot,
+                "bid": self._spot - 0.05, "ask": self._spot + 0.05,
+                "bid_date": now_ms, "ask_date": now_ms, "trade_date": now_ms}
 
     async def option_expirations(self, symbol):
         return [self._exp]
@@ -294,3 +300,14 @@ def _not_extended_by_default(monkeypatch):
         return False
     monkeypatch.setattr(_troute, "_in_extended_session", _no)
     _troute._EXT_CACHE.update(t=0.0, vals=None)
+
+
+@pytest.fixture(autouse=True)
+def _regular_session_by_default(monkeypatch):
+    """Spot selection depends on the session; tests must not depend on the wall
+    clock. Default: regular session. Tests of the pre/post-market path patch
+    _regular_session_now themselves."""
+    from app.routes import torque as _troute
+    async def _yes(client):
+        return True
+    monkeypatch.setattr(_troute, "_regular_session_now", _yes)

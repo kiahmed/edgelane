@@ -254,8 +254,13 @@ async def _yahoo_spot(ticker: str) -> float | None:
                               headers={"User-Agent": "Mozilla/5.0"})
             r.raise_for_status()
             res = r.json()["chart"]["result"][0]["meta"]
-            px = res.get("regularMarketPrice") or res.get("previousClose")
-            return float(px) if px is not None else None
+            px, ts = res.get("regularMarketPrice"), res.get("regularMarketTime")
+            # Only a FRESH regular-session print: at 09:30:00, in a halt or when
+            # Yahoo lags, regularMarketPrice is still the prior close. Never the
+            # previousClose fallback.
+            if px is None or ts is None or time.time() - float(ts) > _FRESH_QUOTE_SEC:
+                return None
+            return float(px)
     except Exception as e:                       # network, parse, http — all soft
         log.warning("yahoo spot failed for %s (%s): %s", ticker, ysym, e)
         return None
@@ -508,6 +513,133 @@ def _account_id(req_account: str | None = None) -> str:
     return aid
 
 
+# ── live underlying price ──────────────────────────────────────────────────
+# Before the open (and after the close) Tradier's quote `last` and Yahoo's
+# `regularMarketPrice` are the PREVIOUS session's final print — choosing strikes
+# from them put pre-market Reflex entries ~$7 in the money (2026-11-24). Outside
+# the regular session the spot is the fresh bid/ask midpoint, else the latest
+# time & sales print, else option put-call parity — never a stale `last`.
+_FRESH_QUOTE_SEC = 120        # bid/ask (or a last print) older than this is stale
+_FRESH_TIMESALE_SEC = 300     # newest 1-min time & sales bar older than this is stale
+_SPOT_SOURCE: dict[str, str] = {}
+
+
+def _fresh(ms, now: float, max_age: float) -> bool:
+    try:
+        return ms is not None and now - float(ms) / 1000.0 <= max_age
+    except (TypeError, ValueError):
+        return False
+
+
+def _quote_mid_if_fresh(q: dict, now: float) -> float | None:
+    bid, ask = teng._f(q.get("bid")), teng._f(q.get("ask"))
+    if not (bid and ask) or bid <= 0 or ask < bid:
+        return None
+    if not (_fresh(q.get("bid_date"), now, _FRESH_QUOTE_SEC) and _fresh(q.get("ask_date"), now, _FRESH_QUOTE_SEC)):
+        return None
+    return round((bid + ask) / 2.0, 4)
+
+
+def _last_if_fresh(q: dict, now: float) -> float | None:
+    last = teng._f(q.get("last"))
+    return last if last and _fresh(q.get("trade_date"), now, _FRESH_QUOTE_SEC) else None
+
+
+async def _timesale_price(client, sym: str, now: float) -> float | None:
+    """Close of the newest 1-minute time & sales bar (extended hours included),
+    if it is fresh."""
+    try:
+        d = await client._get("markets/timesales", {"symbol": sym, "interval": "1min", "session_filter": "all"})
+        data = (d.get("series") or {}).get("data") if isinstance(d, dict) else None
+        bar = data[-1] if isinstance(data, list) and data else (data if isinstance(data, dict) else None)
+        if not bar or now - float(bar.get("timestamp") or 0) > _FRESH_TIMESALE_SEC:
+            return None
+        return teng._f(bar.get("close") or bar.get("price"))
+    except Exception as e:
+        log.warning("time & sales for %s failed: %s", sym, e)
+        return None
+
+
+async def _regular_session_now(client) -> bool:
+    """True only inside the regular session per Tradier's calendar."""
+    try:
+        _st, is_open = await _tradier_market_state(client)
+    except Exception:
+        is_open = None
+    return is_open is True
+
+
+async def _live_spot(client, sym: str, q: dict, contracts: list[dict]) -> tuple[float | None, str]:
+    """(spot, source). Regular session: a fresh Yahoo print → a fresh Tradier
+    last → fresh bid/ask mid → parity. Otherwise: fresh bid/ask mid → time &
+    sales → nothing (no parity). Never a stale `last` or a prior close."""
+    now = time.time()
+    parity = teng.implied_spot(contracts, fallback=None)
+    if await _regular_session_now(client):
+        for src, fn in (("yahoo", lambda: _yahoo_spot(sym)),):
+            px = await fn()
+            if px:
+                return px, src
+        for src, px in (("last", _last_if_fresh(q, now)), ("bid_ask_mid", _quote_mid_if_fresh(q, now)),
+                        ("parity", parity)):
+            if px:
+                return px, src
+        return None, "none"
+    mid = _quote_mid_if_fresh(q, now)
+    if mid:
+        return mid, "bid_ask_mid"
+    ts = await _timesale_price(client, sym, now)
+    if ts:
+        return ts, "timesales"
+    # No parity outside the regular session: pre-market option quotes are often
+    # last night's, so parity would be the same stale-strike bug by another route.
+    return None, "none"
+
+
+def strike_too_far(spot: float, contracts: list[dict], side: str, strike: float) -> bool:
+    """A single-leg strike more than ONE listed strike away from the live
+    price (the strike nearest to spot ±1) — the Reflex entry rule."""
+    grid = teng._grid(contracts, side)
+    if not grid or strike not in grid:
+        return True
+    near = min(range(len(grid)), key=lambda i: abs(grid[i] - spot))
+    return abs(grid.index(strike) - near) > 1
+
+
+async def _independent_price(client, sym: str) -> tuple[float | None, str]:
+    """A fresh price fetched NOW, independent of the build's cached spot: the
+    fresh bid/ask mid, else the newest time & sales bar. Never Yahoo, last or
+    parity."""
+    now = time.time()
+    try:
+        q = await client.stock_quote(sym)
+    except Exception:
+        q = {}
+    mid = _quote_mid_if_fresh(q or {}, now)
+    if mid:
+        return mid, "bid_ask_mid"
+    ts = await _timesale_price(client, sym, now)
+    return (ts, "timesales") if ts else (None, "none")
+
+
+async def _strike_too_far(request, symbol: str, build: dict) -> str | None:
+    """Reflex single-leg guard, checked against an INDEPENDENT fresh price (the
+    build's spot can't check itself). No fresh reference → refuse."""
+    legs = build.get("legs") or []
+    if len(legs) != 1:
+        return None
+    lg = legs[0]
+    client = _client(request)
+    ref, src = await _independent_price(client, symbol.upper())
+    if not ref:
+        return f"no fresh {symbol.upper()} price to verify the strike against — not placed"
+    _spot, _exp, contracts = await _get_chain(client, symbol)
+    if strike_too_far(ref, contracts, lg.get("side"), lg.get("strike")):
+        return (f"strike {lg.get('strike')} is more than one strike from the live price "
+                f"{ref} ({src}) — not placed")
+    return None
+
+
 async def _get_chain(client, symbol: str) -> tuple[float, str, list[dict]]:
     """Return (spot, expiration, normalized_contracts) with a 2s TTL cache."""
     sym = symbol.upper()
@@ -546,15 +678,14 @@ async def _get_chain(client, symbol: str) -> tuple[float, str, list[dict]]:
         msg = f"Tradier chain fetch failed for {sym}: {e}"
         _CHAIN_FAIL[sym] = (now, 502, msg)
         raise HTTPException(502, msg)
-    # Spot source order: Yahoo live quote → Tradier put-call parity → raw broker
-    # quote → median strike. Yahoo is the primary live print; parity covers a
-    # Yahoo outage and is computed from the real-time option bid/ask we already
-    # hold (the broker's own derived index quote lags during fast moves).
-    parity = teng.implied_spot(contracts, fallback=spot)
-    spot = await _yahoo_spot(sym) or parity
-    if spot is None and contracts:
-        ks = sorted(c["strike"] for c in contracts)
-        spot = ks[len(ks) // 2]
+    # Spot: the CURRENT price (see _live_spot) — never a stale `last` / prior
+    # close. No fresh price at all → refuse rather than build strikes off a guess.
+    spot, source = await _live_spot(client, sym, q or {}, contracts)
+    if not spot:
+        msg = f"no fresh price for {sym} (quote, time & sales and option parity all stale)"
+        _CHAIN_FAIL[sym] = (now, 503, msg)
+        raise HTTPException(503, msg)
+    _SPOT_SOURCE[sym] = source
     _CHAIN_CACHE[sym] = (now, spot, exp, contracts)
     _CHAIN_FAIL.pop(sym, None)   # recovered — drop any stale negative-cache entry
     return spot, exp, contracts
@@ -2137,6 +2268,9 @@ async def _news_signal_after_claim(payload: NewsSignalPayload, request: Request,
         return {"ok": True, "accepted": False, "reason": f"build failed: {e.detail}"}
     if build.get("missing_legs"):
         return {"ok": True, "accepted": False, "reason": f"could not resolve contract(s): {build['missing_legs']}"}
+    too_far = await _strike_too_far(request, symbol, build)
+    if too_far:
+        return {"ok": True, "accepted": False, "reason": too_far}
 
     price = build["price"]
     # Fetched fresh right here, at execution time — this payload deliberately
