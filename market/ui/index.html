@@ -1318,6 +1318,10 @@
   // Annotates each tier (modest/balanced/strong) as met / reachable /
   // infeasible based on the candidate's current EV edge over breakeven.
   // Ported (visually condensed) from JSX lines ~4458-4530.
+  function _escHTML(v) {
+    return String(v == null ? '' : v).replace(/[&<>"']/g, ch =>
+      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+  }
   function renderLimitTierStrip(c) {
     const lp = c && c.limit_premiums;
     if (!lp || !Array.isArray(lp.tiers) || !lp.tiers.length) return '';
@@ -1329,15 +1333,27 @@
     const rows = lp.tiers.map(t => {
       const targetEV = Number(t.target_ev || t.targetEV || 0);
       let status;
-      if (currentEV >= targetEV) status = 'met';
+      const liveOk = lp.current != null && lp.current !== '' && Number.isFinite(Number(lp.current));
+      if (liveOk && currentEV >= targetEV) status = 'met';
       else if (t.feasible)       status = 'reach';
       else                        status = 'infeas';
       const cls = status === 'met' ? 'lt-met' : status === 'reach' ? 'lt-reach' : 'lt-infeas';
       const icon = status === 'met' ? '✓' : status === 'reach' ? '○' : '✗';
-      const name = (t.name || t.label || '').toLowerCase();
+      const name = _escHTML((t.name || t.label || '').toLowerCase());
+      // A tier is an EV target: when the live price already beats it (cheap
+      // debit / rich credit) its "limit" lands on the wrong side of the market
+      // (e.g. Buy @ $0.39 with the spread at $0.07). Never suggest paying more
+      // (or collecting less) than market — show the market price instead.
+      const tgt = Number(t.target || 0), cur = Number(lp.current);
+      // Number(null) / Number('') are 0 — guard the raw value, or a missing
+      // live price would render every debit tier as "Buy @ $0.00 market".
+      const curOk = lp.current != null && lp.current !== '' && Number.isFinite(cur) && cur > 0;
+      const worse = curOk && (isCredit ? tgt < cur : tgt > cur);
+      const px = worse ? cur : tgt;
+      const mkt = worse ? ' <span class="text-[10px] opacity-70" title="The live price already beats this tier — no limit needed, it fills at market.">market</span>' : '';
       return `<div class="lt-row ${cls}">
         <span class="uppercase tracking-wider text-[10px] w-20">${icon} ${name}</span>
-        <span>${verb} <strong>${fmtM(Number(t.target||0))}</strong></span>
+        <span>${verb} <strong>${fmtM(px)}</strong>${mkt}</span>
         <span class="text-[10px] opacity-70">EV +${Number(targetEV).toFixed(2)}</span>
       </div>`;
     }).join('');
