@@ -18,7 +18,9 @@ from level_engine.context import TickContext
 from level_engine.levels import Cluster
 from level_engine.scenario import map_scenario
 
-CFG = LevelConfig()
+# Pinned to the pre-2026-11-24 HIT_TOL_PTS (2.0): the scripted price paths are
+# built around that tolerance. The 5.0 default is tested in test_levels_switch.
+CFG = LevelConfig(hit_tol_pts=2.0)
 TD = date(2026, 11, 20)
 T0 = datetime(2026, 11, 20, 14, 40, tzinfo=timezone.utc)
 LEVELS = ((6980.0, "W"), (7000.0, "L"), (7020.0, "U"), (7040.0, "Y"))

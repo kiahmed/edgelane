@@ -50,10 +50,12 @@ CANDIDATES PER CALL (no pick on wait / done / anything else):
 STRIKES (nearest LISTED strike present in the chain, half-up on ties; a
   candidate whose leg strike/side is missing or has no usable quote — bid <= 0
   or ask <= 0 — is skipped that tick):
-  * long leg (up/down): the listed strike nearest spot. The spec offers
-    "zone lower level strike or the spot strike — the nearer to spot"; the spot
-    strike is by construction the nearer one, so the rule reduces to ATM, and
-    `anchor` records "level" when that strike is also the zone level's strike.
+  * long leg (up/down): the nearest listed strike that is NOT in the money —
+    call: the lowest strike >= spot, put: the highest strike <= spot (ATM or
+    OTM, toward the level). Revised 2026-11-24: the nearest-to-spot rule could
+    pick an ITM put (spot 7268 → 7270P), and a frozen strike drifted deeper ITM
+    as price moved, which priced the debit up and broke its R/R. `anchor`
+    records "level" when that strike is also the zone level's strike.
   * short leg / fly centre: the target level's strike (T_up / T_down; when the
     scenario gives none, the next cluster beyond spot ± BUFFER_PTS).
   * fly wings: the LEGACY width convention — width_base_for_dte(dte, EM) ×
@@ -71,6 +73,11 @@ STRIKE PLAN (§8.4 "fixed for the day"): strikes are resolved lazily per call
   prices differ from the plan's), the trade date changes, or EVERY cluster on
   one side of the plan's anchor spot has been passed (spot beyond it by more
   than BUFFER_PTS). Quotes are re-read every tick at the frozen strikes.
+  ITM RE-STRIKE: when a frozen directional long leg (bull_call / bear_put /
+  long_call / long_put) is in the money at the current spot, that call's
+  strikes are re-resolved (plan.reason "long_leg_itm"). Strikes only ever move
+  in the call's direction, so price oscillating around a strike can't
+  flip-flop them.
 SCORING: no GEX wall penalty — levels replace walls as the structure input, so
   wall_penalty = neutral (factor 1.0) and ev_adjusted = ev. label "Near" /
   "Extreme"; width_preset "levels".
@@ -91,6 +98,13 @@ RISK / REWARD (§8.3, §11; projection.py has the port notes): for the pick and
   Matrix grid's quarter-hours (RR_TIME_FRACTION). rr.extreme uses the family's
   extreme sibling when one was built, else the pick itself. cfg.reach limits
   which are computed ('near' | 'extreme' | 'both'); the other key is None.
+  HEALTH HYSTERESIS: a candidate keeps last tick's R/R band while rr_profit
+  is within cfg.health_hysteresis of it (an R/R on a band edge flipped
+  thin ↔ capital_trap each tick: a ±25-point composite swing).
+  PICK STICKINESS: the previous best (same pick_id) stays the pick unless a
+  challenger in the gated pool beats its composite by cfg.pick_switch_margin
+  points — near-tied candidates (call fly vs put fly on range) otherwise swap
+  every few ticks and the Matrix pick card churns.
   R/R GATE (§8.3 "informs the pick"): the best pick is the top composite among
   near candidates whose projected P&L at the call's own target (rr.near, or
   rr.extreme when REACH=extreme) is >= 0 — a structure that loses money when
@@ -250,6 +264,31 @@ def _next_beyond(clusters, spot, buffer_pts, direction):
     return next((c for c in sorted(clusters, key=lambda c: -c.price) if c.price < spot - buffer_pts), None)
 
 
+def otm_long_strike(chain: Chain, side: str, spot: float) -> float | None:
+    """Nearest listed strike of `side` that is not in the money: call → lowest
+    strike >= spot, put → highest strike <= spot."""
+    ks = [k for (k, sd) in chain.by if sd == side and (k >= spot if side == "call" else k <= spot)]
+    if not ks:
+        return None
+    return min(ks) if side == "call" else max(ks)
+
+
+def is_itm(strike: float, side: str, spot: float) -> bool:
+    return strike < spot if side == "call" else strike > spot
+
+
+DIRECTIONAL_LONGS = ("bull_call", "bear_put", "long_call", "long_put")
+
+
+def _long_leg_itm(specs: list[Spec], spot: float) -> bool:
+    for sp in specs:
+        if sp.strategy in DIRECTIONAL_LONGS and sp.reach == "near":
+            k, side = sp.leg("long")
+            if is_itm(k, side, spot):
+                return True
+    return False
+
+
 def _fly_wings(chain: Chain, side: str, center: float, w: float):
     cs = chain.side(side)
     lo = find_closest_strike(cs, side, center - w, lambda c: float(c["strike"]) < center)
@@ -276,22 +315,27 @@ def build_specs(call: str, ctx: TickContext, chain: Chain, up_t: Cluster | None,
         return specs, targets
     zone = getattr(ctx.scenario, "zone", None)
     zl = getattr(zone, "lower", None) if call == "up" else getattr(zone, "upper", None)
-    anchor = "level" if zl is not None and chain.snap(zl.price) == k_atm else "spot"
+
+    def anchor_of(k: float) -> str:
+        return "level" if zl is not None and chain.snap(zl.price) == k else "spot"
 
     def directional(side: str, t: Cluster | None, sgn: int):
         fly = "call_butterfly" if side == "call" else "put_butterfly"
         vert = "bull_call" if side == "call" else "bear_put"
         single = "long_call" if side == "call" else "long_put"
+        k_long = otm_long_strike(chain, side, spot)
         if t is not None:
             k_t = chain.snap(t.price)
-            if k_t is not None and (k_t - k_atm) * sgn > 0:
-                specs.append(Spec(vert, "near", (("long", k_atm, side), ("short", k_t, side)), anchor))
+            if k_long is not None and k_t is not None and (k_t - k_long) * sgn > 0:
+                specs.append(Spec(vert, "near", (("long", k_long, side), ("short", k_t, side)),
+                                  anchor_of(k_long)))
             if k_t is not None:
                 wings = _fly_wings(chain, side, k_t, w)
                 if wings:
                     specs.append(Spec(fly, "near", (("low", wings[0], side), ("mid", k_t, side),
                                                     ("high", wings[1], side))))
-        specs.append(Spec(single, "near", (("long", k_atm, side),), anchor))
+        if k_long is not None:
+            specs.append(Spec(single, "near", (("long", k_long, side),), anchor_of(k_long)))
 
     def vol_plays():
         near = min(clusters, key=lambda c: (abs(c.price - spot), c.price))
@@ -312,13 +356,13 @@ def build_specs(call: str, ctx: TickContext, chain: Chain, up_t: Cluster | None,
         directional("call", up_t, +1)
         vol_plays()
         kx = chain.snap(clusters[-1].price)
-        if kx > k_atm:
+        if kx > k_atm and not is_itm(kx, "call", spot):
             specs.append(Spec("long_call", "extreme", (("long", kx, "call"),)))
     elif call == "down":
         directional("put", down_t, -1)
         vol_plays()
         kx = chain.snap(clusters[0].price)
-        if kx < k_atm:
+        if kx < k_atm and not is_itm(kx, "put", spot):
             specs.append(Spec("long_put", "extreme", (("long", kx, "put"),)))
     elif call == "range" and up_t is not None and down_t is not None:
         k_up, k_dn = chain.snap(up_t.price), chain.snap(down_t.price)
@@ -394,6 +438,19 @@ def rr_health(rr_profit: float | None) -> str | None:
     return "capital_trap"
 
 
+def rr_health_sticky(rr_profit: float | None, prev: str | None, hyst: float) -> str | None:
+    """rr_health with hysteresis: keep the previous band while rr_profit is
+    within `hyst` of it. An R/R sitting on a band edge (0.29 ↔ 0.30) otherwise
+    flips thin ↔ capital_trap every tick — a ±25-point composite swing that
+    made the pick and the grid churn."""
+    new = rr_health(rr_profit)
+    if prev is None or new is None or new == prev or hyst <= 0:
+        return new
+    if prev in (rr_health(rr_profit - hyst), rr_health(rr_profit + hyst)):
+        return prev
+    return new
+
+
 def rr_profit_of(rr: dict | None) -> float | None:
     """(value_at_target − cost) / cost on the near reach (extreme when near is
     not computed, e.g. REACH=extreme)."""
@@ -403,12 +460,13 @@ def rr_profit_of(rr: dict | None) -> float | None:
     return round((float(r["value"]) - float(r["cost"])) / float(r["cost"]), 4)
 
 
-def finish(c: dict) -> dict:
+def finish(c: dict, prev_health: str | None = None, hyst: float = 0.0) -> dict:
     """R/R health BEFORE composite_score (so the badge ranks on it); the
-    scorer's own value is kept as health_legacy. No DTE veto."""
+    scorer's own value is kept as health_legacy. No DTE veto. `prev_health`
+    (this candidate's band last tick) + `hyst` apply band hysteresis."""
     c["health_legacy"] = c.get("health")
     c["rr_profit"] = rr_profit_of(c.get("rr"))
-    c["health"] = rr_health(c["rr_profit"])
+    c["health"] = rr_health_sticky(c["rr_profit"], prev_health, hyst)
     c["rr_line"] = format_rr_line(c.get("rr"))
     c["composite_score"] = composite_score(c)
     c["composite_verdict"] = composite_verdict(
@@ -525,10 +583,16 @@ class StrategyAgent:
     def __init__(self) -> None:
         self.plan: StrikePlan | None = None
         self.rebuilds = 0
+        self.itm_restrikes = 0                # per day; surfaced in pick["plan"] for replay
+        self.held: dict[str, str] = {}        # call → pick_id of the current best (stickiness)
+        self.health_mem: dict[str, str] = {}  # pick_id → R/R health band last tick (hysteresis)
 
     def reset_day(self) -> None:
         self.plan = None
         self.rebuilds = 0
+        self.itm_restrikes = 0
+        self.held = {}
+        self.health_mem = {}
 
     def _ensure_plan(self, ctx: TickContext) -> StrikePlan:
         sig = _sig(ctx.clusters)
@@ -538,7 +602,7 @@ class StrategyAgent:
         if p is None:
             reason = "initial"
         elif p.trade_date != ctx.trade_date:
-            reason, self.rebuilds = "new_day", 0
+            reason, self.rebuilds, self.itm_restrikes = "new_day", 0, 0
         elif ctx.levels_changed or p.cluster_sig != sig:
             reason = "levels_changed"
         else:
@@ -563,6 +627,11 @@ class StrategyAgent:
         if not chain.strikes or ctx.spot is None:
             return None
         plan = self._ensure_plan(ctx)
+        if call in plan.specs and _long_leg_itm(plan.specs[call], float(ctx.spot)):
+            del plan.specs[call]                  # re-strike OTM (see ITM RE-STRIKE)
+            plan.reason = "long_leg_itm"
+            self.rebuilds += 1
+            self.itm_restrikes += 1
         if call not in plan.specs:
             specs, targets = build_specs(call, ctx, chain, up_target, down_target)
             plan.specs[call], plan.targets[call] = specs, targets
@@ -595,11 +664,14 @@ class StrategyAgent:
             ext_t = None
         want_near, want_ext = reach in ("both", "near"), reach in ("both", "extreme")
         sib = {c["strategy"]: c for c in cands if c["reach"] == "extreme"}
+        hyst = float(getattr(ctx.cfg, "health_hysteresis", 0.0) or 0.0)
         for c in cands:
             x = sib.get(c["strategy"], c) if c["reach"] == "near" else c
             c["rr"] = {"near": _rr(c, near_t, spot, m_now, ivs) if want_near else None,
                        "extreme": _rr(x, ext_t, spot, m_now, ivs) if want_ext else None}
-            finish(c)
+            finish(c, self.health_mem.get(c["pick_id"]), hyst)
+            if c.get("health") is not None:
+                self.health_mem[c["pick_id"]] = c["health"]
 
         # Best: top composite among near candidates that MAKE money if the call
         # plays out (R/R gate, §8.3 "informs the pick"); none → top composite.
@@ -609,6 +681,12 @@ class StrategyAgent:
         passing = [c for c in near if gate_pnl(c) is None or gate_pnl(c) >= 0]
         pool, rr_gate = (passing, "passed") if passing else (near, "none_passed")
         best = max(enumerate(pool), key=lambda ic: (ic[1]["composite_score"] or 0, -ic[0]))[1]
+        inc = next((c for c in pool if c["pick_id"] == self.held.get(call)), None)
+        margin = float(getattr(ctx.cfg, "pick_switch_margin", 0.0) or 0.0)
+        if inc is not None and inc is not best and \
+                (best["composite_score"] or 0) < (inc["composite_score"] or 0) + margin:
+            best = inc                            # stickiness: not a clear enough win
+        self.held[call] = best["pick_id"]
 
         legacy = legacy_fields(best, call)
         target_level = {"up": up_target, "down": down_target}.get(call)
@@ -633,7 +711,7 @@ class StrategyAgent:
             "health_legacy": best["health_legacy"],
             "rr_gate": rr_gate,
             "candidates": [compact(c) for c in cands if c is not best],
-            "plan": plan.to_dict(),
+            "plan": {**plan.to_dict(), "itm_restrikes": self.itm_restrikes},
             # full grid (C1) — the brain moves it to decision["strategies"]
             # (never persisted with the pick)
             "strategies": build_grid(cands, call, best),

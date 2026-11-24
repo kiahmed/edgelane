@@ -140,7 +140,9 @@ def test_down_candidates_mirror():
     by = {(c["strategy"], c["reach"]): c for c in _all(p)}
     assert set(s for s, _ in by) == {"bear_put", "put_butterfly", "long_put", "straddle", "strangle"}
     bp = by[("bear_put", "near")]["strikes"]
-    assert bp["long_put"] == 7270.0 and bp["short_put"] == 7260.0
+    # OTM long put (highest strike <= spot 7268) — never the ITM 7270P
+    assert bp["long_put"] == 7265.0 and bp["short_put"] == 7260.0
+    assert by[("long_put", "near")]["strikes"]["long_put"] == 7265.0
     assert by[("put_butterfly", "near")]["strikes"]["center"] == 7260.0
     assert by[("long_put", "extreme")]["strikes"]["long_put"] == 7240.0
 
@@ -204,7 +206,8 @@ def test_snaps_to_nearest_listed_strike_not_grid():
 def test_strikes_fixed_across_ticks():
     a = st.StrategyAgent()
     p1, _ = up_pick(a)
-    p2, _ = up_pick(a, spot=7276.0, ts=T0 + timedelta(minutes=5), chain=bs_chain(7276.0))
+    # spot moves but the frozen 7270C long stays OTM → no re-strike
+    p2, _ = up_pick(a, spot=7269.5, ts=T0 + timedelta(minutes=5), chain=bs_chain(7269.5))
     assert p1["pick_id"] == p2["pick_id"] or p2["strikes"] in [c["strikes"] for c in _all(p1)]
     ids1 = {(c["strategy"], c["reach"]): c["strikes"] for c in _all(p1)}
     ids2 = {(c["strategy"], c["reach"]): c["strikes"] for c in _all(p2)}
@@ -215,7 +218,7 @@ def test_strikes_fixed_across_ticks():
 def test_rebuild_on_levels_changed():
     a = st.StrategyAgent()
     up_pick(a)
-    p, _ = up_pick(a, spot=7276.0, ts=T0 + timedelta(minutes=5), chain=bs_chain(7276.0),
+    p, _ = up_pick(a, spot=7272.0, ts=T0 + timedelta(minutes=5), chain=bs_chain(7272.0),
                    levels_changed=True)
     assert a.rebuilds == 1 and p["plan"]["reason"] == "levels_changed"
     bc = next(c for c in _all(p) if c["strategy"] == "bull_call")
@@ -353,3 +356,56 @@ def test_rr_gate_falls_back_to_top_composite(monkeypatch):
     assert p["rr_gate"] == "none_passed"
     assert all(p["composite_score"] >= c["composite_score"] for c in p["candidates"]
                if c["reach"] == "near")
+
+
+
+# ---- OTM long legs / ITM re-strike / pick stickiness (2026-11-24) --------
+@pytest.mark.parametrize("call,side", [("up", "call"), ("down", "put")])
+def test_directional_long_legs_are_never_itm(call, side):
+    for spot in (7261.0, 7263.5, 7268.0, 7271.0):
+        targets = (BY["C"], BY["B"], BY["B"]) if call == "up" else (BY["E"], BY["A"], BY["C"])
+        p = st.StrategyAgent().pick(ctx(spot=spot, chain=bs_chain(spot)), call, *targets)
+        for c in _all(p):
+            if c["strategy"] in st.DIRECTIONAL_LONGS:
+                k = c["strikes"][f"long_{side}"]
+                assert (k >= spot) if side == "call" else (k <= spot), (spot, c["strategy"], k)
+
+
+def test_frozen_long_leg_going_itm_is_restruck_otm():
+    a = st.StrategyAgent()
+    up_pick(a)                                            # long 7270C at spot 7268
+    p, _ = up_pick(a, spot=7271.0, ts=T0 + timedelta(minutes=5), chain=bs_chain(7271.0))
+    assert p["plan"]["reason"] == "long_leg_itm" and a.rebuilds == 1
+    assert p["plan"]["itm_restrikes"] == 1
+    lc = next(c for c in _all(p) if c["strategy"] == "long_call" and c["reach"] == "near")
+    assert lc["strikes"]["long_call"] == 7275.0
+    # price falls back below 7275: still OTM, strikes do not flip back
+    up_pick(a, spot=7269.0, ts=T0 + timedelta(minutes=6), chain=bs_chain(7269.0))
+    assert a.rebuilds == 1
+
+
+def test_pick_sticks_unless_challenger_wins_by_margin():
+    from dataclasses import replace
+    a = st.StrategyAgent()
+    p1 = a.pick(ctx(), "range", BY["C"], BY["B"], None)
+    others = [c for c in p1["candidates"] if c["reach"] == "near"]
+    assert others
+    # force the incumbent to be a different candidate: hold it, then re-pick
+    rival = others[0]
+    a.held["range"] = rival["pick_id"]
+    gap = p1["composite_score"] - rival["composite_score"]
+    big = replace(CFG, pick_switch_margin=gap + 1.0)
+    p2 = a.pick(ctx(cfg=big, ts=T0 + timedelta(minutes=1)), "range", BY["C"], BY["B"], None)
+    assert p2["pick_id"] == rival["pick_id"]              # not a clear win → incumbent stays
+    zero = replace(CFG, pick_switch_margin=0.0)
+    p3 = a.pick(ctx(cfg=zero, ts=T0 + timedelta(minutes=2)), "range", BY["C"], BY["B"], None)
+    assert p3["pick_id"] == p1["pick_id"]                 # margin 0 → top composite
+
+
+def test_health_band_hysteresis():
+    assert st.rr_health_sticky(0.29, "thin", 0.05) == "thin"            # just under 0.30: holds
+    assert st.rr_health_sticky(0.31, "capital_trap", 0.05) == "capital_trap"
+    assert st.rr_health_sticky(0.24, "thin", 0.05) == "capital_trap"    # clearly below: moves
+    assert st.rr_health_sticky(0.36, "capital_trap", 0.05) == "thin"
+    assert st.rr_health_sticky(0.29, None, 0.05) == "capital_trap"      # no history: plain bands
+    assert st.rr_health_sticky(0.29, "thin", 0.0) == "capital_trap"

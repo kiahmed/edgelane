@@ -5,7 +5,8 @@ with pick=None (no strategy available) — price-only shadow grading.
 
 Directional leg (σ = +1 up, −1 down), levels fixed at open. Binary: result is
 `win` or `loss`, close_reason records which event ended it:
-  win  / target         spot came within HIT_TOL_PTS of the target level
+  win  / target         spot came within HIT_TOL_PTS (default 5) of the target
+                        level at any point before the leg ended
                         (σ·(spot − target) ≥ −HIT_TOL_PTS)
   loss / invalidation   spot leaves through the far side of the invalidation band
                         (σ·(spot − inv) < −BUFFER_PTS — the state machine's "fail" side)

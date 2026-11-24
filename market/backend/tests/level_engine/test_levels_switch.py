@@ -17,7 +17,9 @@ from level_engine.store import MemoryStore
 from . import test_strategy as ts
 from ._brain_sim import Sim, drift, reclaim_upper
 
-CFG = LevelConfig()
+DEFAULT = LevelConfig()
+# Exact-spot tests below are written for HIT_TOL_PTS=2.0 (the pre-2026-11-24 default).
+CFG = LevelConfig(hit_tol_pts=2.0)
 TD = date(2026, 11, 20)
 T0 = datetime(2026, 11, 20, 15, 0, tzinfo=timezone.utc)
 
@@ -26,7 +28,7 @@ T0 = datetime(2026, 11, 20, 15, 0, tzinfo=timezone.utc)
 # config
 # ============================================================================
 def test_hit_tol_config_default_and_override():
-    assert CFG.hit_tol_pts == 2.0
+    assert DEFAULT.hit_tol_pts == 5.0
     assert from_mapping({"HIT_TOL_PTS": "1.5"}).hit_tol_pts == 1.5
     with pytest.raises(ConfigError):
         from_mapping({"HIT_TOL_PTS": "-1"})
@@ -123,6 +125,14 @@ def test_invalidation_is_a_loss_with_reason():
     g = G()
     g.mark(7017.4)                                                   # U − 2.6 < −BUFFER
     assert g.leg.result == "loss" and g.leg.close_reason == "invalidation"
+
+
+def test_default_tolerance_is_five_points_of_the_target():
+    g = G(cfg=DEFAULT)                                               # target Y 7040
+    g.mark(7034.9)
+    assert g.leg.open                                                # 5.1 short: open
+    g.mark(7035.0)
+    assert g.leg.result == "win" and g.leg.close_reason == "target"
 
 
 def test_tolerance_is_configurable():

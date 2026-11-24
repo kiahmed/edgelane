@@ -50,7 +50,9 @@ class LevelConfig:
     min_dwell_min: float = 5.0
     max_repass: int = 2
     reach: str = "both"
-    hit_tol_pts: float = 2.0          # §12: directional win = spot within this of the target
+    hit_tol_pts: float = 5.0          # §12: directional win = spot within this of the target
+    pick_switch_margin: float = 5.0   # §8.4: composite pts a challenger needs to replace the pick
+    health_hysteresis: float = 0.05   # §8.4: R/R must clear a health band edge by this to change band
     lvl_db_url: str = ""
     lvl_replay_db_url: str = ""
     read_port: int = 8791
@@ -82,6 +84,10 @@ class LevelConfig:
             raise ConfigError("REACH must be both|near|extreme")
         if self.hit_tol_pts < 0:
             raise ConfigError("HIT_TOL_PTS must be >= 0")
+        if self.health_hysteresis < 0:
+            raise ConfigError("HEALTH_HYSTERESIS must be >= 0")
+        if self.pick_switch_margin < 0:
+            raise ConfigError("PICK_SWITCH_MARGIN must be >= 0")
         if not (self.typo_check_pct >= 0 and self.typo_check_pct != float("inf")):
             raise ConfigError("TYPO_CHECK_PCT must be >= 0 (0 disables the check)")
         if self.tick_sec <= 0 or self.hold_min <= 0:

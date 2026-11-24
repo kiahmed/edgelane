@@ -171,7 +171,9 @@ role (§5.1), never the service_role key.
 | `MIN_DWELL_MIN` | `5` | minimum time between flips |
 | `MAX_REPASS` | `2` | manager follow-up passes per tick |
 | `REACH` | `both` | risk/reward computes `near` and `extreme` |
-| `HIT_TOL_PTS` | `2.0` | grading (§12): a directional leg wins when spot comes within this many SPX points of its target before the leg ends |
+| `HIT_TOL_PTS` | `5.0` | grading (§12): a directional leg wins when spot comes within this many SPX points of its target at any point before the leg ends (≈ $0.50 on SPY — SPY levels are graded in SPX space) |
+| `HEALTH_HYSTERESIS` | `0.05` | strategy (§8.4): a candidate keeps its R/R health band until R/R clears the band edge by this much (an R/R on 0.30 flipped thin ↔ capital trap every tick, a ±25 composite swing) |
+| `PICK_SWITCH_MARGIN` | `5.0` | strategy (§8.4): composite points a challenger must beat the current pick by to replace it (stops near-tied picks swapping every tick) |
 | `LVL_DB_URL` | — | Postgres DSN of the `facades_levels_engine_rw` role (§5.1) — **not** the service_role key |
 | `LVL_REPLAY_DB_URL` | — | DSN of the `facades_levels_engine_replay` role (§14) |
 | `READ_PORT` / `ADMIN_PORT` | `8791` / `8790` | listeners (§3.1) |
@@ -352,8 +354,10 @@ Posts `rr` evidence (doesn't move direction beliefs; informs the pick).
   call fly, put fly, **straddle**, **strangle**, iron condor (range days only).
   No credit verticals (bull put / bear call) — today's engine keeps them.
 - Strikes come **from levels** (nearest listed strike), fixed for the day:
-  - up: long at current zone's `lower`/spot strike, short at `T_up`; fly centred on `T_up`.
-  - down: mirror.
+  - up: long at the nearest strike that is **not in the money** (lowest strike ≥
+    spot), short at `T_up`; fly centred on `T_up`. Revised 2026-11-24 — the
+    nearest-to-spot rule could buy an ITM leg, which overprices the debit.
+  - down: mirror (long put = highest strike ≤ spot).
   - straddle: at the nearest level to spot. Strangle: call at next-up level, put at
     next-down level (`near`); `extreme` variant at the day's highest/lowest.
   - condor: wings at the contested zone's two levels.
@@ -362,7 +366,11 @@ Posts `rr` evidence (doesn't move direction beliefs; informs the pick).
   **unchanged**. New: a small `score_straddle_strangle` producing the same fields
   (net debit, breakevens, max loss = debit, EV, POP) so `composite_score` works.
 - Strikes are **rebuilt only** when every level on one side has been passed
-  (targets achieved) or the day's levels are edited.
+  (targets achieved), the day's levels are edited, or a directional long leg
+  has gone in the money (re-struck OTM; strikes only move in the call's
+  direction, so they can't flip-flop).
+- **Pick stickiness:** the current pick stays unless a challenger beats its
+  composite by `PICK_SWITCH_MARGIN` (5) points.
 - **Health = R/R to the level** (revised 2026-11-23). The legacy health rule
   marks every debit at DTE ≤ 2 `broken` and measures max profit at expiry over the
   full width, so it never fits a 0DTE level trade. Level picks set
@@ -444,12 +452,15 @@ The tile shows one compact line for `rr`:
 
 - A **leg** opens when the manager makes a call (up/down/range) with a pick.
 - **Directional legs are binary:** `win` if spot comes within `HIT_TOL_PTS`
-  (default 2.0 SPX pts ≈ daily ATR × 0.03, the Confluencer `levelTol`; SPY levels
-  are graded in SPX space, so ≈ $0.20 on SPY) of the target level before the leg
-  ends; otherwise `loss`. The leg ends on the first of: target hit (`win`),
-  invalidation broken (`loss`), call flips (`loss` unless the target was hit),
-  session close (`loss` unless hit). `close_reason` records which
-  (`target | invalidation | flipped | session_close`).
+  (default 5.0 SPX pts, revised 2026-11-24 from 2.0 — "within the 5-point
+  vicinity of the target"; SPY levels are graded in SPX space, so ≈ $0.50 on
+  SPY) of the target level at any point before the leg ends; otherwise `loss`.
+  The leg ends on the first of: target hit (`win`), invalidation broken
+  (`loss`), call flips (`loss` unless hit), session close (`loss` unless hit).
+  `close_reason` records which (`target | invalidation | flipped |
+  session_close`). A short-lived "progressed" win (15 min / 5 pts toward the
+  target) was tried and removed the same day: it closed a leg as a win on its
+  first excursion even if the leg later broke invalidation.
 - **Range legs:** `win` if price holds the zone until the call changes or the
   close; `loss` if it leaves (`close_reason` `zone_held | zone_exit`).
 - Recorded: time to target, max adverse excursion, progress %, strategy P&L at

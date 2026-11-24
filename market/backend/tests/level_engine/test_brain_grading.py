@@ -147,3 +147,4 @@ def test_day_summary_only_once():
     s.run(drift(7010.0, 5))
     assert s.tick(7010, session_close=True).day_summary is not None
     assert s.tick(7010, session_close=True).day_summary is None
+

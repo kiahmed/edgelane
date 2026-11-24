@@ -264,6 +264,10 @@
                     list-style:disc; }
     .doc-prose li.dont { color:#fda4af; }
     .doc-prose li.dont::marker { color:#fb7185; }
+  /* Level mode: a pick held through a brief engine gap (_stableLevelSnap) is
+     shown dimmed and can't be placed — it is not the engine's current pick. */
+  .lvl-held { opacity: .7; }
+  .lvl-held button[data-action="place"] { pointer-events: none; opacity: .4; }
   </style>
 </head>
 <body class="text-slate-200">
@@ -999,7 +1003,43 @@
     } catch (_) { /* fall back to /status's list */ }
   }
 
+  // Level mode: a pick / grid can drop out for a tick or two (a quote with no
+  // bid, the engine between ticks, a brief WAIT). Hold the last good pick and
+  // grid until the empty state has lasted LEVEL_HOLD_MS, so the panel stays
+  // still instead of blanking and refilling. A real end ("done" / session
+  // close) shows at once.
+  const LEVEL_HOLD_MS = 60000;
+  const _lvlHold = { pick: null, strategies: null, ld: null, at: 0, emptySince: 0 };
+  function _stableLevelSnap(snap) {
+    if (!snap || !_levelMode(snap)) return snap;
+    const ld = snap.level_decision || {};
+    const hasPick = !!(snap.engine_pick && snap.engine_pick.pick_id);
+    const hasGrid = Object.keys(snap.strategies || {}).length > 0;
+    const now = Date.now();
+    if (hasPick && hasGrid) {
+      Object.assign(_lvlHold, { pick: snap.engine_pick, strategies: snap.strategies,
+                                ld: snap.level_decision, at: now, emptySince: 0 });
+      return snap;
+    }
+    const ended = ld.call === 'done' || ld.status === 'session_close';
+    if (!_lvlHold.pick || ended) return snap;
+    if (!_lvlHold.emptySince) _lvlHold.emptySince = now;
+    if (now - _lvlHold.emptySince >= LEVEL_HOLD_MS) return snap;
+    return { ...snap, __held: true,
+             engine_pick: hasPick ? snap.engine_pick : _lvlHold.pick,
+             strategies: hasGrid ? snap.strategies : _lvlHold.strategies,
+             level_decision: hasPick ? snap.level_decision : (_lvlHold.ld || snap.level_decision) };
+  }
+  // innerHTML only when the markup changed: re-assigning identical HTML
+  // still tears down and rebuilds the nodes (flicker, lost hover/tooltip).
+  function _setHTML(el, html) {
+    if (!el || el.__html === html) return false;
+    el.innerHTML = html; el.__html = html;
+    return true;
+  }
+
   function renderSnapshot(snap) {
+    snap = _stableLevelSnap(snap);
     state.snapshot = snap;
     if (!snap || snap.__404) {
       $('spotPrice').textContent = '—';
@@ -1014,7 +1054,7 @@
       $('callWall').textContent = '—'; $('callWallStr').textContent = '';
       $('gexWall').textContent = '—'; $('gexWallStr').textContent = '';
       $('pickCard').classList.add('hidden');
-      $('stratGrid').innerHTML = '';
+      _setHTML($('stratGrid'), '');
       return;
     }
     clearError();
@@ -1116,13 +1156,13 @@
       $('pickVerdict').className = `pill ${verdictClass(v.color)}`;
       $('pickVerdict').title = TT_VERDICT[(v.label||'').toLowerCase()] || '';
       $('pickStructure').textContent = pick.structure_text || '';
-      $('pickMetrics').innerHTML = `
+      _setHTML($('pickMetrics'), `
         <div><div class="text-slate-500 tt" title="${TT_METRIC.net_premium}">Net prem</div><div>${fmt.money(pick.net_premium)}</div></div>
         <div><div class="text-slate-500 tt" title="${TT_METRIC.max_profit}">Max P</div><div class="text-emerald-300">${fmt.money(pick.max_profit)}</div></div>
         <div><div class="text-slate-500 tt" title="${TT_METRIC.max_loss}">Max L</div><div class="text-rose-300">${fmt.money(pick.max_loss)}</div></div>
         <div><div class="text-slate-500 tt" title="${TT_METRIC.pop_pct}">POP</div><div>${fmt.pct(pick.pop_pct,1)}</div></div>
         <div><div class="text-slate-500 tt" title="${TT_METRIC.ev}">EV</div><div>${fmt.money(pick.ev,2)}</div></div>
-      `;
+      `);
     } else if (snap.level_decision) {
       // Level mode with no pick (wait / done / no tick yet / engine unreachable):
       // show the level state — never a legacy pick (docs/level_engine.md §3.4).
@@ -1138,14 +1178,13 @@
       $('pickVerdict').className = 'pill bg-slate-700 text-slate-200';
       $('pickVerdict').title = '';
       $('pickStructure').textContent = ld.reason || '';
-      $('pickMetrics').innerHTML = '';
+      _setHTML($('pickMetrics'), '');
     } else {
       $('pickCard').classList.add('hidden');
     }
 
     // Strategy pills (8) — or, in level mode, the level grid (§3.4 / §8.4)
     const grid = $('stratGrid');
-    grid.innerHTML = '';
     const strats = snap.strategies || {};
     const lvlMode = _levelMode(snap);
     const order = lvlMode
@@ -1153,16 +1192,16 @@
       : ['bull_put','bear_call','iron_condor','iron_butterfly','bull_call','bear_put','call_butterfly','put_butterfly'];
     $('stratHeading').textContent = lvlMode ? `Strategies (${order.length})` : 'Strategies (8)';
     $('stratLegend').textContent = lvlMode ? '★ level pick' : '★ recommended by bias';
+    let gridHTML = '';
     if (lvlMode && !order.length) {
       const ld = snap.level_decision || {};
       const done = ld.call === 'done' || ld.status === 'session_close';
       const msg = ld.status === 'unavailable' ? 'unavailable' : done ? 'done for the day' : 'waiting for a setup';
-      grid.innerHTML = `<div class="card p-3 col-span-full text-xs text-slate-500">Level engine — ${msg}</div>`;
+      gridHTML = `<div class="card p-3 col-span-full text-xs text-slate-500">Level engine — ${msg}</div>`;
     }
-    for (const key of order) {
-      const s = strats[key];
-      grid.insertAdjacentHTML('beforeend', renderStrategyPill(key, s));
-    }
+    for (const key of order) gridHTML += renderStrategyPill(key, strats[key]);
+    grid.classList.toggle('lvl-held', !!snap.__held);
+    if (!_setHTML(grid, gridHTML)) return;   // unchanged: keep the nodes (and their handlers)
     // Bind buttons
     grid.querySelectorAll('button[data-action]').forEach(btn => {
       btn.addEventListener('click', (e) => {
@@ -1216,8 +1255,9 @@
     const isLevel = !!(pick && pick.source === 'levels');
     const showSrc = isLevel || !!ld;
     $('pickSource').classList.toggle('hidden', !showSrc);
-    $('pickSource').textContent = (ld && ld.status === 'unavailable')
-      ? 'Level engine unavailable' : 'Level engine';
+    $('pickSource').textContent = snap.__held ? 'Level engine · held — re-evaluating'
+      : (ld && ld.status === 'unavailable') ? 'Level engine unavailable' : 'Level engine';
+    $('pickCard').classList.toggle('lvl-held', !!snap.__held);
     // Call + target / invalidation
     const callSrc = isLevel ? pick : ld;
     let callTxt = '';
@@ -1235,6 +1275,7 @@
     $('pickRR').textContent = rr;
     $('pickRR').classList.toggle('hidden', !rr);
     $('pickPlaceBtn').classList.toggle('hidden', !(isLevel && pick.pick_id && (pick.legs || []).length));
+    $('pickPlaceBtn').disabled = !!snap.__held;
   }
 
   function verdictClass(color) {
@@ -1690,6 +1731,7 @@
   });
 
   function placeOrder(strategy) {
+    if (state.snapshot && state.snapshot.__held) return;     // held grid: Copy only
     openOrderDialog(strategy);
   }
 
@@ -1703,6 +1745,7 @@
     // Level-engine pick on the tile → the dialog places exactly that pick (pick_id).
     $('pickPlaceBtn').addEventListener('click', () => {
       const p = state.snapshot && state.snapshot.engine_pick;
+      if (state.snapshot && state.snapshot.__held) return;   // held, not the current pick
       if (p && p.source === 'levels' && p.pick_id) openOrderDialog(p.strategy, p);
     });
     const sb = $('orderSubmitBtn');
@@ -1724,7 +1767,9 @@
       ]);
       renderStatus(status);
       if (snap && !snap.__err) renderSnapshot(snap);
-      else if (snap && snap.__err) {
+      else if (snap && snap.__err && !state.snapshot) {
+        // Only blank when there is nothing on screen yet. A transient failed
+        // fetch must not wipe a good view — the next poll repaints it.
         renderSnapshot(null);
       }
     } catch (e) {
