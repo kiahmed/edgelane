@@ -15,7 +15,7 @@ The level engine never calls Tradier; this is its only data input.
             stale": no tick, no decision);
     ok    = otherwise.
 * `prior_close(symbol)` → spx_prevclose / spy_prevclose from the last good
-  feed (the admin page's ±5% typo guard, §17).
+  feed (the admin page's soft ±TYPO_CHECK_PCT typo check, §17).
 
 The token is sent as `X-Internal-Token` and never logged.
 """
@@ -135,12 +135,19 @@ class FeedClient:
     def prior_close(self, symbol: str) -> float | None:
         with self._lock:
             f = self.last_feed or {}
-        key = {"SPX": "spx_prevclose", "SPY": "spy_prevclose"}.get(str(symbol).upper())
-        if key is None:
+        # Reference price for the admin's ±% typo guard (§17). The LATEST trade
+        # first: levels are entered evenings / pre-market, and after the close
+        # Tradier's `prevclose` still points at the session BEFORE today, so a
+        # big day made valid levels look like typos. prevclose is the fallback.
+        keys = {"SPX": ("spot", "spx_prevclose"),
+                "SPY": ("spy_spot", "spy_prevclose")}.get(str(symbol).upper())
+        if keys is None:
             return None
-        v = f.get(key)
-        try:
-            v = float(v)
-        except (TypeError, ValueError):
-            return None
-        return v if v > 0 else None
+        for key in keys:
+            try:
+                v = float(f.get(key))
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                return v
+        return None

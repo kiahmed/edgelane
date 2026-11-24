@@ -56,7 +56,7 @@ class LevelConfig:
     read_port: int = 8791
     admin_port: int = 8790
     strike_step: float = 5.0          # SPX listed-strike grid (§6)
-    price_guard_pct: float = 5.0      # admin: price within ±N% of prior close (§17)
+    typo_check_pct: float = 30.0      # §17: admin asks to confirm a level > ±this % from the last trade; 0 = off
 
     # ---- derived ----
     @property
@@ -82,6 +82,8 @@ class LevelConfig:
             raise ConfigError("REACH must be both|near|extreme")
         if self.hit_tol_pts < 0:
             raise ConfigError("HIT_TOL_PTS must be >= 0")
+        if not (self.typo_check_pct >= 0 and self.typo_check_pct != float("inf")):
+            raise ConfigError("TYPO_CHECK_PCT must be >= 0 (0 disables the check)")
         if self.tick_sec <= 0 or self.hold_min <= 0:
             raise ConfigError("TICK_SEC and HOLD_MIN must be > 0")
         self.session_open, self.session_close, self.ratio_lock  # parse check

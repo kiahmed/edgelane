@@ -130,7 +130,7 @@ def test_form_bulk_and_one_bad_line_inserts_nothing(client, store):
         ("SPY", 594.1, "ON low", "pivot")]
     assert rows[2]["condition_text"] == "if gap"
 
-    bad = "SPY 595.5 A\nSPY abc B\nSPX 6001 C [sideways]\nSPY 700 D"
+    bad = "SPY 595.5 A\nSPY abc B\nSPX 6001 C [sideways]\nSPY 0 D"
     r = post(client, "/levels/bulk", {"text": bad})
     assert r.status_code == 422
     assert "line 2" in r.text and "line 3" in r.text and "line 4" in r.text
@@ -171,7 +171,7 @@ def test_api_bulk_rows_text_dry_run(client, store):
     r = client.post("/api/levels/bulk", json={"rows": rows}, headers=ORIGIN)
     assert r.status_code == 201 and len(store.list_levels(TODAY)) == 2
 
-    r = client.post("/api/levels/bulk", json={"text": "SPY 595 X\nSPY 1 Y"}, headers=ORIGIN)
+    r = client.post("/api/levels/bulk", json={"text": "SPY 595 X\nSPY 0 Y"}, headers=ORIGIN)
     assert r.status_code == 422
     assert r.json()["errors"][0]["line"] == 2
     assert len(store.list_levels(TODAY)) == 2
@@ -180,28 +180,157 @@ def test_api_bulk_rows_text_dry_run(client, store):
     assert r.status_code == 422
 
 
-# ---- §17 guard --------------------------------------------------------------
-def test_price_guard(client, store):
-    def add(sym, price):
-        return client.post("/api/levels", json={"symbol": sym, "price": price, "name": "g"},
-                           headers=ORIGIN)
-    assert add("SPY", 595 * 1.05).status_code == 201
-    assert add("SPY", 595 * 0.95).status_code == 201
-    r = add("SPY", 595 * 1.051)
-    assert r.status_code == 422 and "prior close" in r.json()["error"]
-    assert add("SPX", 5000).status_code == 422
-    # edit is guarded too
-    lv = store.list_levels(TODAY)[0]
-    r = client.patch(f"/api/levels/{lv['id']}", json={"price": 59.5}, headers=ORIGIN)
-    assert r.status_code == 422
+# ---- soft typo check (±TYPO_CHECK_PCT % from the last trade) ------------------
+def test_within_band_no_prompt(client, store):
+    # +21.7% / +20% / -16.7%: valid after big days — saved, no notice, no badge
+    for sym, price in (("SPY", 724.48), ("SPY", 595 * 1.2), ("SPX", 5000)):
+        r = client.post("/api/levels", json={"symbol": sym, "price": price, "name": "g"},
+                        headers=ORIGIN)
+        assert r.status_code == 201 and r.json()["warning"] is None
+    r = post(client, "/levels", {"symbol": "SPY", "price": "700", "name": "form ok"})
+    assert r.status_code == 303
+    r = post(client, "/levels/bulk", {"text": "SPY 720 a\nSPX 7000 b"})
+    assert r.status_code == 303
+    assert len(store.list_levels(TODAY)) == 6
+    t = client.get("/").text
+    assert "unverified" not in t and "typo" not in t and "Save anyway" not in t
 
 
-def test_no_prior_close_accepts_with_warning(store):
-    c = make(store, closes={})
-    r = c.post("/api/levels", json={"symbol": "SPY", "price": 123.0, "name": "far"}, headers=ORIGIN)
-    assert r.status_code == 201 and "guard not applied" in r.json()["warning"]
-    assert "unverified" in c.get("/").text
-    assert c.get("/api/levels").json()["levels"][0]["warning"]
+def test_form_add_outside_band_needs_confirm(client, store):
+    form = {"date": TODAY.isoformat(), "symbol": "SPY", "price": "59.52", "name": "PM high",
+            "kind": "support", "condition_text": ""}
+    r = post(client, "/levels", form)
+    assert r.status_code == 409
+    assert store.list_levels(TODAY) == []
+    t = r.text
+    assert "SPY 59.52 is 90% below the last trade 595.00 — typo?" in t
+    assert "Save anyway" in t and "name=confirm value=1" in t
+    assert "<form method=post action='/levels' class=bar>" in t
+    assert "name='price' value='59.52'" in t and "name='name' value='PM high'" in t
+    # confirm path re-posts the same values with confirm=1 → saved
+    r = post(client, "/levels", {**form, "confirm": "1"})
+    assert r.status_code == 303
+    [lv] = store.list_levels(TODAY)
+    assert (lv["price"], lv["name"], lv["kind"]) == (59.52, "PM high", "support")
+
+
+def test_form_edit_outside_band_needs_confirm(client, store):
+    lv = store.add_level(TODAY, {"symbol": "SPY", "price": 595.0, "name": "PM high"}, today=TODAY)
+    form = {"symbol": "SPY", "price": "5950", "name": "PM high", "kind": "", "condition_text": ""}
+    r = post(client, f"/levels/{lv['id']}/edit", form)
+    assert r.status_code == 409
+    assert "SPY 5,950.00 is 900% above the last trade 595.00 — typo?" in r.text
+    assert f"action='/levels/{lv['id']}/edit'" in r.text
+    assert store.get_level(lv["id"])["price"] == 595.0
+    # an edit that leaves an already out-of-band price alone is not re-checked
+    store.update_level(lv["id"], {"price": 5950.0}, TODAY)
+    assert post(client, f"/levels/{lv['id']}/edit", {**form, "name": "renamed"}).status_code == 303
+    store.update_level(lv["id"], {"price": 595.0}, TODAY)
+    assert post(client, f"/levels/{lv['id']}/edit", {**form, "confirm": "1"}).status_code == 303
+    assert store.get_level(lv["id"])["price"] == 5950.0
+
+
+def test_form_bulk_flags_every_line_all_or_nothing(client, store):
+    text = "SPY 595.2 ok\nSPY 72.48 typo one\nSPX 600 typo two\nSPX 6010 fine"
+    r = post(client, "/levels/bulk", {"date": TODAY.isoformat(), "text": text})
+    assert r.status_code == 409
+    assert store.list_levels(TODAY) == []
+    t = r.text
+    assert "line 2: SPY 72.48 is 87.8% below the last trade 595.00 — typo?" in t
+    assert "line 3: SPX 600.00 is 90% below the last trade 6,000.00 — typo?" in t
+    assert "line 1:" not in t and "line 4:" not in t
+    assert "<form method=post action='/levels/bulk' class=bar>" in t
+    assert "name='text' value='SPY 595.2 ok\nSPY 72.48 typo one" in t  # hidden re-post
+    assert "SPX 6010 fine</textarea>" in t  # textarea keeps the paste
+    r = post(client, "/levels/bulk", {"date": TODAY.isoformat(), "text": text, "confirm": "1"})
+    assert r.status_code == 303
+    assert len(store.list_levels(TODAY)) == 4
+
+
+def test_api_needs_confirm_409(client, store):
+    r = client.post("/api/levels", json={"symbol": "SPY", "price": 72.48, "name": "x"},
+                    headers=ORIGIN)
+    assert r.status_code == 409
+    b = r.json()
+    assert b["needs_confirm"] is True and "typo" in b["error"]
+    [f] = b["flagged"]
+    assert (f["symbol"], f["price"], f["last"], f["pct_off"]) == ("SPY", 72.48, 595.0, -87.8)
+    assert store.list_levels(TODAY) == []
+    r = client.post("/api/levels", json={"symbol": "SPY", "price": 72.48, "name": "x",
+                                         "confirm": True}, headers=ORIGIN)
+    assert r.status_code == 201
+    lv = r.json()
+
+    r = client.patch(f"/api/levels/{lv['id']}", json={"price": 7248}, headers=ORIGIN)
+    assert r.status_code == 409 and r.json()["needs_confirm"] is True
+    assert store.get_level(lv["id"])["price"] == 72.48
+    r = client.patch(f"/api/levels/{lv['id']}", json={"price": 7248, "confirm": True}, headers=ORIGIN)
+    assert r.status_code == 200 and r.json()["price"] == 7248.0
+
+    rows = [{"line": 1, "symbol": "SPY", "price": 595, "name": "a"},
+            {"line": 2, "symbol": "SPX", "price": 60000, "name": "b"}]
+    r = client.post("/api/levels/bulk", json={"rows": rows}, headers=ORIGIN)
+    assert r.status_code == 409
+    assert [(x["line"], x["symbol"], x["pct_off"]) for x in r.json()["flagged"]] == [(2, "SPX", 900.0)]
+    assert len(store.list_levels(TODAY)) == 1
+    r = client.post("/api/levels/bulk", json={"rows": rows, "confirm": True}, headers=ORIGIN)
+    assert r.status_code == 201 and len(store.list_levels(TODAY)) == 3
+    assert r.json()["flagged"][0]["line"] == 2
+
+
+def test_api_bulk_dry_run_returns_flags(client, store):
+    r = client.post("/api/levels/bulk", json={"text": "SPY 595 a\nSPY 59.5 b", "dry_run": True},
+                    headers=ORIGIN)
+    assert r.status_code == 200
+    b = r.json()
+    assert len(b["levels"]) == 2 and [x["line"] for x in b["flagged"]] == [2]
+    r = client.post("/api/levels/bulk", json={"text": "SPY 595 a", "dry_run": True}, headers=ORIGIN)
+    assert r.status_code == 200 and r.json()["flagged"] == []
+    assert store.list_levels(TODAY) == []
+
+
+def test_unknown_reference_is_saved(store):
+    c = make(store, closes={"SPX": 6000.0})          # SPY last trade unknown
+    r = c.post("/api/levels", json={"symbol": "SPY", "price": 5.95, "name": "x"}, headers=ORIGIN)
+    assert r.status_code == 201
+    boom = create_admin_app(store, LevelConfig(), prior_close=lambda s: 1 / 0, today=lambda: TODAY)
+    c2 = TestClient(boom, base_url=BASE, follow_redirects=False)
+    assert c2.post("/levels", data={"symbol": "SPX", "price": "60", "name": "y"},
+                   headers=ORIGIN).status_code == 303
+    assert len(store.list_levels(TODAY)) == 2
+
+
+def test_typo_check_pct_zero_disables(store):
+    app = create_admin_app(store, LevelConfig(typo_check_pct=0), prior_close=lambda s: CLOSES.get(s),
+                           today=lambda: TODAY)
+    c = TestClient(app, base_url=BASE, follow_redirects=False)
+    assert c.post("/api/levels", json={"symbol": "SPY", "price": 5.95, "name": "x"},
+                  headers=ORIGIN).status_code == 201
+    assert c.post("/levels/bulk", data={"text": "SPX 60 y"}, headers=ORIGIN).status_code == 303
+    assert len(store.list_levels(TODAY)) == 2
+
+
+def test_typo_check_pct_config():
+    from level_engine.config import ConfigError, from_mapping
+    assert LevelConfig().typo_check_pct == 30.0
+    assert from_mapping({"TYPO_CHECK_PCT": "12.5"}).typo_check_pct == 12.5
+    assert from_mapping({"TYPO_CHECK_PCT": "0"}).typo_check_pct == 0.0
+    for bad in ("-1", "nan", "inf"):
+        with pytest.raises(ConfigError):
+            from_mapping({"TYPO_CHECK_PCT": bad})
+
+
+def test_typo_notice_is_escaped(client, store):
+    form = {"symbol": "SPY", "price": "5.95", "name": "<script>alert(1)</script>",
+            "condition_text": "\"'><img src=x>"}
+    r = post(client, "/levels", form)
+    assert r.status_code == 409
+    t = r.text
+    assert "<script>alert(1)</script>" not in t and "<img src=x>" not in t
+    assert "value='&lt;script&gt;alert(1)&lt;/script&gt;'" in t
+    assert "&quot;&#x27;&gt;&lt;img src=x&gt;" in t
+    # the only script tag is the nonce'd one
+    assert t.count("<script") == 1 and "<script nonce=" in t
 
 
 # ---- past dates -------------------------------------------------------------

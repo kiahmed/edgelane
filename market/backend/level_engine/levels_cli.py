@@ -1,7 +1,7 @@
 """Levels CLI — backup / automation front door to the admin listener (§10).
 
     python -m level_engine.levels_cli show   [--date YYYY-MM-DD] [--json]
-    python -m level_engine.levels_cli import FILE [--date YYYY-MM-DD] [--dry-run]
+    python -m level_engine.levels_cli import FILE [--date YYYY-MM-DD] [--dry-run] [--force]
 
 It talks to the admin JSON API over HTTP (stdlib urllib only), so it runs on the
 host against the container and never needs DB credentials. Base URL:
@@ -29,8 +29,13 @@ Import file formats (auto-detected):
   skipped.
 
 Parsing is all-or-nothing: any bad line is reported with its line number and
-nothing is sent. The server re-validates (incl. the ±N% prior-close guard) and
-also inserts nothing unless every row passes.
+nothing is sent. The server re-validates and also inserts nothing unless every
+row passes.
+
+Typo check (§17): a price more than ±TYPO_CHECK_PCT % from the latest trade is
+flagged by the server (409 needs_confirm). The CLI then prints the flagged lines
+and exits 1 with nothing inserted; `--force` sends `"confirm": true` and imports
+them anyway. `--dry-run` lists the flags too (exit 1 if any, unless --force).
 
 This module is stdlib-only on purpose; the admin app imports its parsers so the
 page and the CLI share one grammar.
@@ -260,17 +265,23 @@ def cmd_show(client: AdminClient, date: str | None, as_json: bool, out=None) -> 
     print(f"  {'SYM':<4} {'PRICE':>10}  {'NAME':<28} {'KIND':<11} {'SPX(conv)':>10}  CONDITION", file=out)
     for lv in levels:
         conv = (lv.get("converted") or {}).get("price")
-        warn = " !" if lv.get("warning") else ""
+        warn = ""
         print(f"  {lv.get('symbol', ''):<4} {_fmt(lv.get('price')):>10}  "
               f"{str(lv.get('name', ''))[:28]:<28} {lv.get('kind') or '-':<11} "
               f"{_fmt(conv):>10}  {lv.get('condition_text') or ''}{warn}", file=out)
-    if any(lv.get("warning") for lv in levels):
-        print("  ! = no prior close available; the price guard was not applied", file=out)
     return 0
 
 
+def _print_flagged(flagged: list[dict], out) -> None:
+    for f in flagged:
+        where = f"line {f['line']}: " if f.get("line") is not None else ""
+        msg = f.get("message") or (f"{f.get('symbol')} {_fmt(f.get('price'))} is "
+                                   f"{f.get('pct_off')}% off the last trade {_fmt(f.get('last'))}")
+        print(f"  {where}{msg}", file=out)
+
+
 def cmd_import(client: AdminClient, path: str, date: str | None, dry_run: bool,
-               out=None) -> int:
+               out=None, force: bool = False) -> int:
     out = out or sys.stdout
     try:
         with open(path, encoding="utf-8-sig") as fh:
@@ -287,8 +298,15 @@ def cmd_import(client: AdminClient, path: str, date: str | None, dry_run: bool,
         print(f"{path}: no levels found", file=sys.stderr)
         return 1
     status, data = client.request("POST", "/api/levels/bulk",
-                                  body={"date": date, "rows": rows, "dry_run": dry_run})
+                                  body={"date": date, "rows": rows, "dry_run": dry_run,
+                                        "confirm": bool(force)})
     data = data or {}
+    if status == 409 and data.get("needs_confirm"):
+        flagged = data.get("flagged") or []
+        print(f"{path}: {len(flagged)} price(s) look like typos (far from the last trade) "
+              "- nothing imported; re-run with --force if they are right:", file=sys.stderr)
+        _print_flagged(flagged, sys.stderr)
+        return 1
     if status not in (200, 201):
         print(f"refused ({status}): {data.get('error', '')} - nothing imported", file=sys.stderr)
         _print_errors(data.get("errors") or [], sys.stderr)
@@ -299,6 +317,16 @@ def cmd_import(client: AdminClient, path: str, date: str | None, dry_run: bool,
     for lv in data.get("levels") or []:
         print(f"  {lv.get('symbol')} {_fmt(lv.get('price'))} {lv.get('name')}"
               f"{' [' + lv['kind'] + ']' if lv.get('kind') else ''}", file=out)
+    flagged = data.get("flagged") or []
+    if flagged:
+        if force:
+            print(f"forced past {len(flagged)} typo flag(s):", file=out)
+            _print_flagged(flagged, out)
+        else:
+            print(f"{len(flagged)} price(s) look like typos - a real import needs --force:",
+                  file=sys.stderr)
+            _print_flagged(flagged, sys.stderr)
+            return 1
     return 0
 
 
@@ -313,12 +341,14 @@ def main(argv: list[str] | None = None) -> int:
     i.add_argument("file")
     i.add_argument("--date", help="YYYY-MM-DD (default: today ET)")
     i.add_argument("--dry-run", action="store_true", help="validate on the server, insert nothing")
+    i.add_argument("--force", action="store_true",
+                   help="import prices flagged by the typo check (far from the last trade)")
     a = ap.parse_args(argv)
     try:
         client = AdminClient(a.url)
         if a.cmd == "show":
             return cmd_show(client, a.date, a.json)
-        return cmd_import(client, a.file, a.date, a.dry_run)
+        return cmd_import(client, a.file, a.date, a.dry_run, force=a.force)
     except CliError as e:
         print(str(e), file=sys.stderr)
         return 2

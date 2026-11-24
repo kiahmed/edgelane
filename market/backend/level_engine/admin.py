@@ -32,10 +32,18 @@ Pages / endpoints
   GET  /healthz               {"ok": true}
 
 Bulk grammar: see `levels_cli` (shared parser) — `SYMBOL PRICE NAME [kind] [| condition]`.
-Writes for a trade_date before today are refused (403). §17 guard: when
-`prior_close(symbol)` is known, a price outside ±`price_guard_pct`% of it is
-refused (422); when unknown the level is accepted with an "unverified" badge.
-Every write is audited by the store.
+Writes for a trade_date before today are refused (403). Every write is audited
+by the store.
+
+Typo check (§17, soft — the hard ±5% guard was removed 2026-11-23): when the
+reference price (`prior_close(symbol)` → feed.prior_close = latest trade) is
+known and a NEW or EDITED level's price is more than ±TYPO_CHECK_PCT % from it,
+the write is NOT applied until confirmed. Forms re-render with the notice and a
+"Save anyway" button that re-posts the same values with `confirm=1`; the JSON
+API answers 409 {error, needs_confirm: true, flagged:[{line?, symbol, price,
+last, pct_off, message}]} — resend with `"confirm": true`. Bulk stays
+all-or-nothing; `dry_run` returns the flags (200, `flagged`). Unknown reference
+or TYPO_CHECK_PCT=0 → no check.
 """
 from __future__ import annotations
 
@@ -71,6 +79,29 @@ class _Conflict(RuntimeError):
     pass
 
 
+class _NeedsConfirm(Exception):
+    """Price(s) far from the last trade — not applied until resent with confirm."""
+
+    def __init__(self, flagged: list[dict], fields: dict | None = None):
+        msgs = "; ".join(f["message"] for f in flagged)
+        super().__init__(f"{msgs} — not saved; confirm to save anyway")
+        self.flagged = flagged
+        self.fields = fields
+
+
+def typo_message(symbol: str, price: float, last: float, pct_off: float) -> str:
+    """'SPY 72.48 is 90% below the last trade 722.29 — typo?'"""
+    side = "below" if pct_off < 0 else "above"
+    return (f"{symbol} {_num(price)} is {abs(pct_off):g}% {side} the last trade "
+            f"{_num(last)} — typo?")
+
+
+def _truthy(v: Any) -> bool:
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return v is True or (isinstance(v, int) and not isinstance(v, bool) and v == 1)
+
+
 class _BulkError(LevelValidationError):
     def __init__(self, errors: list[dict]):
         super().__init__(f"{len(errors)} bad line(s) - nothing imported")
@@ -78,6 +109,8 @@ class _BulkError(LevelValidationError):
 
 
 def _status_for(exc: Exception) -> int:
+    if isinstance(exc, _NeedsConfirm):
+        return 409
     if isinstance(exc, PastDateError):
         return 403
     if isinstance(exc, KeyError):
@@ -223,6 +256,7 @@ form.inline{display:inline}.grid{display:flex;flex-wrap:wrap;gap:6px;align-items
 .grid label{display:flex;flex-direction:column;font-size:12px;color:var(--mut)}
 .msg{padding:8px 10px;border-radius:4px;margin:8px 0}
 .msg.err{background:var(--badbg);color:var(--bad)}.msg.ok{background:var(--okbg);color:var(--ok)}
+.msg.warn{background:var(--warnbg);color:var(--warn)}.msg ul{margin:4px 0;padding-left:20px}
 .badge{display:inline-block;font-size:11px;padding:0 6px;border-radius:9px;margin-left:4px}
 .badge.warn{background:var(--warnbg);color:var(--warn)}.badge.ro{background:var(--hd);color:var(--mut)}
 .mut{color:var(--mut)}details summary{cursor:pointer;color:var(--acc)}code{font-size:12px}
@@ -249,7 +283,6 @@ def create_admin_app(store: Store, cfg: LevelConfig,
         extra = [h.strip() for h in os.environ.get(ENV_ALLOWED_HOSTS, "").split(",") if h.strip()]
         allowed_hosts = (*DEFAULT_ALLOWED_HOSTS, *extra)
     allowed = {h.strip("[]").lower() for h in allowed_hosts}
-    pct = float(cfg.price_guard_pct)
 
     # ---- middleware: tunnel refusal, host allow-list, CSRF, headers ----
     def _secure(resp: Response, nonce: str = "") -> Response:
@@ -288,35 +321,38 @@ def create_admin_app(store: Store, cfg: LevelConfig,
             return None
         return v if v is not None and math.isfinite(v) and v > 0 else None
 
-    def _guard_price(symbol: str, price: float | None) -> str | None:
-        """Raise on a price outside ±pct of the prior close; return a warning
-        string when the prior close is unknown (guard not applied)."""
-        if price is None:
-            return None
-        pc = _pc(symbol)
-        if pc is None:
-            return f"no prior close for {symbol}; ±{pct:g}% guard not applied"
-        lo, hi = pc * (1 - pct / 100), pc * (1 + pct / 100)
-        if not lo <= price <= hi:
-            raise LevelValidationError(
-                f"{symbol} {price:g} is outside ±{pct:g}% of the prior close {pc:,.2f} "
-                f"(allowed {lo:,.2f}–{hi:,.2f}) — typo?")
-        return None
-
     def _writable(d: date) -> None:
         t = today()
         if d < t:
             raise PastDateError(f"levels for {d} are read-only (today is {t})")
 
+    def _typo(symbol: str | None, price: float | None) -> dict | None:
+        """{symbol, price, last, pct_off, message} when price is > ±TYPO_CHECK_PCT %
+        from the latest trade; None when within the band, off, or unknown."""
+        pct = float(cfg.typo_check_pct or 0)
+        if pct <= 0 or price is None or not symbol:
+            return None
+        last = _pc(symbol)
+        if last is None:
+            return None
+        off = round((float(price) - last) / last * 100.0, 1)
+        if abs(off) <= pct:
+            return None
+        return {"symbol": symbol, "price": float(price), "last": last, "pct_off": off,
+                "message": typo_message(symbol, float(price), last, off)}
+
     def _clean_new(fields: dict) -> tuple[dict, str | None]:
         f = validate_level_fields({**_user_fields(fields), "source": "entered"})
         if f["symbol"] == "SPY" and f.get("price") is None:
             raise LevelValidationError("SPY levels need a price")
-        return f, _guard_price(f["symbol"], f.get("price"))
+        return f, None
 
-    def op_add(d: date, fields: dict) -> dict:
+    def op_add(d: date, fields: dict, confirm: bool = False) -> dict:
         _writable(d)
         f, warn = _clean_new(fields)
+        flag = _typo(f["symbol"], f.get("price"))
+        if flag and not confirm:
+            raise _NeedsConfirm([flag], fields=f)
         row = store.add_level(d, f, today())
         return {**row, "warning": warn}
 
@@ -329,18 +365,20 @@ def create_admin_app(store: Store, cfg: LevelConfig,
             raise _Conflict("converted levels are written by the engine; edit the SPY level instead")
         return cur
 
-    def op_edit(level_id: str, fields: dict) -> dict:
+    def op_edit(level_id: str, fields: dict, confirm: bool = False) -> dict:
         cur = _get_editable(level_id)
         f = validate_level_fields(_user_fields(fields), partial=True)
         sym = f.get("symbol", cur["symbol"])
         price = f["price"] if "price" in f else cur.get("price")
         if sym == "SPY" and price is None:
             raise LevelValidationError("SPY levels need a price")
-        warn = None
-        if "symbol" in f or "price" in f:
-            warn = _guard_price(sym, None if price is None else float(price))
+        cur_price = None if cur.get("price") is None else float(cur["price"])
+        if (sym, price) != (cur["symbol"], cur_price):  # only a changed price/symbol is checked
+            flag = _typo(sym, price)
+            if flag and not confirm:
+                raise _NeedsConfirm([flag], fields=f)
         row = store.update_level(level_id, f, today())
-        return {**row, "warning": warn}
+        return {**row, "warning": None}
 
     def op_delete(level_id: str) -> dict:
         cur = _get_editable(level_id)
@@ -348,10 +386,12 @@ def create_admin_app(store: Store, cfg: LevelConfig,
         return cur
 
     def op_bulk(d: date, rows: list[dict], pre_errors: list[dict] | None = None,
-                dry_run: bool = False) -> list[dict]:
+                dry_run: bool = False, confirm: bool = False) -> tuple[list[dict], list[dict]]:
+        """→ (rows inserted — or validated on dry_run —, typo flags)."""
         _writable(d)
         errors = list(pre_errors or [])
         clean: list[dict] = []
+        flagged: list[dict] = []
         for i, r in enumerate(rows, 1):
             line = r.get("line", i) if isinstance(r, dict) else i
             try:
@@ -359,6 +399,9 @@ def create_admin_app(store: Store, cfg: LevelConfig,
                     raise LevelValidationError("row must be an object")
                 f, _ = _clean_new(r)
                 clean.append(f)
+                flag = _typo(f["symbol"], f.get("price"))
+                if flag:
+                    flagged.append({"line": line, **flag})
             except LevelValidationError as ex:
                 errors.append({"line": line, "error": str(ex)})
         if not rows and not errors:
@@ -366,9 +409,11 @@ def create_admin_app(store: Store, cfg: LevelConfig,
         if errors:
             raise _BulkError(sorted(errors, key=lambda x: (x.get("line") or 0)))
         if dry_run:
-            return clean
+            return clean, flagged
+        if flagged and not confirm:
+            raise _NeedsConfirm(flagged)
         # all-or-nothing: one transaction in PgStore, validate-then-insert in MemoryStore
-        return store.add_levels(d, clean, today())
+        return store.add_levels(d, clean, today()), flagged
 
     def _converted(d: date) -> list[dict]:
         try:
@@ -406,15 +451,12 @@ def create_admin_app(store: Store, cfg: LevelConfig,
         for r in entered:
             rid = str(r["id"])
             c = by_parent.get(rid)
-            warn = None
-            if editable and r.get("price") is not None and pcs.get(r["symbol"]) is None:
-                warn = f"no prior close for {r['symbol']}; ±{pct:g}% guard not applied"
-            levels.append({**r, "converted": c, "warning": warn,
+            levels.append({**r, "converted": c, "warning": None,
                            "outcome": outcomes.get(rid)})
         parent_ids = {str(r["id"]) for r in entered}
         unmatched = [c for c in converted if str(c.get("converted_from")) not in parent_ids]
         return {"trade_date": d, "today": t, "read_only": not editable,
-                "ratio": _ratio(d, converted), "prior_close": pcs, "levels": levels,
+                "ratio": _ratio(d, converted), "last_price": pcs, "levels": levels,
                 "converted": converted, "unmatched_converted": unmatched,
                 "summary": summary, "outcomes": outcomes}
 
@@ -454,6 +496,9 @@ def create_admin_app(store: Store, cfg: LevelConfig,
         body: dict[str, Any] = {"error": _msg(exc)}
         if isinstance(exc, _BulkError):
             body["errors"] = exc.errors
+        if isinstance(exc, _NeedsConfirm):
+            body["needs_confirm"] = True
+            body["flagged"] = exc.flagged
         return JSONResponse(body, status_code=_status_for(exc))
 
     def _j(obj: Any, status: int = 200) -> JSONResponse:
@@ -467,7 +512,8 @@ def create_admin_app(store: Store, cfg: LevelConfig,
     # ---- HTML ----
     def _render(request: Request, d: date, *, status: int = 200, msg: str | None = None,
                 err: str | None = None, errors: list[dict] | None = None,
-                bulk_text: str = "") -> HTMLResponse:
+                bulk_text: str = "", confirm: dict | None = None,
+                add_values: dict | None = None) -> HTMLResponse:
         nonce = getattr(request.state, "nonce", "")
         day = _day(d)
         ro = day["read_only"]
@@ -494,15 +540,29 @@ def create_admin_app(store: Store, cfg: LevelConfig,
                 a("<ul>" + "".join(f"<li>line {e(x.get('line'))}: {e(x.get('error'))}</li>"
                                    for x in errors) + "</ul>")
             a("</div>")
+        if confirm:
+            # typo check: nothing saved; offer a one-click re-post of the same values
+            fl = confirm["flagged"]
+            a("<div class='msg warn' id=typo><b>Not saved — "
+              f"{'this price looks' if len(fl) == 1 else 'these prices look'} like a typo "
+              f"(more than ±{e(f'{float(cfg.typo_check_pct):g}')}% from the last trade):</b><ul>")
+            for x in fl:
+                ln = f"line {e(x['line'])}: " if x.get("line") is not None else ""
+                a(f"<li>{ln}{e(x['message'])}</li>")
+            a(f"</ul><form method=post action='{e(confirm['action'])}' class=bar>")
+            for k, v in confirm["fields"].items():
+                a(f"<input type=hidden name='{e(k)}' value='{e(v)}'>")
+            a("<input type=hidden name=confirm value=1><button type=submit>Save anyway</button>"
+              "<span class=mut>or fix it below and submit again</span></form></div>")
 
         r = day["ratio"]
         rtxt = (f"{r['value']:.4f} ({'locked' if r['locked'] else 'provisional'})"
                 if r["value"] else "not set yet")
         a(f"<p class=mut>SPX/SPY ratio: {e(rtxt)}")
         if not ro:
-            pcs = day["prior_close"]
+            pcs = day["last_price"]
             parts = [f"{s} {_num(pcs[s])}" if pcs.get(s) else f"{s} unknown" for s in SYMBOLS]
-            a(f" · prior close: {e(' · '.join(parts))} (guard ±{e(f'{pct:g}')}%)")
+            a(f" · last price: {e(' · '.join(parts))}")
         a("</p>")
 
         # levels table
@@ -547,7 +607,7 @@ def create_admin_app(store: Store, cfg: LevelConfig,
         if not ro:
             dv = e(d.isoformat())
             a("<h2>Add a level</h2><form method=post action='/levels' class=grid>"
-              f"<input type=hidden name=date value='{dv}'>" + _fields_html({"symbol": "SPY"}) +
+              f"<input type=hidden name=date value='{dv}'>" + _fields_html(add_values or {"symbol": "SPY"}) +
               "<button type=submit>Add</button></form>")
             a("<h2>Bulk paste</h2>"
               f"<p class=mut>One per line: <code>{e(GRAMMAR)}</code>. Also "
@@ -629,7 +689,16 @@ def create_admin_app(store: Store, cfg: LevelConfig,
             return _render(request, today(), status=400, err=str(ex))
         return _render(request, d, msg=msg)
 
-    def _form_fail(request: Request, d: date, ex: Exception, bulk_text: str = "") -> HTMLResponse:
+    _REPOST_KEYS = ("date", *USER_FIELDS, "text")
+
+    def _form_fail(request: Request, d: date, ex: Exception, bulk_text: str = "",
+                   action: str = "", form: dict | None = None,
+                   prefill_add: bool = False) -> HTMLResponse:
+        if isinstance(ex, _NeedsConfirm):
+            fields = {k: v for k, v in (form or {}).items() if k in _REPOST_KEYS}
+            return _render(request, d, status=409, bulk_text=bulk_text,
+                           confirm={"action": action, "fields": fields, "flagged": ex.flagged},
+                           add_values=ex.fields if prefill_add else None)
         return _render(request, d, status=_status_for(ex), err=_msg(ex),
                        errors=getattr(ex, "errors", None), bulk_text=bulk_text)
 
@@ -639,9 +708,9 @@ def create_admin_app(store: Store, cfg: LevelConfig,
         d = today()
         try:
             d = _parse_date(form.get("date"))
-            row = op_add(d, form)
-        except (PastDateError, LevelValidationError, _BadRequest) as ex:
-            return _form_fail(request, d, ex)
+            row = op_add(d, form, confirm=_truthy(form.get("confirm")))
+        except (PastDateError, LevelValidationError, _BadRequest, _NeedsConfirm) as ex:
+            return _form_fail(request, d, ex, action="/levels", form=form, prefill_add=True)
         return _back(d, f"Added {_label(row)}")
 
     @app.post("/levels/bulk")
@@ -651,9 +720,9 @@ def create_admin_app(store: Store, cfg: LevelConfig,
         try:
             d = _parse_date(form.get("date"))
             rows, perrs = parse_bulk_text(text)
-            done = op_bulk(d, rows, perrs)
-        except (PastDateError, LevelValidationError, _BadRequest) as ex:
-            return _form_fail(request, d, ex, bulk_text=text)
+            done, _ = op_bulk(d, rows, perrs, confirm=_truthy(form.get("confirm")))
+        except (PastDateError, LevelValidationError, _BadRequest, _NeedsConfirm) as ex:
+            return _form_fail(request, d, ex, bulk_text=text, action="/levels/bulk", form=form)
         return _back(d, f"Imported {len(done)} level(s)")
 
     def _level_date(level_id: str) -> date:
@@ -665,9 +734,9 @@ def create_admin_app(store: Store, cfg: LevelConfig,
         form = await _form(request)
         d = _level_date(level_id)
         try:
-            row = op_edit(level_id, form)
-        except (PastDateError, LevelValidationError, KeyError, _Conflict) as ex:
-            return _form_fail(request, d, ex)
+            row = op_edit(level_id, form, confirm=_truthy(form.get("confirm")))
+        except (PastDateError, LevelValidationError, KeyError, _Conflict, _NeedsConfirm) as ex:
+            return _form_fail(request, d, ex, action=f"/levels/{level_id}/edit", form=form)
         return _back(d, f"Saved {_label(row)}")
 
     @app.post("/levels/{level_id}/delete")
@@ -688,7 +757,7 @@ def create_admin_app(store: Store, cfg: LevelConfig,
         except _BadRequest as ex:
             return _jerr(ex)
         return _j({k: day[k] for k in ("trade_date", "today", "read_only", "ratio",
-                                        "prior_close", "levels", "converted")})
+                                        "last_price", "levels", "converted")})
 
     @app.post("/api/levels")
     async def api_add(request: Request):
@@ -696,8 +765,8 @@ def create_admin_app(store: Store, cfg: LevelConfig,
             body = await _json(request)
             if not isinstance(body, dict):
                 raise _BadRequest("body must be a JSON object")
-            row = op_add(_parse_date(body.get("date")), body)
-        except (PastDateError, LevelValidationError, _BadRequest) as ex:
+            row = op_add(_parse_date(body.get("date")), body, confirm=_truthy(body.get("confirm")))
+        except (PastDateError, LevelValidationError, _BadRequest, _NeedsConfirm) as ex:
             return _jerr(ex)
         return _j(row, 201)
 
@@ -715,10 +784,11 @@ def create_admin_app(store: Store, cfg: LevelConfig,
             else:
                 rows, perrs = parse_bulk_text(str(body.get("text") or ""))
             dry = bool(body.get("dry_run"))
-            out = op_bulk(d, rows, perrs, dry_run=dry)
-        except (PastDateError, LevelValidationError, _BadRequest) as ex:
+            out, flagged = op_bulk(d, rows, perrs, dry_run=dry, confirm=_truthy(body.get("confirm")))
+        except (PastDateError, LevelValidationError, _BadRequest, _NeedsConfirm) as ex:
             return _jerr(ex)
-        return _j({"trade_date": d, "dry_run": dry, "levels": out}, 200 if dry else 201)
+        return _j({"trade_date": d, "dry_run": dry, "levels": out, "flagged": flagged},
+                  200 if dry else 201)
 
     @app.patch("/api/levels/{level_id}")
     async def api_edit(request: Request, level_id: str):
@@ -726,8 +796,9 @@ def create_admin_app(store: Store, cfg: LevelConfig,
             body = await _json(request)
             if not isinstance(body, dict):
                 raise _BadRequest("body must be a JSON object")
-            row = op_edit(level_id, body)
-        except (PastDateError, LevelValidationError, KeyError, _Conflict, _BadRequest) as ex:
+            row = op_edit(level_id, body, confirm=_truthy(body.get("confirm")))
+        except (PastDateError, LevelValidationError, KeyError, _Conflict, _BadRequest,
+                _NeedsConfirm) as ex:
             return _jerr(ex)
         return _j(row)
 

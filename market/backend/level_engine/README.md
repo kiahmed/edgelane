@@ -68,11 +68,11 @@ first if it holds admin port 8790.
 | Module | Role |
 |---|---|
 | `main.py` | entrypoint: read listener (`READ_PORT`, compose network only) + admin listener (`ADMIN_PORT`, host loopback) + tick loop in one asyncio loop; SIGTERM → graceful stop |
-| `feed.py` | `FeedClient` — `GET /internal/feed/{symbol}` with `X-Internal-Token`; new-ts dedupe; status ok / stale (> 3×TICK_SEC without a new ts) / down; prior closes for the admin ±5% guard |
+| `feed.py` | `FeedClient` — `GET /internal/feed/{symbol}` with `X-Internal-Token`; new-ts dedupe; status ok / stale (> 3×TICK_SEC without a new ts) / down; latest SPY / SPX trade (`prior_close`) — the admin page's reference and its typo-check price |
 | `tick.py` | `TickRunner` — one deterministic tick: session gate → ratio → levels/clusters → state machine → scenario → `lvl_ticks` row (filtered chain) → brain → persist. Session-close tick, `maybe_close` fallback, `warm_start` (restart safety) |
 | `read_api.py` | `GET /levels/decision/{symbol}`, `/levels/day/{date}`, `/levels/trace/{symbol}` (+ `/healthz`); everything else 404 |
 | `replay.py` | `run_replay(source, cfg, date)` + CLI; levels as of each tick from `lvl_level_audit`; `--config-b` diff; `--memory` dry run |
-| `admin.py` / `levels_cli.py` | Level Engine Management page + `make levels-show / levels-import` |
+| `admin.py` / `levels_cli.py` | Level Engine Management page + `make levels-show / levels-import`. Soft typo check (§17): a new / edited level > ±`TYPO_CHECK_PCT` % (default 30, 0 = off) from the latest trade isn't saved until confirmed — page **Save anyway**, JSON 409 `needs_confirm` → resend `"confirm": true`, `levels_cli import --force` |
 | `config.py`, `store.py`, `clock.py`, `levels.py`, `ratio.py`, `state_machine.py`, `scenario.py`, `context.py` | config, storage contract (MemoryStore / PgStore), SPY→SPX conversion + clusters, ratio lock, §7.1 state machine, §7.2 scenario, brain seam |
 
 ## Determinism notes

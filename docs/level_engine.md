@@ -498,7 +498,7 @@ strategy and R/R agents replay exactly. Built in phase 1, before any decision lo
 
 ## 17. Risks and guards
 
-- **Bad levels** (typo): admin validates price within ±5% of the prior close.
+- **Bad levels** (typo): soft typo check, no hard guard (the ±5% guard was removed 2026-11-23 — it rejected valid levels after big days). A new or edited level more than ±`TYPO_CHECK_PCT` % (default 30; 0 = off) from the latest SPY / SPX trade is not saved until confirmed: the admin page shows e.g. "SPY 72.48 is 90% below the last trade 722.29 — typo?" with a one-click **Save anyway**; the JSON API answers 409 `needs_confirm` (resend with `"confirm": true`; bulk `dry_run` lists the flags); `levels_cli import` exits 1 unless `--force`. Unknown last trade → no check. The page also shows the latest trade next to the table.
 - **Feed outage:** no tick, no decision; status `stale`; legs stay open.
 - **Ratio drift:** locked at 09:35 by design.
 - **Thresholds untested:** every default (`BUFFER_PTS`, `KNIFE_PTS`, `HOLD_MIN`,

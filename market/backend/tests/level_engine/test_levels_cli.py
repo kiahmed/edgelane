@@ -146,10 +146,11 @@ def test_cli_import_and_show(wired, tmp_path, capsys):
 def test_cli_import_server_refusal_inserts_nothing(wired, tmp_path, capsys):
     store, _ = wired
     f = tmp_path / "levels.txt"
-    f.write_text("SPY 595.2 ok\nSPY 700 typo\n")  # 700 is outside ±5% of 595
-    assert cli.main(["import", str(f)]) == 1
-    assert store.list_levels(TODAY) == []
-    assert "line 2" in capsys.readouterr().err
+    f.write_text("SPY 595.2 ok\nSPY 700 also ok\n")
+    # the server refuses the whole batch (past date is read-only) — nothing lands
+    assert cli.main(["import", str(f), "--date", "2020-01-02"]) == 1
+    assert store.list_levels(TODAY) == [] and store.list_levels(__import__("datetime").date(2020, 1, 2)) == []
+    assert "read-only" in capsys.readouterr().err
 
 
 def test_cli_import_local_parse_error_sends_nothing(wired, tmp_path, capsys):
@@ -180,3 +181,33 @@ def test_base_url_from_env(monkeypatch):
     monkeypatch.setenv(cli.ENV_URL, "http://localhost:9000/")
     c = cli.AdminClient()
     assert c.base == "http://localhost:9000" and c.origin == "http://localhost:9000"
+
+
+# ---- typo check ------------------------------------------------------------------
+def test_cli_typo_flag_exits_1_without_force(wired, tmp_path, capsys):
+    store, seen = wired
+    f = tmp_path / "levels.txt"
+    f.write_text("SPY 595.2 ok\nSPY 72.48 fat finger\n")
+    assert cli.main(["import", str(f)]) == 1
+    assert store.list_levels(TODAY) == []
+    err = capsys.readouterr().err
+    assert "line 2: SPY 72.48 is 87.8% below the last trade 595.00" in err and "--force" in err
+    assert seen[-1][:2] == ("POST", "/api/levels/bulk")  # the server did the check
+    # dry run lists the flags too and signals them
+    assert cli.main(["import", str(f), "--dry-run"]) == 1
+    cap = capsys.readouterr()
+    assert "would import 2" in cap.out and "line 2:" in cap.err
+    assert store.list_levels(TODAY) == []
+
+
+def test_cli_typo_flag_inserts_with_force(wired, tmp_path, capsys):
+    store, seen = wired
+    f = tmp_path / "levels.txt"
+    f.write_text("SPY 595.2 ok\nSPY 72.48 fat finger\n")
+    assert cli.main(["import", str(f), "--force"]) == 0
+    assert sorted(x["price"] for x in store.list_levels(TODAY)) == [72.48, 595.2]
+    method, path, headers = seen[-1]
+    assert (method, path) == ("POST", "/api/levels/bulk")
+    assert headers["Origin"] == "http://127.0.0.1:8790"
+    out = capsys.readouterr().out
+    assert "imported 2" in out and "forced past 1" in out

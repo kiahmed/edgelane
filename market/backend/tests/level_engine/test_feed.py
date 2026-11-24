@@ -105,11 +105,22 @@ def test_prior_close_from_last_feed():
     fc = _client(be, clock)
     assert fc.prior_close("SPX") is None
     fc.fetch()
-    assert fc.prior_close("SPX") == 6990.5 and fc.prior_close("spy") == 699.1
+    # latest trade first (SPX spot 7000), prevclose only as fallback (no spy_spot here)
+    assert fc.prior_close("SPX") == 7000.0 and fc.prior_close("spy") == 699.1
     assert fc.prior_close("NDX") is None
     be.status = 503
     fc.fetch()                                          # a failed fetch keeps the last good
-    assert fc.prior_close("SPX") == 6990.5
+    assert fc.prior_close("SPX") == 7000.0
+
+
+def test_guard_reference_after_a_big_day_uses_last_trade():
+    # 2026-11-23 after hours: Tradier prevclose still = the session BEFORE today
+    # (SPY 689.81) while SPY closed 722.29 — a valid 724.48 level must pass.
+    fc = _client(Backend(), Clock())
+    fc.last_feed = {"spot": 7237.17, "spy_spot": 722.29,
+                    "spx_prevclose": 6910.39, "spy_prevclose": 689.81}
+    assert fc.prior_close("SPY") == 722.29 and fc.prior_close("SPX") == 7237.17
+    assert abs(724.48 / fc.prior_close("SPY") - 1) < 0.05
 
 
 def test_parse_ts():

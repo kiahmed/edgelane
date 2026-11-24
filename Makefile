@@ -323,6 +323,7 @@ deploy-data-restore: ## Restore that tarball into the volume on a new host
 #   make levels-import FILE=levels.csv         CSV (symbol,price,name,kind,condition_text)
 #                                              or bulk text ("SPY 595.20 PM high [support]")
 #   make levels-import FILE=levels.txt DRY=1   validate only, insert nothing
+#   make levels-import FILE=levels.txt FORCE=1 also import lines > ±TYPO_CHECK_PCT from the last trade
 #
 # Container (compose service facades-levels-engine, profile `levels`). Every
 # call passes --profile levels; the plain deploy targets never start it.
@@ -340,9 +341,9 @@ LVL_ADMIN   = http://127.0.0.1:$(or $(LEVEL_ADMIN_PORT),8790)
 levels-show: ## Show a day's levels via the admin API: [DATE=YYYY-MM-DD]
 	@cd $(BACKEND) && $(LVL_PY) -m level_engine.levels_cli show $(if $(DATE),--date $(DATE))
 
-levels-import: ## Import levels from a CSV / bulk-text file: FILE=levels.csv [DATE=YYYY-MM-DD] [DRY=1]
-	@test -n "$(FILE)" || { echo "usage: make levels-import FILE=levels.csv [DATE=YYYY-MM-DD] [DRY=1]"; exit 2; }
-	@cd $(BACKEND) && $(LVL_PY) -m level_engine.levels_cli import "$(abspath $(FILE))" $(if $(DATE),--date $(DATE)) $(if $(DRY),--dry-run)
+levels-import: ## Import levels from a CSV / bulk-text file: FILE=levels.csv [DATE=YYYY-MM-DD] [DRY=1] [FORCE=1]
+	@test -n "$(FILE)" || { echo "usage: make levels-import FILE=levels.csv [DATE=YYYY-MM-DD] [DRY=1] [FORCE=1]"; exit 2; }
+	@cd $(BACKEND) && $(LVL_PY) -m level_engine.levels_cli import "$(abspath $(FILE))" $(if $(DATE),--date $(DATE)) $(if $(DRY),--dry-run) $(if $(FORCE),--force)
 
 levels-replay: ## Replay a recorded day through the level engine: DATE=YYYY-MM-DD [CONFIG=…] [CONFIG_B=…]
 	@test -n "$(DATE)" || { echo "usage: make levels-replay DATE=YYYY-MM-DD [CONFIG=path] [CONFIG_B=path]"; exit 2; }

@@ -28,5 +28,8 @@ HIT_TOL_PTS=2.0
 # least-privilege Postgres roles (docs §5.1) — never the service_role key
 LVL_DB_URL=
 LVL_REPLAY_DB_URL=
+# §17 admin typo check: a new / edited level more than ±this % from the latest trade is
+# not saved until confirmed ("Save anyway" / JSON "confirm": true / levels_cli --force). 0 = off
+TYPO_CHECK_PCT=30
 READ_PORT=8791
 ADMIN_PORT=8790
