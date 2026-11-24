@@ -47,3 +47,32 @@ def _torque_ticker_setup():
     tcfg._SETUP.update(saved_rows)
     tcfg._SETUP_STATE.clear()
     tcfg._SETUP_STATE.update(saved_state)
+
+
+# ---------------------------------------------------------------------------
+# Level-engine switches are pinned OFF whenever the REAL edgelane_market.config
+# is loaded under pytest. That file may run Matrix in
+# MATRIX_DECISION_SOURCE=levels with the feed on; tests must not inherit it.
+# Only loads of the real default file are touched — tests that build Settings(...)
+# directly, pass an explicit path, or point EDGELANE_MARKET_CONFIG at a temp
+# file keep full control (that's how the level-mode tests opt in).
+# ---------------------------------------------------------------------------
+import os  # noqa: E402
+
+from app import config as _app_config  # noqa: E402
+
+_PINNED_OFF = {"matrix_decision_source": "engine", "level_feed_enabled": False,
+               "internal_feed_token": ""}
+_orig_load_settings = _app_config.load_settings
+
+
+def _load_settings_pinned(path=None):
+    s = _orig_load_settings(path)
+    env_path = os.environ.get("EDGELANE_MARKET_CONFIG")
+    real = path is None and (not env_path or
+                             Path(env_path).resolve() == Path(_app_config._DEFAULT_CONFIG).resolve())
+    return s.model_copy(update=_PINNED_OFF) if real else s
+
+
+_app_config.load_settings = _load_settings_pinned
+_app_config._cached = None
