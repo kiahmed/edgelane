@@ -23,6 +23,7 @@ import re
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
+from .. import level_accuracy, level_view
 from ..config import get_settings
 from ..poller import state as poller_state
 
@@ -59,13 +60,30 @@ def _snapshot_or_404(symbol: str) -> tuple[str, dict]:
     return sym, snap
 
 
+async def _view_snapshot_or_404(symbol: str) -> tuple[str, dict]:
+    """`_snapshot_or_404`, then — levels mode, SPX — the level-view COPY
+    (level_view.level_snapshot): pick + grid from the level engine, the poller
+    cache untouched. Engine mode returns the cached snapshot as before."""
+    sym, snap = _snapshot_or_404(symbol)
+    settings = get_settings()
+    if sym == level_view.LEVELS_SYMBOL and level_view.levels_mode(settings):
+        snap = await level_view.level_snapshot(settings, snap)
+    return sym, snap
+
+
 def _accuracy_view(sym: str) -> tuple[dict, dict]:
     """(trust, stats) for the self-eval blocks, reusing the accuracy route's own
-    logic rather than restating the tiering rules here."""
+    logic rather than restating the tiering rules here.
+
+    Sync. In levels mode (SPX) it reads the LAST level stats this process
+    fetched (level_accuracy.cached_stats — refreshed by every evaluator pass);
+    async callers use `_accuracy_view_async`, which fetches."""
     from .. import main as _main
     from .accuracy import _tier, _trust_state
 
     settings = get_settings()
+    if level_accuracy.applies(settings, sym):
+        return level_accuracy.accuracy_view(level_accuracy.cached_stats(), settings, sym)
     db = getattr(_main, "_db", None)
     if db is None:
         return {}, {}
@@ -81,8 +99,21 @@ def _accuracy_view(sym: str) -> tuple[dict, dict]:
     return trust, stats
 
 
-def _state_block(snap: dict, block: str, sym: str) -> dict:
-    """Slice one block out of the cached snapshot. Read-only projections."""
+async def _accuracy_view_async(sym: str) -> tuple[dict, dict]:
+    """`_accuracy_view`, fetching fresh level stats in levels mode (engine mode:
+    exactly `_accuracy_view(sym)`)."""
+    settings = get_settings()
+    if level_accuracy.applies(settings, sym):
+        stats = await level_accuracy.level_stats(settings)
+        return level_accuracy.accuracy_view(stats, settings, sym)
+    return _accuracy_view(sym)
+
+
+def _state_block(snap: dict, block: str, sym: str,
+                 accuracy: tuple[dict, dict] | None = None) -> dict:
+    """Slice one block out of the cached snapshot. Read-only projections.
+    `accuracy` = a precomputed (trust, stats) for the bias / win_eval blocks
+    (levels mode); None → `_accuracy_view(sym)`."""
     bias = snap.get("bias") or {}
     if block == "pick":
         pick = snap.get("engine_pick") or {}
@@ -107,7 +138,7 @@ def _state_block(snap: dict, block: str, sym: str) -> dict:
             } if best else None
         return {"expiration": snap.get("expiration"), "grid": grid}
     if block == "bias":
-        trust, _ = _accuracy_view(sym)
+        trust, _ = accuracy if accuracy is not None else _accuracy_view(sym)
         return {
             "bias_label": bias.get("bias_label"),
             "directional_score": bias.get("directional_score"),
@@ -117,7 +148,7 @@ def _state_block(snap: dict, block: str, sym: str) -> dict:
             "trust": trust or None,
         }
     if block == "win_eval":
-        trust, stats = _accuracy_view(sym)
+        trust, stats = accuracy if accuracy is not None else _accuracy_view(sym)
         return {"trust": trust or None, "stats": stats or None}
     if block == "walls":
         return {
@@ -143,8 +174,12 @@ async def matrix_state_block(symbol: str, block: str = Query(default="pick")):
     if block not in _STATE_BLOCKS:
         raise HTTPException(422, f"invalid block {block!r}; allowed: "
                             f"{', '.join(_STATE_BLOCKS)}")
-    sym, snap = _snapshot_or_404(symbol)
-    return {"symbol": sym, "block": block, "data": _state_block(snap, block, sym)}
+    sym, snap = await _view_snapshot_or_404(symbol)
+    accuracy = None
+    if block in ("bias", "win_eval") and level_accuracy.applies(get_settings(), sym):
+        accuracy = await _accuracy_view_async(sym)
+    return {"symbol": sym, "block": block,
+            "data": _state_block(snap, block, sym, accuracy=accuracy)}
 
 
 @router.get("/matrix/snap/{symbol}", dependencies=_API_TOKEN_GATE,
@@ -157,8 +192,8 @@ async def matrix_snap(symbol: str, view: str = Query(default="engine_pick")):
     if view not in snap_mod.VIEWS:
         raise HTTPException(422, f"invalid view {view!r}; allowed: "
                             f"{', '.join(snap_mod.VIEWS)}")
-    sym, snap = _snapshot_or_404(symbol)
+    sym, snap = await _view_snapshot_or_404(symbol)
     trust = stats = None
     if view in ("bias_chip", "win_eval_grid"):
-        trust, stats = _accuracy_view(sym)
+        trust, stats = await _accuracy_view_async(sym)
     return HTMLResponse(snap_mod.render_snap_card(snap, view, trust=trust, stats=stats))

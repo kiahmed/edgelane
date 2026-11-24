@@ -4,6 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Request
 
+from .. import level_view
 from ..poller import state as poller_state
 from ..tradier_client import get_rate_limit_state
 
@@ -55,7 +56,8 @@ async def status(request: Request):
         "version": "0.1.0",
         "market_open": is_open,
         "market_reason": reason,
-        "symbols": s.symbols,
+        # The Matrix symbol dropdown reads this; levels mode = SPX only (§3.4).
+        "symbols": level_view.level_symbols(s, s.symbols),
         "poll_interval_sec": s.poll_interval_sec,
         "tradier_env": s.tradier_env,
         "using_mock": using_mock,

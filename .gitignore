@@ -110,4 +110,4 @@ simmer_analysis_*.json
 simmer_demo_*.json
 # Drafted social posts + their board snapshots — local marketing scratch.
 simmer/posts/
-market/backend/level_engine/level_engine.config
+market/backend/level_engine/facades_levels_engine.config

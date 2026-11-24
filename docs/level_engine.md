@@ -72,16 +72,16 @@ Tradier ── backend poller (only caller) ──► PollerState (spot, 0DTE ch
 
 ### 3.1 Container and listeners
 
-New compose service `edgelane-level-engine` (same image build context, own
+New compose service `facades-levels-engine` (same image build context, own
 entrypoint). It runs **two separate listeners** (two ASGI apps), so a route can
 never be reached through the wrong door:
 
 | Listener | Container bind | Published | Serves |
 |---|---|---|---|
-| **Read API** | `0.0.0.0:8791` | **not published** — compose network only | `GET /levels/decision/{symbol}`, `GET /levels/day/{date}`, `GET /levels/trace/{symbol}` — read-only |
+| **Read API** | `0.0.0.0:8791` | **not published** — compose network only | `GET /levels/decision/{symbol}`, `GET /levels/day/{date}`, `GET /levels/trace/{symbol}`, `GET /levels/stats/{symbol}` (recent closed legs + hit rates, for the outcomes tile) — read-only |
 | **Admin** | `0.0.0.0:8790` | `127.0.0.1:8790:8790` (host loopback only) | the admin page (§10) and every write (levels add / edit / delete / import) |
 
-Own config `level_engine.config` (§4). Database access through a least-privilege
+Own config `facades_levels_engine.config` (§4). Database access through a least-privilege
 role (§5.1), never the service_role key.
 
 ### 3.2 Data feed (no duplicate API calls)
@@ -108,28 +108,42 @@ role (§5.1), never the service_role key.
 - All state is written to the `lvl_*` tables (§5).
 - The read API (§3.1) serves the latest pick, a day, and the trace.
 - The backend exposes `/levels/*` to Matrix as an **allow-list proxy**: exactly
-  the three GETs above, forwarded to the read listener only (never the admin
+  the four GETs above, forwarded to the read listener only (never the admin
   port), behind the **same auth / entitlement as `/snapshot`**. Anything else under
   `/levels/` is 404. No Cloudflare change.
 
-### 3.4 Matrix switch
+### 3.4 Matrix switch (revised 2026-11-23 — "levels" means everything follows levels)
 
 - `MATRIX_DECISION_SOURCE=engine|levels` (backend config, default `engine`).
-- `levels`: `/snapshot/SPX` returns the level pick **in `engine_pick`** and the
-  legacy pick in `engine_pick_legacy` — **response-only swap**. Persisted
-  `bias_decisions`, the legacy evaluator, `matrix_signals`, posts, the Matrix
-  ledger and snap cards (`matrix_ledger`, `/matrix/snap`) **stay on the legacy
-  pick** — said explicitly so nobody expects them to follow the tile.
-- **Order dialog:** it must pre-fill and place **the pick that is shown**. Today
-  `routes/orders.py::_lookup_candidate` resolves a candidate by strategy + label
-  from the legacy engine's `strategies`; with `levels` it must resolve level picks
-  from the level engine (by `pick_id`, carried in the level pick). This is a
-  required backend change in phase 3 — without it, placing a level pick would fail
-  or place the wrong structure.
-- The tile shows a `Level engine` label and one small legacy line; no layout change.
-- Bias, walls, spot and strategy-grid tiles render exactly as today. NDX untouched.
+  `engine` = today, byte-identical. `levels` = **every decision Matrix shows or
+  emits comes from the level engine**; the legacy engine is kept only as a **data
+  service** (GEX/DEX/walls/flow — the bias computation the level engine already
+  consumes through the feed). Legacy code stays in place, inactive; it is retired
+  after a few good runs.
+- With `levels`:
+  - **Symbols:** only SPX is polled (NDX and any other `SYMBOLS` entry are
+    dropped while `levels` is on; `engine` keeps the configured list).
+  - **Engine-pick tile:** the level pick. **Strategy grid:** the level candidates
+    (§8.4 set) in the grid's existing shape (`strategies[strategy].best`, one card
+    per strategy; the `extreme` sibling in `all_widths`). Wait / done → empty grid.
+  - **Health slot** on the cards shows the R/R-based health (§8.4).
+  - **Outcomes / self-eval tile, win rate, trust state** (`/accuracy/SPX`, same
+    contract): from level legs (§12) via the read API's stats route.
+  - **Signals / posts (`matrix_signals`), Matrix ledger, snap cards
+    (`/matrix/state`, `/matrix/snap`), daily email:** follow the level pick and
+    level grading (`pick_result` keyed by `pick_id`).
+  - **Legacy evaluator does not grade** (no silent shadow grading); the poller
+    stops capturing a gradable legacy pick. Its archive / daily-email loop keeps
+    running, fed by level grading.
+  - **Bias, walls, spot tiles** render as today (they are the data service).
+  - The poller's cached snapshot is never mutated (the internal feed keeps
+    sending the legacy output to the level engine); each consumer gets a
+    level-view copy.
+- **Order dialog:** places **the pick / card that is shown**, resolved from the
+  level engine by `pick_id` (tile and grid); never falls back to a legacy candidate.
+- No layout change.
 
-## 4. Config — `level_engine.config` (KEY=VALUE, gitignored, `.example` committed)
+## 4. Config — `facades_levels_engine.config` (KEY=VALUE, gitignored, `.example` committed)
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -157,8 +171,9 @@ role (§5.1), never the service_role key.
 | `MIN_DWELL_MIN` | `5` | minimum time between flips |
 | `MAX_REPASS` | `2` | manager follow-up passes per tick |
 | `REACH` | `both` | risk/reward computes `near` and `extreme` |
-| `LVL_DB_URL` | — | Postgres DSN of the `level_engine_rw` role (§5.1) — **not** the service_role key |
-| `LVL_REPLAY_DB_URL` | — | DSN of the `level_engine_replay` role (§14) |
+| `HIT_TOL_PTS` | `2.0` | grading (§12): a directional leg wins when spot comes within this many SPX points of its target before the leg ends |
+| `LVL_DB_URL` | — | Postgres DSN of the `facades_levels_engine_rw` role (§5.1) — **not** the service_role key |
+| `LVL_REPLAY_DB_URL` | — | DSN of the `facades_levels_engine_replay` role (§14) |
 | `READ_PORT` / `ADMIN_PORT` | `8791` / `8790` | listeners (§3.1) |
 
 ## 5. Data model (Supabase, new tables, prefix `lvl_`)
@@ -172,16 +187,16 @@ role (§5.1), never the service_role key.
 | `lvl_evidence` | `trade_date`, `ts`, `agent`, `scenario` (up\|down\|range), `weight` (−1…+1), `kind`, `detail` (jsonb), `reason` (text) | the shared board |
 | `lvl_beliefs` | `trade_date`, `ts`, `p_up`, `p_down`, `p_range`, `call`, `target_level_id`, `invalidation_level_id`, `confidence`, `trace` (text) | one row per tick |
 | `lvl_picks` | `trade_date`, `ts`, `pick` (jsonb, `engine_pick` shape + level fields) | on change only |
-| `lvl_legs` | `id`, `trade_date`, `opened_at`, `call`, `target_level_id`, `invalidation_level_id`, `entry_spot`, `pick` (jsonb), `closed_at`, `result` (win\|loss\|flipped\|unresolved), `progress_pct`, `mae_pts`, `time_to_target_min`, `strategy_pnl` | grading (§12) |
+| `lvl_legs` | `id`, `trade_date`, `opened_at`, `call`, `target_level_id`, `invalidation_level_id`, `entry_spot`, `exit_spot`, `target_level` / `invalidation_level` (jsonb {price,name}), `pick` (jsonb), `closed_at`, `result` (win\|loss — binary, §12; old flipped\|unresolved rows tolerated), `close_reason` (target\|invalidation\|flipped\|session_close\|zone_held\|zone_exit), `progress_pct`, `mae_pts`, `time_to_target_min`, `strategy_pnl` | grading (§12) |
 | `lvl_day_summary` | `trade_date`, `close`, `final_zone`, `levels_outcome` (jsonb: per level held/failed/broken/contested/untested), `legs` (counts), `notes` | end of day (§13), read-only after close |
 
 ### 5.1 Database roles (least privilege)
 
-- `level_engine_rw`: LOGIN, no superuser / bypassrls; `select, insert, update,
+- `facades_levels_engine_rw`: LOGIN, no superuser / bypassrls; `select, insert, update,
   delete` on `lvl_*` only (and `usage` on the schema). Its DSN is the only
   credential the container gets. It has no access to any other table — notably
   not broker or user data. (Same pattern as the poster `poster_dedupe_rw` role.)
-- `level_engine_replay`: `select` on the live `lvl_*` tables, all privileges on
+- `facades_levels_engine_replay`: `select` on the live `lvl_*` tables, all privileges on
   schema `lvl_replay` only. It **cannot write live tables**, by grant (§14).
 - RLS on every `lvl_*` table with policies for these roles only; no anon /
   authenticated grants (Matrix reads via the backend proxy, not PostgREST).
@@ -348,6 +363,14 @@ Posts `rr` evidence (doesn't move direction beliefs; informs the pick).
   (net debit, breakevens, max loss = debit, EV, POP) so `composite_score` works.
 - Strikes are **rebuilt only** when every level on one side has been passed
   (targets achieved) or the day's levels are edited.
+- **Health = R/R to the level** (revised 2026-11-23). The legacy health rule
+  marks every debit at DTE ≤ 2 `broken` and measures max profit at expiry over the
+  full width, so it never fits a 0DTE level trade. Level picks set
+  `health` from `rr_profit = (value_at_target − cost) / cost` (§8.3, near reach):
+  `≥ 0.60` healthy, `0.30–0.60` thin, `< 0.30` capital_trap (the legacy debit
+  bands, applied to the level target); no DTE veto. Set before `composite_score`
+  (so the badge ranks on it); the scorer's own value is kept as `health_legacy`.
+  The card shows R/R in the health slot. Limit-premium tiers unchanged.
 
 ### 8.5 Manager (orchestrator)
 
@@ -417,18 +440,23 @@ Same keys as `engine_pick` (§2), plus:
 The tile shows one compact line for `rr`:
 `Near: risk $310 → +$900 at 7,280 · Extreme: risk $85 → +$1,400 at 7,320`.
 
-## 12. Grading (event-based, by level)
+## 12. Grading (event-based, by level — binary, revised 2026-11-23)
 
 - A **leg** opens when the manager makes a call (up/down/range) with a pick.
-- It closes on the first of: **target reached** → `win`; **invalidation reached** →
-  `loss`; the manager flips → `flipped` (graded by `progress_pct`); session close →
-  `unresolved` (graded by progress and strategy P&L).
-- Recorded: time to target, max adverse excursion, strategy P&L at close of leg
-  (legs repriced from the feed's contracts).
-- Range legs: `win` if price stays inside the zone until the close or the call
-  changes; `loss` if it leaves.
-- Stats: hit rate per call type and **per level name** (which level names work).
-- The legacy evaluator (`EVAL_WINDOW_MIN`, rolling regime) is untouched.
+- **Directional legs are binary:** `win` if spot comes within `HIT_TOL_PTS`
+  (default 2.0 SPX pts ≈ daily ATR × 0.03, the Confluencer `levelTol`; SPY levels
+  are graded in SPX space, so ≈ $0.20 on SPY) of the target level before the leg
+  ends; otherwise `loss`. The leg ends on the first of: target hit (`win`),
+  invalidation broken (`loss`), call flips (`loss` unless the target was hit),
+  session close (`loss` unless hit). `close_reason` records which
+  (`target | invalidation | flipped | session_close`).
+- **Range legs:** `win` if price holds the zone until the call changes or the
+  close; `loss` if it leaves (`close_reason` `zone_held | zone_exit`).
+- Recorded: time to target, max adverse excursion, progress %, strategy P&L at
+  close (legs repriced from the feed's contracts).
+- Win rate = wins / (wins + losses). Stats: hit rate per call type and **per level
+  name**. Served by `GET /levels/stats/{symbol}` for Matrix's outcomes tile.
+- With `MATRIX_DECISION_SOURCE=levels` the legacy evaluator does not grade (§3.4).
 
 ## 13. End of day
 
@@ -440,7 +468,7 @@ Read-only afterwards. (Using it to seed the next day is a later feature.)
 
 `make levels-replay DATE=YYYY-MM-DD [CONFIG=…]` re-runs the whole pipeline over
 that day's `lvl_ticks` (spot, ratio, the stored `chain` and `bias`) and that day's
-levels with a given config. It connects as `level_engine_replay`, which can only
+levels with a given config. It connects as `facades_levels_engine_replay`, which can only
 **read** live `lvl_*` tables and **write** schema `lvl_replay` (§5.1) — so a replay
 can't touch live data by construction, not just by a parameter. It prints the
 legs and results and can diff two configs. Because ticks carry the chain, the

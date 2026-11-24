@@ -114,6 +114,11 @@ class MatrixSignalState:
         self.day_best: dict[str, dict] = {}
         self.day_worst: dict[str, dict] = {}
         self.day_best_pick: dict[str, dict] = {}     # the full best pick, for its card
+        # Levels mode only (MATRIX_DECISION_SOURCE=levels): the regime replayed
+        # from level legs ({"alert", "consec_wins"}), set by each evaluation
+        # pass. Present ⇒ _recovery_earned reads it instead of the legacy
+        # evaluator's counters (which never move in levels mode).
+        self.level_regime: dict[str, dict] = {}
 
     def reset(self) -> None:
         for d in (self.last_pick_key, self.cur_pick_key, self.cur_pick_polls,
@@ -122,7 +127,7 @@ class MatrixSignalState:
                   self.last_trust_state, self.last_win_tier,
                   self.last_regime_alert, self.session_open_date, self.last_digest_at,
                   self.last_digest_grid, self.last_recap_date, self.day_date,
-                  self.day_best, self.day_worst, self.day_best_pick):
+                  self.day_best, self.day_worst, self.day_best_pick, self.level_regime):
             d.clear()
 
 
@@ -164,10 +169,14 @@ def _fire(symbol: str, state_name: str, expiry: Any = None,
         try:
             if frozen is not None and matrix_events.is_enabled():
                 eid = matrix_events.event_id(symbol, state_name, None, disc)
+                extra: dict[str, Any] = {}
+                acc = await _level_accuracy_for(symbol)
+                if acc is not None:          # levels mode: the level engine's record
+                    extra["accuracy"] = acc
                 row = await asyncio.to_thread(
                     matrix_ledger.build_row, event_id=eid, symbol=symbol,
                     state=state_name, expiry=expiry, attrs=attrs, snap=frozen,
-                    card_pick=frozen_pick, event_at=event_at)
+                    card_pick=frozen_pick, event_at=event_at, **extra)
                 if not await matrix_ledger.record(row):
                     # No row, no message: a poster woken for an event it can't
                     # read would only log an error.
@@ -183,6 +192,18 @@ def _fire(symbol: str, state_name: str, expiry: Any = None,
     _INFLIGHT.add(task)                        # hold a ref; asyncio only weakrefs tasks
     task.add_done_callback(_INFLIGHT.discard)
     return state_name
+
+
+async def _level_accuracy_for(symbol: str) -> tuple[dict, dict] | None:
+    """Levels mode (SPX): the (trust, stats) a ledger row / card shows, from the
+    level engine's grading. Engine mode: None (build_row reads the legacy
+    grader itself, as before)."""
+    from . import level_accuracy
+    from .config import get_settings
+    if not level_accuracy.applies(get_settings(), symbol):
+        return None
+    from .routes.matrix import _accuracy_view_async
+    return await _accuracy_view_async(str(symbol).upper())
 
 
 async def drain(timeout: float = 10.0) -> None:
@@ -206,7 +227,13 @@ def _pick_key(pick: dict) -> str:
     Falls back to strategy/label/strikes when a snapshot carries no legs.
 
     Composite score is deliberately excluded: it drifts every poll, so folding
-    it in would make every single poll look like a brand-new pick."""
+    it in would make every single poll look like a brand-new pick.
+
+    A LEVEL pick (levels mode, `source == "levels"`) is keyed by its `pick_id`
+    — the identity the level engine grades its legs under (§3.4), so a
+    pick_result resolves against the same thing the chip announced."""
+    if pick.get("source") == "levels" and pick.get("pick_id"):
+        return f"pick_id:{pick.get('pick_id')}"
     legs = pick.get("legs")
     if legs:
         try:
@@ -257,6 +284,11 @@ def _recovery_earned(sym: str) -> bool:
     is how you end up posting the same broken idea repeatedly. Mirrors the
     earned-recovery rule `win_rate_notable` already uses — the pause must be
     off AND there must be a real graded win behind it."""
+    lvl = state.level_regime.get(sym)
+    if lvl is not None:                  # levels mode: the level-leg regime
+        if lvl.get("alert"):
+            return False
+        return int(lvl.get("consec_wins") or 0) >= 1
     from .evaluator import state as evaluator_state
     if evaluator_state.regime_alert_active_by_symbol.get(sym, False):
         return False
@@ -502,6 +534,12 @@ async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
         sym = str(snap.get("symbol") or "").upper()
         if not sym:
             return published
+        if settings is not None and "level_decision" not in snap:
+            from . import level_accuracy
+            if level_accuracy.applies(settings, sym):
+                # Levels mode: every post follows the LEVEL pick / grid — the
+                # level-view copy (the poller's cache is never mutated).
+                snap = await _level_view_snap(settings, snap)
         expiry = snap.get("expiration")
         pick = snap.get("engine_pick") or {}
         bias = snap.get("bias") or {}
@@ -545,13 +583,18 @@ async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
                         # Close the loop later: report how THIS pick ended.
                         # The full pick is kept so the result's card shows THIS
                         # pick, not whatever the engine is showing by then.
-                        state.pending_results.setdefault(sym, []).append({
+                        entry = {
                             "key": key, "expiry": expiry, "summary": summary,
                             "pick": copy.deepcopy(pick),
                             "since": state.cur_pick_since.get(sym)
                                      or datetime.now(timezone.utc),
                             "announced_at": datetime.now(timezone.utc),
-                        })
+                        }
+                        if pick.get("source") == "levels":
+                            # Resolved against the level leg graded under it.
+                            entry["pick_id"] = pick.get("pick_id")
+                            entry["call"] = pick.get("call")
+                        state.pending_results.setdefault(sym, []).append(entry)
 
         # 2. session_open — the first persisted poll of a new ET day whose call
         #    and put walls have resolved, within the first hour of the session.
@@ -597,14 +640,110 @@ async def on_snapshot(snap: dict, settings: Any = None) -> list[str]:
     return published
 
 
+def _trust_and_rate_events(sym: str, expiry: Any, snap: dict, trust: dict, graded: int,
+                           pct: float, wins: Any, losses: Any, alert: bool,
+                           consec_wins: Any, min_graded: int, green: float,
+                           red: float) -> list[str]:
+    """Signals 4/5 (bias_aligned | bias_diverged) and 6 (win_rate_notable) for
+    one symbol, and the last-published markers they gate on. Shared by the
+    legacy sweep and the levels pass — only the record they read differs."""
+    from .routes.accuracy import _tier
+
+    published: list[str] = []
+    # 4/5. bias_aligned | bias_diverged — the trust relationship flipped.
+    #      in_sync is "aligned"; everything else (low_conf, calibrating,
+    #      paused) is "diverged". Fires on the transition, not per poll.
+    cur_state = str(trust.get("state") or "")
+    prev_state = state.last_trust_state.get(sym)
+    if prev_state is not None and cur_state != prev_state:
+        was, now = prev_state == "in_sync", cur_state == "in_sync"
+        if was != now:
+            ev = "bias_aligned" if now else "bias_diverged"
+            # Not every flip is news. The engine posts a bias change only
+            # when it says something true and worth showing:
+            #   aligned  — bias agrees AND the record behind it clears
+            #              the show bar (else "it agrees" means nothing)
+            #   diverged — only a real PAUSE (a genuine loss streak) off a
+            #              record we had been showing. low_conf/calibrating
+            #              wobbles are noise, never posted.
+            good = _record_worth_showing(trust.get("win_rate") if now else pct,
+                                         graded, min_graded)
+            if now:
+                meaningful = good
+                why = "record below the show bar"
+            else:
+                prior_good = _record_worth_showing(
+                    state.last_win_rate.get(sym), state.last_graded.get(sym),
+                    min_graded)
+                meaningful = cur_state == "paused" and prior_good
+                why = ("not a real pause" if cur_state != "paused"
+                       else "no shown record to retract")
+            if not meaningful:
+                log.info("[matrix-signals] %s %s suppressed (%s>%s, %s)",
+                         sym, ev, prev_state, cur_state, why)
+                ev = None
+        if was != now and ev:
+            published.append(_fire(sym, ev, expiry, snap=snap,
+                                   disc=matrix_events.discriminator(
+                f"{prev_state}>{cur_state}"), attrs={
+                "trust_state": cur_state,
+                "previous_state": prev_state,
+                "win_rate": str(trust.get("win_rate") or ""),
+                "graded": str(graded),
+                "hint": str(trust.get("hint_text") or ""),
+            }))
+    state.last_trust_state[sym] = cur_state
+    state.last_win_rate[sym] = trust.get("win_rate")
+    state.last_graded[sym] = graded
+
+    # 6. win_rate_notable — only when earned (§3). Either rule suffices.
+    prev_alert = state.last_regime_alert.get(sym)
+    tier = _tier(pct, graded, green, red)
+    prev_tier = state.last_win_tier.get(sym)
+
+    # Recovery = the pause just lifted AND the number the post will show
+    # is genuinely good on a real sample. Without the pct floor, 2 wins
+    # in a row could announce a 10% record as "notable".
+    lifted = prev_alert is True and alert is False
+    recovered = (lifted and graded >= min_graded
+                 and pct > _SHOW_MIN_WIN_PCT)
+    crossed_green = (prev_tier is not None and prev_tier != "green"
+                     and tier == "green" and graded >= min_graded)
+    if lifted and not recovered:
+        log.info("[matrix-signals] %s win_rate_notable suppressed "
+                 "(recovery at %.0f%% over %d graded — below the %.0f%% bar)",
+                 sym, pct, graded, _SHOW_MIN_WIN_PCT)
+    if recovered or crossed_green:
+        reason = "recovery" if recovered else "win_streak"
+        published.append(_fire(sym, "win_rate_notable", expiry, snap=snap,
+                               disc=matrix_events.discriminator(reason), attrs={
+            "reason": reason,
+            "win_rate": f"{pct:.0f}",
+            "graded": str(graded),
+            "wins": str(wins or 0),
+            "losses": str(losses or 0),
+            "consec_wins": str(consec_wins),
+        }))
+    state.last_regime_alert[sym] = alert
+    state.last_win_tier[sym] = tier
+    return published
+
+
 async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
     """Evaluator-side transitions, called at the end of the existing sweep.
 
     The sweep is the one place that already holds the before/after of the regime
     counters, so it can tell "did this just change" without re-deriving it
-    (docs/matrix_events_update.md §3). Never raises."""
+    (docs/matrix_events_update.md §3). Never raises.
+
+    Levels mode (MATRIX_DECISION_SOURCE=levels): the record is the level
+    engine's binary leg grades — see `_on_evaluation_levels`."""
+    from . import level_accuracy
+    if level_accuracy.levels_mode(settings):
+        return await _on_evaluation_levels(db, poller_state, settings)
+
     from .evaluator import state as evaluator_state
-    from .routes.accuracy import _trust_state, _tier
+    from .routes.accuracy import _trust_state
 
     published: list[str] = []
     try:
@@ -629,83 +768,12 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
             pct = float(stats.get("accuracy_pct") or 0.0)
             trust = _trust_state(sym, graded, pct, settings)
 
-            # 4/5. bias_aligned | bias_diverged — the trust relationship flipped.
-            #      in_sync is "aligned"; everything else (low_conf, calibrating,
-            #      paused) is "diverged". Fires on the transition, not per poll.
-            cur_state = str(trust.get("state") or "")
-            prev_state = state.last_trust_state.get(sym)
-            if prev_state is not None and cur_state != prev_state:
-                was, now = prev_state == "in_sync", cur_state == "in_sync"
-                if was != now:
-                    ev = "bias_aligned" if now else "bias_diverged"
-                    # Not every flip is news. The engine posts a bias change only
-                    # when it says something true and worth showing:
-                    #   aligned  — bias agrees AND the record behind it clears
-                    #              the show bar (else "it agrees" means nothing)
-                    #   diverged — only a real PAUSE (a genuine loss streak) off a
-                    #              record we had been showing. low_conf/calibrating
-                    #              wobbles are noise, never posted.
-                    good = _record_worth_showing(trust.get("win_rate") if now else pct,
-                                                 graded, min_graded)
-                    if now:
-                        meaningful = good
-                        why = "record below the show bar"
-                    else:
-                        prior_good = _record_worth_showing(
-                            state.last_win_rate.get(sym), state.last_graded.get(sym),
-                            min_graded)
-                        meaningful = cur_state == "paused" and prior_good
-                        why = ("not a real pause" if cur_state != "paused"
-                               else "no shown record to retract")
-                    if not meaningful:
-                        log.info("[matrix-signals] %s %s suppressed (%s>%s, %s)",
-                                 sym, ev, prev_state, cur_state, why)
-                        ev = None
-                if was != now and ev:
-                    published.append(_fire(sym, ev, expiry, snap=snap,
-                                           disc=matrix_events.discriminator(
-                        f"{prev_state}>{cur_state}"), attrs={
-                        "trust_state": cur_state,
-                        "previous_state": prev_state,
-                        "win_rate": str(trust.get("win_rate") or ""),
-                        "graded": str(graded),
-                        "hint": str(trust.get("hint_text") or ""),
-                    }))
-            state.last_trust_state[sym] = cur_state
-            state.last_win_rate[sym] = trust.get("win_rate")
-            state.last_graded[sym] = graded
-
-            # 6. win_rate_notable — only when earned (§3). Either rule suffices.
             alert = bool(evaluator_state.regime_alert_active_by_symbol.get(sym, False))
-            prev_alert = state.last_regime_alert.get(sym)
-            tier = _tier(pct, graded, green, red)
-            prev_tier = state.last_win_tier.get(sym)
-
-            # Recovery = the pause just lifted AND the number the post will show
-            # is genuinely good on a real sample. Without the pct floor, 2 wins
-            # in a row could announce a 10% record as "notable".
-            lifted = prev_alert is True and alert is False
-            recovered = (lifted and graded >= min_graded
-                         and pct > _SHOW_MIN_WIN_PCT)
-            crossed_green = (prev_tier is not None and prev_tier != "green"
-                             and tier == "green" and graded >= min_graded)
-            if lifted and not recovered:
-                log.info("[matrix-signals] %s win_rate_notable suppressed "
-                         "(recovery at %.0f%% over %d graded — below the %.0f%% bar)",
-                         sym, pct, graded, _SHOW_MIN_WIN_PCT)
-            if recovered or crossed_green:
-                reason = "recovery" if recovered else "win_streak"
-                published.append(_fire(sym, "win_rate_notable", expiry, snap=snap,
-                                       disc=matrix_events.discriminator(reason), attrs={
-                    "reason": reason,
-                    "win_rate": f"{pct:.0f}",
-                    "graded": str(graded),
-                    "wins": str(stats.get("wins") or 0),
-                    "losses": str(stats.get("losses") or 0),
-                    "consec_wins": str(evaluator_state.consec_wins_by_symbol.get(sym, 0)),
-                }))
-            state.last_regime_alert[sym] = alert
-            state.last_win_tier[sym] = tier
+            published.extend(_trust_and_rate_events(
+                sym, expiry, snap, trust, graded, pct,
+                stats.get("wins"), stats.get("losses"), alert,
+                evaluator_state.consec_wins_by_symbol.get(sym, 0),
+                min_graded, green, red))
 
             # 8. pick_result — how each posted pick actually ended.
             published.extend(_resolve_pick_results(sym, db, snap))
@@ -738,4 +806,218 @@ async def on_evaluation(db: Any, poller_state: Any, settings: Any) -> list[str]:
                                            card_pick=state.day_best_pick.get(sym)))
     except Exception:
         log.exception("[matrix-signals] on_evaluation failed (ignored)")
+    return published
+
+
+# ── levels mode (docs/level_engine.md §3.4, §12) ────────────────────────────
+
+async def _level_view_snap(settings: Any, snap: dict) -> dict:
+    """The level-view copy of a poller snapshot (pick + grid from the level
+    engine). Already a level view → as is. Any failure → the snapshot with NO
+    pick and an empty grid: levels mode never posts a legacy pick."""
+    if "level_decision" in snap:
+        return snap
+    from . import level_view
+    try:
+        return await level_view.level_snapshot(settings, snap)
+    except Exception:
+        log.exception("[matrix-signals] level view failed — posting no pick")
+        out = dict(snap)
+        out["engine_pick"] = None
+        out["strategies"] = {}
+        out["level_decision"] = {"status": "unavailable"}
+        return out
+
+
+def _ts_utc(v: Any) -> datetime | None:
+    from .level_accuracy import _parse_ts
+    return _parse_ts(v)
+
+
+def _match_level_leg(legs: list[dict], open_leg: dict | None, p: dict) -> tuple[str, dict | None]:
+    """('closed', leg) | ('open', None) | ('none', None) for one announced
+    level pick. By `pick_id` — the leg graded under the announced pick, closed
+    after its run began. Fallback (the pick was re-struck mid-leg, so its id is
+    not the leg's opening id): the leg of the same call that was live when the
+    pick was announced."""
+    pid = p.get("pick_id")
+    since = (p.get("since") or p["announced_at"]) - timedelta(seconds=90)
+    announced = p["announced_at"]
+    if open_leg and pid and open_leg.get("pick_id") == pid:
+        return "open", None
+    hits = []
+    for leg in legs:
+        closed = _ts_utc(leg.get("closed_at"))
+        if pid and leg.get("pick_id") == pid and closed and closed >= since:
+            hits.append((closed, leg))
+    if hits:
+        return "closed", min(hits, key=lambda h: h[0])[1]
+    call = p.get("call")
+    if open_leg and call and open_leg.get("call") == call:
+        opened = _ts_utc(open_leg.get("opened_at"))
+        if opened and opened <= announced:
+            return "open", None
+    for leg in legs:
+        opened, closed = _ts_utc(leg.get("opened_at")), _ts_utc(leg.get("closed_at"))
+        if (call and leg.get("call") == call and opened and closed
+                and opened <= announced <= closed):
+            return "closed", leg
+    return "none", None
+
+
+def _resolve_level_pick_results(sym: str, stats: dict, snap: dict | None = None) -> list[str]:
+    """Levels mode pick_result: each announced level pick, resolved by the
+    level leg graded under its `pick_id` — binary win / loss (C2), with the
+    leg's entry / exit spot, strategy P&L, hold and close reason."""
+    from . import level_accuracy as la
+
+    published: list[str] = []
+    pending = state.pending_results.get(sym) or []
+    if not pending:
+        return published
+    now = datetime.now(timezone.utc)
+    legs = la.closed_legs(stats)
+    ol = stats.get("open_leg") if isinstance(stats.get("open_leg"), dict) else None
+    open_leg = la.normalize_leg(ol) if ol else None
+    keep: list[dict] = []
+    for p in pending:
+        age_h = (now - p["announced_at"]).total_seconds() / 3600.0
+        status, leg = _match_level_leg(legs, open_leg, p)
+        if leg is None:
+            if age_h < _RESULT_MAX_WAIT_HOURS:
+                keep.append(p)          # still open / not graded yet
+            else:
+                log.info("[matrix-signals] %s pick_result dropped (no level leg "
+                         "closed within %.0fh)", sym, _RESULT_MAX_WAIT_HOURS)
+            continue
+        opened, closed = _ts_utc(leg.get("opened_at")), _ts_utc(leg.get("closed_at"))
+        held = ((closed - opened).total_seconds() / 60.0) if (opened and closed) else 0.0
+        if held < _ANNOUNCE_MIN_HOLD_MIN:
+            log.info("[matrix-signals] %s pick_result not posted (held %.1fm — not a trade)",
+                     sym, held)
+            continue
+        result = str(leg.get("result") or "")
+        if result not in ("win", "loss"):
+            continue
+        tgt = leg.get("target_level") if isinstance(leg.get("target_level"), dict) else {}
+        pnl = leg.get("strategy_pnl")
+        attrs = dict(p.get("summary") or {})
+        attrs.update({
+            "result": result,
+            "entry_premium": "",
+            "exit_premium": "",
+            "favorable_delta": "" if pnl is None else str(pnl),
+            "held_minutes": f"{held:.0f}",
+            "announced_at": p["announced_at"].isoformat(),
+            "source": "levels",
+            "pick_id": str(p.get("pick_id") or ""),
+            "leg_id": str(leg.get("id") or ""),
+            "call": str(leg.get("call") or ""),
+            "entry_spot": "" if leg.get("entry_spot") is None else str(leg.get("entry_spot")),
+            "exit_spot": "" if leg.get("exit_spot") is None else str(leg.get("exit_spot")),
+            "strategy_pnl": "" if pnl is None else str(pnl),
+            "close_reason": str(leg.get("close_reason") or ""),
+            "target_level": str(tgt.get("name") or ""),
+            "target_price": "" if tgt.get("price") is None else str(tgt.get("price")),
+        })
+        published.append(_fire(sym, "pick_result", p.get("expiry"), attrs,
+                               disc=matrix_events.discriminator(p["key"]),
+                               snap=snap, card_pick=p.get("pick")))
+    state.pending_results[sym] = keep
+    return published
+
+
+def _leg_rank(leg: dict) -> tuple:
+    try:
+        pnl = float(leg.get("strategy_pnl"))
+    except (TypeError, ValueError):
+        pnl = float("-inf")
+    try:
+        prog = float(leg.get("progress_pct"))
+    except (TypeError, ValueError):
+        prog = float("-inf")
+    return (leg.get("result") == "win", pnl, prog)
+
+
+def _leg_summary(leg: dict) -> dict[str, str]:
+    pick = leg.get("pick") if isinstance(leg.get("pick"), dict) else None
+    base = _pick_summary(pick or {
+        "strategy": leg.get("strategy"), "label": leg.get("label"),
+        "structure_text": leg.get("structure_text")})
+    tgt = leg.get("target_level") if isinstance(leg.get("target_level"), dict) else {}
+    pnl = leg.get("strategy_pnl")
+    base.update({
+        "result": str(leg.get("result") or ""),
+        "strategy_pnl": "" if pnl is None else str(pnl),
+        "close_reason": str(leg.get("close_reason") or ""),
+        "target_level": str(tgt.get("name") or ""),
+        "pick_id": str(leg.get("pick_id") or ""),
+    })
+    return base
+
+
+async def _level_daily_recap(sym: str, settings: Any, snap: dict, expiry: Any,
+                             today: str) -> list[str]:
+    """daily_recap from the finished day's level legs: headlined by the best
+    leg (a win, then strategy P&L), the worst riding along. Engine
+    unreachable → retried next pass (not marked done)."""
+    from . import level_accuracy as la
+
+    recap_for = state.day_date.get(sym)
+    if not (recap_for and recap_for != today and state.last_recap_date.get(sym) != recap_for):
+        return []
+    day = await la.level_day(settings, recap_for)
+    if day is None:
+        return []
+    state.last_recap_date[sym] = recap_for
+    legs = [la.normalize_leg(r) for r in (day.get("legs") or []) if isinstance(r, dict)]
+    legs = [l for l in legs if l.get("result") in ("win", "loss")]
+    if not legs:
+        return []
+    best = max(legs, key=_leg_rank)
+    worst = min(legs, key=_leg_rank)
+    wins = sum(1 for l in legs if l["result"] == "win")
+    attrs = {"session_date": recap_for, "headline": "best", "source": "levels",
+             "wins": str(wins), "losses": str(len(legs) - wins),
+             "win_rate": f"{100.0 * wins / len(legs):.0f}"}
+    attrs.update({f"best_{k}": v for k, v in _leg_summary(best).items()})
+    attrs.update({f"worst_{k}": v for k, v in _leg_summary(worst).items()})
+    card = best.get("pick") if isinstance(best.get("pick"), dict) else state.day_best_pick.get(sym)
+    return [_fire(sym, "daily_recap", expiry, attrs, snap=snap, card_pick=card)]
+
+
+async def _on_evaluation_levels(db: Any, poller_state: Any, settings: Any) -> list[str]:
+    """Levels-mode evaluation pass (SPX only — the level engine's symbol):
+    trust / win-rate transitions from the level stats, pick_result by pick_id,
+    daily_recap from the day's legs. Engine unreachable → nothing changes
+    (no transition is inferred from an outage). Never raises."""
+    from . import level_accuracy as la
+
+    published: list[str] = []
+    try:
+        sym = la.LEVELS_SYMBOL
+        raw = (getattr(poller_state, "latest_by_symbol", {}) or {}).get(sym)
+        if not raw:
+            return published
+        min_graded = int(getattr(settings, "eval_min_graded", 10))
+        state.min_graded = min_graded
+        green = float(getattr(settings, "pill_green_pct", 60.0))
+        red = float(getattr(settings, "pill_red_pct", 40.0))
+        stats = await la.level_stats(settings)
+        if stats is None:
+            log.debug("[matrix-signals] %s level stats unavailable — signals wait", sym)
+            return published
+        snap = await _level_view_snap(settings, raw)
+        expiry = snap.get("expiration")
+        p = la.accuracy_payload(stats, settings, sym)
+        state.level_regime[sym] = {"alert": bool(p["regime_alert"]),
+                                   "consec_wins": int(p["regime_consec_wins"])}
+        published.extend(_trust_and_rate_events(
+            sym, expiry, snap, p, int(p["n"]), float(p["accuracy_pct"]),
+            p["wins"], p["losses"], bool(p["regime_alert"]), p["regime_consec_wins"],
+            min_graded, green, red))
+        published.extend(_resolve_level_pick_results(sym, stats, snap))
+        published.extend(await _level_daily_recap(sym, settings, snap, expiry, _et_date()))
+    except Exception:
+        log.exception("[matrix-signals] levels on_evaluation failed (ignored)")
     return published

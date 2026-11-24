@@ -33,6 +33,9 @@ _STRATEGY_NAMES = {
     "bull_put": "Bull Put", "bear_call": "Bear Call", "iron_condor": "Iron Condor",
     "iron_butterfly": "Iron Butterfly", "bull_call": "Bull Call", "bear_put": "Bear Put",
     "call_butterfly": "Call Fly", "put_butterfly": "Put Fly",
+    # level-engine candidates (level_engine/strategy.py NAMES, §8.4)
+    "long_call": "Long Call", "long_put": "Long Put",
+    "straddle": "Straddle", "strangle": "Strangle",
 }
 _HEALTH_COLOR = {"healthy": "#34d399", "thin": "#fbbf24", "directional": "#fbbf24",
                  "broken": "#fb7185", "capital_trap": "#fb7185"}
@@ -227,6 +230,18 @@ def _render_engine_pick(snap: dict) -> str:
         _kv("POP", f"{_num(pick.get('pop_pct'), 1)}%"),
         _kv("EV (adj)", _money(pick.get("ev_adjusted"), 3)),
     ])
+    if pick.get("source") == "levels":
+        # A level pick (§11): its target / invalidation and the one-line R/R.
+        tgt = pick.get("target_level") or {}
+        inv = pick.get("invalidation_level") or {}
+        extra = []
+        if isinstance(tgt, dict) and tgt.get("price") is not None:
+            extra.append(_kv("Target", _esc(f"{tgt.get('name') or ''} {_num(tgt.get('price'))}".strip())))
+        if isinstance(inv, dict) and inv.get("price") is not None:
+            extra.append(_kv("Invalidation", _esc(f"{inv.get('name') or ''} {_num(inv.get('price'))}".strip())))
+        if pick.get("rr_line"):
+            extra.append(_kv("Risk / reward", _esc(pick.get("rr_line"))))
+        rows += "".join(extra)
     sub = (f'<div style="color:{_DIM};font-size:13px;margin-bottom:12px;">'
            f'{_esc(name)} · {_esc(pick.get("label"))} · '
            f'<span style="color:{accent};">{_esc(vlabel)}</span></div>')

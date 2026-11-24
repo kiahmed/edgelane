@@ -166,6 +166,32 @@ USE_EXTERNAL_GEX=true
 EXTERNAL_GEX_TIMEOUT_SEC=30
 EXTENSION_POLICY_VERSION=1
 
+# ── Level Engine data feed (docs/level_engine.md §3.2) ──
+# The level-engine container never calls Tradier; it reads GET /internal/feed/SPX
+# from this backend over the compose network. LEVEL_FEED_ENABLED=true makes the
+# poller cache the normalised SPX chain and fetch SPY on the SAME quote call
+# (one batched `SPX,SPY` request — no extra API hit). Off ⇒ poller unchanged.
+# INTERNAL_FEED_TOKEN is the shared secret the level engine sends as the
+# X-Internal-Token header. Blank ⇒ the feed route 404s for every request (fail
+# closed). Requests that came through the Cloudflare tunnel are always refused.
+# Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+# LEVEL_FEED_ENABLED=false
+# INTERNAL_FEED_TOKEN=
+
+# ── Matrix decision source (docs/level_engine.md §3.4) ──
+# engine (default) = today, unchanged. levels = EVERYTHING Matrix shows or emits
+# follows the level engine (SPX only): only SPX is polled (NDX / other SYMBOLS
+# dropped); the engine-pick tile and the strategy grid are the level pick / grid,
+# placed by pick_id; signals, ledger, snap cards, daily email and the outcomes /
+# win-rate tile follow level grading; the legacy evaluator stops grading. The
+# legacy engine stays a data service (spot / bias / walls / the level feed).
+# Level engine unreachable ⇒ NO pick and an empty grid (never the legacy pick).
+# Needs LEVEL_FEED_ENABLED=true. Unknown value ⇒ engine (with a warning).
+# MATRIX_DECISION_SOURCE=engine
+# The level engine's READ listener (compose network only, never the admin port).
+# The /levels/* allow-list proxy and the pick swap call this base and nothing else.
+# LEVEL_ENGINE_READ_URL=http://facades-levels-engine:8791
+
 # ── Torque news-signal ingestion (facades-news-reactor webhook) ──
 # POST /webhook/news_signal always accepts the request; when this is false it
 # logs-and-drops instead of executing. Every account with "news-reactor" in

@@ -45,6 +45,9 @@ _NAMES = {
     "bull_put": "Bull Put", "bear_call": "Bear Call", "iron_condor": "Iron Condor",
     "iron_butterfly": "Iron Butterfly", "bull_call": "Bull Call", "bear_put": "Bear Put",
     "call_butterfly": "Call Fly", "put_butterfly": "Put Fly",
+    # level-engine candidates (level_engine/strategy.py NAMES, §8.4)
+    "long_call": "Long Call", "long_put": "Long Put",
+    "straddle": "Straddle", "strangle": "Strangle",
 }
 
 
@@ -82,9 +85,17 @@ def _replay_pauses(results: list[str], alert_after: int, clear_after: int) -> di
             "longest_losing_streak": worst_streak, "ended_paused": paused}
 
 
-def build_report(db: Any, settings: Any, session_date: date) -> dict:
+def build_report(db: Any, settings: Any, session_date: date,
+                 level_day: dict | None = None) -> dict:
     """The day's numbers for every Matrix symbol. Pure read of the Matrix
-    tables; sync (DuckDB) — call it off the event loop."""
+    tables; sync (DuckDB) — call it off the event loop.
+
+    Levels mode (MATRIX_DECISION_SOURCE=levels): the day's LEVEL legs instead
+    (`level_day` = the /levels/day/{date} body, fetched by send_for) — binary
+    win / loss per leg, by strategy and by target level (§12)."""
+    from . import level_accuracy
+    if level_accuracy.levels_mode(settings):
+        return _build_level_report(db, settings, session_date, level_day)
     start, end = _session_bounds(session_date)
     dwell = int(getattr(settings, "pick_min_dwell_polls", 1) or 1)
     alert_after = int(getattr(settings, "regime_alert_consec_losses", 3))
@@ -115,6 +126,52 @@ def build_report(db: Any, settings: Any, session_date: date) -> dict:
             "any_picks": any(s["picks"] for s in symbols)}
 
 
+def _build_level_report(db: Any, settings: Any, session_date: date,
+                        level_day: dict | None) -> dict:
+    """Levels-mode report: one SPX block from the day's graded level legs."""
+    from . import level_accuracy as la
+    start, end = _session_bounds(session_date)
+    alert_after = int(getattr(settings, "regime_alert_consec_losses", 3))
+    clear_after = int(getattr(settings, "regime_clear_consec_wins", 2))
+    sym = la.LEVELS_SYMBOL
+    if level_day is None:
+        return {"date": session_date.isoformat(), "symbols": [], "any_picks": False,
+                "source": "levels", "unavailable": True}
+    legs = [la.normalize_leg(r) for r in (level_day.get("legs") or []) if isinstance(r, dict)]
+    legs = [l for l in legs if l.get("result") in ("win", "loss")]
+    legs.sort(key=lambda l: str(l.get("closed_at") or l.get("opened_at") or ""))
+    table: dict[str, dict[str, int]] = {}
+    by_level: dict[str, dict[str, int]] = {}
+    for l in legs:
+        table.setdefault(_name(l.get("strategy") or ""), {"win": 0, "loss": 0})[l["result"]] += 1
+        tgt = l.get("target_level") if isinstance(l.get("target_level"), dict) else {}
+        lname = str(tgt.get("name") or "").strip() or "unnamed level"
+        by_level.setdefault(lname, {"win": 0, "loss": 0})[l["result"]] += 1
+    w = sum(1 for l in legs if l["result"] == "win")
+    lo = len(legs) - w
+    try:
+        coverage = db.fetch_session_coverage(sym, start, end)
+    except Exception:
+        log.exception("[matrix-daily] coverage read failed")
+        coverage = {}
+    ds = level_day.get("day_summary") if isinstance(level_day.get("day_summary"), dict) else {}
+    srt = lambda t: dict(sorted(t.items(), key=lambda kv: -sum(kv[1].values())))
+    block = {
+        "symbol": sym,
+        "picks": len(legs),
+        "wins": w, "losses": lo, "neutrals": 0,
+        "right_pct": (round(100.0 * w / (w + lo)) if (w + lo) else None),
+        "table": srt(table),
+        "by_level": srt(by_level),
+        **_replay_pauses([l["result"] for l in legs], alert_after, clear_after),
+        "coverage": coverage,
+        "day_summary": {"close": ds.get("close"), "legs": ds.get("legs")} if ds else None,
+        "source": "levels",
+    }
+    return {"date": session_date.isoformat(), "symbols": [block],
+            "any_picks": bool(legs), "source": "levels"}
+
+
 # ── email ───────────────────────────────────────────────────────────────────
 
 def _headline(s: dict) -> str:
@@ -140,9 +197,70 @@ def _health(s: dict) -> str:
     return f"Watched {first:%-I:%M}–{last:%-I:%M %p} ET{flag}."
 
 
+def _level_headline(s: dict) -> str:
+    if not s["picks"]:
+        return f"{s['symbol']} — no graded legs today."
+    rate = f" · {s['right_pct']}% win rate" if s["right_pct"] is not None else ""
+    pause = (f"Paused {s['pauses']}×" + (f", recovered {s['recoveries']}×" if s["pauses"] else "")
+             if s["pauses"] else "Never paused")
+    return (f"{s['symbol']} — win {s['wins']} · loss {s['losses']} "
+            f"({s['picks']} legs){rate}. {pause}.")
+
+
+def _wl_table(title: str, rows_map: dict) -> str:
+    cell = "padding:4px 10px;border-bottom:1px solid #e5e7eb;text-align:right;"
+    rows = "".join(
+        f"<tr><td style='padding:4px 10px;border-bottom:1px solid #e5e7eb;'>{escape(k)}</td>"
+        f"<td style='{cell}color:#047857;'>{v['win']}</td>"
+        f"<td style='{cell}color:#b91c1c;'>{v['loss']}</td></tr>"
+        for k, v in rows_map.items())
+    return (f"<table style='border-collapse:collapse;font-size:13px;margin:6px 0 4px;'>"
+            f"<tr style='color:#6b7280;font-size:11px;text-transform:uppercase;'>"
+            f"<th style='padding:4px 10px;text-align:left;'>{escape(title)}</th>"
+            f"<th style='padding:4px 10px;text-align:right;'>Win</th>"
+            f"<th style='padding:4px 10px;text-align:right;'>Loss</th></tr>{rows}</table>"
+            ) if rows_map else ""
+
+
+def _render_level_email(report: dict) -> tuple[str, str]:
+    """Levels mode: per-leg binary results — strategy × Win / Loss, then the
+    same by target level name."""
+    d = datetime.fromisoformat(report["date"])
+    score = " · ".join(f"{s['symbol']} {s['wins']}–{s['losses']}" for s in report["symbols"] if s["picks"])
+    subject = f"Matrix daily · {d:%b %-d}" + (f": {score} (win–loss)" if score else "")
+    blocks = []
+    for s in report["symbols"]:
+        ds = s.get("day_summary") or {}
+        close = ""
+        try:
+            if ds.get("close") is not None:
+                close = f"Closed {float(ds['close']):,.2f}. "
+        except (TypeError, ValueError):
+            close = ""
+        blocks.append(
+            f"<div style='margin:0 0 18px;'>"
+            f"<div style='font-size:15px;font-weight:600;color:#111827;'>{escape(_level_headline(s))}</div>"
+            f"{_wl_table('Strategy', s.get('table') or {})}"
+            f"{_wl_table('Level', s.get('by_level') or {})}"
+            f"<div style='font-size:12px;color:#6b7280;'>{escape(close + _health(s))}</div></div>")
+    html = f"""<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:560px;color:#111827;">
+  <div style="font-size:12px;letter-spacing:.08em;color:#059669;font-weight:700;">MATRIX · DAILY SUMMARY</div>
+  <div style="font-size:13px;color:#6b7280;margin:2px 0 16px;">{d:%A, %B %-d, %Y}</div>
+  {''.join(blocks)}
+  <div style="font-size:11px;color:#9ca3af;border-top:1px solid #e5e7eb;padding-top:10px;">
+    One result per leg, graded by the level: a win if price reached the target level before the call ended, otherwise a loss.
+    A snapshot of engine performance, not advice.<br>
+    You're getting this because <b>Daily summary email</b> is on in your Matrix settings — switch it off there anytime.
+  </div>
+</div>"""
+    return subject, html
+
+
 def render_email(report: dict) -> tuple[str, str]:
     """(subject, html). Short on purpose: a headline per symbol, one small
     strategy × result table, one health line."""
+    if report.get("source") == "levels":
+        return _render_level_email(report)
     d = datetime.fromisoformat(report["date"])
     score = " · ".join(f"{s['symbol']} {s['wins']}–{s['losses']}" for s in report["symbols"] if s["picks"])
     subject = f"Matrix daily · {d:%b %-d}" + (f": {score} (right–wrong)" if score else "")
@@ -244,7 +362,18 @@ async def send_for(db: Any, settings: Any, session_date: date) -> str:
         if await asyncio.to_thread(db.matrix_daily_email_handled, session_date):
             _state["handled"] = session_date
             return "already handled"
-        report = await asyncio.to_thread(build_report, db, settings, session_date)
+        from . import level_accuracy
+        if level_accuracy.levels_mode(settings):
+            # Levels mode: the day's level legs. Unreachable → try again on a
+            # later sweep (nothing is marked handled, nothing legacy is sent).
+            level_day = await level_accuracy.level_day(settings, session_date)
+            if level_day is None:
+                log.warning("[matrix-daily] %s level engine unavailable — will retry", session_date)
+                return "retry"
+            report = await asyncio.to_thread(build_report, db, settings, session_date,
+                                             level_day)
+        else:
+            report = await asyncio.to_thread(build_report, db, settings, session_date)
         if not report["any_picks"]:
             # A holiday or an outage: nothing graded, nothing to say.
             await asyncio.to_thread(db.log_matrix_daily_email, session_date, "skipped", 0,

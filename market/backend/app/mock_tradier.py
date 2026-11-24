@@ -3,6 +3,7 @@
 Matches the public interface of `app.tradier_client.TradierClient`:
 
     await client.stock_quote(symbol)        -> dict (quote)         (unwrapped)
+    await client.stock_quotes([syms])       -> {SYM: quote}         (batched)
     await client.option_expirations(symbol) -> list[str]            (dates)
     await client.options_chain(symbol, expiration) -> list[dict]    (contracts)
     await client.close() -> None
@@ -137,6 +138,36 @@ class MockTradierClient:
         return _DEFAULT_SPOTS.get(symbol.upper(), 100.0)
 
     async def stock_quote(self, symbol: str) -> dict:
+        return self._drift_quote(symbol)
+
+    async def stock_quotes(self, symbols: list[str]) -> dict[str, dict]:
+        """Batched quotes (mirrors TradierClient.stock_quotes), keyed by upper
+        symbol, each with a `prevclose` (the undrifted base). Each requested
+        symbol advances its own drift counter exactly as one stock_quote call
+        would, so SPX keeps its existing behaviour. When SPX is in the batch,
+        SPY is pinned to SPX/10 so the SPY→SPX ratio stays deterministic."""
+        syms = [str(s).strip().upper() for s in symbols if s and str(s).strip()]
+        out: dict[str, dict] = {}
+        for sym in syms:
+            if sym == "SPY" and "SPX" in syms:
+                continue
+            q = self._drift_quote(sym)
+            q["prevclose"] = self._spot_for(sym)
+            out[sym] = q
+        if "SPY" in syms:
+            if "SPX" in out:
+                spx = out["SPX"]
+                spot = float(spx["last"]) / 10.0
+                out["SPY"] = {
+                    "symbol": "SPY", "description": "MOCK SPY",
+                    "last": spot, "close": spot,
+                    "bid": spot - 0.01, "ask": spot + 0.01,
+                    "volume": 0, "type": "etf",
+                    "prevclose": float(spx["prevclose"]) / 10.0,
+                }
+        return out
+
+    def _drift_quote(self, symbol: str) -> dict:
         base = self._spot_for(symbol)
         # Deterministic non-monotonic drift in absolute price units:
         #   call 1..5  → +0.4 .. +2.0   (small up)

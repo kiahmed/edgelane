@@ -49,7 +49,9 @@ DATA_DUMP    = deploy/edgelane-data.tar.gz
         doctor vercel-setup check-tunnel vercel-clean \
         simmer-ui-install simmer-ui-dev simmer-ui-build simmer-ui-check \
         simmer-ui-test deploy-simmer simmer-postiz-integrate simmer-fire-event gcloud-setup \
-        bump-version
+        bump-version \
+        levels-show levels-import levels-replay \
+        deploy-levels levels-restart levels-down levels-logs levels-status levels-run-local
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} \
@@ -184,10 +186,13 @@ vercel-clean: ## Delete a Vercel project's old deployments (PROJECT=edgelane-sim
 		exit 1; }
 	@$(DEPLOY_SH) --vercel-clean $(PROJECT) $(ARGS)
 
-# Teardown the whole stack (backend + cloudflared + network). The named
-# edgelane-data volume (DuckDB) is KEPT; add ARGS=-v to also drop it.
-deploy-down: ## Stop + remove the stack, keeping the DB volume (ARGS=-v drops it)
-	@$(COMPOSE) down $(ARGS)
+# Teardown the whole stack (backend + cloudflared + level engine + network). The
+# named edgelane-data volume (DuckDB) is KEPT; add ARGS=-v to also drop it.
+# `--profile levels` is load-bearing: plain `compose down` only removes services
+# of ACTIVE profiles, so it would leave facades-levels-engine running (and then
+# fail to remove the network it is still attached to).
+deploy-down: ## Stop + remove the WHOLE stack incl. the level engine, keeping the DB volume (ARGS=-v drops it)
+	@$(COMPOSE) --profile levels down $(ARGS)
 
 # Remove ONLY the backend container; leaves cloudflared (and the tunnel) running.
 deploy-be-down: ## Remove ONLY the backend (cloudflared keeps running)
@@ -307,6 +312,68 @@ deploy-data-restore: ## Restore that tarball into the volume on a new host
 	@docker run --rm -v $(DATA_VOLUME):/data -v "$(CURDIR)/deploy":/backup \
 		alpine sh -c "rm -rf /data/* && tar xzf /backup/$(notdir $(DATA_DUMP)) -C /data"
 	@echo ">>> restored $(DATA_VOLUME) from $(DATA_DUMP)"
+
+# ---- Level Engine ----
+# Levels for the level engine (docs/level_engine.md §10) — backup / automation
+# path to the admin page. The CLI talks to the admin listener over HTTP
+# (127.0.0.1:8790, override with LEVEL_ADMIN_URL), so it needs no DB
+# credentials. Uses the backend venv's python when it exists, else $(PY).
+#   make levels-show                           today's levels
+#   make levels-show DATE=2026-11-20           a past day (read-only)
+#   make levels-import FILE=levels.csv         CSV (symbol,price,name,kind,condition_text)
+#                                              or bulk text ("SPY 595.20 PM high [support]")
+#   make levels-import FILE=levels.txt DRY=1   validate only, insert nothing
+#
+# Container (compose service facades-levels-engine, profile `levels`). Every
+# call passes --profile levels; the plain deploy targets never start it.
+#   make deploy-levels            preflight → build + (re)create ONLY the engine
+#   make levels-restart           restart it, no rebuild (e.g. after a config edit)
+#   make levels-down              stop + remove ONLY the engine (backend + tunnel stay)
+#   make levels-logs [N=500]      follow its logs
+#   make levels-status            container state + both /healthz + feed/runner status
+#   make levels-run-local         run on the host (CONFIG=…, MEMORY=1 for no DB)
+LVL_PY = $(if $(wildcard $(BACKEND)/.venv/bin/python),.venv/bin/python,$(PY))
+LVL_COMPOSE = $(COMPOSE) --profile levels
+LVL_CONFIG  = $(BACKEND)/level_engine/facades_levels_engine.config
+LVL_ADMIN   = http://127.0.0.1:$(or $(LEVEL_ADMIN_PORT),8790)
+
+levels-show: ## Show a day's levels via the admin API: [DATE=YYYY-MM-DD]
+	@cd $(BACKEND) && $(LVL_PY) -m level_engine.levels_cli show $(if $(DATE),--date $(DATE))
+
+levels-import: ## Import levels from a CSV / bulk-text file: FILE=levels.csv [DATE=YYYY-MM-DD] [DRY=1]
+	@test -n "$(FILE)" || { echo "usage: make levels-import FILE=levels.csv [DATE=YYYY-MM-DD] [DRY=1]"; exit 2; }
+	@cd $(BACKEND) && $(LVL_PY) -m level_engine.levels_cli import "$(abspath $(FILE))" $(if $(DATE),--date $(DATE)) $(if $(DRY),--dry-run)
+
+levels-replay: ## Replay a recorded day through the level engine: DATE=YYYY-MM-DD [CONFIG=…] [CONFIG_B=…]
+	@test -n "$(DATE)" || { echo "usage: make levels-replay DATE=YYYY-MM-DD [CONFIG=path] [CONFIG_B=path]"; exit 2; }
+	@cd $(BACKEND) && $(LVL_PY) -m level_engine.replay --date $(DATE) $(if $(CONFIG),--config "$(abspath $(CONFIG))") $(if $(CONFIG_B),--config-b "$(abspath $(CONFIG_B))")
+
+# Builds the shared image tag (EDGELANE_IMAGE, default edgelane-backend:latest) from
+# current code; the running backend keeps its old container until recreated.
+deploy-levels: deploy-builder ## Preflight, then build + (re)create ONLY the level engine container
+	@ops/levels_preflight.sh $(LVL_CONFIG) $(MARKET_CONFIG)
+	@BUILDX_BUILDER=$(BUILDER) $(LVL_COMPOSE) up -d --no-deps --build facades-levels-engine
+
+levels-restart: ## Restart the level engine container (no rebuild; picks up config edits)
+	@$(LVL_COMPOSE) restart facades-levels-engine
+
+levels-down: ## Stop + remove ONLY the level engine (backend + cloudflared keep running)
+	@$(LVL_COMPOSE) rm -sf facades-levels-engine
+
+levels-logs: ## Follow the level engine logs: [N=200]
+	@$(LVL_COMPOSE) logs -f --tail=$(or $(N),200) facades-levels-engine
+
+levels-status: ## Level engine container state, admin + read /healthz, feed/runner status (read-only)
+	@$(LVL_COMPOSE) ps facades-levels-engine
+	@echo "admin /healthz ($(LVL_ADMIN)): $$(curl -sf -m 3 $(LVL_ADMIN)/healthz || echo DOWN)"
+	@echo "read  /healthz (in-container :8791): $$(docker exec facades-levels-engine curl -sf -m 3 http://localhost:8791/healthz 2>/dev/null || echo DOWN)"
+	@docker exec facades-levels-engine curl -sf -m 3 http://localhost:8791/levels/decision/$(or $(SYMBOL),SPX) 2>/dev/null \
+		| $(PY) -c 'import json,sys; [print(f"  {k:<16} {v}") for k,v in json.load(sys.stdin)["status"].items()]' 2>/dev/null \
+		|| echo "runner status: n/a (engine not running / read API down)"
+
+levels-run-local: ## Run the level engine on the host (dev): [CONFIG=path] [MEMORY=1 = no DB]
+	@cd $(BACKEND) && LEVEL_ENGINE_CONFIG="$(if $(CONFIG),$(abspath $(CONFIG)),level_engine/facades_levels_engine.config)" \
+		$(if $(MEMORY),LEVEL_ENGINE_MEMORY_STORE=1) $(LVL_PY) -m level_engine.main
 
 # ---- Diagnostics ----
 

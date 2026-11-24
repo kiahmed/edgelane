@@ -9,6 +9,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from .. import level_pick
 from ..poller import state as poller_state
 from ..config import get_settings
 from ..auth import get_current_user
@@ -75,6 +76,11 @@ class OrderRequest(BaseModel):
     account_id: str | None = None
     order_type: str | None = None
     confirm: bool = False
+    # Level-engine pick (docs/level_engine.md §3.4): the Matrix tile sends the
+    # pick_id it shows (and source="levels"); resolved from the level engine,
+    # never from the legacy strategies.
+    pick_id: str | None = None
+    source: str | None = None
 
 
 def _lookup_candidate(symbol: str, strategy: str, label: str) -> tuple[dict, dict]:
@@ -94,6 +100,57 @@ def _lookup_candidate(symbol: str, strategy: str, label: str) -> tuple[dict, dic
         labels = sorted({c.get("label") for c in cands if c}) if cands else []
         raise HTTPException(404, f"no '{label}' variant of {strategy} for {sym}; available labels: {labels}")
     return snap, cand
+
+
+_STALE_LEVEL_PICK = "level pick no longer current — refresh"
+
+
+def _is_level_request(req: OrderRequest) -> bool:
+    return bool(req.pick_id) or (req.source or "").strip().lower() == "levels"
+
+
+async def _lookup_level_candidate(req: OrderRequest) -> tuple[dict, dict]:
+    """Resolve a level pick by pick_id from a FRESH level-engine decision —
+    the tile's pick or any grid card (decision.strategies[*].best / all_widths).
+    Stale / flipped / unknown / not-orderable → 409. Never falls back to a
+    legacy candidate."""
+    if getattr(get_settings(), "matrix_decision_source", "engine") != "levels":
+        raise HTTPException(409, "level picks are not enabled (MATRIX_DECISION_SOURCE) — refresh")
+    if not req.pick_id:
+        raise HTTPException(409, f"level order without a pick_id — {_STALE_LEVEL_PICK}")
+    sym = req.symbol.upper()
+    decision = await level_pick.fetch_decision(get_settings(), sym, max_age=0)
+    if decision is None:
+        raise HTTPException(503, "level engine unavailable — nothing was placed; try again")
+    pick = level_pick.find_level_pick(decision, req.pick_id)
+    if pick is None:
+        raise HTTPException(409, _STALE_LEVEL_PICK)
+    if not pick.get("legs"):
+        raise HTTPException(409, f"level candidate {req.pick_id} has no orderable legs — "
+                                 f"{_STALE_LEVEL_PICK}")
+    # The tile sends the pick's strategy, a grid card its grid key (contract C1)
+    # — either names this candidate; anything else is a stale / mismatched card.
+    if req.strategy not in level_pick.level_strategy_names(decision, req.pick_id):
+        raise HTTPException(409, _STALE_LEVEL_PICK)
+    cand = dict(pick)
+    # Level picks carry the legacy engine_pick key `spread_type`; the order
+    # path reads the candidate key `type` (credit/debit).
+    if not cand.get("type") and cand.get("spread_type"):
+        cand["type"] = cand["spread_type"]
+    legacy = poller_state.latest_by_symbol.get(sym) or {}
+    snap = {"symbol": sym, "expiration": pick.get("expiration") or legacy.get("expiration")}
+    return snap, cand
+
+
+async def _resolve_candidate(req: OrderRequest) -> tuple[dict, dict]:
+    if _is_level_request(req):
+        return await _lookup_level_candidate(req)
+    if (getattr(get_settings(), "matrix_decision_source", "engine") == "levels"
+            and req.symbol.upper() == "SPX"):
+        # Levels mode shows nothing legacy (docs/level_engine.md §3.4) — an SPX
+        # order must name the level pick / card it came from.
+        raise HTTPException(409, f"levels mode: SPX orders need the level pick_id — {_STALE_LEVEL_PICK}")
+    return _lookup_candidate(req.symbol, req.strategy, req.candidate_label)
 
 
 def _resolve_account_id(req: OrderRequest) -> str:
@@ -169,7 +226,7 @@ async def _ensure_leg_symbols(legs: list[Leg], symbol: str, expiration: str,
 
 async def _submit_webull(req: OrderRequest, client: WebullClient, preview: bool,
                          account_override: str | None = None) -> dict:
-    snap, cand = _lookup_candidate(req.symbol, req.strategy, req.candidate_label)
+    snap, cand = await _resolve_candidate(req)
     expiration = snap.get("expiration")
     if not expiration:
         raise HTTPException(500, f"snapshot missing expiration for {req.symbol}")
@@ -210,7 +267,7 @@ async def _submit_webull(req: OrderRequest, client: WebullClient, preview: bool,
 async def _submit_order(req: OrderRequest, tradier_client, preview: bool,
                         account_override: str | None = None,
                         per_user: bool = False) -> dict:
-    snap, cand = _lookup_candidate(req.symbol, req.strategy, req.candidate_label)
+    snap, cand = await _resolve_candidate(req)
     if account_override and account_override.strip():
         account_id = account_override.strip()
     elif per_user:
@@ -256,6 +313,8 @@ async def _submit_order(req: OrderRequest, tradier_client, preview: bool,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
+    if len(legs) == 1:
+        payload = _single_leg_payload(payload, order_type)
 
     response = await _post_to_tradier(tradier_client, account_id, payload)
     return {
@@ -266,6 +325,22 @@ async def _submit_order(req: OrderRequest, tradier_client, preview: bool,
         "limit_price": limit_price, "duration": req.duration,
         "payload": payload, "tradier_response": response,
     }
+
+
+def _single_leg_payload(multileg: dict, order_type: str) -> dict:
+    """Tradier's `multileg` class needs 2+ legs; a one-leg structure (the level
+    engine's long call / long put) must go as `class=option` with an un-indexed
+    leg and a market|limit type — same shape Torque's single-option orders use.
+    Built from the already-validated multileg params, so nothing else changes."""
+    p = {k: v for k, v in multileg.items() if not k.endswith("[0]")}
+    p.update({
+        "class": "option",
+        "option_symbol": multileg["option_symbol[0]"],
+        "side": multileg["side[0]"],
+        "quantity": multileg["quantity[0]"],
+        "type": "market" if order_type == "market" else "limit",
+    })
+    return p
 
 
 async def _post_to_tradier(tradier_client, account_id: str, payload: dict) -> dict:

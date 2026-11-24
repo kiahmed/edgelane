@@ -5,6 +5,7 @@ convention the retired legacy single-file config used). Parses inline `#`
 comments outside quoted values. Exposed as an immutable Pydantic settings object.
 """
 from __future__ import annotations
+import logging
 import os
 import re
 from pathlib import Path
@@ -245,6 +246,31 @@ class Settings(BaseModel):
     # Manager `matrix-api-token`). Blank ⇒ those endpoints stay CLOSED (401).
     matrix_api_token: str = Field(default="")
 
+    # --- Level Engine data feed (docs/level_engine.md §3.2) ---
+    # LEVEL_FEED_ENABLED: the poller also caches the normalised SPX chain and
+    # rides SPY on the SPX quote call (one batched `markets/quotes`, no extra
+    # request). Off ⇒ the poller behaves exactly as before.
+    level_feed_enabled: bool = Field(default=False)
+    # INTERNAL_FEED_TOKEN: shared secret the level-engine container presents as
+    # `X-Internal-Token` on GET /internal/feed/{symbol}. Blank ⇒ the route 404s
+    # for every request (fail closed). Secret — never logged or echoed.
+    internal_feed_token: str = Field(default="", repr=False)
+
+    # --- Matrix decision source (docs/level_engine.md §3.4) ---
+    # MATRIX_DECISION_SOURCE: `engine` (default) = today, byte-identical.
+    # `levels` = EVERY decision Matrix shows or emits follows the level engine
+    # (SPX only; revised §3.4): only SPX is polled; /snapshot's engine_pick and
+    # strategies grid are the level pick / grid (nothing legacy shown, even
+    # when the level engine is unreachable); signals / ledger / snap / email /
+    # accuracy follow level grading; the poller stops capturing a gradable
+    # legacy pick. The legacy engine stays a data service (spot / bias / walls
+    # / the level feed). Helpers: app/level_view.py (levels_mode, …).
+    # Unknown values fall back to `engine` with a warning.
+    matrix_decision_source: str = Field(default="engine")
+    # LEVEL_ENGINE_READ_URL: the level engine's READ listener (compose network
+    # only). The /levels/* proxy and the pick swap call this base and nothing else.
+    level_engine_read_url: str = Field(default="http://facades-levels-engine:8791")
+
     # --- Simmer news + sentiment (Phase 3a — see app/simmer_news.py) ---
     # Alpaca Market Data news (free with a paper account at alpaca.markets).
     # Both keys blank → the news refresh is a clean no-op with a data_quality
@@ -446,6 +472,21 @@ class Settings(BaseModel):
         return False
 
 
+_DECISION_SOURCES = ("engine", "levels")
+
+
+def _decision_source(value: str) -> str:
+    """MATRIX_DECISION_SOURCE ∈ engine|levels; anything else → engine (+ warning)."""
+    v = (value or "").strip().lower()
+    if v in _DECISION_SOURCES:
+        return v
+    if not v:
+        return "engine"
+    logging.getLogger("edgelane.market.config").warning(
+        "MATRIX_DECISION_SOURCE=%r is not one of %s — using 'engine'", value, _DECISION_SOURCES)
+    return "engine"
+
+
 def _coerce(raw: dict[str, str]) -> dict[str, Any]:
     out: dict[str, Any] = {}
 
@@ -545,6 +586,13 @@ def _coerce(raw: dict[str, str]) -> dict[str, Any]:
         out["matrix_events_enabled"] = raw["MATRIX_EVENTS_ENABLED"].strip().lower() in ("true", "1", "yes", "on")
     if "MATRIX_EVENTS_TOPIC" in raw:         out["matrix_events_topic"] = raw["MATRIX_EVENTS_TOPIC"].strip()
     if "MATRIX_API_TOKEN" in raw:            out["matrix_api_token"] = raw["MATRIX_API_TOKEN"].strip()
+    if "LEVEL_FEED_ENABLED" in raw:
+        out["level_feed_enabled"] = raw["LEVEL_FEED_ENABLED"].strip().lower() in ("true", "1", "yes", "on")
+    if "INTERNAL_FEED_TOKEN" in raw:         out["internal_feed_token"] = raw["INTERNAL_FEED_TOKEN"].strip()
+    if "MATRIX_DECISION_SOURCE" in raw:
+        out["matrix_decision_source"] = _decision_source(raw["MATRIX_DECISION_SOURCE"])
+    if raw.get("LEVEL_ENGINE_READ_URL", "").strip():
+        out["level_engine_read_url"] = raw["LEVEL_ENGINE_READ_URL"].strip().rstrip("/")
 
     if "ALPACA_KEY_ID" in raw:               out["alpaca_key_id"] = raw["ALPACA_KEY_ID"].strip()
     if "ALPACA_SECRET_KEY" in raw:           out["alpaca_secret_key"] = raw["ALPACA_SECRET_KEY"].strip()

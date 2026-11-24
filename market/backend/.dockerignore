@@ -9,7 +9,15 @@ tests/
 README.md
 *.duckdb
 *.db
-# never ship local config / secrets in the image
+# never ship local config / secrets in the image (these patterns match at ANY
+# depth only with the **/ prefix — .dockerignore globs are rooted at the context)
 *.config
 *.config.*
+**/*.config
+**/*.config.*
 .env
+**/.env
+# explicit: facades_levels_engine.config holds LVL_DB_URL / INTERNAL_FEED_TOKEN
+# (gitignored; bind-mounted at runtime by the facades-levels-engine service).
+# The committed facades_levels_engine.config.example is harmless and also excluded.
+level_engine/facades_levels_engine.config

@@ -440,15 +440,19 @@
     <div class="flex items-center justify-between flex-wrap gap-2">
       <div>
         <span class="text-xs uppercase tracking-wide text-emerald-400">Engine pick</span>
+        <span id="pickSource" class="hidden ml-2 pill bg-sky-500/20 text-sky-200 text-xs">Level engine</span>
         <span id="pickName" class="ml-2 font-bold text-lg">—</span>
         <span id="pickLabel" class="ml-2 text-xs text-slate-400"></span>
       </div>
       <div class="flex items-center gap-2">
         <span id="pickComposite" class="pill bg-emerald-500/20 text-emerald-200">composite —</span>
         <span id="pickVerdict" class="pill bg-slate-700 text-slate-200">—</span>
+        <button id="pickPlaceBtn" type="button" class="hidden btn btn-primary">Place order</button>
       </div>
     </div>
     <div id="pickStructure" class="mt-2 text-sm text-slate-300"></div>
+    <div id="pickLevelCall" class="hidden mt-1 text-xs text-slate-400"></div>
+    <div id="pickRR" class="hidden mt-1 text-xs text-slate-300"></div>
     <div id="pickMetrics" class="mt-2 grid grid-cols-2 md:grid-cols-5 gap-2 text-xs"></div>
     <!-- Bias-trust hint (confidence framing) — shown when /accuracy show_hint=true -->
     <div id="pickHint" class="hidden mt-2 text-xs text-slate-500 italic"></div>
@@ -457,8 +461,8 @@
   <!-- Strategy grid -->
   <section data-gated>
     <div class="flex items-center justify-between mb-2">
-      <h2 class="text-sm uppercase tracking-wide text-slate-400">Strategies (8)</h2>
-      <div class="text-xs text-slate-500">★ recommended by bias</div>
+      <h2 id="stratHeading" class="text-sm uppercase tracking-wide text-slate-400">Strategies (8)</h2>
+      <div id="stratLegend" class="text-xs text-slate-500">★ recommended by bias</div>
     </div>
     <div id="stratGrid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
       <!-- pills injected here -->
@@ -839,6 +843,9 @@
     iron_condor: 'Iron Condor', iron_butterfly: 'Iron Fly',
     bull_call: 'Bull Call', bear_put: 'Bear Put',
     call_butterfly: 'Call Fly', put_butterfly: 'Put Fly',
+    // Level-engine-only structures (docs/level_engine.md §8.4).
+    long_call: 'Long Call', long_put: 'Long Put',
+    straddle: 'Straddle', strangle: 'Strangle',
   };
 
   // ── Feature 2: tooltip text dictionaries ────────────────────────────────
@@ -966,14 +973,30 @@
     } else {
       $('lastUpdate').textContent = `Last poll ${fmt.when(st.last_poll_ts)} (${st.last_poll_symbol || '—'})`;
     }
-    // Populate symbol dropdown if changed
-    const sel = $('symbolSel');
+    // Populate symbol dropdown if changed. /symbols is authoritative (level
+    // mode serves SPX only); /status's list is the fallback until it answers.
     const incoming = (st.symbols || []).join(',');
-    const current = (state.symbols || []).join(',');
-    if (incoming && incoming !== current) {
-      state.symbols = st.symbols;
-      sel.innerHTML = st.symbols.map(s => `<option ${s===state.symbol?'selected':''}>${s}</option>`).join('');
-    }
+    if (incoming && incoming !== state._statusSymbols) { state._statusSymbols = incoming; _loadSymbols(); }
+    _applySymbolList(state.symbolsApi || st.symbols);
+  }
+
+  function _applySymbolList(list) {
+    if (!Array.isArray(list) || !list.length) return;
+    if (list.join(',') === (state.symbols || []).join(',')) return;
+    state.symbols = list;
+    const switched = !list.includes(state.symbol);
+    if (switched) state.symbol = list[0];
+    $('symbolSel').innerHTML = list.map(s => `<option ${s===state.symbol?'selected':''}>${s}</option>`).join('');
+    if (switched) setTimeout(() => { poll(); pollAccuracy(); renderLookup(); }, 0);
+  }
+  async function _loadSymbols() {
+    try {
+      const r = await getJSON('/symbols');
+      if (r && Array.isArray(r.symbols) && r.symbols.length) {
+        state.symbolsApi = r.symbols;
+        _applySymbolList(r.symbols);
+      }
+    } catch (_) { /* fall back to /status's list */ }
   }
 
   function renderSnapshot(snap) {
@@ -1081,9 +1104,10 @@
 
     // Engine pick
     const pick = snap.engine_pick;
+    _renderLevelPickExtras(snap);
     if (pick) {
       $('pickCard').classList.remove('hidden');
-      $('pickName').textContent = `${STRATEGY_NAMES[pick.strategy] || pick.strategy}`;
+      $('pickName').textContent = `${STRATEGY_NAMES[pick.strategy] || pick.name || pick.strategy}`;
       $('pickLabel').textContent = `${pick.label || ''} · ${pick.width_preset || ''}`;
       $('pickComposite').textContent = `composite ${Number(pick.composite_score||0).toFixed(1)}`;
       $('pickComposite').title = TT_COMPOSITE;
@@ -1099,15 +1123,42 @@
         <div><div class="text-slate-500 tt" title="${TT_METRIC.pop_pct}">POP</div><div>${fmt.pct(pick.pop_pct,1)}</div></div>
         <div><div class="text-slate-500 tt" title="${TT_METRIC.ev}">EV</div><div>${fmt.money(pick.ev,2)}</div></div>
       `;
+    } else if (snap.level_decision) {
+      // Level mode with no pick (wait / done / no tick yet / engine unreachable):
+      // show the level state — never a legacy pick (docs/level_engine.md §3.4).
+      const ld = snap.level_decision;
+      const done = ld.call === 'done' || ld.status === 'session_close';
+      const down = ld.status === 'unavailable';
+      $('pickCard').classList.remove('hidden');
+      $('pickName').textContent = down ? 'unavailable' : done ? 'done for the day' : 'waiting for a setup';
+      $('pickLabel').textContent = '';
+      $('pickComposite').textContent = 'composite —';
+      $('pickComposite').title = '';
+      $('pickVerdict').textContent = '—';
+      $('pickVerdict').className = 'pill bg-slate-700 text-slate-200';
+      $('pickVerdict').title = '';
+      $('pickStructure').textContent = ld.reason || '';
+      $('pickMetrics').innerHTML = '';
     } else {
       $('pickCard').classList.add('hidden');
     }
 
-    // Strategy pills (8)
+    // Strategy pills (8) — or, in level mode, the level grid (§3.4 / §8.4)
     const grid = $('stratGrid');
     grid.innerHTML = '';
     const strats = snap.strategies || {};
-    const order = ['bull_put','bear_call','iron_condor','iron_butterfly','bull_call','bear_put','call_butterfly','put_butterfly'];
+    const lvlMode = _levelMode(snap);
+    const order = lvlMode
+      ? [...LEVEL_GRID_ORDER.filter(k => strats[k]), ...Object.keys(strats).filter(k => !LEVEL_GRID_ORDER.includes(k))]
+      : ['bull_put','bear_call','iron_condor','iron_butterfly','bull_call','bear_put','call_butterfly','put_butterfly'];
+    $('stratHeading').textContent = lvlMode ? `Strategies (${order.length})` : 'Strategies (8)';
+    $('stratLegend').textContent = lvlMode ? '★ level pick' : '★ recommended by bias';
+    if (lvlMode && !order.length) {
+      const ld = snap.level_decision || {};
+      const done = ld.call === 'done' || ld.status === 'session_close';
+      const msg = ld.status === 'unavailable' ? 'unavailable' : done ? 'done for the day' : 'waiting for a setup';
+      grid.innerHTML = `<div class="card p-3 col-span-full text-xs text-slate-500">Level engine — ${msg}</div>`;
+    }
     for (const key of order) {
       const s = strats[key];
       grid.insertAdjacentHTML('beforeend', renderStrategyPill(key, s));
@@ -1120,6 +1171,70 @@
         else if (act === 'place') placeOrder(strat);
       });
     });
+  }
+
+  // Level-engine extras on the engine-pick tile (docs/level_engine.md §3.4, §11).
+  // Only present when the backend runs MATRIX_DECISION_SOURCE=levels; in engine
+  // mode every element here stays hidden and the tile is unchanged.
+  function _lvlPrice(lv) {
+    if (!lv || lv.price == null) return '';
+    const p = Number(lv.price).toLocaleString(undefined, { maximumFractionDigits: 2 });
+    return lv.name ? `${p} (${lv.name})` : p;
+  }
+  // Level mode = the backend is in MATRIX_DECISION_SOURCE=levels (pick tagged
+  // source:"levels", or any level_decision — including status "unavailable",
+  // where the backend shows nothing legacy, docs/level_engine.md §3.4).
+  function _levelMode(snap) {
+    if (!snap) return false;
+    if (snap.engine_pick && snap.engine_pick.source === 'levels') return true;
+    return !!snap.level_decision;
+  }
+  // Preferred card order for the level grid (keys as level_engine/strategy.py emits them).
+  const LEVEL_GRID_ORDER = ['bull_call','bear_put','long_call','long_put','call_butterfly',
+                            'put_butterfly','straddle','strangle','iron_condor'];
+  // R/R to the level target (near reach) as a fraction: 1.9 = +190%.
+  function _rrProfit(c) {
+    if (c.rr_profit != null && Number.isFinite(Number(c.rr_profit))) return Number(c.rr_profit);
+    const n = c.rr && c.rr.near;
+    if (n && Number(n.cost) > 0 && n.pnl != null) return Number(n.pnl) / Number(n.cost);
+    if (n && Number(n.cost) > 0 && n.value != null) return (Number(n.value) - Number(n.cost)) / Number(n.cost);
+    return null;
+  }
+  // Health slot on a level card: the R/R, coloured by the R/R-based health.
+  function _rrBadge(c) {
+    const rp = _rrProfit(c);
+    const txt = rp == null ? (c.health || '—')
+      : `R/R ${rp >= 0 ? '+' : '−'}${Math.abs(Math.round(rp * 100))}%`;
+    const tip = `R/R to the level target: (value at target − cost) / cost. `
+      + `${c.health || '—'} — healthy ≥ +60% · thin +30–60% · capital trap < +30%.`
+      + (c.rr_line ? `\n${c.rr_line}` : '');
+    return `<span class="${badgeClass(c.health)}" title="${tip.replace(/"/g, '&quot;')}">${txt}</span>`;
+  }
+  function _renderLevelPickExtras(snap) {
+    const pick = snap.engine_pick;
+    const ld = snap.level_decision;
+    const isLevel = !!(pick && pick.source === 'levels');
+    const showSrc = isLevel || !!ld;
+    $('pickSource').classList.toggle('hidden', !showSrc);
+    $('pickSource').textContent = (ld && ld.status === 'unavailable')
+      ? 'Level engine unavailable' : 'Level engine';
+    // Call + target / invalidation
+    const callSrc = isLevel ? pick : ld;
+    let callTxt = '';
+    if (showSrc && callSrc && callSrc.call && !(ld && ld.status === 'unavailable')) {
+      const parts = [`Call ${String(callSrc.call).toUpperCase()}`];
+      const t = _lvlPrice(callSrc.target_level), inv = _lvlPrice(callSrc.invalidation_level);
+      if (t) parts.push(`target ${t}`);
+      if (inv) parts.push(`invalidation ${inv}`);
+      if (callSrc.confidence != null) parts.push(`conf ${Number(callSrc.confidence).toFixed(2)}`);
+      callTxt = parts.join(' · ');
+    }
+    $('pickLevelCall').textContent = callTxt;
+    $('pickLevelCall').classList.toggle('hidden', !callTxt);
+    const rr = isLevel ? (pick.rr_line || '') : '';
+    $('pickRR').textContent = rr;
+    $('pickRR').classList.toggle('hidden', !rr);
+    $('pickPlaceBtn').classList.toggle('hidden', !(isLevel && pick.pick_id && (pick.legs || []).length));
   }
 
   function verdictClass(color) {
@@ -1143,12 +1258,14 @@
   function renderStrategyPill(key, s) {
     if (!s) return '';
     const best = s.best;
-    const star = s.is_recommended ? '<span class="text-amber-300 ml-1" title="recommended by bias">★</span>' : '';
+    const lvl = !!(best && best.pick_id);   // level-engine card (§3.4)
+    const star = s.is_recommended ? `<span class="text-amber-300 ml-1" title="${lvl ? 'the level engine pick' : 'recommended by bias'}">★</span>` : '';
+    const title = STRATEGY_NAMES[key] || s.name || (best && best.name) || key;
     const recCls = s.is_recommended ? ' recommended-glow' : '';
     if (!best) {
       return `<div class="card p-3${recCls}">
         <div class="flex justify-between items-baseline">
-          <div class="font-semibold">${STRATEGY_NAMES[key] || key}${star}</div>
+          <div class="font-semibold">${title}${star}</div>
           <span class="pill bg-slate-700 text-slate-400">no candidate</span>
         </div>
         <div class="mt-2 text-xs text-slate-500">No tradeable structure found at this chain/DTE.</div>
@@ -1167,7 +1284,7 @@
     return `<div class="card p-3${recCls}">
       <div class="flex justify-between items-start gap-2">
         <div>
-          <div class="font-semibold">${STRATEGY_NAMES[key] || key}${star}</div>
+          <div class="font-semibold">${title}${star}</div>
           <div class="text-xs text-slate-500">${best.label || ''} · ${best.width_preset || ''} · ${legsCount} legs</div>
         </div>
         <div class="text-right">
@@ -1185,7 +1302,7 @@
         <div><div class="text-slate-500">Adj EV</div>${fmt.money(best.ev_adjusted,2)}</div>
       </div>
       <div class="mt-2 flex flex-wrap gap-1">
-        <span class="${badgeClass(best.health)}" title="${healthTip}">${best.health || '—'}</span>
+        ${lvl ? _rrBadge(best) : `<span class="${badgeClass(best.health)}" title="${healthTip}">${best.health || '—'}</span>`}
         <span class="${liqClass(best.liquidity)}" title="${liqTip}">liq ${best.liquidity || '—'}</span>
         <span class="${verdictClass(v.color)} pill" title="${verdictTip}">${(v.label||'').toUpperCase()}</span>
       </div>
@@ -1247,8 +1364,10 @@
       pop_pct: best.pop_pct,
       composite_score: best.composite_score,
       legs: best.legs || [],
-      decision_id: state.snapshot?.engine_pick?.decision_id ?? null,
+      decision_id: (state.snapshot?.engine_pick_legacy || state.snapshot?.engine_pick)?.decision_id ?? null,
       generated_at: new Date().toISOString(),
+      // Level card: the backend resolves exactly this card by pick_id.
+      ...(best.pick_id ? { pick_id: best.pick_id, source: 'levels' } : {}),
     };
   }
 
@@ -1273,6 +1392,7 @@
   const orderModal = {
     strategy: null,
     candidate: null,
+    pickId: null,     // set only for a level-engine pick (sent as pick_id)
     snap: null,
     previewOk: false,
     holdTimer: null,
@@ -1350,7 +1470,7 @@
     $('orderCostVal').textContent = txt;
   }
 
-  function openOrderDialog(strategy) {
+  function openOrderDialog(strategy, levelPick) {
     const snap = state.snapshot;
     if (!snap) { toast('No snapshot yet'); return; }
     // Trade execution requires the user's OWN active broker connection. The
@@ -1361,15 +1481,24 @@
       try { toggleSettings(true); } catch (_) {}
       return;
     }
-    const bucket = (snap.strategies || {})[strategy];
-    if (!bucket || !bucket.best) { toast('No candidate available'); return; }
-    const cand = bucket.best;
+    let cand;
+    if (levelPick) {
+      // Level-engine pick from the tile: place exactly the pick that is shown.
+      cand = { ...levelPick, type: levelPick.type || levelPick.spread_type };
+    } else {
+      const bucket = (snap.strategies || {})[strategy];
+      if (!bucket || !bucket.best) { toast('No candidate available'); return; }
+      cand = bucket.best;
+      // Level grid card: place exactly the card shown (resolved by pick_id).
+      if (cand.pick_id && !cand.type) cand = { ...cand, type: cand.spread_type };
+    }
     orderModal.strategy = strategy;
     orderModal.candidate = cand;
+    orderModal.pickId = levelPick ? levelPick.pick_id : (cand.pick_id || null);
     orderModal.snap = snap;
     orderModal.previewOk = false;
 
-    const labelName = STRATEGY_NAMES[strategy] || strategy;
+    const labelName = STRATEGY_NAMES[strategy] || cand.name || strategy;
     $('orderHeader').textContent =
       `${labelName} · ${cand.label || ''} · ${snap.symbol} · exp ${snap.expiration}`;
     $('orderQty').value = 1;
@@ -1393,10 +1522,11 @@
     _cancelHold();
     orderModal.strategy = null;
     orderModal.candidate = null;
+    orderModal.pickId = null;
   }
 
   function _buildOrderReq() {
-    return {
+    const req = {
       symbol: orderModal.snap.symbol,
       strategy: orderModal.strategy,
       candidate_label: orderModal.candidate.label,
@@ -1407,6 +1537,8 @@
       // so the backend resolves the real account from the user's broker token.
       account_id: _looksLikeAccountId($('orderAccount').value) ? $('orderAccount').value.trim() : null,
     };
+    if (orderModal.pickId) { req.pick_id = orderModal.pickId; req.source = 'levels'; }
+    return req;
   }
 
   // Never rejects — a network failure or timeout resolves to {ok:false,status:0}
@@ -1552,6 +1684,11 @@
       if (e.target.id === 'orderModal') closeOrderDialog();
     });
     $('orderPreviewBtn').addEventListener('click', doPreview);
+    // Level-engine pick on the tile → the dialog places exactly that pick (pick_id).
+    $('pickPlaceBtn').addEventListener('click', () => {
+      const p = state.snapshot && state.snapshot.engine_pick;
+      if (p && p.source === 'levels' && p.pick_id) openOrderDialog(p.strategy, p);
+    });
     const sb = $('orderSubmitBtn');
     sb.addEventListener('mousedown', _startHold);
     sb.addEventListener('mouseup', _cancelHold);
@@ -1610,8 +1747,32 @@
     }
   }
 
+  // Level legs (§12): binary win/loss with a close reason; no neutrals.
+  const CLOSE_REASON_TEXT = {
+    target: 'hit', invalidation: 'invalidated', flipped: 'flipped',
+    session_close: 'closed', zone_held: 'zone held', zone_exit: 'left zone',
+  };
+  function _levelOutcomeDetail(r) {
+    let why = CLOSE_REASON_TEXT[r.close_reason] || String(r.close_reason);
+    const tl = r.target_level;
+    if (r.close_reason === 'target' && tl && tl.price != null) {
+      why += ` ${Number(tl.price).toLocaleString(undefined, { maximumFractionDigits: 2 })}${tl.name ? ' ' + tl.name : ''}`;
+    }
+    let pnl = '';
+    if (r.favorable_delta != null && Number.isFinite(Number(r.favorable_delta))) {
+      const v = Number(r.favorable_delta);
+      const cls = v > 0 ? 'text-emerald-300' : (v < 0 ? 'text-rose-300' : 'text-slate-300');
+      pnl = `<span class="text-slate-400">P&amp;L <span class="${cls}">${v >= 0 ? '+' : '−'}$${Math.abs(Math.round(v)).toLocaleString()}</span></span>`;
+    }
+    const typ = r.spread_type ? `<span class="text-slate-500">${r.spread_type}</span>` : '';
+    return `${typ}<span class="text-slate-300">${why}</span>${pnl}`;
+  }
+
   function renderAccuracy(acc) {
     if (!acc) return;
+    const lvlAcc = _levelMode(state.snapshot)
+      || (acc.recent_outcomes || []).some(r => r && r.close_reason != null);
+    const tallyOf = (a) => lvlAcc ? `${a.wins}W / ${a.losses}L` : `${a.wins}W / ${a.losses}L / ${a.neutrals}N`;
     const pill = $('accuracyPill');
     const banner = $('regimeBanner');
     // Self-eval is paused while the market is closed — the backend stops
@@ -1631,7 +1792,7 @@
         pill.textContent = 'Accuracy collecting…';
         pill.title = 'No outcomes evaluated yet';
       } else if (!earned) {
-        const tally = `(${acc.wins}W / ${acc.losses}L / ${acc.neutrals}N)`;
+        const tally = `(${tallyOf(acc)})`;
         if (acc.state === 'paused') {
           pill.className = 'pill bg-amber-500/20 text-amber-200';
           pill.textContent = `Recalibrating ${tally}`;
@@ -1644,7 +1805,7 @@
       } else {
         const a = Number(acc.win_rate != null ? acc.win_rate : (acc.accuracy_pct || 0)).toFixed(0);
         pill.className = `pill ${tierClass(acc.tier)}`;
-        pill.textContent = `Accuracy ${a}% (${acc.wins}W / ${acc.losses}L / ${acc.neutrals}N)`;
+        pill.textContent = `Accuracy ${a}% (${tallyOf(acc)})`;
         pill.title = `rolling window of ${acc.window} · ${acc.n} outcomes counted`;
       }
       // Regime banner
@@ -1689,7 +1850,9 @@
       ? `last eval ${etTime(acc.last_evaluated_at)} · ${acc.n}/${acc.window} in window`
       : 'awaiting first sweep';
     if (!rows.length) {
-      list.innerHTML = '<div class="text-slate-500 italic">No evaluations yet — first outcomes will land ' +
+      list.innerHTML = lvlAcc
+        ? '<div class="text-slate-500 italic">No graded level calls yet — each lands when its call closes.</div>'
+        : '<div class="text-slate-500 italic">No evaluations yet — first outcomes will land ' +
         '3 minutes after the first bias decision.</div>';
       return;
     }
@@ -1709,7 +1872,9 @@
       // Premium-movement rows (new eval) show the spread's own favorable delta;
       // fall back to the legacy spot-move display for older outcome rows.
       let detail;
-      if (r.favorable_delta != null) {
+      if (r.close_reason != null) {
+        detail = _levelOutcomeDetail(r);
+      } else if (r.favorable_delta != null) {
         const fav = Number(r.favorable_delta);
         const favStr = (fav >= 0 ? '+' : '') + fav.toFixed(2);
         const favCls = fav > 0 ? 'text-emerald-300' : (fav < 0 ? 'text-rose-300' : 'text-slate-300');

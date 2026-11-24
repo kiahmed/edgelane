@@ -14,9 +14,19 @@ Config comes from deploy/.env:
 Then mirrors the APP_CONFIG_SYNC keys of edgelane_market.config (Torque's
 trading window + extended-hours tickers) into public.app_config.
 
+Finally provisions the Level Engine (tools/levels_provision.py): migration
+0035 creates its two login roles with no password; for each role whose DSN
+(LVL_DB_URL / LVL_REPLAY_DB_URL) is empty in
+market/backend/level_engine/facades_levels_engine.config, a random password is
+set on the role (sent as a SCRAM verifier) and the pooler DSN is written there.
+A filled DSN is never touched, so re-runs are no-ops; an emptied one = rotate.
+INTERNAL_FEED_TOKEN is generated / synced between that file and
+edgelane_market.config. Secrets are never printed.
+
 Usage:
-  python3 tools/db_push.py            apply all migrations
-  python3 tools/db_push.py --dry-run  list what would run, apply nothing
+  python3 tools/db_push.py            apply all migrations, sync, provision
+  python3 tools/db_push.py --dry-run  list what would run / be provisioned
+                                      (no network, no DB change, no file write)
 """
 from __future__ import annotations
 
@@ -25,6 +35,9 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import levels_provision  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = ROOT / "deploy" / ".env"
@@ -108,6 +121,7 @@ def main() -> int:
         print(f"    {f.relative_to(ROOT)}")
     if dry:
         print("[dry-run] nothing applied")
+        levels_provision.provision(dry_run=True)
         return 0
 
     env = _load_env(ENV_FILE)
@@ -131,6 +145,15 @@ def main() -> int:
 
     rc = _sync_app_config(ref, token)
     if rc:
+        return rc
+
+    try:
+        rc = levels_provision.provision(ref, token, run_sql=_run_sql)
+    except Exception as exc:          # never let a traceback echo a secret
+        print(f"FAILED level engine provisioning -> {type(exc).__name__}", file=sys.stderr)
+        return 1
+    if rc:
+        print("FAILED level engine provisioning (see above)", file=sys.stderr)
         return rc
 
     try:

@@ -14,6 +14,8 @@ back-compat.
 """
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException
 
 from ..config import get_settings
@@ -45,14 +47,23 @@ def _latest_bias_confidence(sym: str) -> str | None:
     return str(conf).lower() if conf else None
 
 
-def _trust_state(sym: str, graded: int, pct: float, settings) -> dict:
+def _trust_state(sym: str, graded: int, pct: float, settings, *,
+                 regime_active: bool | None = None,
+                 consec_wins: int | None = None) -> dict:
     """Compute the single bias-trust state + its display strings.
 
     Precedence: paused (regime alert) → low_conf (bias confidence low) →
     calibrating (too few graded) → in_sync.
+
+    `regime_active` / `consec_wins` default to the legacy evaluator's counters;
+    levels mode (app/level_accuracy.py) passes the ones replayed from level legs.
     """
-    regime_active = bool(evaluator_state.regime_alert_active_by_symbol.get(sym, False))
-    consec_wins = int(evaluator_state.consec_wins_by_symbol.get(sym, 0))
+    if regime_active is None:
+        regime_active = bool(evaluator_state.regime_alert_active_by_symbol.get(sym, False))
+    regime_active = bool(regime_active)
+    if consec_wins is None:
+        consec_wins = int(evaluator_state.consec_wins_by_symbol.get(sym, 0))
+    consec_wins = int(consec_wins)
     clear_wins = int(getattr(settings, "regime_clear_consec_wins", 2))
     min_graded = int(getattr(settings, "eval_min_graded", 10))
     bias_conf = _latest_bias_confidence(sym)
@@ -93,7 +104,21 @@ def _trust_state(sym: str, graded: int, pct: float, settings) -> dict:
 
 
 @router.get("/accuracy/{symbol}")
-def get_accuracy(symbol: str):
+async def get_accuracy(symbol: str):
+    """Levels mode (SPX): the same contract from level legs (§3.4, §12) — the
+    legacy grader is off, so its numbers are never shown. Engine mode: the
+    legacy DuckDB stats, byte-identical (run off the event loop, as FastAPI did
+    for the sync route)."""
+    from .. import level_accuracy
+
+    settings = get_settings()
+    if level_accuracy.applies(settings, symbol):
+        stats = await level_accuracy.level_stats(settings)
+        return level_accuracy.accuracy_payload(stats, settings, symbol)
+    return await asyncio.to_thread(_engine_accuracy, symbol)
+
+
+def _engine_accuracy(symbol: str) -> dict:
     sym = symbol.upper()
     # Runtime import — avoids the import cycle main.py ↔ routes at module load.
     from .. import main as _main

@@ -344,7 +344,14 @@ async def evaluate_pending(db, poller_state, settings) -> int:
     docs/spread_outcome_eval.md). Decisions with no pick never reach here
     (filtered out by fetch_pending_evaluations). Spot move is kept only as
     context metadata; it no longer decides win/loss.
+
+    Levels mode (MATRIX_DECISION_SOURCE=levels, docs/level_engine.md §3.4/§12):
+    grading belongs to the level engine — nothing is graded here (no silent
+    shadow grading); see `levels_pass`.
     """
+    if _levels_mode(settings):
+        await levels_pass(db, poller_state, settings)
+        return 0
     pending = await asyncio.to_thread(
         db.fetch_pending_evaluations, settings.eval_window_min
     )
@@ -449,6 +456,24 @@ async def evaluate_pending(db, poller_state, settings) -> int:
     return n
 
 
+def _levels_mode(settings) -> bool:
+    from . import level_view
+    try:
+        return level_view.levels_mode(settings)
+    except Exception:
+        return False
+
+
+async def levels_pass(db, poller_state, settings) -> None:
+    """One levels-mode sweep: no legacy grading, no regime rehydrate — the
+    record is the level engine's binary leg grades. matrix_signals still runs
+    every pass (trust / win-rate transitions, pick_result by pick_id,
+    daily_recap), fed by those grades. Runs whether or not the market is open:
+    a leg closed at the bell (session_close) still has its result posted."""
+    from . import matrix_signals
+    await matrix_signals.on_evaluation(db, poller_state, settings)
+
+
 async def evaluator_loop(db, poller_state, settings) -> None:
     """Run forever. Sleep 30s between sweeps regardless of work."""
     log.info("evaluator loop started; window=%dm band=%.4f%% alert_after=%dL clear_after=%dW",
@@ -477,6 +502,15 @@ async def evaluator_loop(db, poller_state, settings) -> None:
                 # work to a background task, so it never slows this sweep.
                 from . import matrix_daily_summary
                 matrix_daily_summary.tick(db, settings)
+
+                # Levels mode: the level engine grades; this loop only keeps
+                # the archive / daily email / signals running (§3.4).
+                if _levels_mode(settings):
+                    await levels_pass(db, poller_state, settings)
+                    state.last_run_at = datetime.now(timezone.utc).isoformat()
+                    state.last_error = None
+                    await asyncio.sleep(30)
+                    continue
 
                 # Self-eval is paused while the market is closed: prices are
                 # frozen, so any "outcome" would be manufactured noise. The

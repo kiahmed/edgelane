@@ -23,6 +23,10 @@ dependencies = [
     # to Pub/Sub (app/simmer_events.py). Imported lazily and best-effort, so a
     # missing client only disables events — it never breaks the sweep.
     "google-cloud-pubsub>=2.18",
+    # Level Engine container (level_engine/store.py PgStore): Postgres via a
+    # least-privilege role DSN (docs/level_engine.md §5.1). Imported lazily —
+    # the backend app never loads it.
+    "psycopg[binary]>=3.1",
     "tzdata; sys_platform == 'win32'",
 ]
 
@@ -33,12 +37,13 @@ dev = [
     "pytest-cov>=4",
 ]
 
-# The container copies both app/ and ui/ into /srv (ui/torque.html is resolved
-# by filesystem path, not import), so setuptools' flat-layout auto-discovery
-# sees two top-level dirs and bails. Package only `app` (+ subpackages); ui/
-# stays on disk for the Torque route to read, just not as an installed package.
+# The container copies app/, ui/ and level_engine/ into /srv (ui/torque.html is
+# resolved by filesystem path, not import), so setuptools' flat-layout
+# auto-discovery sees several top-level dirs and bails. Package `app` and
+# `level_engine` (+ subpackages); ui/ stays on disk for the Torque route to
+# read, just not as an installed package.
 [tool.setuptools.packages.find]
-include = ["app*"]
+include = ["app*", "level_engine*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -34,6 +34,10 @@ COPY ui ./ui
 # docker-execs). Not packaged — run by path with `app` importable via the
 # editable install below.
 COPY tools ./tools
+# Level Engine (docs/level_engine.md) — same image, own entrypoint
+# (`python -m level_engine.main`, the facades-levels-engine compose service).
+# Its config (facades_levels_engine.config, gitignored) is bind-mounted at runtime.
+COPY level_engine ./level_engine
 RUN pip install -e . \
  # The Webull SDK declares cryptography<42, but only its UNUSED RSA private-key
  # signer imports cryptography — our app-key auth path (and PyJWT's Supabase

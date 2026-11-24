@@ -56,9 +56,14 @@ def freeze_snapshot(snap: dict | None) -> dict:
 
 def build_row(*, event_id: str, symbol: str, state: str, expiry: Any,
               attrs: dict, snap: dict, card_pick: dict | None = None,
-              event_at: datetime | None = None) -> dict:
+              event_at: datetime | None = None,
+              accuracy: tuple[dict, dict] | None = None) -> dict:
     """Assemble the ledger row. Pure apart from reading the grader's record (the
-    same read the /matrix/state API does). Runs off the poll path."""
+    same read the /matrix/state API does). Runs off the poll path.
+
+    `accuracy` = a precomputed (trust, stats) — levels mode, where the record is
+    the level engine's (fetched async by matrix_signals before this thread
+    runs). None → the legacy grader's, read here as before."""
     from .routes.matrix import _accuracy_view, _state_block
 
     sym = str(symbol or "").upper()
@@ -75,7 +80,7 @@ def build_row(*, event_id: str, symbol: str, state: str, expiry: Any,
     data: dict[str, Any] = {}
     for block in ("pick", "grid", "bias", "win_eval", "walls"):
         try:
-            data[block] = _state_block(card_snap, block, sym)
+            data[block] = _state_block(card_snap, block, sym, accuracy=accuracy)
         except Exception:
             log.exception("[matrix-ledger] block %s failed for %s", block, sym)
     if card_pick:
@@ -83,7 +88,7 @@ def build_row(*, event_id: str, symbol: str, state: str, expiry: Any,
 
     trust = stats = None
     if view in ("bias_chip", "win_eval_grid"):
-        trust, stats = _accuracy_view(sym)
+        trust, stats = accuracy if accuracy is not None else _accuracy_view(sym)
     from .matrix_snap import render_snap_card
     html = render_snap_card(card_snap, view, trust=trust, stats=stats)
 

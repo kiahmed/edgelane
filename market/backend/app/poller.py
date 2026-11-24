@@ -25,7 +25,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from . import supabase_admin
+from . import level_view, supabase_admin
 
 log = logging.getLogger("edgelane.market.poller")
 
@@ -48,6 +48,14 @@ class PollerState:
         self.last_tradier_success_at: str | None = None
         self.last_tradier_error: str | None = None
         self.last_tradier_error_at: str | None = None
+        # Level Engine feed (docs/level_engine.md §3.2) — populated ONLY when
+        # LEVEL_FEED_ENABLED, and written in _poll_all in the same step as
+        # latest_by_symbol so they always match that snapshot's `ts`.
+        self.latest_contracts_by_symbol: dict[str, list[dict]] = {}
+        self.latest_spy_spot: float | None = None
+        self.latest_quote_by_symbol: dict[str, dict] = {}   # {SYM: {last, prevclose}}
+        # poll_symbol -> _poll_all hand-off for the above (not read by routes).
+        self._pending_feed: dict[str, dict] = {}
 
 
 # Module-level singleton — routes import this directly.
@@ -186,6 +194,32 @@ def _quote_map(contracts: list[dict]) -> dict[str, dict]:
     return out
 
 
+def _spot_from_quote(quote: dict | None) -> float:
+    """Spot from a quote dict: first positive of last / close / prevclose.
+    Kept bit-for-bit with the original inline loop (including returning the
+    last parsed non-positive value when none is positive)."""
+    spot = 0.0
+    for key in ("last", "close", "prevclose"):
+        v = quote.get(key) if quote else None
+        if v not in (None, ""):
+            try:
+                spot = float(v)
+                if spot > 0:
+                    break
+            except (TypeError, ValueError):
+                continue
+    return spot
+
+
+def _float_or_none(v: Any) -> float | None:
+    if v in (None, ""):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _compute_dte_fraction(exp_iso: str) -> float:
     """DTE in days. Same-day expiration -> 0.5 (intraday gate).
     Future expirations -> integer days + 0.5 (mid-day execution assumption)."""
@@ -208,18 +242,21 @@ async def poll_symbol(symbol: str, tradier_client, db, settings, persist: bool =
     bias_decisions so the self-eval has nothing frozen to score."""
     from .engine import compute_engine_output
 
-    # 1. spot quote
-    quote = await tradier_client.stock_quote(symbol)
-    spot = 0.0
-    for key in ("last", "close", "prevclose"):
-        v = quote.get(key) if quote else None
-        if v not in (None, ""):
-            try:
-                spot = float(v)
-                if spot > 0:
-                    break
-            except (TypeError, ValueError):
-                continue
+    feed_on = bool(getattr(settings, "level_feed_enabled", False))
+    spy_quote: dict | None = None
+
+    # 1. spot quote. Level Engine feed on + SPX: SPY rides the SAME request
+    # (one batched `markets/quotes`, docs/level_engine.md §3.2). A client
+    # without stock_quotes falls back to the single quote (no SPY) rather than
+    # spending a second request.
+    batched = getattr(tradier_client, "stock_quotes", None) if feed_on else None
+    if batched is not None and symbol.upper() == "SPX":
+        quotes = await batched(["SPX", "SPY"]) or {}
+        quote = quotes.get("SPX") or {}
+        spy_quote = quotes.get("SPY")
+    else:
+        quote = await tradier_client.stock_quote(symbol)
+    spot = _spot_from_quote(quote)
     if not spot:
         raise RuntimeError(f"no spot price for {symbol}")
 
@@ -263,13 +300,39 @@ async def poll_symbol(symbol: str, tradier_client, db, settings, persist: bool =
     # Engine output itself is left math-pure (parity); this is a poller add-on.
     output["_quote_by_symbol"] = _quote_map(contracts)
 
+    # Level Engine feed: stage the chain + quotes; _poll_all commits them to
+    # PollerState together with latest_by_symbol. Nothing staged when off.
+    if feed_on:
+        quotes_seen = {symbol.upper(): {"last": spot,
+                                        "prevclose": _float_or_none((quote or {}).get("prevclose"))}}
+        spy_spot = None
+        if spy_quote:
+            spy_spot = _spot_from_quote(spy_quote) or None
+            quotes_seen["SPY"] = {"last": spy_spot,
+                                  "prevclose": _float_or_none(spy_quote.get("prevclose"))}
+        state._pending_feed[symbol] = {
+            "contracts": contracts,
+            "quotes": quotes_seen,
+            "spy_spot": spy_spot,
+            "spy_fetched": symbol.upper() == "SPX",
+        }
+
     # 6. persist — DuckDB ops are sync; run in default executor so we don't
     # block the asyncio loop on disk I/O. Skipped for display-only polls.
     output["market_open"] = state.market_open
     output["evaluation_active"] = persist
+    # MATRIX_DECISION_SOURCE=levels (docs/level_engine.md §3.4): the legacy
+    # engine is a data service only — its bias / walls rows are still written,
+    # but no gradable legacy pick is captured (the legacy evaluator then has
+    # nothing to grade) and the cached output is left exactly as computed.
+    levels = level_view.levels_mode(settings)
     if persist:
         try:
-            await asyncio.to_thread(_persist_snapshot, db, symbol, chosen_exp, spot, output)
+            if levels:
+                await asyncio.to_thread(_persist_snapshot, db, symbol, chosen_exp, spot,
+                                        output, gradable=False)
+            else:
+                await asyncio.to_thread(_persist_snapshot, db, symbol, chosen_exp, spot, output)
         except Exception as e:
             log.warning("persist failed for %s: %s", symbol, e)
 
@@ -279,13 +342,34 @@ async def poll_symbol(symbol: str, tradier_client, db, settings, persist: bool =
         # here (like the engine above) to keep module import order simple;
         # on_snapshot swallows its own errors, so this can never cost a poll.
         from . import matrix_signals
-        await matrix_signals.on_snapshot(output, settings)
+        # Levels mode: signals follow the level pick / grid — a level-view COPY
+        # (the cached `output` is never mutated). The level engine ticks on the
+        # feed of the PREVIOUS poll (this output isn't cached yet), so the level
+        # decision seen here lags one poll (~POLL_INTERVAL_SEC) — acceptable.
+        if levels:
+            try:
+                snap_view = await level_view.level_snapshot(settings, output)
+            except Exception as e:      # never cost the poll its snapshot
+                log.warning("level view failed for %s: %s", symbol, e)
+                # Still a level view (no pick, empty grid) — never the legacy pick.
+                snap_view = {**output, "engine_pick": None, "strategies": {},
+                             "level_decision": {"status": "unavailable"}}
+            await matrix_signals.on_snapshot(snap_view, settings)
+        else:
+            await matrix_signals.on_snapshot(output, settings)
 
     return output
 
 
-def _persist_snapshot(db, symbol: str, expiration: str, spot: float, output: dict) -> None:
-    """Write per-strike gex_snapshots rows + a bias_decisions row. Best-effort."""
+def _persist_snapshot(db, symbol: str, expiration: str, spot: float, output: dict,
+                      gradable: bool = True) -> None:
+    """Write per-strike gex_snapshots rows + a bias_decisions row. Best-effort.
+
+    `gradable=False` (MATRIX_DECISION_SOURCE=levels): the bias_decisions row is
+    still written (bias / walls — the data service) but with pick_legs /
+    pick_entry_mid / pick_spread_type / pick_strategy NULL, so the legacy
+    evaluator has nothing to grade, and no decision_id is written back into the
+    output's engine_pick (the poller cache stays exactly as computed)."""
     bias = output.get("bias") or {}
     now = datetime.now(timezone.utc)
 
@@ -320,7 +404,7 @@ def _persist_snapshot(db, symbol: str, expiration: str, spot: float, output: dic
             log.warning("gex_snapshot insert failed: %s", e)
 
     # Engine-pick capture (spread-outcome eval). Null when no pick → not graded.
-    pick = output.get("engine_pick") or {}
+    pick = (output.get("engine_pick") or {}) if gradable else {}
     pick_legs = pick.get("legs")
     pick_legs_json = json.dumps(pick_legs) if pick_legs else None
 
@@ -347,7 +431,7 @@ def _persist_snapshot(db, symbol: str, expiration: str, spot: float, output: dic
             "pick_strategy": pick.get("strategy") if pick_legs_json else None,
         })
         # attach decision_id back into the engine output so the UI can reference it
-        if output.get("engine_pick"):
+        if gradable and output.get("engine_pick"):
             output["engine_pick"]["decision_id"] = decision_id
     except Exception as e:
         log.warning("bias_decision insert failed: %s", e)
@@ -407,6 +491,8 @@ async def poll_loop(tradier_client, db, settings) -> None:
     tz_name = getattr(settings, "market_hours_tz", "America/New_York")
     interval = max(5, int(getattr(settings, "poll_interval_sec", 20)))
     symbols: list[str] = list(getattr(settings, "symbols", []) or [])
+    # MATRIX_DECISION_SOURCE=levels polls SPX only (docs/level_engine.md §3.4).
+    symbols = level_view.level_symbols(settings, symbols)
     # Prefer the new name, fall back to the legacy name for older settings views.
     poll_when_closed = bool(getattr(settings, "should_poll_when_market_closed",
                                     getattr(settings, "force_poll_when_closed", False)))
@@ -481,6 +567,15 @@ async def _poll_all(symbols: list[str], tradier_client, db, settings, persist: b
             now = _utc_iso()
             out["ts"] = now  # capture time, for anything rendering "as of" (matrix_snap.py)
             state.latest_by_symbol[sym] = out
+            feed = state._pending_feed.pop(sym, None)
+            if feed is not None:
+                state.latest_contracts_by_symbol[sym] = feed["contracts"]
+                state.latest_quote_by_symbol.update(feed["quotes"])
+                if feed["spy_fetched"]:
+                    # Clear on a miss so a stale SPY never pairs with a fresh ts.
+                    state.latest_spy_spot = feed["spy_spot"]
+                    if feed["spy_spot"] is None:
+                        state.latest_quote_by_symbol.pop("SPY", None)
             state.last_poll_at[sym] = now
             state.last_error.pop(sym, None)
             state.last_tradier_success_at = now
@@ -495,6 +590,7 @@ async def _poll_all(symbols: list[str], tradier_client, db, settings, persist: b
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            state._pending_feed.pop(sym, None)
             log.exception("poll failed for %s", sym)
             msg = f"{type(e).__name__}: {e}"
             state.last_error[sym] = msg

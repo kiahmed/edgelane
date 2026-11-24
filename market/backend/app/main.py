@@ -60,6 +60,10 @@ def _settings_view(settings, should_poll_when_closed: bool, tradier_mode: str):
         should_poll_when_closed=bool(should_poll_when_closed),
         tradier_env=settings.tradier_env,
         tradier_mode=tradier_mode,
+        # Level Engine feed (docs/level_engine.md §3.2): poller caches the chain
+        # + SPY quote only when on. The token is NOT copied here — the feed route
+        # reads it from get_settings() directly.
+        level_feed_enabled=bool(settings.level_feed_enabled),
     )
 
 
@@ -168,10 +172,17 @@ async def lifespan(app: FastAPI):
     # Restore per-symbol regime counters (consec loss/win + pause flag) from the
     # outcomes table BEFORE the evaluator loop starts — otherwise a restart wipes
     # an active pause / loss streak and the win-rate gets republished mid-meltdown.
-    try:
-        await asyncio.to_thread(evaluator_rehydrate_regime, db, settings)
-    except Exception as e:
-        log.warning("  regime rehydrate skipped: %s", e)
+    # Levels mode: the legacy evaluator does not grade, so there is no legacy
+    # streak to restore — the regime is replayed from level legs on read
+    # (app/level_accuracy.py, docs/level_engine.md §3.4).
+    from . import level_view as _level_view
+    if _level_view.levels_mode(settings):
+        log.info("  regime rehydrate skipped: MATRIX_DECISION_SOURCE=levels (level engine grades)")
+    else:
+        try:
+            await asyncio.to_thread(evaluator_rehydrate_regime, db, settings)
+        except Exception as e:
+            log.warning("  regime rehydrate skipped: %s", e)
 
     eval_task = asyncio.create_task(
         evaluator_loop(db, poller_state, settings),
@@ -261,7 +272,7 @@ app.add_middleware(
 
 from .routes import (  # noqa: E402
     status, symbols, snapshot, accuracy, diag, orders, webhook, torque, session, broker, contact,
-    strike_profiles, simmer, auth_proxy, matrix,
+    strike_profiles, simmer, auth_proxy, matrix, internal_feed, levels_proxy,
 )
 
 app.include_router(status.router)
@@ -274,6 +285,8 @@ app.include_router(webhook.router)
 app.include_router(torque.router)
 app.include_router(simmer.router)
 app.include_router(matrix.router)
+app.include_router(internal_feed.router)   # level-engine feed; token-gated, not in OpenAPI
+app.include_router(levels_proxy.router)    # /levels/* allow-list proxy → level-engine read API
 app.include_router(auth_proxy.router)
 app.include_router(session.router)
 app.include_router(broker.router)

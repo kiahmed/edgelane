@@ -2,6 +2,8 @@
 #
 #   edgelane-backend   FastAPI app + Torque page (port 8789, internal)
 #   edgelane-cloudflared  Cloudflare tunnel exposing the backend over HTTPS
+#   facades-levels-engine Level Engine (opt-in: --profile levels; admin on
+#                         127.0.0.1:8790, read API on the compose network only)
 #
 # The tunnel routes the permanent hostname edge.facades.trade to
 # http://edgelane-backend:8789 across the compose network — so nothing needs
@@ -93,6 +95,51 @@ services:
       # back — surfacing as endless "control stream encountered a failure" /
       # "datagram handler: context canceled" loops. TCP is stable here.
       TUNNEL_TRANSPORT_PROTOCOL: http2
+    depends_on:
+      edgelane-backend:
+        condition: service_started
+    networks:
+      - edgelane-network
+
+  # Level Engine (docs/level_engine.md) — deterministic level-based SPX
+  # decision engine beside Matrix's engine. Same image as the backend, own
+  # entrypoint. It never calls Tradier: it reads the backend's cached data via
+  # GET http://edgelane-backend:8789/internal/feed/SPX (X-Internal-Token).
+  #
+  # Two listeners (§3.1), so a route can't be reached through the wrong door:
+  #   8791 read API  (/levels/decision|day|trace) — compose network ONLY, not
+  #                  published; the backend's /levels/* allow-list proxy uses it
+  #   8790 admin     (level management page + every write) — published on the
+  #                  host LOOPBACK only; never proxied, never on the tunnel
+  #
+  # Opt-in: behind the `levels` profile, so a plain `docker compose up` (and
+  # deploy.sh) is unchanged until the config exists. Start it with
+  #   docker compose -f deploy/docker-compose.yml --env-file deploy/.env --profile levels up -d
+  # Config: market/backend/level_engine/facades_levels_engine.config (gitignored; copy
+  # facades_levels_engine.config.example) — LVL_DB_URL is the facades_levels_engine_rw DSN (§5.1),
+  # never the service_role key; INTERNAL_FEED_TOKEN must match the backend's.
+  # Keep READ_PORT/ADMIN_PORT at 8791/8790 (the mappings below assume them).
+  facades-levels-engine:
+    profiles: ["levels"]
+    build:
+      context: ../market/backend
+      dockerfile: Dockerfile
+    image: ${EDGELANE_IMAGE:-edgelane-backend:latest}
+    container_name: facades-levels-engine
+    restart: unless-stopped
+    command: ["python", "-m", "level_engine.main"]
+    environment:
+      LEVEL_ENGINE_CONFIG: /config/facades_levels_engine.config
+    volumes:
+      - ../market/backend/level_engine/facades_levels_engine.config:/config/facades_levels_engine.config:ro
+    ports:
+      - "127.0.0.1:${LEVEL_ADMIN_PORT:-8790}:8790"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8791/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     depends_on:
       edgelane-backend:
         condition: service_started

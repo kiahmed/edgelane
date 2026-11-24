@@ -215,6 +215,25 @@ class TradierClient:
             q = q[0] if q else {}
         return q
 
+    async def stock_quotes(self, symbols: list[str]) -> dict[str, dict]:
+        """Batched quotes: ONE `markets/quotes` call for several symbols
+        (comma-joined). Returns {UPPER_SYMBOL: inner quote dict}. Tradier
+        answers a dict under `quote` for one symbol and a list for many;
+        unknown symbols are simply absent (they land in `unmatched_symbols`)."""
+        syms = [str(s).strip().upper() for s in symbols if s and str(s).strip()]
+        if not syms:
+            return {}
+        d = await self._get("markets/quotes",
+                            {"symbols": ",".join(syms), "greeks": "false"})
+        q = (d.get("quotes") or {}).get("quote") or []
+        if isinstance(q, dict):
+            q = [q]
+        out: dict[str, dict] = {}
+        for item in q:
+            if isinstance(item, dict) and item.get("symbol"):
+                out[str(item["symbol"]).upper()] = item
+        return out
+
     async def market_calendar(self, month: int, year: int) -> dict:
         """Raw `GET /v1/markets/calendar` response for one month. Each day
         carries `status` ("open"/"closed") and, on open days, `premarket`/

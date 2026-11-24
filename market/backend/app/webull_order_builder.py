@@ -39,6 +39,10 @@ WEBULL_STRATEGY = {
     "call_fly": "BUTTERFLY",
     "put_butterfly": "BUTTERFLY",
     "put_fly": "BUTTERFLY",
+    # Level engine long-vol structures (docs/level_engine.md §8.4); single-leg
+    # long_call / long_put already go as SINGLE by leg count.
+    "straddle": "STRADDLE",
+    "strangle": "STRANGLE",
 }
 
 # Net direction of the strategy: credit spreads are a net SELL, debit a net BUY.
